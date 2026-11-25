@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node / Web PWA
+web/node_modules/
+web/dist/
+web/.vite/
+
+# OS / Editor / Environment
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+.env
+.env.local
+.env.*.local
+
+# Runtime outputs, caches, tile builds, and GIS artifacts
+/data/
+/out/
+/output/
+/work/
+/packs/
+/tiles/
+.trailforge-data/
+.cache/
+*.gpkg
+*.gpkg-shm
+*.gpkg-wal
+*.tif
+*.tiff
+*.vrt
+*.osm
+*.osm.pbf
+*.mbtiles
+*.pmtiles
+*.kmz
+*.gpx
+*.geojson
+
+# Keep synthetic unit/integration test fixtures tracked
+!tests/fixtures/
+!tests/fixtures/**
