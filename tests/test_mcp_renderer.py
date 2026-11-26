@@ -319,3 +319,43 @@ def test_simplification_downsampling_and_450kb_result_budget_guard() -> None:
     assert serialized_result_size_bytes(oversized) > MAX_CALL_TOOL_RESULT_BYTES
     bounded = enforce_call_tool_result_budget(oversized)
     assert serialized_result_size_bytes(bounded) <= MAX_CALL_TOOL_RESULT_BYTES
+
+
+def test_elevation_png_alpha_blending_preserves_dark_snowline_and_legible_grade_pill() -> None:
+    """Ensure RGB base canvas alpha-blends translucent snowline, steep zones, and grade pills."""
+    points = [
+        CompactElevationPoint(
+            dist_m=i * 200.0,
+            elev_m=900.0 + (i * 20.0 if i <= 35 else (70 - i) * 20.0),
+            slope_deg=18.5 if 20 <= i <= 30 else 6.0,
+            grade="Extreme" if 20 <= i <= 30 else "Medium",
+        )
+        for i in range(71)
+    ]
+    png = render_elevation_profile_png(
+        title="Davies Plain High Ridge",
+        points=points,
+        grade="Extreme",
+        total_length_m=14_000.0,
+        elev_gain_m=700.0,
+        elev_loss_m=700.0,
+        max_slope_deg=18.5,
+        snowline_m=1000,
+        suitability_label="High Risk for your rig",
+    )
+    img = _decode_png(png).convert("RGB")
+    # Upper plot above snowline (y=92) must be dark translucent blend, not opaque (125,211,252)
+    for sample_x in (140, 480, 820):
+        px = img.getpixel((sample_x, 92))
+        assert px[0] < 60 and px[1] < 80 and px[2] < 105, (
+            f"Unblended opaque snowline/steep pixel at ({sample_x}, 92): {px}"
+        )
+    # Header grade pill region (top-right) must have dark blended pill pixels, not solid (239,68,68)
+    header_pixels = [
+        img.getpixel((x, y)) for x in range(620, 945, 2) for y in range(10, 44, 2)
+    ]
+    opaque_red_count = sum(
+        1 for (r, g, b) in header_pixels if r >= 225 and 50 <= g <= 85 and 50 <= b <= 85
+    )
+    # Only text/border pixels should be bright red; pill interior stays dark-blended
+    assert opaque_red_count < len(header_pixels) * 0.25

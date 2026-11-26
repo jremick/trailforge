@@ -201,7 +201,7 @@ def _encode_png_under_budget(
     *,
     max_bytes: int = MAX_PNG_BYTES,
 ) -> bytes:
-    """Downscale 2x supersampled RGBA canvas and encode PNG strictly under ``max_bytes``."""
+    """Downscale 2x supersampled RGB canvas and encode PNG strictly under ``max_bytes``."""
     downscaled = supersampled.resize(target_size, Image.Resampling.LANCZOS).convert("RGB")
     buf = io.BytesIO()
     downscaled.save(buf, format="PNG", optimize=True, compress_level=9)
@@ -258,7 +258,7 @@ def render_elevation_profile_png(
 ) -> bytes:
     """Render a 960x420 anti-aliased dark-topo elevation profile PNG."""
     w, h = ELEVATION_PNG_SIZE[0] * _SCALE, ELEVATION_PNG_SIZE[1] * _SCALE
-    img = Image.new("RGBA", (w, h), _BG_CANVAS)
+    img = Image.new("RGB", (w, h), _BG_CANVAS[:3])
     draw = ImageDraw.Draw(img, "RGBA")
 
     # Header bar
@@ -557,7 +557,7 @@ def render_map_card_png(
 ) -> bytes:
     """Render a 960x540 aspect-corrected dark-topo Track / Route / Area map card PNG."""
     w, h = MAP_CARD_PNG_SIZE[0] * _SCALE, MAP_CARD_PNG_SIZE[1] * _SCALE
-    img = Image.new("RGBA", (w, h), _BG_CANVAS)
+    img = Image.new("RGB", (w, h), _BG_CANVAS[:3])
     draw = ImageDraw.Draw(img, "RGBA")
 
     header_h = 64 * _SCALE
@@ -887,7 +887,7 @@ def render_comparison_png(
 ) -> bytes:
     """Render a 960x460 overlaid elevation curves + KPI strips PNG comparing 2-4 tracks."""
     w, h = COMPARISON_PNG_SIZE[0] * _SCALE, COMPARISON_PNG_SIZE[1] * _SCALE
-    img = Image.new("RGBA", (w, h), _BG_CANVAS)
+    img = Image.new("RGB", (w, h), _BG_CANVAS[:3])
     draw = ImageDraw.Draw(img, "RGBA")
 
     header_h = 56 * _SCALE

@@ -764,12 +764,13 @@ def test_full_w1_w2_w3_w4_e2e_oauth_pat_mcp_and_admin_metrics(
             assert "?route=" in saved_sc["deep_link_url"]
             assert "rig=Touring" in saved_sc["deep_link_url"]
 
-            # OAuth token cannot manage PATs, OAuth grants, or admin API
+            # OAuth token cannot manage PATs, OAuth grants, admin API, or log out user sessions
             assert client.get("/api/auth/tokens", headers=oauth_hdrs).status_code == 403
             assert client.get("/api/auth/oauth-grants", headers=oauth_hdrs).status_code == 403
             assert client.get("/api/admin/stats", headers=oauth_hdrs).status_code == 403
+            assert client.post("/api/auth/logout", headers=oauth_hdrs).status_code == 403
 
-            # Driver session lists the connected OAuth app cleanly
+            # Driver session remains intact and lists the connected OAuth app cleanly
             driver_sess_hdrs = {"Authorization": f"Bearer {driver_session_tok}"}
             r_grants = client.get("/api/auth/oauth-grants", headers=driver_sess_hdrs)
             assert r_grants.status_code == 200
@@ -829,10 +830,13 @@ def test_full_w1_w2_w3_w4_e2e_oauth_pat_mcp_and_admin_metrics(
             assert r_ro_write_api.status_code == 403
             assert "trailforge:write" in r_ro_write_api.json()["detail"]
 
-            # PATs cannot manage /api/auth/tokens, /api/auth/oauth-grants, or /api/admin/*
+            # PATs cannot manage /api/auth/tokens, /api/auth/oauth-grants, /api/admin/*, or logout
             assert client.get("/api/auth/tokens", headers=rw_hdrs).status_code == 403
             assert client.get("/api/auth/oauth-grants", headers=rw_hdrs).status_code == 403
             assert client.get("/api/admin/stats", headers=rw_hdrs).status_code == 403
+            assert client.post("/api/auth/logout", headers=ro_hdrs).status_code == 403
+            assert client.post("/api/auth/logout", headers=rw_hdrs).status_code == 403
+            assert client.get("/api/auth/me", headers=ro_hdrs).json()["authenticated"] is True
 
             # Write PAT succeeds on MCP write + REST write
             r_rw_pin = _mcp_post(

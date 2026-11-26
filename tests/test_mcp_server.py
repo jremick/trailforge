@@ -783,6 +783,14 @@ def test_all_public_and_app_tools_end_to_end_offline(seeded_mcp_env: dict[str, A
     _assert_valid_png_block(i_imgs[0], (960, 420))
     _assert_valid_png_block(i_imgs[1], (960, 540))
 
+    # Alpha-compositing regression: translucent snowline/steep overlays must blend darkly onto
+    # the RGB canvas rather than overwriting with opaque solid cyan (125,211,252) or red (239,68,68)
+    elev_img = Image.open(io.BytesIO(base64.b64decode(i_imgs[0]["data"]))).convert("RGB")
+    sky_px = elev_img.getpixel((480, 96))
+    assert sky_px[0] < 60 and sky_px[1] < 80 and sky_px[2] < 105, (
+        f"Elevation PNG upper plot area is opaque instead of dark-blended: {sky_px}"
+    )
+
     # Fuzzy name lookup resolves unique name and disambiguates ambiguous prefix
     i_name = call("inspect_track", {"track_name": first_name, "include_images": False})
     assert i_name["structuredContent"]["track"]["summary"]["track_id"] == first_tid

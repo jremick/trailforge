@@ -564,7 +564,7 @@ def test_pat_lifecycle_scopes_revocation_suspension_and_logout(sqlite_db: Sessio
         assert "token_hash" not in listed[0]
         assert listed[0]["token_prefix"] == ro_token[:13]
 
-        # PAT CANNOT manage /api/auth/tokens or /api/auth/oauth-grants (403)
+        # PAT CANNOT manage /api/auth/tokens, /api/auth/oauth-grants, or log out sessions (403)
         pat_hdr = {"Authorization": f"Bearer {ro_token}"}
         assert client.get("/api/auth/tokens", headers=pat_hdr).status_code == 403
         assert (
@@ -580,6 +580,17 @@ def test_pat_lifecycle_scopes_revocation_suspension_and_logout(sqlite_db: Sessio
                 "/api/auth/oauth-grants", headers={"Authorization": f"Bearer {ro_token}"}
             ).status_code
             == 403
+        )
+        tv_before = int(user_a.token_version)
+        assert client.post("/api/auth/logout", headers=pat_hdr).status_code == 403
+        sqlite_db.refresh(user_a)
+        assert int(user_a.token_version) == tv_before
+        # Existing session token remains valid after blocked PAT logout attempt
+        assert (
+            client.get(
+                "/api/auth/tokens", headers={"Authorization": f"Bearer {session_a}"}
+            ).status_code
+            == 200
         )
 
         # Read-only PAT authenticates /mcp & /mcp/auth read, but is rejected (403) on writes
@@ -1009,6 +1020,10 @@ def test_full_oauth21_pkce_dcr_rotation_reuse_revoke_and_grants(
             ).status_code
             == 403
         )
+        tv_before_oauth_logout = int(user.token_version)
+        assert client.post("/api/auth/logout", headers=oauth_hdr).status_code == 403
+        sqlite_db.refresh(user)
+        assert int(user.token_version) == tv_before_oauth_logout
 
         # 15. Account Panel /api/auth/oauth-grants lists the connected app (using session cookie!)
         grants_resp = client.get("/api/auth/oauth-grants")

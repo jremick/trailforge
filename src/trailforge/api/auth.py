@@ -11,7 +11,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from trailforge.auth.dependencies import resolve_token_user
+from trailforge.auth.dependencies import resolve_request_auth_context
 from trailforge.auth.invites import (
     get_admin_email,
     get_demo_banner,
@@ -24,6 +24,7 @@ from trailforge.auth.security import (
     normalize_email,
     verify_password,
 )
+from trailforge.auth.tokens import SCOPE_READ
 from trailforge.config import get_settings
 from trailforge.db.models import InviteCode, User, VehicleProfile
 from trailforge.db.session import get_db
@@ -311,11 +312,23 @@ def logout_user(
     response: Response,
     db: Session = Depends(get_db),
 ) -> dict[str, bool]:
-    """Revoke active tokens server-side (incrementing ``token_version``) and clear cookie."""
-    user = resolve_token_user(request, db)
-    if user is not None:
-        user.token_version = int(getattr(user, "token_version", 1) or 1) + 1
-        user.updated_at = datetime.now(UTC)
+    """Revoke active tokens server-side (incrementing ``token_version``) and clear cookie.
+
+    Requires full session credentials; PATs and OAuth tokens are rejected with HTTP 403
+    so a delegated AI token cannot globally terminate all user sessions.
+    """
+    ctx = resolve_request_auth_context(request, db, touch_last_used=False)
+    if ctx.auth_method in ("pat", "oauth"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Session authentication required; Personal Access Tokens and OAuth tokens "
+                "cannot log out user sessions"
+            ),
+        )
+    if ctx.auth_method == "session" and ctx.user is not None:
+        ctx.user.token_version = int(getattr(ctx.user, "token_version", 1) or 1) + 1
+        ctx.user.updated_at = datetime.now(UTC)
         db.commit()
     cfg = get_settings()
     response.delete_cookie(key=cfg.auth_cookie_name, path="/")
@@ -328,7 +341,8 @@ def get_me(
     db: Session = Depends(get_db),
 ) -> AuthMeResponse:
     """Return active session state; anonymous gets `authenticated: false`, suspended gets `403`."""
-    user = resolve_token_user(request, db)
+    ctx = resolve_request_auth_context(request, db)
+    user = ctx.user
     if user is None:
         return AuthMeResponse(authenticated=False, user=None)
     if not user.is_active:
@@ -336,4 +350,6 @@ def get_me(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account is suspended",
         )
+    if ctx.auth_method in ("pat", "oauth") and not ctx.has_scope(SCOPE_READ):
+        return AuthMeResponse(authenticated=False, user=None)
     return AuthMeResponse(authenticated=True, user=_to_user_public(db, user))
