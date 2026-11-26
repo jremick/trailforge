@@ -39,7 +39,7 @@ from trailforge.worker.main import run_due_closure_syncs
 def test_all_five_adapters_implement_protocol_and_parse_mocked_http() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
-        if "mapshare" in url:
+        if "mapshare" in url or "paim_vm_tr_road_closures" in url:
             return httpx.Response(
                 200,
                 json={
@@ -402,10 +402,79 @@ def test_closures_sync_propagation_capad_join_and_outage_resilience(
         assert all(i["severity"] == "critical" for i in crit["items"])
 
 
+def test_npws_rss_and_vic_paim_wfs_parsing_offline() -> None:
+    rss_xml = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<rss version="2.0"><channel><title>NSW National Parks</title><item>'
+        "<guid>Kosciuszko-NP-Closure-1</guid>"
+        "<link>https://www.nationalparks.nsw.gov.au/alerts</link>"
+        "<title>Kosciuszko National Park</title>"
+        "<description>&lt;strong&gt;Closed areas: Alpine Way snow closure&lt;/strong&gt;"
+        "&lt;br/&gt;4WD tracks closed due to snow.</description>"
+        "<pubDate>Fri, 18 Sep 2026 08:37:08 +1100</pubDate>"
+        "</item></channel></rss>"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "paim_vm_tr_road_closures" in url:
+            return httpx.Response(
+                200,
+                json={
+                    "type": "FeatureCollection",
+                    "features": [
+                        {
+                            "type": "Feature",
+                            "properties": {
+                                "vdpid": 101,
+                                "ezi_road_name_label": "Block Six Rd",
+                                "status": "Closed - Full",
+                                "reason": "Seasonal Closure",
+                                "closure_date": "2026-06-16T00:00:00Z",
+                                "reopen_date": "2026-10-31T00:00:00Z",
+                                "editdate": "2026-03-30T00:00:00Z",
+                            },
+                            "geometry": {
+                                "type": "LineString",
+                                "coordinates": [[148.12, -36.58], [148.123, -36.62]],
+                            },
+                        }
+                    ],
+                },
+            )
+        if "nationalparks.nsw.gov.au" in url:
+            return httpx.Response(
+                200,
+                text=rss_xml,
+                headers={"Content-Type": "application/rss+xml; charset=utf-8"},
+            )
+        return httpx.Response(404)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        vic_items = VicSeasonalClosuresAdapter(client=client).fetch()
+        assert len(vic_items) == 1
+        assert vic_items[0].external_id == "101"
+        assert vic_items[0].title == "Block Six Rd"
+        assert vic_items[0].alert_type == "seasonal_closure"
+        assert vic_items[0].db_severity == "closed"
+        assert vic_items[0].effective_from is not None
+
+        npws_items = NSWNPWSAdapter(client=client).fetch()
+        assert len(npws_items) == 1
+        assert npws_items[0].park_name == "Kosciuszko National Park"
+        assert "Alpine Way snow closure" in npws_items[0].title
+        assert npws_items[0].alert_type == "park_closure"
+        assert npws_items[0].db_severity == "closed"
+
+
 @pytest.mark.live
 def test_live_vic_nsw_incident_feeds_smoke() -> None:
-    """Optional live smoke check against VicEmergency & NSW RFS JSON feeds (excluded from CI)."""
+    """Optional live smoke check against VIC/NSW official closure & incident feeds."""
+    vic_seasonal = VicSeasonalClosuresAdapter(timeout_s=20.0).fetch()
     vic_items = VicEmergencyAdapter(timeout_s=15.0).fetch()
     rfs_items = NSWRFSAdapter(timeout_s=15.0).fetch()
+    npws_items = NSWNPWSAdapter(timeout_s=20.0).fetch()
+    assert isinstance(vic_seasonal, list) and len(vic_seasonal) > 0
     assert isinstance(vic_items, list)
     assert isinstance(rfs_items, list)
+    assert isinstance(npws_items, list) and len(npws_items) > 0

@@ -586,9 +586,13 @@ def test_poi_dedupe_keeps_distinct_nearby_types() -> None:
 
 @pytest.mark.live
 def test_live_au_connectors_smoke() -> None:
-    """Optional live smoke test against VIC DataVic WFS & CAPAD (excluded from offline CI)."""
+    """Optional live smoke test against CAPAD, DataVic WFS, NSW Spatial & GA Hydrology."""
     parks = CAPADConnector().fetch_parks(CORRIDOR_ALPS_BBOX)
     assert any("Alpine" in p.name or "Kosciuszko" in p.name for p in parks)
     vic_tracks = VICTrailsConnector().fetch_tracks(CORRIDOR_ALPS_BBOX)
-    assert isinstance(vic_tracks, list)
+    assert isinstance(vic_tracks, list) and len(vic_tracks) > 0
+    nsw_tracks = NSWTrailsConnector().fetch_tracks(CORRIDOR_ALPS_BBOX)
+    assert isinstance(nsw_tracks, list) and len(nsw_tracks) > 0
+    waterways = GAHydroConnector().fetch_waterways(CORRIDOR_ALPS_BBOX)
+    assert isinstance(waterways, list) and len(waterways) > 0
     assert json.dumps([p.name for p in parks])

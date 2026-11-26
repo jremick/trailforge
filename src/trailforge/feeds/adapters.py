@@ -6,8 +6,11 @@ CI tests run 100% offline while live production runs talk directly to official V
 
 from __future__ import annotations
 
+import html
 import json
 import logging
+import re
+import xml.etree.ElementTree as ET
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -183,41 +186,63 @@ class VicSeasonalClosuresAdapter(_BaseHttpFeedAdapter):
             props = dict(item.get("properties") or {})
             geom = _normalize_geojson_geometry(item.get("geometry"))
             ext_id = str(
-                prop_ci(props, "external_id", "pfi", "ufi", "objectid", "id")
+                prop_ci(props, "external_id", "pfi", "ufi", "vdpid", "objectid", "id")
                 or item.get("id")
                 or ""
             ).strip()
         else:
             props = dict(item)
             geom = _normalize_geojson_geometry(item.get("geometry"))
-            ext_id = str(prop_ci(props, "external_id", "pfi", "objectid", "id") or "").strip()
+            ext_id = str(
+                prop_ci(props, "external_id", "pfi", "ufi", "vdpid", "objectid", "id") or ""
+            ).strip()
 
         title = str(
-            prop_ci(props, "title", "road_name", "ezi_road_name_label", "name") or ""
+            prop_ci(props, "title", "road_name", "ezi_road_name_label", "ezi_road_name", "name")
+            or ""
         ).strip()
         if not title:
             return None
         if not ext_id:
             ext_id = f"vic-seasonal-{title.lower().replace(' ', '-')}"
 
+        raw_desc = str(
+            prop_ci(props, "description", "comments", "statusnote", "reason") or ""
+        ).strip()
+
         return NormalizedClosure(
             source_feed=self.feed_source,
             external_id=ext_id,
             alert_type=_normalize_alert_type(
-                prop_ci(props, "alert_type", "closure_type"), default="seasonal_closure"
+                prop_ci(props, "alert_type", "closure_type", "reason", "statusnote"),
+                default="seasonal_closure",
             ),
-            db_severity=_normalize_db_severity(prop_ci(props, "severity"), default="closed"),
+            db_severity=_normalize_db_severity(
+                prop_ci(props, "severity", "status"), default="closed"
+            ),
             status=_normalize_status(prop_ci(props, "status"), default="active"),
             title=title,
-            description=str(prop_ci(props, "description", "comments", "reason") or "").strip()
-            or None,
+            description=raw_desc or None,
             state=_normalize_state(prop_ci(props, "state"), default="VIC"),
-            source_url=str(prop_ci(props, "source_url", "url") or self.source_url).strip(),
+            source_url=str(
+                prop_ci(props, "source_url", "url", "url_string") or self.source_url
+            ).strip(),
             geometry=geom,
-            effective_from=parse_iso_datetime(prop_ci(props, "effective_from", "start_date")),
-            effective_to=parse_iso_datetime(prop_ci(props, "effective_to", "end_date")),
+            effective_from=parse_iso_datetime(
+                prop_ci(props, "effective_from", "start_date", "closure_date")
+            ),
+            effective_to=parse_iso_datetime(
+                prop_ci(props, "effective_to", "end_date", "reopen_date")
+            ),
             source_updated_at=parse_iso_datetime(
-                prop_ci(props, "source_updated_at", "updated_at", "last_updated")
+                prop_ci(
+                    props,
+                    "source_updated_at",
+                    "updated_at",
+                    "last_updated",
+                    "editdate",
+                    "ufi_created",
+                )
             )
             or datetime.now(UTC),
             raw_payload=props,
@@ -401,10 +426,103 @@ class NSWRFSAdapter(_BaseHttpFeedAdapter):
         return out
 
 
+_HTML_STRONG_RE: Final[re.Pattern[str]] = re.compile(
+    r"<strong[^>]*>(.*?)</strong>", re.IGNORECASE | re.DOTALL
+)
+_HTML_TAG_RE: Final[re.Pattern[str]] = re.compile(r"<[^>]+>")
+_WS_COLLAPSE_RE: Final[re.Pattern[str]] = re.compile(r"\s+")
+
+
+def _strip_html(raw: str) -> str:
+    unescaped = html.unescape(raw)
+    cleaned = _HTML_TAG_RE.sub(" ", unescaped)
+    return _WS_COLLAPSE_RE.sub(" ", cleaned).strip()
+
+
 class NSWNPWSAdapter(_BaseHttpFeedAdapter):
-    """NSW National Parks & Wildlife Service (NPWS) park alerts adapter (CAPAD joined)."""
+    """NSW National Parks & Wildlife Service (NPWS) park alerts adapter (CAPAD joined).
+
+    Supports both the official live NPWS RSS 2.0 feed (``/api/rssfeed/get``) and
+    JSON alert fixtures/payloads.
+    """
 
     feed_source: FeedSourceLiteral = "nsw_npws"
+
+    def _parse_rss_items(self, xml_text: str) -> list[dict[str, Any]]:
+        root = ET.fromstring(xml_text)
+        parsed_items: list[dict[str, Any]] = []
+        for elem in root.findall(".//item"):
+            park_name = (elem.findtext("title") or "").strip()
+            if not park_name:
+                continue
+            guid = (elem.findtext("guid") or "").strip()
+            link = (elem.findtext("link") or "").strip() or self.source_url
+            pub_date = (elem.findtext("pubDate") or "").strip()
+            raw_desc = elem.findtext("description") or ""
+
+            headline = ""
+            m_strong = _HTML_STRONG_RE.search(raw_desc)
+            if m_strong:
+                headline = _strip_html(m_strong.group(1))
+            plain_desc = _strip_html(raw_desc)
+            if len(plain_desc) > 1200:
+                plain_desc = plain_desc[:1197].rstrip() + "..."
+
+            title = f"{park_name} — {headline}" if headline else park_name
+            lower_blob = f"{headline} {plain_desc}".lower()
+            if "closed" in lower_blob or "closure" in lower_blob:
+                alert_type = "park_closure"
+                severity = "closed"
+            elif "fire" in lower_blob:
+                alert_type = "bushfire"
+                severity = "advisory"
+            elif "flood" in lower_blob:
+                alert_type = "flood"
+                severity = "advisory"
+            else:
+                alert_type = "hazard_warning"
+                severity = "advisory"
+
+            parsed_items.append(
+                {
+                    "id": guid or f"npws-rss-{park_name.lower().replace(' ', '-')[:48]}",
+                    "title": title,
+                    "parkName": park_name,
+                    "alertType": alert_type,
+                    "severity": severity,
+                    "description": plain_desc or None,
+                    "url": link,
+                    "updated": pub_date or None,
+                }
+            )
+        return parsed_items
+
+    def _fetch_npws_payload(self) -> Any:
+        owns_client = self._client is None
+        http = (
+            self._client
+            if self._client is not None
+            else httpx.Client(
+                timeout=httpx.Timeout(self.timeout_s, connect=min(8.0, self.timeout_s)),
+                follow_redirects=True,
+                headers={"User-Agent": USER_AGENT},
+            )
+        )
+        try:
+            resp = http.get(self.source_url, headers={"User-Agent": USER_AGENT})
+            resp.raise_for_status()
+            content_type = (resp.headers.get("content-type") or "").lower()
+            body_text = resp.text
+            if (
+                "xml" in content_type
+                or "rss" in content_type
+                or body_text.lstrip().startswith("<")
+            ):
+                return self._parse_rss_items(body_text)
+            return resp.json()
+        finally:
+            if owns_client:
+                http.close()
 
     def _parse_item(self, item: Mapping[str, Any]) -> NormalizedClosure | None:
         if item.get("type") == "Feature":
@@ -458,7 +576,9 @@ class NSWNPWSAdapter(_BaseHttpFeedAdapter):
             raw_items: list[Mapping[str, Any]] = self._fixture_items
         else:
             payload = (
-                self._fixture_payload if self._fixture_payload is not None else self._fetch_json()
+                self._fixture_payload
+                if self._fixture_payload is not None
+                else self._fetch_npws_payload()
             )
             if isinstance(payload, Mapping) and isinstance(payload.get("alerts"), list):
                 raw_items = payload["alerts"]

@@ -42,12 +42,17 @@ ClosureStatusLiteral = Literal["active", "scheduled", "cleared", "stale"]
 TrackClosureStatusLiteral = Literal["open", "info", "warning", "seasonal", "gated", "closed"]
 StateLiteral = Literal["VIC", "NSW", "ACT"]
 
-DEFAULT_VIC_SEASONAL_URL: Final[str] = "https://mapshare.vic.gov.au/mapsharevic/"
+DEFAULT_VIC_SEASONAL_URL: Final[str] = (
+    "https://opendata.maps.vic.gov.au/geoserver/wfs"
+    "?service=WFS&version=2.0.0&request=GetFeature"
+    "&typeNames=open-data-platform:paim_vm_tr_road_closures"
+    "&outputFormat=application/json&srsName=EPSG:4326&count=500"
+)
 DEFAULT_VIC_EMERGENCY_URL: Final[str] = (
     "https://emergency.vic.gov.au/public/events-geojson.json"
 )
 DEFAULT_NSW_RFS_URL: Final[str] = "https://www.rfs.nsw.gov.au/feeds/majorIncidents.json"
-DEFAULT_NSW_NPWS_URL: Final[str] = "https://www.nationalparks.nsw.gov.au/alerts"
+DEFAULT_NSW_NPWS_URL: Final[str] = "https://www.nationalparks.nsw.gov.au/api/rssfeed/get"
 DEFAULT_OSM_ACCESS_URL: Final[str] = "https://www.openstreetmap.org/copyright"
 
 
