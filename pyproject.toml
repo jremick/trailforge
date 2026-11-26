@@ -38,6 +38,7 @@ dependencies = [
     "httpx>=0.27,<1.0",
     "python-multipart>=0.0.12,<1.0",
     "pillow>=11.0,<14.0",
+    "mcp>=1.10,<2.0",
 ]
 
 [project.optional-dependencies]
@@ -63,6 +64,7 @@ dev = [
 [project.scripts]
 trailforge-api = "trailforge.api.main:run"
 trailforge-worker = "trailforge.worker.main:run"
+trailforge-mcp = "trailforge.mcp.stdio_proxy:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/trailforge"]
