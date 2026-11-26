@@ -28,6 +28,7 @@ web/.vite/
 .env
 .env.local
 .env.*.local
+.wrangler/
 
 # Runtime outputs, caches, tile builds, and GIS artifacts
 /data/

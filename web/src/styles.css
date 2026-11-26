@@ -975,16 +975,6 @@ button {
   gap: 8px;
 }
 
-.tf-section-index {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 700;
-  color: var(--accent-amber-bright);
-  background: var(--accent-amber-soft);
-  border-radius: 3px;
-  padding: 1px 5px;
-}
-
 .tf-section-title {
   font-size: 11.5px;
   font-weight: 700;
@@ -1033,6 +1023,114 @@ button {
 .tf-toggle-row:hover {
   background: var(--bg-elevated);
   border-color: var(--border-strong);
+}
+
+.tf-layer-row {
+  align-items: center;
+  gap: 6px;
+  padding: 6px 6px 6px 5px;
+  cursor: default;
+}
+
+.tf-layer-row.dragging {
+  opacity: 0.45;
+  border-style: dashed;
+  border-color: var(--accent-cyan);
+}
+
+.tf-layer-row.drag-over {
+  border-color: var(--accent-amber);
+  box-shadow: 0 -2px 0 0 var(--accent-amber);
+}
+
+.tf-layer-drag-handle {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1;
+  letter-spacing: -1px;
+  padding: 4px 2px;
+  cursor: grab;
+  user-select: none;
+  flex-shrink: 0;
+  opacity: 0.65;
+  transition: opacity 0.14s ease, color 0.14s ease;
+}
+
+.tf-layer-row:hover .tf-layer-drag-handle,
+.tf-admin-layer-row:hover .tf-layer-drag-handle {
+  opacity: 1;
+  color: var(--text-secondary);
+}
+
+.tf-layer-drag-handle:active {
+  cursor: grabbing;
+}
+
+.tf-layer-toggle-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.tf-layer-move-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex-shrink: 0;
+  opacity: 0.4;
+  transition: opacity 0.14s ease;
+}
+
+.tf-layer-row:hover .tf-layer-move-controls,
+.tf-layer-row:focus-within .tf-layer-move-controls,
+.tf-layer-move-controls.always-visible {
+  opacity: 1;
+}
+
+.tf-layer-move-btn {
+  width: 19px;
+  height: 16px;
+  padding: 0;
+  border-radius: 3px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 1;
+  display: grid;
+  place-items: center;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.tf-layer-move-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--accent-cyan);
+  color: var(--text-primary);
+}
+
+.tf-layer-move-btn:disabled {
+  opacity: 0.25;
+  cursor: default;
+}
+
+.tf-layer-prefs-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: var(--radius-md);
+  background: rgba(56, 189, 248, 0.08);
+  border: 1px solid rgba(56, 189, 248, 0.24);
+}
+
+.tf-layer-prefs-note {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--accent-cyan);
 }
 
 .tf-checkbox {
@@ -1240,7 +1338,8 @@ button {
   transition: transform 0.22s ease, visibility 0s linear 0.22s;
 }
 
-.tf-shell.inspector-open .tf-inspector {
+.tf-shell.inspector-open .tf-inspector:not(.tf-closure-inspector),
+.tf-shell.closure-open .tf-closure-inspector {
   transform: translateX(0);
   visibility: visible;
   pointer-events: auto;
@@ -2250,7 +2349,8 @@ button {
   left: 120px;
 }
 
-.tf-shell.inspector-open .tf-map-toolbar {
+.tf-shell.inspector-open .tf-map-toolbar,
+.tf-shell.closure-open .tf-map-toolbar {
   right: calc(var(--inspector-w) + 12px);
 }
 
@@ -2327,7 +2427,8 @@ button {
   transition: right 0.22s ease;
 }
 
-.tf-shell.inspector-open .tf-offline-banner {
+.tf-shell.inspector-open .tf-offline-banner,
+.tf-shell.closure-open .tf-offline-banner {
   right: calc(var(--inspector-w) + 12px);
 }
 
@@ -2351,7 +2452,8 @@ button {
   transition: right 0.22s ease;
 }
 
-.tf-shell.inspector-open .tf-coord-hud {
+.tf-shell.inspector-open .tf-coord-hud,
+.tf-shell.closure-open .tf-coord-hud {
   right: calc(var(--inspector-w) + 12px);
 }
 
@@ -4751,4 +4853,205 @@ button {
 .tf-admin-user-suspended {
   border-color: rgba(239, 68, 68, 0.4);
   background: rgba(239, 68, 68, 0.06);
+}
+
+/* ---------- Incident / Closure Inspector & Admin UI Settings ---------- */
+
+.tf-closure-kicker-critical {
+  color: #f87171;
+}
+
+.tf-closure-kicker-warning {
+  color: var(--accent-amber-bright);
+}
+
+.tf-closure-kicker-info {
+  color: var(--accent-cyan);
+}
+
+.tf-btn-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+}
+
+.tf-closure-detail-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tf-closure-detail-para {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.tf-closure-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.tf-closure-overlap-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.tf-closure-overlap-btn {
+  width: 100%;
+  text-align: left;
+  padding: 7px 9px;
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  border-left-width: 3px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  transition: background 0.14s ease, border-color 0.14s ease;
+}
+
+.tf-closure-overlap-btn.tone-critical {
+  border-left-color: var(--accent-red);
+}
+
+.tf-closure-overlap-btn.tone-warning {
+  border-left-color: var(--accent-amber);
+}
+
+.tf-closure-overlap-btn.tone-info {
+  border-left-color: var(--accent-cyan);
+}
+
+.tf-closure-overlap-btn:hover {
+  background: var(--bg-elevated);
+}
+
+.tf-closure-overlap-btn.active {
+  background: rgba(245, 158, 11, 0.1);
+  border-color: rgba(245, 158, 11, 0.55);
+}
+
+.tf-closure-overlap-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.tf-closure-overlap-sub {
+  font-size: 10.5px;
+  color: var(--text-secondary);
+}
+
+.tf-closure-track-row {
+  width: 100%;
+  text-align: left;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 9px;
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  transition: background 0.14s ease, border-color 0.14s ease;
+}
+
+.tf-closure-track-row:hover {
+  background: var(--bg-elevated);
+  border-color: var(--accent-cyan);
+}
+
+.tf-closure-track-main {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.tf-closure-track-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tf-closure-track-sub {
+  font-size: 10.5px;
+  color: var(--text-secondary);
+}
+
+.tf-closure-track-arrow {
+  color: var(--text-muted);
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.tf-admin-layer-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.tf-admin-layer-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 7px;
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  transition: border-color 0.14s ease, background 0.14s ease;
+}
+
+.tf-admin-layer-row:hover {
+  background: var(--bg-elevated);
+  border-color: var(--border-strong);
+}
+
+.tf-admin-layer-row.dragging {
+  opacity: 0.45;
+  border-style: dashed;
+  border-color: var(--accent-cyan);
+}
+
+.tf-admin-layer-row.drag-over {
+  border-color: var(--accent-amber);
+  box-shadow: 0 -2px 0 0 var(--accent-amber);
+}
+
+.tf-admin-layer-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.tf-admin-layer-toggle .tf-checkbox {
+  margin: 0;
+}
+
+.tf-admin-layer-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tf-admin-telemetry-toggle {
+  align-items: flex-start;
 }

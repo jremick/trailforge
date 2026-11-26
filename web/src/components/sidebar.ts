@@ -3,6 +3,13 @@ import {
   summarizeFeedStatus,
 } from "../closuresHelpers";
 import {
+  CANONICAL_LAYER_ORDER,
+  LAYER_DEFINITION_MAP,
+  moveLayerInOrder,
+  normalizeLayerOrder,
+  reorderLayerKeys,
+} from "../layerPrefsHelpers";
+import {
   DEFAULT_SNOWLINE_BANDS_M,
   DIFFICULTY_META,
   OUTDOOR_POI_ICONS,
@@ -27,6 +34,8 @@ import type {
 
 export interface SidebarCallbacks {
   onLayerToggle: (key: LayerKey, enabled: boolean) => void;
+  onLayerOrderChange: (order: LayerKey[]) => void;
+  onResetLayerPreferences?: () => void;
   onSnowLineElevationChange: (elevationM: number) => void;
   onResetRegion: () => void;
   onOpenOfflinePacks?: () => void;
@@ -37,72 +46,22 @@ export interface SidebarCallbacks {
   onResetWidth?: () => void;
 }
 
-interface LayerToggleDef {
-  key: LayerKey;
-  label: string;
-  hint: string;
+export interface SidebarOptions {
+  initialOrder?: readonly LayerKey[];
+  hasCustomLayerPrefs?: boolean;
+  showTelemetrySection?: boolean;
 }
-
-const LAYER_TOGGLES: readonly LayerToggleDef[] = [
-  {
-    key: "tracks",
-    label: "4WD Tracks (Graded)",
-    hint: "Canonical 50–100 m segments colored Easy → Extreme (click to inspect)",
-  },
-  {
-    key: "steepHighlights",
-    label: "Steep Climbs (≥14°)",
-    hint: "Highlighted sustained & max gradient hazard pitches",
-  },
-  {
-    key: "hotspots",
-    label: "Obstacle Hotspots",
-    hint: "Crowdsourced slow-crawl & high-roughness terrain pinch points",
-  },
-  {
-    key: "closures",
-    label: "Closures & Gates",
-    hint: "Official AU state seasonal closures, fire/park alerts & locked gates",
-  },
-  {
-    key: "reports",
-    label: "Hazard & Gate Reports",
-    hint: "Community trail condition reports & distinct locked-gate warnings",
-  },
-  {
-    key: "unmapped",
-    label: "Unmapped Track Spurs",
-    hint: "Anonymized off-network GPS traces discovered outside canonical roads",
-  },
-  {
-    key: "contoursHillshade",
-    label: "Contours & Hillshade",
-    hint: "20 m minor / 100 m index topo contours + Terrain-RGB shaded relief",
-  },
-  {
-    key: "snowLine",
-    label: "Alpine Snow-Line Band",
-    hint: "Configurable elevation highlight (>1,000 m default)",
-  },
-  {
-    key: "parksWaterways",
-    label: "Parks & Waterways",
-    hint: "CAPAD 2025 reserve boundaries & GA/OSM perennial/intermittent streams",
-  },
-  {
-    key: "pois",
-    label: "Outdoor POIs",
-    hint: "Campgrounds, alpine huts, trigs, lookouts & access gates",
-  },
-];
 
 export class Sidebar {
   private readonly root: HTMLElement;
   private readonly callbacks: SidebarCallbacks;
+  private readonly layerListEl: HTMLElement;
+  private readonly layerPrefsBarEl: HTMLElement;
   private readonly snowSliderRowEl: HTMLElement;
   private readonly snowSliderEl: HTMLInputElement;
   private readonly snowValEl: HTMLElement;
   private readonly snowTicksEl: HTMLElement;
+  private readonly difficultyLegendEl: HTMLElement;
   private readonly tileModePillEl: HTMLElement;
   private readonly feedsSectionEl: HTMLDetailsElement;
   private readonly feedsPillEl: HTMLElement;
@@ -112,6 +71,7 @@ export class Sidebar {
   private readonly regionDescEl: HTMLElement;
   private readonly regionBboxEl: HTMLElement;
   private readonly regionPackEl: HTMLElement;
+  private readonly telemetrySectionEl: HTMLDetailsElement;
   private readonly sysTilesEl: HTMLElement;
   private readonly sysApiEl: HTMLElement;
   private readonly sysPostgisEl: HTMLElement;
@@ -121,6 +81,10 @@ export class Sidebar {
   private readonly collapseBtnEl: HTMLButtonElement;
   private readonly resizerEl: HTMLElement;
 
+  private layerOrder: LayerKey[];
+  private layerState: LayerVisibilityState;
+  private hasCustomLayerPrefs: boolean;
+  private draggingKey: LayerKey | null = null;
   private snowBands: number[] = [...DEFAULT_SNOWLINE_BANDS_M];
   private currentWidthPx: number = SIDEBAR_DEFAULT_WIDTH_PX;
   private maxWidthPx: number = SIDEBAR_MAX_WIDTH_PX;
@@ -129,10 +93,18 @@ export class Sidebar {
     container: HTMLElement,
     initialLayers: LayerVisibilityState,
     initialPreset: RegionPreset,
-    callbacks: SidebarCallbacks
+    callbacks: SidebarCallbacks,
+    options?: SidebarOptions
   ) {
     this.root = container;
     this.callbacks = callbacks;
+    this.layerOrder = normalizeLayerOrder(
+      options?.initialOrder ?? CANONICAL_LAYER_ORDER
+    );
+    this.layerState = { ...initialLayers };
+    this.hasCustomLayerPrefs = Boolean(options?.hasCustomLayerPrefs);
+    const showTelemetry = Boolean(options?.showTelemetrySection);
+
     this.root.className = "tf-sidebar";
     this.root.setAttribute("aria-label", "Map layers and trail controls");
 
@@ -171,33 +143,25 @@ export class Sidebar {
         <details class="tf-section" open>
           <summary class="tf-section-summary">
             <span class="tf-section-title-group">
-              <span class="tf-section-index">01</span>
               <span class="tf-section-title">Map Layers</span>
             </span>
             <span class="tf-section-pill" data-role="tile-mode-pill">Loading…</span>
           </summary>
 
           <div class="tf-section-body">
-            <div class="tf-layer-list">
-              ${LAYER_TOGGLES.map(
-                (item) => `
-                  <label class="tf-toggle-row">
-                    <input
-                      type="checkbox"
-                      class="tf-checkbox"
-                      data-layer-key="${escapeHtml(item.key)}"
-                      ${initialLayers[item.key] ? "checked" : ""}
-                    />
-                    <span class="tf-toggle-copy">
-                      <span class="tf-toggle-label">${escapeHtml(item.label)}</span>
-                      <span class="tf-toggle-hint">${escapeHtml(item.hint)}</span>
-                    </span>
-                  </label>
-                `
-              ).join("")}
+            <div class="tf-layer-list" data-role="layer-list"></div>
+
+            <div class="tf-layer-prefs-bar ${this.hasCustomLayerPrefs ? "" : "hidden"}" data-role="layer-prefs-bar">
+              <span class="tf-layer-prefs-note">Preferences saved</span>
+              <button
+                type="button"
+                class="tf-mini-btn"
+                data-role="reset-layer-prefs"
+                title="Reset map layer order and on/off toggles to instance defaults"
+              >Reset defaults</button>
             </div>
 
-            <div class="tf-snow-control ${initialLayers.snowLine ? "" : "dimmed"}" data-role="snow-control">
+            <div class="tf-snow-control ${initialLayers.snowLine ? "" : "hidden"}" data-role="snow-control">
               <div class="tf-snow-head">
                 <span>Snow-Line Threshold</span>
                 <span class="mono tf-accent-cyan" data-role="snow-val">&ge; ${snappedInit.toLocaleString()} m</span>
@@ -215,7 +179,7 @@ export class Sidebar {
               <div class="tf-snow-ticks mono" data-role="snow-ticks"></div>
             </div>
 
-            <div class="tf-legend-block">
+            <div class="tf-legend-block ${initialLayers.tracks ? "" : "hidden"}" data-role="difficulty-legend">
               <div class="tf-subhead">Track Difficulty Grade</div>
               <div class="tf-difficulty-grid">
                 ${DIFFICULTY_META.map(
@@ -250,7 +214,6 @@ export class Sidebar {
         <details class="tf-section" data-role="feeds-section">
           <summary class="tf-section-summary">
             <span class="tf-section-title-group">
-              <span class="tf-section-index">02</span>
               <span class="tf-section-title">AU Agency Feeds</span>
             </span>
             <span class="tf-section-pill mono" data-role="feeds-pill">Checking…</span>
@@ -264,7 +227,6 @@ export class Sidebar {
         <details class="tf-section" open>
           <summary class="tf-section-summary">
             <span class="tf-section-title-group">
-              <span class="tf-section-index">03</span>
               <span class="tf-section-title">Active Corridor</span>
             </span>
             <span class="tf-section-pill mono" data-role="region-tag">${escapeHtml(initialPreset.stateTag)}</span>
@@ -290,10 +252,9 @@ export class Sidebar {
           </div>
         </details>
 
-        <details class="tf-section">
+        <details class="tf-section ${showTelemetry ? "" : "hidden"}" data-role="telemetry-section">
           <summary class="tf-section-summary">
             <span class="tf-section-title-group">
-              <span class="tf-section-index">04</span>
               <span class="tf-section-title">Stack &amp; Offline Telemetry</span>
             </span>
             <span class="tf-section-pill">v0.1</span>
@@ -333,10 +294,13 @@ export class Sidebar {
       </div>
     `;
 
+    this.layerListEl = this.q("[data-role='layer-list']");
+    this.layerPrefsBarEl = this.q("[data-role='layer-prefs-bar']");
     this.snowSliderRowEl = this.q("[data-role='snow-control']");
     this.snowSliderEl = this.q<HTMLInputElement>("[data-role='snow-slider']");
     this.snowValEl = this.q("[data-role='snow-val']");
     this.snowTicksEl = this.q("[data-role='snow-ticks']");
+    this.difficultyLegendEl = this.q("[data-role='difficulty-legend']");
     this.tileModePillEl = this.q("[data-role='tile-mode-pill']");
     this.feedsSectionEl = this.q<HTMLDetailsElement>("[data-role='feeds-section']");
     this.feedsPillEl = this.q("[data-role='feeds-pill']");
@@ -346,6 +310,9 @@ export class Sidebar {
     this.regionDescEl = this.q("[data-role='region-desc']");
     this.regionBboxEl = this.q("[data-role='region-bbox']");
     this.regionPackEl = this.q("[data-role='region-pack']");
+    this.telemetrySectionEl = this.q<HTMLDetailsElement>(
+      "[data-role='telemetry-section']"
+    );
     this.sysTilesEl = this.q("[data-role='sys-tiles']");
     this.sysApiEl = this.q("[data-role='sys-api']");
     this.sysPostgisEl = this.q("[data-role='sys-postgis']");
@@ -355,6 +322,7 @@ export class Sidebar {
     this.collapseBtnEl = this.q<HTMLButtonElement>("[data-role='sidebar-collapse-btn']");
     this.resizerEl = this.q("[data-role='sidebar-resizer']");
 
+    this.renderLayerList();
     this.renderSnowTicks();
     this.updatePreset(initialPreset);
 
@@ -365,21 +333,16 @@ export class Sidebar {
     this.bindResizerEvents();
 
     this.root
-      .querySelectorAll<HTMLInputElement>("[data-layer-key]")
-      .forEach((input) => {
-        input.addEventListener("change", () => {
-          const key = input.dataset.layerKey as LayerKey;
-          if (key === "snowLine") {
-            this.snowSliderRowEl.classList.toggle("dimmed", !input.checked);
-          }
-          callbacks.onLayerToggle(key, input.checked);
-        });
+      .querySelector<HTMLButtonElement>("[data-role='reset-layer-prefs']")
+      ?.addEventListener("click", () => {
+        callbacks.onResetLayerPreferences?.();
       });
 
     this.snowSliderEl.addEventListener("input", () => {
       const idx = Number(this.snowSliderEl.value);
       const elev = this.snowBands[idx] ?? 1000;
       this.snowValEl.textContent = `≥ ${elev.toLocaleString()} m`;
+      this.layerState = { ...this.layerState, snowLineElevationM: elev };
       this.callbacks.onSnowLineElevationChange(elev);
     });
 
@@ -392,6 +355,30 @@ export class Sidebar {
       ?.addEventListener("click", () => {
         callbacks.onOpenOfflinePacks?.();
       });
+  }
+
+  /**
+   * Synchronize sidebar layer rows, checkboxes, conditional controls, and custom-prefs bar
+   * after async config/preferences load, login/logout, admin change, or reset.
+   */
+  syncLayerPreferences(
+    order: readonly LayerKey[],
+    layers: LayerVisibilityState,
+    hasCustomPrefs: boolean
+  ): void {
+    this.layerOrder = normalizeLayerOrder(order);
+    this.layerState = { ...layers };
+    this.hasCustomLayerPrefs = hasCustomPrefs;
+    this.renderLayerList();
+    this.syncConditionalLayerControls();
+    this.layerPrefsBarEl.classList.toggle("hidden", !hasCustomPrefs);
+  }
+
+  setTelemetrySectionVisible(visible: boolean): void {
+    this.telemetrySectionEl.classList.toggle("hidden", !visible);
+    if (!visible) {
+      this.telemetrySectionEl.open = false;
+    }
   }
 
   openFeedsSection(): void {
@@ -409,6 +396,146 @@ export class Sidebar {
   updateCollapsedState(collapsed: boolean): void {
     this.root.setAttribute("aria-hidden", String(collapsed));
     this.collapseBtnEl.setAttribute("aria-expanded", String(!collapsed));
+  }
+
+  private syncConditionalLayerControls(): void {
+    this.snowSliderRowEl.classList.toggle("hidden", !this.layerState.snowLine);
+    this.difficultyLegendEl.classList.toggle("hidden", !this.layerState.tracks);
+  }
+
+  private renderLayerList(): void {
+    const total = this.layerOrder.length;
+    this.layerListEl.innerHTML = this.layerOrder
+      .map((key, idx) => {
+        const item = LAYER_DEFINITION_MAP[key];
+        const checked = Boolean(this.layerState[key]);
+        return `
+          <div
+            class="tf-toggle-row tf-layer-row"
+            data-layer-row="${escapeHtml(key)}"
+            draggable="true"
+          >
+            <span
+              class="tf-layer-drag-handle"
+              title="Drag to reorder layer"
+              aria-hidden="true"
+            >⋮⋮</span>
+            <label class="tf-layer-toggle-main">
+              <input
+                type="checkbox"
+                class="tf-checkbox"
+                data-layer-key="${escapeHtml(key)}"
+                ${checked ? "checked" : ""}
+              />
+              <span class="tf-toggle-copy">
+                <span class="tf-toggle-label">${escapeHtml(item.label)}</span>
+                <span class="tf-toggle-hint">${escapeHtml(item.hint)}</span>
+              </span>
+            </label>
+            <div class="tf-layer-move-controls">
+              <button
+                type="button"
+                class="tf-layer-move-btn"
+                data-move-layer="${escapeHtml(key)}"
+                data-move-dir="up"
+                title="Move ${escapeHtml(item.shortLabel)} up"
+                aria-label="Move ${escapeHtml(item.shortLabel)} up"
+                ${idx === 0 ? "disabled" : ""}
+              >↑</button>
+              <button
+                type="button"
+                class="tf-layer-move-btn"
+                data-move-layer="${escapeHtml(key)}"
+                data-move-dir="down"
+                title="Move ${escapeHtml(item.shortLabel)} down"
+                aria-label="Move ${escapeHtml(item.shortLabel)} down"
+                ${idx === total - 1 ? "disabled" : ""}
+              >↓</button>
+            </div>
+          </div>
+        `;
+      })
+      .join("");
+
+    this.bindLayerListEvents();
+  }
+
+  private bindLayerListEvents(): void {
+    this.layerListEl
+      .querySelectorAll<HTMLInputElement>("[data-layer-key]")
+      .forEach((input) => {
+        input.addEventListener("change", () => {
+          const key = input.dataset.layerKey as LayerKey;
+          this.layerState = { ...this.layerState, [key]: input.checked };
+          this.syncConditionalLayerControls();
+          this.callbacks.onLayerToggle(key, input.checked);
+        });
+      });
+
+    this.layerListEl
+      .querySelectorAll<HTMLButtonElement>("[data-move-layer]")
+      .forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const key = btn.dataset.moveLayer as LayerKey | undefined;
+          const dir = btn.dataset.moveDir as "up" | "down" | undefined;
+          if (!key || (dir !== "up" && dir !== "down")) return;
+          const next = moveLayerInOrder(this.layerOrder, key, dir);
+          this.layerOrder = next;
+          this.renderLayerList();
+          this.callbacks.onLayerOrderChange(next);
+        });
+      });
+
+    this.layerListEl
+      .querySelectorAll<HTMLElement>("[data-layer-row]")
+      .forEach((row) => {
+        const key = row.dataset.layerRow as LayerKey | undefined;
+        if (!key) return;
+
+        row.addEventListener("dragstart", (e) => {
+          this.draggingKey = key;
+          row.classList.add("dragging");
+          if (e.dataTransfer) {
+            e.dataTransfer.effectAllowed = "move";
+            e.dataTransfer.setData("text/plain", key);
+          }
+        });
+
+        row.addEventListener("dragover", (e) => {
+          if (!this.draggingKey || this.draggingKey === key) return;
+          e.preventDefault();
+          if (e.dataTransfer) {
+            e.dataTransfer.dropEffect = "move";
+          }
+          row.classList.add("drag-over");
+        });
+
+        row.addEventListener("dragleave", () => {
+          row.classList.remove("drag-over");
+        });
+
+        row.addEventListener("drop", (e) => {
+          e.preventDefault();
+          row.classList.remove("drag-over");
+          const src = this.draggingKey;
+          this.draggingKey = null;
+          if (!src || src === key) return;
+          const next = reorderLayerKeys(this.layerOrder, src, key);
+          this.layerOrder = next;
+          this.renderLayerList();
+          this.callbacks.onLayerOrderChange(next);
+        });
+
+        row.addEventListener("dragend", () => {
+          this.draggingKey = null;
+          row.classList.remove("dragging");
+          this.layerListEl
+            .querySelectorAll(".drag-over")
+            .forEach((el) => el.classList.remove("drag-over"));
+        });
+      });
   }
 
   private bindResizerEvents(): void {

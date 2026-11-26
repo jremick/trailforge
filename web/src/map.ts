@@ -14,9 +14,11 @@ import {
 } from "./presets";
 import {
   EMPTY_FEATURE_COLLECTION,
+  SELECTED_CLOSURE_OUTLINE_LAYER_ID,
   SELECTED_TRACK_LAYER_IDS,
   SELECTED_TRACK_STEEP_LAYER_ID,
   buildSearchPinGeoJson,
+  buildSelectedClosureFilter,
   buildSelectedTrackFilter,
   buildSnowlineFilter,
   buildTrailForgeStyle,
@@ -25,14 +27,19 @@ import {
   userPinsToGeoJson,
 } from "./style";
 import { getApiBaseUrl } from "./adminHelpers";
-import { formatClosureTypeLabel } from "./closuresHelpers";
+import {
+  extractClosureSummaryFromProps,
+  formatClosureTypeLabel,
+} from "./closuresHelpers";
 import { formatHotspotReason } from "./gradingHelpers";
 import { buildRecordedTrackGeoJson } from "./offline/recorderEngine";
 import { formatReportTypeLabel, isGateWarningType } from "./reportsHelpers";
 import type {
   BasemapId,
   BBoxTuple,
+  ClosureDetailResponse,
   LayerVisibilityState,
+  MapClosureClickPayload,
   PoiItem,
   RecordedBreadcrumbPoint,
   RegionPreset,
@@ -165,6 +172,7 @@ export interface TrailForgeMapCallbacks {
   onMapMoveEnd?: (lat: number, lon: number, zoom: number) => void;
   onBasemapTileError?: () => void;
   onTrackClick?: (trackId: string, segmentId?: string) => void;
+  onClosureClick?: (payload: MapClosureClickPayload) => void;
   onPinDropClick?: (lat: number, lon: number) => void;
   onReportPickClick?: (lat: number, lon: number) => void;
 }
@@ -185,6 +193,7 @@ export class TrailForgeMap {
   private currentLayers: LayerVisibilityState;
   private currentManifest: TileManifestResponse | null = null;
   private selectedTrackId: string | null = null;
+  private selectedClosureId: string | number | null = null;
   private reportedTileError = false;
   private coordPickMode: "pin" | "report" | null = null;
   private pendingPin: { lat: number; lon: number; label: string } | null = null;
@@ -270,6 +279,8 @@ export class TrailForgeMap {
         "tf-tracks-selected-core",
         "tf-steep-highlights",
         "tf-tracks-line",
+        "tf-closures-polygon-outline",
+        "tf-closures-polygon-fill",
       ].filter((id) => Boolean(this.map.getLayer(id)));
       if (hitLayers.length === 0) return;
 
@@ -282,6 +293,7 @@ export class TrailForgeMap {
       });
       const first = features[0];
       if (!first) return;
+      const firstLayerId = first.layer.id;
       const props = (first.properties ?? {}) as Record<string, unknown>;
       const trackId =
         typeof props.track_id === "string" && props.track_id.trim()
@@ -290,7 +302,49 @@ export class TrailForgeMap {
       const segmentId =
         typeof props.segment_id === "string" ? props.segment_id : undefined;
 
+      const isClosureHit =
+        firstLayerId === "tf-closures-points" ||
+        firstLayerId === "tf-closures-polygon-outline" ||
+        firstLayerId === "tf-closures-polygon-fill" ||
+        (firstLayerId === "tf-closures-line" && !trackId);
+
+      if (isClosureHit) {
+        const closureLayerIds = new Set([
+          "tf-closures-points",
+          "tf-closures-line",
+          "tf-closures-polygon-outline",
+          "tf-closures-polygon-fill",
+        ]);
+        const seenIds = new Set<string>();
+        const overlapping: ClosureDetailResponse[] = [];
+        for (const feat of features) {
+          if (!closureLayerIds.has(feat.layer.id)) continue;
+          const summary = extractClosureSummaryFromProps(
+            (feat.properties ?? {}) as Record<string, unknown>,
+            feat.geometry
+          );
+          if (!summary) continue;
+          const dedupeKey = String(summary.closure_id);
+          if (seenIds.has(dedupeKey)) continue;
+          seenIds.add(dedupeKey);
+          overlapping.push(summary);
+        }
+        const primary = overlapping[0];
+        if (primary) {
+          this.setSelectedTrackId(null);
+          this.setSelectedClosureId(primary.closure_id);
+          callbacks.onClosureClick?.({
+            primary,
+            overlapping,
+            clickLat: e.lngLat.lat,
+            clickLon: e.lngLat.lng,
+          });
+        }
+        return;
+      }
+
       if (trackId) {
+        this.setSelectedClosureId(null);
         this.setSelectedTrackId(trackId);
         callbacks.onTrackClick?.(trackId, segmentId);
       }
@@ -373,6 +427,7 @@ export class TrailForgeMap {
         tileManifest: manifest,
         origin: fallbackOrigin,
         selectedTrackId: this.selectedTrackId,
+        selectedClosureId: this.selectedClosureId,
       })
     );
   }
@@ -511,6 +566,22 @@ export class TrailForgeMap {
     }
   }
 
+  setSelectedClosureId(closureId: string | number | null): void {
+    this.selectedClosureId = closureId;
+    if (this.isLoaded) {
+      this.applySelectedClosureHighlight();
+    }
+  }
+
+  private applySelectedClosureHighlight(): void {
+    if (this.map.getLayer(SELECTED_CLOSURE_OUTLINE_LAYER_ID)) {
+      this.map.setFilter(
+        SELECTED_CLOSURE_OUTLINE_LAYER_ID,
+        buildSelectedClosureFilter(this.selectedClosureId)
+      );
+    }
+  }
+
   private applySelectedTrackHighlight(): void {
     const filter = buildSelectedTrackFilter(this.selectedTrackId);
     for (const id of [...SELECTED_TRACK_LAYER_IDS, SELECTED_TRACK_STEEP_LAYER_ID]) {
@@ -644,6 +715,7 @@ export class TrailForgeMap {
     void this.preloadOutdoorIcons();
 
     this.applySelectedTrackHighlight();
+    this.applySelectedClosureHighlight();
 
     if (this.pendingPin) {
       this.applySearchPin(
@@ -747,6 +819,7 @@ export class TrailForgeMap {
       "tf-steep-highlights",
       "tf-tracks-line",
       "tf-unmapped-line",
+      "tf-closures-polygon-outline",
       "tf-closures-polygon-fill",
     ].filter((id) => Boolean(this.map.getLayer(id)));
 
@@ -918,10 +991,17 @@ export class TrailForgeMap {
     if (
       layerId === "tf-closures-line" ||
       layerId === "tf-closures-points" ||
+      layerId === "tf-closures-polygon-outline" ||
       layerId === "tf-closures-polygon-fill"
     ) {
       this.map.getCanvas().style.cursor = "pointer";
       const title = String(props.title ?? "Closure / Access Alert");
+      const subtitle =
+        typeof props.subtitle === "string" &&
+        props.subtitle.trim() &&
+        props.subtitle.trim().toLowerCase() !== title.trim().toLowerCase()
+          ? props.subtitle.trim()
+          : "";
       const typeLabel = formatClosureTypeLabel(
         String(props.closure_type ?? "warning")
       );
@@ -929,15 +1009,20 @@ export class TrailForgeMap {
       const stale = props.is_stale === true ? " · STALE CACHE" : "";
       const hasTrack =
         typeof props.track_id === "string" && props.track_id.length > 0;
+      const hintText =
+        layerId === "tf-closures-line" && hasTrack
+          ? "Click to inspect track"
+          : "Click for details";
       this.hoverPopup
         .setLngLat(e.lngLat)
         .setHTML(
           `<div class="tf-popup-title">⚠ ${escapeHtml(title)}</div>
+           ${subtitle ? `<div class="tf-popup-note">${escapeHtml(subtitle)}</div>` : ""}
            <div class="tf-popup-meta">
              <span class="tf-popup-warn">${escapeHtml(typeLabel)}</span>
              ${agency ? `<span>· ${escapeHtml(agency)}</span>` : ""}
              ${stale ? `<span class="tf-popup-warn">${escapeHtml(stale)}</span>` : ""}
-             ${hasTrack ? `<span class="tf-popup-hint">Click to inspect</span>` : ""}
+             <span class="tf-popup-hint">${escapeHtml(hintText)}</span>
            </div>`
         )
         .addTo(this.map);
@@ -1040,6 +1125,7 @@ export class TrailForgeMap {
     this.setLayerVis("tf-hotspots-points", this.currentLayers.hotspots);
     this.setLayerVis("tf-closures-polygon-fill", this.currentLayers.closures);
     this.setLayerVis("tf-closures-polygon-outline", this.currentLayers.closures);
+    this.setLayerVis(SELECTED_CLOSURE_OUTLINE_LAYER_ID, this.currentLayers.closures);
     this.setLayerVis("tf-closures-line-casing", this.currentLayers.closures);
     this.setLayerVis("tf-closures-line", this.currentLayers.closures);
     this.setLayerVis("tf-closures-points", this.currentLayers.closures);

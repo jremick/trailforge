@@ -8,18 +8,31 @@ import {
   normalizeRouteBreakdown,
   normalizeTrafficWindow,
 } from "../adminHelpers";
+import {
+  CANONICAL_LAYER_ORDER,
+  DEFAULT_LAYER_VISIBILITY,
+  LAYER_DEFINITION_MAP,
+  moveLayerInOrder,
+  normalizeLayerOrder,
+  normalizeLayerVisibility,
+  reorderLayerKeys,
+} from "../layerPrefsHelpers";
 import { escapeHtml } from "../presets";
 import type {
   AdminInviteCreateInput,
   AdminInviteItem,
   AdminStatsResponse,
+  AdminUiSettingsResponse,
+  AdminUiSettingsUpdateInput,
   AdminUserItem,
   AdminUserPatchInput,
+  LayerKey,
+  LayerVisibilityMap,
   RegistrationMode,
   UserRole,
 } from "../types";
 
-export type AdminPanelTab = "overview" | "invites" | "users";
+export type AdminPanelTab = "overview" | "invites" | "users" | "settings";
 
 export interface AdminPanelState {
   currentUserId: string | null;
@@ -28,6 +41,7 @@ export interface AdminPanelState {
   stats: AdminStatsResponse | null;
   invites: AdminInviteItem[];
   users: AdminUserItem[];
+  uiSettings: AdminUiSettingsResponse | null;
   latestCreatedInvite: AdminInviteItem | null;
   busyAction: string | null;
   error: string | null;
@@ -42,6 +56,8 @@ export interface AdminPanelCallbacks {
   onPatchUser: (userId: string, patch: AdminUserPatchInput) => Promise<void>;
   onSyncClosures: () => Promise<void>;
   onRecomputeGrades: () => Promise<void>;
+  onSaveUiSettings: (payload: AdminUiSettingsUpdateInput) => Promise<void>;
+  onResetUiSettings: () => Promise<void>;
 }
 
 export class AdminConsolePanel {
@@ -52,6 +68,11 @@ export class AdminConsolePanel {
   private activeTab: AdminPanelTab = "overview";
   private copiedCode: string | null = null;
   private copiedTimer: number | null = null;
+  private draftOrder: LayerKey[] = [...CANONICAL_LAYER_ORDER];
+  private draftVisibility: LayerVisibilityMap = { ...DEFAULT_LAYER_VISIBILITY };
+  private draftShowTelemetryPublic = false;
+  private draftDirty = false;
+  private draggingKey: LayerKey | null = null;
 
   constructor(
     container: HTMLElement,
@@ -87,8 +108,23 @@ export class AdminConsolePanel {
   }
 
   updateState(patch: Partial<AdminPanelState>): void {
+    const incomingUiSettings = patch.uiSettings;
     this.state = { ...this.state, ...patch };
+    if (incomingUiSettings && (!this.draftDirty || patch.busyAction === null)) {
+      this.syncDraftFromSettings(incomingUiSettings);
+    }
     this.render();
+  }
+
+  private syncDraftFromSettings(settings: AdminUiSettingsResponse): void {
+    this.draftOrder = normalizeLayerOrder(settings.default_layer_order);
+    this.draftVisibility = normalizeLayerVisibility(
+      settings.default_layer_visibility
+    );
+    this.draftShowTelemetryPublic = Boolean(
+      settings.show_stack_telemetry_public
+    );
+    this.draftDirty = false;
   }
 
   private render(): void {
@@ -120,7 +156,7 @@ export class AdminConsolePanel {
         </div>
       </div>
 
-      <div class="tf-panel-tabs" role="tablist">
+      <div class="tf-panel-tabs tf-panel-tabs-4" role="tablist">
         <button
           type="button"
           class="tf-tab-btn ${this.activeTab === "overview" ? "active" : ""}"
@@ -142,6 +178,13 @@ export class AdminConsolePanel {
           role="tab"
           aria-selected="${this.activeTab === "users"}"
         >Users${userCount > 0 ? ` (${userCount})` : ""}</button>
+        <button
+          type="button"
+          class="tf-tab-btn ${this.activeTab === "settings" ? "active" : ""}"
+          data-admin-tab="settings"
+          role="tab"
+          aria-selected="${this.activeTab === "settings"}"
+        >Settings</button>
       </div>
 
       <div class="tf-inspector-body">
@@ -155,7 +198,9 @@ export class AdminConsolePanel {
             ? this.renderOverviewTab()
             : this.activeTab === "invites"
               ? this.renderInvitesTab()
-              : this.renderUsersTab()
+              : this.activeTab === "users"
+                ? this.renderUsersTab()
+                : this.renderSettingsTab()
         }
       </div>
     `;
@@ -532,6 +577,113 @@ export class AdminConsolePanel {
     `;
   }
 
+  private renderSettingsTab(): string {
+    const { uiSettings, loading, busyAction } = this.state;
+
+    if (!uiSettings && loading) {
+      return `<p class="tf-inspector-loading">Loading instance map &amp; UI defaults…</p>`;
+    }
+
+    const total = this.draftOrder.length;
+    const envTelemetryDefault = uiSettings?.env_show_stack_telemetry_public
+      ? "Visible"
+      : "Hidden";
+    const isSaving = busyAction === "save-ui-settings";
+    const isResetting = busyAction === "reset-ui-settings";
+
+    return `
+      <section class="tf-insp-section">
+        <div class="tf-insp-sec-head">
+          <h3>Default Map Layers</h3>
+          <span class="mono tf-insp-meta">${this.draftDirty ? "Unsaved" : "Synced"}</span>
+        </div>
+        <p class="tf-inspector-muted">Set the default sidebar order and initial ON/OFF state for visitors and users who haven&apos;t customized their own preferences.</p>
+
+        <div class="tf-admin-layer-list" data-role="admin-layer-list">
+          ${this.draftOrder
+            .map((key, idx) => {
+              const def = LAYER_DEFINITION_MAP[key];
+              const enabled = Boolean(this.draftVisibility[key]);
+              return `
+                <div
+                  class="tf-admin-layer-row"
+                  data-admin-layer-row="${escapeHtml(key)}"
+                  draggable="true"
+                >
+                  <span class="tf-layer-drag-handle" title="Drag to reorder" aria-hidden="true">⋮⋮</span>
+                  <label class="tf-admin-layer-toggle">
+                    <input
+                      type="checkbox"
+                      class="tf-checkbox"
+                      data-admin-layer-vis="${escapeHtml(key)}"
+                      ${enabled ? "checked" : ""}
+                    />
+                    <span class="tf-admin-layer-name">${escapeHtml(def.label)}</span>
+                  </label>
+                  <span class="tf-mini-tag mono ${enabled ? "emerald" : ""}">${enabled ? "ON" : "OFF"}</span>
+                  <div class="tf-layer-move-controls always-visible">
+                    <button
+                      type="button"
+                      class="tf-layer-move-btn"
+                      data-admin-move-layer="${escapeHtml(key)}"
+                      data-admin-move-dir="up"
+                      title="Move ${escapeHtml(def.shortLabel)} up"
+                      aria-label="Move ${escapeHtml(def.shortLabel)} up"
+                      ${idx === 0 ? "disabled" : ""}
+                    >↑</button>
+                    <button
+                      type="button"
+                      class="tf-layer-move-btn"
+                      data-admin-move-layer="${escapeHtml(key)}"
+                      data-admin-move-dir="down"
+                      title="Move ${escapeHtml(def.shortLabel)} down"
+                      aria-label="Move ${escapeHtml(def.shortLabel)} down"
+                      ${idx === total - 1 ? "disabled" : ""}
+                    >↓</button>
+                  </div>
+                </div>
+              `;
+            })
+            .join("")}
+        </div>
+      </section>
+
+      <section class="tf-insp-section">
+        <div class="tf-insp-sec-head">
+          <h3>Sidebar Visibility</h3>
+          <span class="mono tf-insp-meta">Public Visitors</span>
+        </div>
+        <label class="tf-toggle-row tf-admin-telemetry-toggle">
+          <input
+            type="checkbox"
+            class="tf-checkbox"
+            data-role="admin-telemetry-public"
+            ${this.draftShowTelemetryPublic ? "checked" : ""}
+          />
+          <span class="tf-toggle-copy">
+            <span class="tf-toggle-label">Show Stack &amp; Offline Telemetry publicly</span>
+            <span class="tf-toggle-hint">Always visible to signed-in members and admins. Hoster env default: ${escapeHtml(envTelemetryDefault)} (<code class="mono">TRAILFORGE_SHOW_STACK_TELEMETRY_PUBLIC</code>).</span>
+          </span>
+        </label>
+      </section>
+
+      <div class="tf-btn-row">
+        <button
+          type="button"
+          class="tf-btn-primary"
+          data-role="save-ui-settings"
+          ${busyAction !== null ? "disabled" : ""}
+        >${isSaving ? "Saving…" : "Save Instance Defaults"}</button>
+        <button
+          type="button"
+          class="tf-btn-secondary"
+          data-role="reset-ui-settings"
+          ${busyAction !== null ? "disabled" : ""}
+        >${isResetting ? "Resetting…" : "Reset Factory"}</button>
+      </div>
+    `;
+  }
+
   private bindEvents(): void {
     this.root
       .querySelector<HTMLButtonElement>("[data-role='close']")
@@ -551,7 +703,12 @@ export class AdminConsolePanel {
       .forEach((btn) => {
         btn.addEventListener("click", () => {
           const next = btn.dataset.adminTab as AdminPanelTab | undefined;
-          if (next === "overview" || next === "invites" || next === "users") {
+          if (
+            next === "overview" ||
+            next === "invites" ||
+            next === "users" ||
+            next === "settings"
+          ) {
             this.activeTab = next;
             this.render();
           }
@@ -645,6 +802,113 @@ export class AdminConsolePanel {
             btn.dataset.nextRole === "admin" ? "admin" : "member";
           if (id) void this.callbacks.onPatchUser(id, { role: nextRole });
         });
+      });
+
+    // Settings tab bindings (default layer order, visibility & public stack telemetry)
+    this.root
+      .querySelectorAll<HTMLInputElement>("[data-admin-layer-vis]")
+      .forEach((input) => {
+        input.addEventListener("change", () => {
+          const key = input.dataset.adminLayerVis as LayerKey | undefined;
+          if (!key) return;
+          this.draftVisibility = {
+            ...this.draftVisibility,
+            [key]: input.checked,
+          };
+          this.draftDirty = true;
+          this.render();
+        });
+      });
+
+    this.root
+      .querySelectorAll<HTMLButtonElement>("[data-admin-move-layer]")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const key = btn.dataset.adminMoveLayer as LayerKey | undefined;
+          const dir = btn.dataset.adminMoveDir as "up" | "down" | undefined;
+          if (!key || (dir !== "up" && dir !== "down")) return;
+          this.draftOrder = moveLayerInOrder(this.draftOrder, key, dir);
+          this.draftDirty = true;
+          this.render();
+        });
+      });
+
+    const adminLayerList = this.root.querySelector<HTMLElement>(
+      "[data-role='admin-layer-list']"
+    );
+    adminLayerList
+      ?.querySelectorAll<HTMLElement>("[data-admin-layer-row]")
+      .forEach((row) => {
+        const key = row.dataset.adminLayerRow as LayerKey | undefined;
+        if (!key) return;
+
+        row.addEventListener("dragstart", (e) => {
+          this.draggingKey = key;
+          row.classList.add("dragging");
+          if (e.dataTransfer) {
+            e.dataTransfer.effectAllowed = "move";
+            e.dataTransfer.setData("text/plain", key);
+          }
+        });
+
+        row.addEventListener("dragover", (e) => {
+          if (!this.draggingKey || this.draggingKey === key) return;
+          e.preventDefault();
+          if (e.dataTransfer) {
+            e.dataTransfer.dropEffect = "move";
+          }
+          row.classList.add("drag-over");
+        });
+
+        row.addEventListener("dragleave", () => {
+          row.classList.remove("drag-over");
+        });
+
+        row.addEventListener("drop", (e) => {
+          e.preventDefault();
+          row.classList.remove("drag-over");
+          const src = this.draggingKey;
+          this.draggingKey = null;
+          if (!src || src === key) return;
+          this.draftOrder = reorderLayerKeys(this.draftOrder, src, key);
+          this.draftDirty = true;
+          this.render();
+        });
+
+        row.addEventListener("dragend", () => {
+          this.draggingKey = null;
+          row.classList.remove("dragging");
+          adminLayerList
+            .querySelectorAll(".drag-over")
+            .forEach((el) => el.classList.remove("drag-over"));
+        });
+      });
+
+    this.root
+      .querySelector<HTMLInputElement>("[data-role='admin-telemetry-public']")
+      ?.addEventListener("change", (e) => {
+        const target = e.currentTarget as HTMLInputElement;
+        this.draftShowTelemetryPublic = target.checked;
+        this.draftDirty = true;
+        this.render();
+      });
+
+    this.root
+      .querySelector<HTMLButtonElement>("[data-role='save-ui-settings']")
+      ?.addEventListener("click", () => {
+        this.draftDirty = false;
+        void this.callbacks.onSaveUiSettings({
+          default_layer_order: [...this.draftOrder],
+          default_layer_visibility: { ...this.draftVisibility },
+          show_stack_telemetry_public: this.draftShowTelemetryPublic,
+        });
+      });
+
+    this.root
+      .querySelector<HTMLButtonElement>("[data-role='reset-ui-settings']")
+      ?.addEventListener("click", () => {
+        this.draftDirty = false;
+        void this.callbacks.onResetUiSettings();
       });
   }
 }

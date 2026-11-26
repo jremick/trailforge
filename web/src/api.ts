@@ -16,11 +16,18 @@ import {
   getOfflineTracksGeoJson,
   searchOfflineSnapshots,
 } from "./offline/packStore";
+import {
+  DEFAULT_PUBLIC_UI_CONFIG,
+  normalizePublicUiConfig,
+  normalizeUserUiPreferences,
+} from "./layerPrefsHelpers";
 import type {
   AdminComputeActionResponse,
   AdminInviteCreateInput,
   AdminInviteItem,
   AdminStatsResponse,
+  AdminUiSettingsResponse,
+  AdminUiSettingsUpdateInput,
   AdminUserItem,
   AdminUserPatchInput,
   ApiHealthResponse,
@@ -28,6 +35,7 @@ import type {
   AuthConfigResponse,
   AuthMeResponse,
   AuthTokenResponse,
+  ClosureDetailResponse,
   ClosuresListResponse,
   ClosuresStatusResponse,
   ConditionReportCreateInput,
@@ -40,6 +48,7 @@ import type {
   ParkTenureItem,
   PlannedRouteAnalysis,
   PoiItem,
+  PublicUiConfigResponse,
   RainfallSummaryResponse,
   ReportVoteKind,
   RoutePlanRequest,
@@ -54,6 +63,8 @@ import type {
   UserFavoriteItem,
   UserPinInput,
   UserPinItem,
+  UserUiPreferencesResponse,
+  UserUiPreferencesUpdateInput,
   VehicleCapabilityClass,
   VehicleProfileInput,
   VehicleProfileItem,
@@ -445,6 +456,70 @@ export function fetchClosuresList(
   return requestJson<ClosuresListResponse>("/api/closures?active_only=true", {
     signal,
   });
+}
+
+export function fetchClosureDetail(
+  closureId: number | string,
+  signal?: AbortSignal
+): Promise<ClosureDetailResponse> {
+  return requestJson<ClosureDetailResponse>(
+    `/api/closures/${encodeURIComponent(String(closureId))}`,
+    { signal }
+  );
+}
+
+/* ---------- Public UI Defaults & User Layer Preferences ---------- */
+
+export async function fetchPublicUiConfig(
+  signal?: AbortSignal
+): Promise<PublicUiConfigResponse> {
+  try {
+    const raw = await requestJson<PublicUiConfigResponse>("/api/ui-config", {
+      signal,
+    });
+    return normalizePublicUiConfig(raw);
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    return {
+      default_layer_order: [...DEFAULT_PUBLIC_UI_CONFIG.default_layer_order],
+      default_layer_visibility: {
+        ...DEFAULT_PUBLIC_UI_CONFIG.default_layer_visibility,
+      },
+      show_stack_telemetry_public:
+        DEFAULT_PUBLIC_UI_CONFIG.show_stack_telemetry_public,
+    };
+  }
+}
+
+export async function fetchUserPreferences(
+  signal?: AbortSignal
+): Promise<UserUiPreferencesResponse> {
+  const raw = await requestJson<UserUiPreferencesResponse>(
+    "/api/user/preferences",
+    { signal }
+  );
+  return normalizeUserUiPreferences(raw);
+}
+
+export async function updateUserPreferences(
+  payload: UserUiPreferencesUpdateInput
+): Promise<UserUiPreferencesResponse> {
+  const raw = await requestJson<UserUiPreferencesResponse>(
+    "/api/user/preferences",
+    {
+      method: "PUT",
+      body: payload,
+    }
+  );
+  return normalizeUserUiPreferences(raw);
+}
+
+export async function resetUserPreferences(): Promise<UserUiPreferencesResponse> {
+  const raw = await requestJson<UserUiPreferencesResponse>(
+    "/api/user/preferences",
+    { method: "DELETE" }
+  );
+  return normalizeUserUiPreferences(raw);
 }
 
 /* ---------- Slice 05 Auth, Vehicles, Favorites, Pins & Export ---------- */
@@ -1112,5 +1187,28 @@ export function triggerAdminClosuresSync(): Promise<AdminComputeActionResponse> 
 export function triggerAdminGradingRecompute(): Promise<AdminComputeActionResponse> {
   return requestJson<AdminComputeActionResponse>("/api/grading/recompute", {
     method: "POST",
+  });
+}
+
+export function fetchAdminUiSettings(
+  signal?: AbortSignal
+): Promise<AdminUiSettingsResponse> {
+  return requestJson<AdminUiSettingsResponse>("/api/admin/ui-settings", {
+    signal,
+  });
+}
+
+export function updateAdminUiSettings(
+  payload: AdminUiSettingsUpdateInput
+): Promise<AdminUiSettingsResponse> {
+  return requestJson<AdminUiSettingsResponse>("/api/admin/ui-settings", {
+    method: "PUT",
+    body: payload,
+  });
+}
+
+export function resetAdminUiSettings(): Promise<AdminUiSettingsResponse> {
+  return requestJson<AdminUiSettingsResponse>("/api/admin/ui-settings", {
+    method: "DELETE",
   });
 }

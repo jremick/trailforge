@@ -26,6 +26,7 @@ from trailforge.api.middleware import (
     flush_usage_metrics,
 )
 from trailforge.api.packs import router as packs_router
+from trailforge.api.preferences import router as preferences_router
 from trailforge.api.reports import router as reports_router
 from trailforge.api.routes import router as routes_router
 from trailforge.api.tiles import router as tiles_router
@@ -166,6 +167,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(vehicles_router)
     application.include_router(user_data_router)
     application.include_router(routes_router)
+    application.include_router(preferences_router)
     application.include_router(admin_router)
 
     @application.get("/", tags=["meta"])

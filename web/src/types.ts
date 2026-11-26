@@ -7,16 +7,18 @@ export type TrackDifficulty = "easy" | "medium" | "hard" | "extreme";
 export type CanonicalGrade = "Easy" | "Medium" | "Hard" | "Extreme";
 
 export type LayerKey =
+  | "contoursHillshade"
+  | "parksWaterways"
+  | "pois"
   | "tracks"
   | "steepHighlights"
   | "hotspots"
   | "closures"
   | "reports"
   | "unmapped"
-  | "contoursHillshade"
-  | "snowLine"
-  | "parksWaterways"
-  | "pois";
+  | "snowLine";
+
+export type LayerVisibilityMap = Record<LayerKey, boolean>;
 
 export interface LayerVisibilityState {
   tracks: boolean;
@@ -30,6 +32,37 @@ export interface LayerVisibilityState {
   snowLineElevationM: number;
   parksWaterways: boolean;
   pois: boolean;
+}
+
+export interface PublicUiConfigResponse {
+  default_layer_order: LayerKey[];
+  default_layer_visibility: LayerVisibilityMap;
+  show_stack_telemetry_public: boolean;
+}
+
+export interface AdminUiSettingsResponse extends PublicUiConfigResponse {
+  show_stack_telemetry_public_override: boolean | null;
+  env_show_stack_telemetry_public: boolean;
+  has_custom_layer_order: boolean;
+  has_custom_layer_visibility: boolean;
+  updated_at?: string | null;
+}
+
+export interface AdminUiSettingsUpdateInput {
+  default_layer_order?: LayerKey[] | null;
+  default_layer_visibility?: Partial<LayerVisibilityMap> | null;
+  show_stack_telemetry_public?: boolean | null;
+}
+
+export interface UserUiPreferencesResponse {
+  layer_order: LayerKey[] | null;
+  layer_visibility: Partial<LayerVisibilityMap> | null;
+  has_custom_preferences: boolean;
+}
+
+export interface UserUiPreferencesUpdateInput {
+  layer_order?: LayerKey[] | null;
+  layer_visibility?: Partial<LayerVisibilityMap> | null;
 }
 
 export interface RegionPreset {
@@ -195,6 +228,51 @@ export interface ClosuresStatusResponse {
 export interface ClosuresListResponse {
   items: ClosureItem[];
   feeds?: FeedStatusItem[];
+}
+
+export interface ClosureAffectedTrack {
+  track_id: string;
+  name: string;
+  state: string;
+  grade?: string | null;
+  total_length_m: number;
+}
+
+export interface ClosureDetailResponse {
+  closure_id: number | string;
+  feed_source?: string | null;
+  feed_display_name?: string | null;
+  agency?: string | null;
+  external_id?: string | null;
+  title: string;
+  subtitle?: string | null;
+  description?: string | null;
+  closure_type: ClosureType;
+  alert_type?: string | null;
+  severity: ClosureSeverity;
+  raw_severity?: string | null;
+  status?: string | null;
+  state?: string | null;
+  effective_from?: string | null;
+  effective_to?: string | null;
+  source_url?: string | null;
+  last_updated_at?: string | null;
+  is_stale?: boolean;
+  capad_park_name?: string | null;
+  geometry_type?: string | null;
+  bbox?: BBoxTuple | null;
+  incident_details?: Record<string, string>;
+  affected_segment_count?: number;
+  affected_tracks?: ClosureAffectedTrack[];
+  affected_track_ids?: string[];
+  track_id?: string | null;
+}
+
+export interface MapClosureClickPayload {
+  primary: ClosureDetailResponse;
+  overlapping: ClosureDetailResponse[];
+  clickLat: number;
+  clickLon: number;
 }
 
 /* ---------- Slice 05 Auth, Vehicle Profiles, Favorites & Pins ---------- */

@@ -1,4 +1,4 @@
-"""Offline PostGIS integration tests verifying 30 tables, 21 GIST indexes, ODbL & privacy rules."""
+"""Offline PostGIS integration tests verifying 31 tables, 21 GIST indexes, ODbL & privacy rules."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ EXPECTED_TABLES = frozenset(
         "track_segments",
         "segment_reconciliation_log",
         "pois",
-        # Tier C — Independent TrailForge intelligence, community & access-control tables (18)
+        # Tier C — Independent TrailForge intelligence, community & access-control tables (19)
         "track_segment_grades",
         "closures_alerts",
         "segment_closure_links",
@@ -39,6 +39,7 @@ EXPECTED_TABLES = frozenset(
         "users",
         "invite_codes",
         "usage_metrics_hourly",
+        "instance_ui_settings",
         "vehicle_profiles",
         "user_favorites",
         "user_pins",
@@ -86,7 +87,7 @@ def test_postgis_health_and_schema_revision(postgis_engine: Engine) -> None:
     assert status.db_ok is True
     assert status.postgis_version is not None
     assert status.postgis_version.startswith("3.")
-    assert status.schema_revision == "0005_user_token_version"
+    assert status.schema_revision == "0006_ui_preferences_and_settings"
 
 
 @pytest.mark.integration
@@ -101,12 +102,12 @@ def test_fastapi_health_against_live_postgis(postgis_engine: Engine) -> None:
     body = resp.json()
     assert body["status"] == "ok"
     assert body["db_ok"] is True
-    assert body["schema_revision"] == "0005_user_token_version"
+    assert body["schema_revision"] == "0006_ui_preferences_and_settings"
 
 
 @pytest.mark.integration
-def test_all_30_tables_and_21_gist_indexes_exist(postgis_engine: Engine) -> None:
-    assert len(EXPECTED_TABLES) == 30
+def test_all_31_tables_and_21_gist_indexes_exist(postgis_engine: Engine) -> None:
+    assert len(EXPECTED_TABLES) == 31
     assert len(EXPECTED_GIST_INDEXES) == 21
     inspector = inspect(postgis_engine)
     tables = set(inspector.get_table_names(schema="public"))
@@ -169,12 +170,18 @@ def test_odbl_and_privacy_column_invariants(postgis_engine: Engine) -> None:
         "planned_routes",
         "invite_codes",
         "usage_metrics_hourly",
+        "instance_ui_settings",
     )
     for table_name in tier_c_tables:
         cols = {col["name"] for col in inspector.get_columns(table_name)}
         assert "osm_way_id" not in cols
         assert "tags" not in cols
-    for non_spatial_table in ("planned_routes", "invite_codes", "usage_metrics_hourly"):
+    for non_spatial_table in (
+        "planned_routes",
+        "invite_codes",
+        "usage_metrics_hourly",
+        "instance_ui_settings",
+    ):
         non_spatial_cols = {col["name"] for col in inspector.get_columns(non_spatial_table)}
         assert "geom" not in non_spatial_cols
 

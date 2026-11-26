@@ -35,6 +35,11 @@ from trailforge.db.models import (
 )
 from trailforge.db.session import get_db
 from trailforge.feeds.queries import get_feed_health_summary
+from trailforge.ui_preferences import (
+    get_admin_ui_settings,
+    reset_instance_ui_settings,
+    upsert_instance_ui_settings,
+)
 
 router = APIRouter(
     prefix="/api/admin",
@@ -88,6 +93,23 @@ class CreateInviteRequest(BaseModel):
     role: Literal["member", "admin"] = Field(default="member")
     max_uses: int = Field(default=1, ge=1, le=1000)
     expires_in_days: int | None = Field(default=14, ge=1, le=3650)
+
+
+class AdminUiSettingsResponse(BaseModel):
+    default_layer_order: list[str]
+    default_layer_visibility: dict[str, bool]
+    show_stack_telemetry_public: bool
+    show_stack_telemetry_public_override: bool | None = None
+    env_show_stack_telemetry_public: bool
+    has_custom_layer_order: bool = False
+    has_custom_layer_visibility: bool = False
+    updated_at: str | None = None
+
+
+class AdminUiSettingsUpdateRequest(BaseModel):
+    default_layer_order: list[str] | None = None
+    default_layer_visibility: dict[str, bool] | None = None
+    show_stack_telemetry_public: bool | None = None
 
 
 def _iso_or_none(dt: datetime | None) -> str | None:
@@ -630,3 +652,46 @@ def revoke_admin_invite(
         db.commit()
         db.refresh(invite)
     return _to_admin_invite(invite)
+
+
+@router.get("/ui-settings", response_model=AdminUiSettingsResponse)
+def read_admin_ui_settings(
+    _admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> AdminUiSettingsResponse:
+    """Return instance-wide default map layer order, visibility, and sidebar telemetry settings."""
+    return AdminUiSettingsResponse(**get_admin_ui_settings(db))
+
+
+@router.put("/ui-settings", response_model=AdminUiSettingsResponse)
+def update_admin_ui_settings(
+    payload: AdminUiSettingsUpdateRequest,
+    admin_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> AdminUiSettingsResponse:
+    """Update admin-configured instance UI defaults (layer order, on/off defaults, telemetry)."""
+    kwargs: dict[str, Any] = {"updated_by_user_id": admin_user.id}
+    if "default_layer_order" in payload.model_fields_set:
+        kwargs["default_layer_order"] = payload.default_layer_order
+    if "default_layer_visibility" in payload.model_fields_set:
+        kwargs["default_layer_visibility"] = payload.default_layer_visibility
+    if "show_stack_telemetry_public" in payload.model_fields_set:
+        kwargs["show_stack_telemetry_public"] = payload.show_stack_telemetry_public
+
+    try:
+        updated = upsert_instance_ui_settings(db, **kwargs)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
+    return AdminUiSettingsResponse(**updated)
+
+
+@router.delete("/ui-settings", response_model=AdminUiSettingsResponse)
+def clear_admin_ui_settings(
+    _admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> AdminUiSettingsResponse:
+    """Reset instance-wide admin UI overrides back to factory and environment defaults."""
+    return AdminUiSettingsResponse(**reset_instance_ui_settings(db))

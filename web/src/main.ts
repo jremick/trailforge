@@ -23,9 +23,11 @@ import {
   exportPlannedRoute,
   fetchAdminInvites,
   fetchAdminStats,
+  fetchAdminUiSettings,
   fetchAdminUsers,
   fetchAuthConfig,
   fetchAuthMe,
+  fetchClosureDetail,
   fetchClosuresGeoJson,
   fetchClosuresStatus,
   fetchFavorites,
@@ -34,12 +36,14 @@ import {
   fetchPacksCatalog,
   fetchPins,
   fetchPois,
+  fetchPublicUiConfig,
   fetchReportsGeoJson,
   fetchTileManifest,
   fetchTrackDetail,
   fetchTracksGeoJson,
   fetchTrips,
   fetchUnmappedCandidatesGeoJson,
+  fetchUserPreferences,
   fetchVehicles,
   getSavedRoute,
   getSavedRouteExportUrl,
@@ -50,13 +54,17 @@ import {
   planRoute,
   registerAccount,
   removeFavorite,
+  resetAdminUiSettings,
+  resetUserPreferences,
   revokeAdminInvite,
   saveRoute,
   setStoredAuthToken,
   triggerAdminClosuresSync,
   triggerAdminGradingRecompute,
+  updateAdminUiSettings,
   updateSavedRoute,
   updateTrip,
+  updateUserPreferences,
   updateVehicle,
   uploadMobileTripSync,
   uploadTripGpx,
@@ -71,6 +79,7 @@ import {
   AdminConsolePanel,
   type AdminPanelTab,
 } from "./components/adminPanel";
+import { ClosureInspectorDrawer } from "./components/closureInspector";
 import { renderAttributionFooter } from "./components/footer";
 import { TrackInspectorDrawer } from "./components/inspector";
 import { OfflinePacksPanel } from "./components/packsPanel";
@@ -109,7 +118,19 @@ import {
   listSyncQueue,
 } from "./offline/syncQueue";
 import {
+  CANONICAL_LAYER_ORDER,
+  DEFAULT_PUBLIC_UI_CONFIG,
+  clearStoredUserLayerPrefs,
+  extractLayerVisibilityMap,
+  loadStoredUserLayerPrefs,
+  resolveEffectiveLayerPreferences,
+  saveStoredUserLayerPrefs,
+  shouldShowStackTelemetrySection,
+  type StoredUserLayerPrefs,
+} from "./layerPrefsHelpers";
+import {
   BASEMAP_OPTIONS,
+  DEFAULT_SNOWLINE_ELEVATION_M,
   createInitialLayerState,
   escapeHtml,
   getDefaultPreset,
@@ -141,15 +162,21 @@ import {
 import type {
   AdminInviteItem,
   AdminStatsResponse,
+  AdminUiSettingsResponse,
   AdminUserItem,
   AuthConfigResponse,
   AuthUser,
   BasemapId,
+  ClosureDetailResponse,
+  ClosureItem,
   DownloadedPackRecord,
   HealthState,
+  LayerKey,
   LayerVisibilityState,
+  MapClosureClickPayload,
   OfflinePackRegionItem,
   PlannedRouteAnalysis,
+  PublicUiConfigResponse,
   RecordedBreadcrumbPoint,
   RegionPreset,
   RouteWaypointInput,
@@ -222,6 +249,7 @@ class TrailForgeApp {
   private readonly topbar: TopBar;
   private readonly sidebar: Sidebar;
   private readonly inspector: TrackInspectorDrawer;
+  private readonly closureInspector: ClosureInspectorDrawer;
   private readonly accountPanel: RigAccountPanel;
   private readonly adminPanel: AdminConsolePanel;
   private readonly packsPanel: OfflinePacksPanel;
@@ -245,9 +273,23 @@ class TrailForgeApp {
   private activePreset: RegionPreset = getDefaultPreset();
   private activeBasemap: BasemapId;
   private currentTileManifest: TileManifestResponse | null = null;
+  private uiConfig: PublicUiConfigResponse = {
+    default_layer_order: [...DEFAULT_PUBLIC_UI_CONFIG.default_layer_order],
+    default_layer_visibility: {
+      ...DEFAULT_PUBLIC_UI_CONFIG.default_layer_visibility,
+    },
+    show_stack_telemetry_public:
+      DEFAULT_PUBLIC_UI_CONFIG.show_stack_telemetry_public,
+  };
+  private userLayerPrefs: StoredUserLayerPrefs = loadStoredUserLayerPrefs();
+  private layerOrder: LayerKey[] = [...CANONICAL_LAYER_ORDER];
   private layerState: LayerVisibilityState = createInitialLayerState();
+  private hasCustomLayerPrefs = false;
+  private userPrefsSaveTimer: number | null = null;
   private healthAbort: AbortController | null = null;
   private inspectorAbort: AbortController | null = null;
+  private closureInspectorAbort: AbortController | null = null;
+  private activeOverlappingClosures: ClosureDetailResponse[] = [];
 
   // Bookmarkable / shareable URL state
   private readonly initialUrlState: AppUrlState;
@@ -264,6 +306,7 @@ class TrailForgeApp {
   private adminStats: AdminStatsResponse | null = null;
   private adminInvites: AdminInviteItem[] = [];
   private adminUsers: AdminUserItem[] = [];
+  private adminUiSettings: AdminUiSettingsResponse | null = null;
   private latestCreatedInvite: AdminInviteItem | null = null;
   private anonymousRigClass: VehicleCapabilityClass = loadStoredAnonRig();
   private vehicles: VehicleProfileItem[] = [];
@@ -361,6 +404,15 @@ class TrailForgeApp {
       initialViewportWidth
     );
 
+    const initialResolvedPrefs = resolveEffectiveLayerPreferences(
+      this.uiConfig,
+      this.userLayerPrefs,
+      DEFAULT_SNOWLINE_ELEVATION_M
+    );
+    this.layerOrder = initialResolvedPrefs.layerOrder;
+    this.layerState = initialResolvedPrefs.layerState;
+    this.hasCustomLayerPrefs = initialResolvedPrefs.hasCustomPreferences;
+
     root.innerHTML = `
       <div class="tf-shell ${this.sidebarCollapsed ? "sidebar-collapsed" : ""}" data-role="shell">
         <header data-role="topbar"></header>
@@ -395,6 +447,7 @@ class TrailForgeApp {
 
           <aside data-role="sidebar"></aside>
           <aside data-role="inspector"></aside>
+          <aside data-role="closure-inspector"></aside>
           <aside data-role="account-panel"></aside>
           <aside data-role="admin-panel"></aside>
           <aside data-role="packs-panel"></aside>
@@ -526,12 +579,27 @@ class TrailForgeApp {
         onLayerToggle: (key, enabled) => {
           this.layerState = { ...this.layerState, [key]: enabled };
           this.map.setLayerVisibility(this.layerState);
+          this.persistUserLayerPreferenceChange({
+            layerVisibility: {
+              ...extractLayerVisibilityMap(this.layerState),
+              [key]: enabled,
+            },
+          });
           if (key === "unmapped" && enabled) {
             void this.refreshUnmappedCandidates();
           }
           if (key === "hotspots" && enabled) {
             void this.refreshHotspotsGeoJson();
           }
+        },
+        onLayerOrderChange: (nextOrder) => {
+          this.layerOrder = [...nextOrder];
+          this.persistUserLayerPreferenceChange({
+            layerOrder: [...nextOrder],
+          });
+        },
+        onResetLayerPreferences: () => {
+          void this.handleResetUserLayerPreferences();
         },
         onSnowLineElevationChange: (elevationM) => {
           this.layerState = { ...this.layerState, snowLineElevationM: elevationM };
@@ -565,6 +633,14 @@ class TrailForgeApp {
           this.applySidebarWidth(SIDEBAR_DEFAULT_WIDTH_PX, true);
           window.setTimeout(() => this.map.resize(), 60);
         },
+      },
+      {
+        initialOrder: this.layerOrder,
+        hasCustomLayerPrefs: this.hasCustomLayerPrefs,
+        showTelemetrySection: shouldShowStackTelemetrySection(
+          this.user,
+          this.uiConfig.show_stack_telemetry_public
+        ),
       }
     );
 
@@ -593,6 +669,29 @@ class TrailForgeApp {
           this.map.flyToCoordinate(lat, lon, label, 14.5);
           this.updateCursorReadout(lat, lon);
           this.showToast(`Zoomed to ${label}`, "info");
+        },
+        onOpenClosure: (closure: ClosureItem) => {
+          const cid = closure.closure_id ?? closure.id;
+          if (cid === undefined || cid === null) return;
+          const summary: ClosureDetailResponse = {
+            closure_id: cid,
+            feed_source: closure.feed_source,
+            agency: closure.agency,
+            external_id: closure.external_id,
+            title: closure.title,
+            description: closure.description,
+            closure_type: closure.closure_type,
+            severity: closure.severity,
+            status: closure.status,
+            state: closure.state,
+            effective_from: closure.effective_from,
+            effective_to: closure.effective_to,
+            source_url: closure.source_url,
+            last_updated_at: closure.last_updated_at,
+            is_stale: closure.is_stale,
+            capad_park_name: closure.capad_park_name,
+          };
+          void this.openClosureInspector(summary, [summary]);
         },
         onOpenRigPanel: () => {
           this.openAccountPanel("rig");
@@ -680,6 +779,32 @@ class TrailForgeApp {
       }
     );
 
+    this.closureInspector = new ClosureInspectorDrawer(
+      this.q(root, "[data-role='closure-inspector']"),
+      {
+        onClose: () => {
+          this.closureInspectorAbort?.abort();
+          this.shellEl.classList.remove("closure-open");
+          this.map.setSelectedClosureId(null);
+        },
+        onZoomToClosure: (bbox) => {
+          this.map.fitBBox(bbox, this.getMapLeftPadding(24), 420);
+        },
+        onOpenTrack: (trackId, trackName) => {
+          this.closeClosureInspector();
+          void this.openTrackInspector(trackId, trackName, {
+            autoZoomIfNoCoords: true,
+          });
+        },
+        onSelectOverlapping: (chosen) => {
+          void this.openClosureInspector(
+            chosen,
+            this.activeOverlappingClosures
+          );
+        },
+      }
+    );
+
     this.accountPanel = new RigAccountPanel(
       this.q(root, "[data-role='account-panel']"),
       this.buildAccountPanelState(),
@@ -728,7 +853,15 @@ class TrailForgeApp {
           this.adminStats = null;
           this.adminInvites = [];
           this.adminUsers = [];
+          this.adminUiSettings = null;
           this.latestCreatedInvite = null;
+          if (this.userPrefsSaveTimer !== null) {
+            window.clearTimeout(this.userPrefsSaveTimer);
+            this.userPrefsSaveTimer = null;
+          }
+          this.userLayerPrefs = { layerOrder: null, layerVisibility: null };
+          clearStoredUserLayerPrefs();
+          this.applyResolvedLayerPreferences();
           this.closeAdminPanel();
           this.setCoordPickMode(null);
           this.map.setUserPins([]);
@@ -947,6 +1080,7 @@ class TrailForgeApp {
         stats: null,
         invites: [],
         users: [],
+        uiSettings: null,
         latestCreatedInvite: null,
         busyAction: null,
         error: null,
@@ -1067,6 +1201,64 @@ class TrailForgeApp {
             this.showToast(msg, "error");
           } finally {
             this.adminPanel.updateState({ busyAction: null });
+          }
+        },
+        onSaveUiSettings: async (payload) => {
+          this.adminPanel.updateState({
+            busyAction: "save-ui-settings",
+            error: null,
+          });
+          try {
+            const updated = await updateAdminUiSettings(payload);
+            this.adminUiSettings = updated;
+            this.uiConfig = {
+              default_layer_order: [...updated.default_layer_order],
+              default_layer_visibility: { ...updated.default_layer_visibility },
+              show_stack_telemetry_public: updated.show_stack_telemetry_public,
+            };
+            this.applyResolvedLayerPreferences();
+            this.syncTelemetrySectionVisibility();
+            this.adminPanel.updateState({
+              uiSettings: updated,
+              busyAction: null,
+            });
+            this.showToast("Saved instance default map layers & visibility", "success");
+          } catch (err) {
+            const msg = formatFriendlyApiError(
+              err,
+              "Failed to save instance UI settings"
+            );
+            this.adminPanel.updateState({ error: msg, busyAction: null });
+            this.showToast(msg, "error");
+          }
+        },
+        onResetUiSettings: async () => {
+          this.adminPanel.updateState({
+            busyAction: "reset-ui-settings",
+            error: null,
+          });
+          try {
+            const reset = await resetAdminUiSettings();
+            this.adminUiSettings = reset;
+            this.uiConfig = {
+              default_layer_order: [...reset.default_layer_order],
+              default_layer_visibility: { ...reset.default_layer_visibility },
+              show_stack_telemetry_public: reset.show_stack_telemetry_public,
+            };
+            this.applyResolvedLayerPreferences();
+            this.syncTelemetrySectionVisibility();
+            this.adminPanel.updateState({
+              uiSettings: reset,
+              busyAction: null,
+            });
+            this.showToast("Reset instance map layer defaults to factory settings", "info");
+          } catch (err) {
+            const msg = formatFriendlyApiError(
+              err,
+              "Failed to reset instance UI settings"
+            );
+            this.adminPanel.updateState({ error: msg, busyAction: null });
+            this.showToast(msg, "error");
           }
         },
       }
@@ -1326,10 +1518,14 @@ class TrailForgeApp {
             void this.handleAddTrackToRoute(trackId);
             return;
           }
+          this.closeClosureInspector();
           this.closeAccountPanel();
           this.closeAdminPanel();
           this.closeRoutePlanner();
           void this.openTrackInspector(trackId);
+        },
+        onClosureClick: (payload: MapClosureClickPayload) => {
+          void this.openClosureInspector(payload.primary, payload.overlapping);
         },
         onPinDropClick: (lat, lon) => {
           this.pendingPinCoords = { lat, lon };
@@ -1506,6 +1702,7 @@ class TrailForgeApp {
       this.inspector.close();
       this.shellEl.classList.remove("inspector-open");
     }
+    this.closeClosureInspector();
     this.closeAccountPanel();
     this.closeAdminPanel();
     this.closeRoutePlanner();
@@ -1563,6 +1760,7 @@ class TrailForgeApp {
       this.inspector.close();
       this.shellEl.classList.remove("inspector-open");
     }
+    this.closeClosureInspector();
     this.closeAccountPanel();
     this.closeAdminPanel();
     this.closePacksPanel();
@@ -1951,6 +2149,114 @@ class TrailForgeApp {
       isOfflinePack: Boolean(this.activeOfflinePackId) || !this.isOnline,
     });
     this.syncRoutePlannerUiState();
+    this.syncTelemetrySectionVisibility();
+  }
+
+  private syncTelemetrySectionVisibility(): void {
+    this.sidebar.setTelemetrySectionVisible(
+      shouldShowStackTelemetrySection(
+        this.user,
+        this.uiConfig.show_stack_telemetry_public
+      )
+    );
+  }
+
+  private applyResolvedLayerPreferences(): void {
+    const resolved = resolveEffectiveLayerPreferences(
+      this.uiConfig,
+      this.userLayerPrefs,
+      this.layerState.snowLineElevationM
+    );
+    const newlyEnabledUnmapped =
+      !this.layerState.unmapped && resolved.layerState.unmapped;
+    const newlyEnabledHotspots =
+      !this.layerState.hotspots && resolved.layerState.hotspots;
+
+    this.layerOrder = resolved.layerOrder;
+    this.layerState = resolved.layerState;
+    this.hasCustomLayerPrefs = resolved.hasCustomPreferences;
+
+    this.sidebar.syncLayerPreferences(
+      this.layerOrder,
+      this.layerState,
+      this.hasCustomLayerPrefs
+    );
+    this.map.setLayerVisibility(this.layerState);
+
+    if (newlyEnabledUnmapped) {
+      void this.refreshUnmappedCandidates();
+    }
+    if (newlyEnabledHotspots) {
+      void this.refreshHotspotsGeoJson();
+    }
+  }
+
+  private persistUserLayerPreferenceChange(patch: {
+    layerOrder?: LayerKey[];
+    layerVisibility?: Partial<Record<LayerKey, boolean>>;
+  }): void {
+    this.userLayerPrefs = {
+      layerOrder:
+        patch.layerOrder !== undefined
+          ? [...patch.layerOrder]
+          : this.userLayerPrefs.layerOrder,
+      layerVisibility:
+        patch.layerVisibility !== undefined
+          ? { ...(this.userLayerPrefs.layerVisibility ?? {}), ...patch.layerVisibility }
+          : this.userLayerPrefs.layerVisibility,
+    };
+    this.hasCustomLayerPrefs = Boolean(
+      this.userLayerPrefs.layerOrder !== null ||
+        this.userLayerPrefs.layerVisibility !== null
+    );
+    saveStoredUserLayerPrefs(this.userLayerPrefs);
+    this.sidebar.syncLayerPreferences(
+      this.layerOrder,
+      this.layerState,
+      this.hasCustomLayerPrefs
+    );
+
+    if (this.user && this.isOnline) {
+      if (this.userPrefsSaveTimer !== null) {
+        window.clearTimeout(this.userPrefsSaveTimer);
+      }
+      const snapshot = {
+        layer_order: this.userLayerPrefs.layerOrder,
+        layer_visibility: this.userLayerPrefs.layerVisibility,
+      };
+      this.userPrefsSaveTimer = window.setTimeout(() => {
+        this.userPrefsSaveTimer = null;
+        if (!this.user) return;
+        void updateUserPreferences(snapshot).catch((err) => {
+          console.warn("Failed to persist map layer preferences to account:", err);
+        });
+      }, 250);
+    }
+  }
+
+  private async handleResetUserLayerPreferences(): Promise<void> {
+    if (this.userPrefsSaveTimer !== null) {
+      window.clearTimeout(this.userPrefsSaveTimer);
+      this.userPrefsSaveTimer = null;
+    }
+    this.userLayerPrefs = { layerOrder: null, layerVisibility: null };
+    clearStoredUserLayerPrefs();
+    this.applyResolvedLayerPreferences();
+    let syncedRemote = true;
+    if (this.user && this.isOnline) {
+      try {
+        await resetUserPreferences();
+      } catch (err) {
+        syncedRemote = false;
+        console.warn("Failed to clear saved server layer preferences:", err);
+      }
+    }
+    this.showToast(
+      syncedRemote
+        ? "Map layers reset to instance defaults"
+        : "Map layers reset locally (server sync failed)",
+      "info"
+    );
   }
 
   private openAccountPanel(tab?: AccountPanelTab): void {
@@ -1958,6 +2264,7 @@ class TrailForgeApp {
       this.inspector.close();
       this.shellEl.classList.remove("inspector-open");
     }
+    this.closeClosureInspector();
     this.closeAdminPanel();
     this.closePacksPanel();
     this.closeRoutePlanner();
@@ -1980,6 +2287,7 @@ class TrailForgeApp {
       this.inspector.close();
       this.shellEl.classList.remove("inspector-open");
     }
+    this.closeClosureInspector();
     this.closeAccountPanel();
     this.closePacksPanel();
     this.closeRoutePlanner();
@@ -1999,18 +2307,21 @@ class TrailForgeApp {
     if (!isAdminUser(this.user)) return;
     this.adminPanel.updateState({ loading: true, error: null });
     try {
-      const [stats, invites, users] = await Promise.all([
+      const [stats, invites, users, uiSettings] = await Promise.all([
         fetchAdminStats(),
         fetchAdminInvites(),
         fetchAdminUsers(),
+        fetchAdminUiSettings().catch(() => this.adminUiSettings),
       ]);
       this.adminStats = stats;
       this.adminInvites = invites;
       this.adminUsers = users;
+      this.adminUiSettings = uiSettings;
       this.adminPanel.updateState({
         stats: this.adminStats,
         invites: this.adminInvites,
         users: this.adminUsers,
+        uiSettings: this.adminUiSettings,
         latestCreatedInvite: this.latestCreatedInvite,
         registrationMode:
           stats.registration_mode ?? this.authConfig.registration_mode,
@@ -2119,6 +2430,8 @@ class TrailForgeApp {
           this.closePacksPanel();
         } else if (this.accountPanel.isPanelOpen()) {
           this.closeAccountPanel();
+        } else if (this.closureInspector.openState()) {
+          this.closeClosureInspector();
         } else if (this.inspector.openState()) {
           this.inspector.close();
           this.shellEl.classList.remove("inspector-open");
@@ -2165,6 +2478,7 @@ class TrailForgeApp {
     void this.refreshOfflineLocalState();
     void this.refreshHealth(false);
     void this.hydrateAuthConfig();
+    void this.hydrateUiConfig();
     void this.loadVectorAndTerrainLayers();
     void this.refreshClosures(false);
     void this.refreshHotspotsGeoJson();
@@ -2206,6 +2520,24 @@ class TrailForgeApp {
     }
   }
 
+  private async hydrateUiConfig(): Promise<void> {
+    try {
+      this.uiConfig = await fetchPublicUiConfig();
+    } catch {
+      this.uiConfig = {
+        default_layer_order: [...DEFAULT_PUBLIC_UI_CONFIG.default_layer_order],
+        default_layer_visibility: {
+          ...DEFAULT_PUBLIC_UI_CONFIG.default_layer_visibility,
+        },
+        show_stack_telemetry_public:
+          DEFAULT_PUBLIC_UI_CONFIG.show_stack_telemetry_public,
+      };
+    } finally {
+      this.applyResolvedLayerPreferences();
+      this.syncTelemetrySectionVisibility();
+    }
+  }
+
   private async hydrateAuthSession(): Promise<void> {
     clearLegacyStoredAuthToken();
     try {
@@ -2229,18 +2561,28 @@ class TrailForgeApp {
 
   private async loadSignedInUserData(): Promise<void> {
     try {
-      const [vehicles, trips, favorites, pins, savedRoutes] = await Promise.all([
-        fetchVehicles().catch(() => []),
-        fetchTrips().catch(() => []),
-        fetchFavorites().catch(() => []),
-        fetchPins().catch(() => []),
-        listSavedRoutes().catch(() => []),
-      ]);
+      const [vehicles, trips, favorites, pins, savedRoutes, serverPrefs] =
+        await Promise.all([
+          fetchVehicles().catch(() => []),
+          fetchTrips().catch(() => []),
+          fetchFavorites().catch(() => []),
+          fetchPins().catch(() => []),
+          listSavedRoutes().catch(() => []),
+          fetchUserPreferences().catch(() => null),
+        ]);
       this.vehicles = vehicles;
       this.trips = trips;
       this.favorites = favorites;
       this.pins = pins;
       this.savedRoutes = savedRoutes;
+      if (serverPrefs !== null) {
+        this.userLayerPrefs = {
+          layerOrder: serverPrefs.layer_order,
+          layerVisibility: serverPrefs.layer_visibility,
+        };
+        saveStoredUserLayerPrefs(this.userLayerPrefs);
+        this.applyResolvedLayerPreferences();
+      }
       this.renderCombinedPinsOnMap();
     } finally {
       this.syncRigUiState();
@@ -2375,6 +2717,69 @@ class TrailForgeApp {
     }
   }
 
+  private closeClosureInspector(): void {
+    this.closureInspectorAbort?.abort();
+    this.closureInspector.close();
+    this.shellEl.classList.remove("closure-open");
+    this.map.setSelectedClosureId(null);
+  }
+
+  private async openClosureInspector(
+    primary: ClosureDetailResponse,
+    overlapping: ClosureDetailResponse[]
+  ): Promise<void> {
+    this.closureInspectorAbort?.abort();
+    const controller = new AbortController();
+    this.closureInspectorAbort = controller;
+
+    if (this.inspector.openState()) {
+      this.inspector.close();
+      this.shellEl.classList.remove("inspector-open");
+      this.map.setSelectedTrackId(null);
+      this.syncUrlState({ trackId: null, profileOpen: false }, "replace");
+    }
+    this.closeAccountPanel();
+    this.closeAdminPanel();
+    this.closePacksPanel();
+    this.closeRoutePlanner();
+
+    this.activeOverlappingClosures =
+      overlapping.length > 0 ? overlapping : [primary];
+    this.shellEl.classList.add("closure-open");
+    this.map.setSelectedClosureId(primary.closure_id);
+
+    const numericId = Number(primary.closure_id);
+    const canFetchFull =
+      this.isOnline && Number.isInteger(numericId) && numericId > 0;
+
+    this.closureInspector.showClosure(primary, {
+      overlapping: this.activeOverlappingClosures,
+      loading: canFetchFull,
+      error: null,
+    });
+
+    if (!canFetchFull) return;
+
+    try {
+      const full = await fetchClosureDetail(numericId, controller.signal);
+      if (controller.signal.aborted) return;
+      const merged: ClosureDetailResponse = {
+        ...primary,
+        ...full,
+        bbox: full.bbox ?? primary.bbox ?? null,
+      };
+      this.closureInspector.updateDetail(merged, {
+        loading: false,
+        error: null,
+      });
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      const msg =
+        err instanceof Error ? err.message : "Offline or unavailable";
+      this.closureInspector.setLoadingError(msg);
+    }
+  }
+
   private async openTrackInspector(
     trackId: string,
     trackLabel?: string,
@@ -2388,6 +2793,7 @@ class TrailForgeApp {
     const controller = new AbortController();
     this.inspectorAbort = controller;
 
+    this.closeClosureInspector();
     this.closeAccountPanel();
     this.closeAdminPanel();
     this.closePacksPanel();

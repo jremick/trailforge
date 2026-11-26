@@ -70,6 +70,27 @@ export const SELECTED_TRACK_LAYER_IDS = [
 
 export const SELECTED_TRACK_STEEP_LAYER_ID = "tf-tracks-selected-steep";
 
+export const SELECTED_CLOSURE_OUTLINE_LAYER_ID = "tf-closures-selected-outline";
+
+/**
+ * Build the MapLibre filter expression for highlighting a selected closure/incident geometry.
+ */
+export function buildSelectedClosureFilter(
+  closureId: string | number | null
+): FilterSpecification {
+  return [
+    "all",
+    ["in", ["geometry-type"], ["literal", ["Polygon", "LineString"]]],
+    [
+      "==",
+      ["to-string", ["coalesce", ["get", "closure_id"], ""]],
+      closureId !== null && closureId !== undefined
+        ? String(closureId)
+        : "__none__",
+    ],
+  ];
+}
+
 export interface TrackSelectionOpacities {
   casing: number;
   line: number;
@@ -375,6 +396,7 @@ export interface BuildStyleOptions {
   tileManifest?: TileManifestResponse | null;
   origin?: string;
   selectedTrackId?: string | null;
+  selectedClosureId?: string | number | null;
 }
 
 /**
@@ -392,6 +414,7 @@ export function buildTrailForgeStyle(
     tileManifest,
     origin,
     selectedTrackId = null,
+    selectedClosureId = null,
   } = options;
 
   const showOsm = initialBasemap === "osm" || initialBasemap === "opentopo";
@@ -1132,6 +1155,7 @@ export function buildTrailForgeStyle(
   }
 
   const closureColor = buildClosureColorExpression();
+  const selectedClosureFilter = buildSelectedClosureFilter(selectedClosureId);
 
   // Line & polygon overlays (all rendered BELOW point/icon/marker layers)
   // Slice 04 Live Closures, Seasonal Restrictions, Incidents & Gates hazard lines/polygons
@@ -1158,6 +1182,18 @@ export function buildTrailForgeStyle(
         "line-width": 2.2,
         "line-dasharray": [4, 2],
         "line-opacity": 0.92,
+      },
+    },
+    {
+      id: SELECTED_CLOSURE_OUTLINE_LAYER_ID,
+      type: "line",
+      source: "tf-closures",
+      filter: selectedClosureFilter,
+      layout: { visibility: vis(layers.closures) },
+      paint: {
+        "line-color": "#FDE047",
+        "line-width": 4.2,
+        "line-opacity": 0.96,
       },
     },
     {
