@@ -6,14 +6,16 @@ import json
 import os
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Any, Final
 
 import httpx
 
 from trailforge.ingestion.connectors.base import (
     ATTRIBUTION_CAPAD,
+    AU_STATE_CODES,
     BBox,
     RawCapadFeature,
+    StateLiteral,
     iter_spatial_tiles,
     prop_ci,
     query_arcgis_geojson,
@@ -25,11 +27,11 @@ DEFAULT_AU_PARKS_URL: Final[str] = (
 # ~5 m simplification offset keeps massive National Park / IPA polygons < 500 KB
 CAPAD_MAX_ALLOWABLE_OFFSET_DEG: Final[str] = "0.00005"
 
-_SUPPORTED_STATES: Final[frozenset[str]] = frozenset({"VIC", "NSW", "ACT"})
+_SUPPORTED_STATES: Final[frozenset[str]] = frozenset(AU_STATE_CODES)
 
 
 def parse_capad_feature(feat: Mapping[str, Any]) -> RawCapadFeature | None:
-    """Normalize a CAPAD 2025 GeoJSON feature into ``RawCapadFeature`` (VIC/NSW/ACT)."""
+    """Normalize a CAPAD 2025 GeoJSON feature into ``RawCapadFeature`` (all 8 AU states)."""
     geom = feat.get("geometry")
     if not isinstance(geom, Mapping) or geom.get("type") not in ("Polygon", "MultiPolygon"):
         return None
@@ -41,7 +43,7 @@ def parse_capad_feature(feat: Mapping[str, Any]) -> RawCapadFeature | None:
     state_raw = str(prop_ci(props, "STATE", "state") or "").strip().upper()
     if state_raw not in _SUPPORTED_STATES:
         return None
-    state: Literal["VIC", "NSW", "ACT"] = state_raw  # type: ignore[assignment]
+    state: StateLiteral = state_raw  # type: ignore[assignment]
 
     park_type = str(prop_ci(props, "TYPE", "park_type") or "Protected Area").strip()
     type_abbr_val = prop_ci(props, "TYPE_ABBR", "type_abbr")

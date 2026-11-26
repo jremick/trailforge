@@ -1,9 +1,9 @@
-"""Multi-source track conflation engine (OSM > VIC > NSW) in EPSG:3577.
+"""Multi-source Pan-Australia track conflation engine (OSM > Official AU State Layers) in EPSG:3577.
 
-Implements docs/SPEC_GIS_SCHEMA.md Section 3.1:
+Implements docs/SPEC_GIS_SCHEMA.md Section 3.1 across all 8 Australian states & territories:
   - Filters non-vehicular walking tracks out of the 4WD conflated network
   - Deduplicates overlapping lower-priority geometries within 20 m corridor (>=70% overlap,
-    <=30 deg acute heading difference), attaching state provenance, names, and surface hints
+    <=30 deg acute heading diff), attaching state provenance, names, classes, and surface hints
   - Cuts partial overlaps (20%..70%), discards slivers <35 m, and snaps T-junction endpoints
     within 20 m onto the winning higher-priority line
 """
@@ -23,7 +23,7 @@ from shapely.geometry import LineString, MultiLineString, shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import nearest_points, unary_union
 
-SourceKind = Literal["osm", "vic", "nsw"]
+SourceKind = Literal["osm", "vic", "nsw", "act", "tas", "qld", "wa", "sa", "nt"]
 
 _TO_ALBERS = Transformer.from_crs("EPSG:4326", "EPSG:3577", always_xy=True).transform
 _TO_WGS84 = Transformer.from_crs("EPSG:3577", "EPSG:4326", always_xy=True).transform
@@ -42,6 +42,33 @@ _SOURCE_PRIORITY: dict[tuple[str, str], int] = {
     ("vic", "recweb_tracks"): 3,
     ("nsw", "nsw_fire_trails_l9"): 4,
     ("nsw", "nsw_tracks_l5"): 5,
+    ("act", "act_transport_track"): 6,
+    ("act", "act_rural_roads"): 7,
+    ("act", "act_equestrian_routes"): 8,
+    ("tas", "tas_transport_segments"): 9,
+    ("qld", "qld_qpws_park_roads"): 10,
+    ("qld", "qld_qpws_walking"): 11,
+    ("qld", "qld_qpws_great_walks"): 11,
+    ("qld", "qld_state_tracks"): 12,
+    ("wa", "wa_slip_tracks"): 13,
+    ("wa", "wa_dbca_tracks"): 14,
+    ("sa", "sa_fire_tracks"): 15,
+    ("sa", "sa_recreation_trails"): 16,
+    ("sa", "sa_ga_topo250k"): 17,
+    ("nt", "nt_roads"): 18,
+    ("nt", "nt_ga_topo250k"): 19,
+}
+
+_SOURCE_FALLBACK_PRIORITY: dict[str, int] = {
+    "osm": 1,
+    "vic": 3,
+    "nsw": 5,
+    "act": 8,
+    "tas": 9,
+    "qld": 12,
+    "wa": 14,
+    "sa": 17,
+    "nt": 19,
 }
 
 _PLACEHOLDER_NAMES = frozenset({"", "unnamed", "unknown", "none", "null", "n/a"})
@@ -175,7 +202,7 @@ def _to_shapely(geom_obj: Any) -> BaseGeometry:
 def _priority_rank(source: str, source_layer: str) -> int:
     if (source, source_layer) in _SOURCE_PRIORITY:
         return _SOURCE_PRIORITY[(source, source_layer)]
-    return {"osm": 1, "vic": 3, "nsw": 5}.get(source, 99)
+    return _SOURCE_FALLBACK_PRIORITY.get(source, 99)
 
 
 @dataclass
@@ -234,7 +261,7 @@ def _snap_residual_endpoints(
 
 
 def _merge_metadata(winner: ConflatedWay, source_ref: dict[str, Any], feat: Any) -> None:
-    """Enrich winning higher-priority way with non-conflicting state provenance/names/surface."""
+    """Enrich winning higher-priority way with non-conflicting state provenance/names/class."""
     if source_ref not in winner.source_refs:
         winner.source_refs.append(source_ref)
 
@@ -247,6 +274,14 @@ def _merge_metadata(winner: ConflatedWay, source_ref: dict[str, Any], feat: Any)
         ):
             winner.alt_names.append(other_name)
 
+    other_class = getattr(feat, "trail_class", None)
+    if (
+        other_class in ("fire_trail", "management_trail")
+        and winner.trail_class == "4wd_track"
+        and not winner.is_4wd_only
+    ):
+        winner.trail_class = other_class
+
     other_surface = getattr(feat, "surface_class", "unknown") or "unknown"
     if winner.surface_class == "unknown" and other_surface != "unknown":
         winner.surface_class = other_surface
@@ -256,7 +291,7 @@ def _merge_metadata(winner: ConflatedWay, source_ref: dict[str, Any], feat: Any)
 
 
 def conflate_tracks(features: Sequence[Any]) -> ConflationResult:
-    """Conflate OSM, VIC, and NSW track features in EPSG:3577 with priority OSM > VIC > NSW.
+    """Conflate OSM and official AU state track features in EPSG:3577 (OSM > official state layers).
 
     Accepts any sequence of track feature objects exposing attributes matching
     `RawTrackFeature` (`source`, `source_layer`, `source_id`, `name`, `trail_class`,
@@ -307,6 +342,9 @@ def conflate_tracks(features: Sequence[Any]) -> ConflationResult:
         }
         if feat_name:
             source_ref["name"] = feat_name
+        feat_class = getattr(feat, "trail_class", None)
+        if feat_class:
+            source_ref["trail_class"] = feat_class
 
         # Only deduplicate against strictly higher-priority sources (VIC vs OSM, NSW vs OSM/VIC)
         higher_indices = [i for i, r in enumerate(accepted_ranks) if r < rank]

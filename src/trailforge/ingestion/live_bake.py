@@ -38,15 +38,15 @@ from trailforge.feeds.adapters import build_default_adapters
 from trailforge.feeds.sync import sync_configured_feeds, sync_from_fixtures
 from trailforge.grading.live import recompute_live_grades
 from trailforge.ingestion.conflate import conflate_tracks
+from trailforge.ingestion.connectors.au_states import (
+    AutoAUStateTrailsRouter,
+    resolve_intersecting_states,
+)
 from trailforge.ingestion.connectors.base import (
     ATTRIBUTION_CAPAD,
     ATTRIBUTION_GA_DEM,
     ATTRIBUTION_GA_HYDRO,
-    ATTRIBUTION_NSW_SPATIAL,
-    ATTRIBUTION_OPEN_METEO,
     ATTRIBUTION_OSM,
-    ATTRIBUTION_STATE_FEEDS,
-    ATTRIBUTION_VIC_DEECA,
     GDAL_STREAMING_ENV,
     BBox,
     CorridorDataset,
@@ -54,22 +54,22 @@ from trailforge.ingestion.connectors.base import (
     RawPoiFeature,
     RawWaterwayFeature,
     dedupe_poi_features,
-    is_in_nsw_coverage,
-    is_in_vic_coverage,
     iter_spatial_tiles,
 )
 from trailforge.ingestion.connectors.capad import CAPADConnector
 from trailforge.ingestion.connectors.dem import AUElvisDEMConnector
 from trailforge.ingestion.connectors.fixtures import load_corridor_fixtures
 from trailforge.ingestion.connectors.hydro import GAHydroConnector
-from trailforge.ingestion.connectors.nsw import NSWTrailsConnector
 from trailforge.ingestion.connectors.osm import OSMConnector
-from trailforge.ingestion.connectors.vic import VICTrailsConnector
 from trailforge.ingestion.pbf import StreamingPBFExtractor
 from trailforge.ingestion.pipeline import ingest_corridor_dataset
 from trailforge.ingestion.segmenter import segment_conflated_ways
 from trailforge.packs.builder import build_regional_pack
-from trailforge.packs.catalog import PACK_REGIONS, get_pack_region
+from trailforge.packs.catalog import (
+    PACK_REGIONS,
+    build_pack_attributions,
+    get_pack_region,
+)
 from trailforge.tiles.builder import build_tiles
 
 logger = logging.getLogger("trailforge.ingestion.live_bake")
@@ -149,6 +149,7 @@ class TileStatusRecord(BaseModel):
     osm_tracks: int = 0
     vic_tracks: int = 0
     nsw_tracks: int = 0
+    au_state_tracks: int = 0
     waterways: int = 0
     pois: int = 0
     capad_parks: int = 0
@@ -367,21 +368,18 @@ def fetch_live_tile_dataset(
         osm_conn = OSMConnector(cache_dir=cache_dir, client=http_client)
         osm_tracks = osm_conn.fetch_overpass_tracks(tile_bbox)
 
-    # 2. Victoria DataVic WFS (if intersecting VIC)
-    vic_tracks = []
-    if is_in_vic_coverage(tile_bbox):
-        attributions.append(ATTRIBUTION_VIC_DEECA)
-        vic_conn = VICTrailsConnector(cache_dir=cache_dir, client=http_client)
-        vic_tracks = vic_conn.fetch_tracks(tile_bbox, tile_deg=max(0.25, tile_bbox.width))
-        all_pois.extend(vic_conn.fetch_pois(tile_bbox, tile_deg=max(0.25, tile_bbox.width)))
-
-    # 3. NSW Spatial Services ArcGIS (if intersecting NSW/ACT)
-    nsw_tracks = []
-    if is_in_nsw_coverage(tile_bbox):
-        attributions.append(ATTRIBUTION_NSW_SPATIAL)
-        nsw_conn = NSWTrailsConnector(cache_dir=cache_dir, client=http_client)
-        nsw_tracks = nsw_conn.fetch_tracks(tile_bbox, tile_deg=max(0.25, tile_bbox.width))
-        all_pois.extend(nsw_conn.fetch_pois(tile_bbox, tile_deg=max(0.25, tile_bbox.width)))
+    # 2. Pan-Australia Official State Trails & POIs (auto-detects all intersecting AU states)
+    state_router = AutoAUStateTrailsRouter(cache_dir=cache_dir, client=http_client)
+    state_result = state_router.fetch(
+        tile_bbox,
+        tile_deg=max(0.25, tile_bbox.width),
+        include_pois=True,
+    )
+    vic_tracks = state_result.vic_tracks
+    nsw_tracks = state_result.nsw_tracks
+    au_state_tracks = state_result.au_state_tracks
+    all_pois.extend(state_result.pois)
+    attributions.extend(state_result.attributions)
 
     # 4. GA National Surface Hydrology
     attributions.append(ATTRIBUTION_GA_HYDRO)
@@ -426,6 +424,7 @@ def fetch_live_tile_dataset(
         osm_tracks=osm_tracks,
         vic_tracks=vic_tracks,
         nsw_tracks=nsw_tracks,
+        au_state_tracks=au_state_tracks,
         waterways=waterways,
         pois=dedupe_poi_features(all_pois),
         capad_parks=capad_parks,
@@ -646,16 +645,10 @@ def run_bake(
     )
     save_bake_manifest(manifest_path, manifest)
 
-    attributions: list[str] = [
-        ATTRIBUTION_OSM,
-        ATTRIBUTION_VIC_DEECA,
-        ATTRIBUTION_NSW_SPATIAL,
-        ATTRIBUTION_GA_HYDRO,
-        ATTRIBUTION_CAPAD,
-        ATTRIBUTION_GA_DEM,
-        ATTRIBUTION_OPEN_METEO,
-        ATTRIBUTION_STATE_FEEDS,
-    ]
+    if region_id in PACK_REGIONS:
+        attributions = list(get_pack_region(region_id).attributions)
+    else:
+        attributions = build_pack_attributions(resolve_intersecting_states(bbox))
 
     # -------------------------------------------------------------------------
     # Dry-Run Mode (zero DB writes; offline fixtures verify conflation/segmenter)
@@ -675,6 +668,7 @@ def run_bake(
             rec.osm_tracks = len(ds.osm_tracks)
             rec.vic_tracks = len(ds.vic_tracks)
             rec.nsw_tracks = len(ds.nsw_tracks)
+            rec.au_state_tracks = len(ds.au_state_tracks)
             rec.waterways = len(ds.waterways)
             rec.pois = len(ds.pois)
             rec.capad_parks = len(ds.capad_parks)
@@ -786,6 +780,7 @@ def run_bake(
                 rec.osm_tracks = len(dataset.osm_tracks)
                 rec.vic_tracks = len(dataset.vic_tracks)
                 rec.nsw_tracks = len(dataset.nsw_tracks)
+                rec.au_state_tracks = len(dataset.au_state_tracks)
                 rec.waterways = len(dataset.waterways)
                 rec.pois = len(dataset.pois)
                 rec.capad_parks = len(dataset.capad_parks)

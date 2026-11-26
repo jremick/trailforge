@@ -1,4 +1,4 @@
-"""Offline PostGIS integration tests verifying all 27 tables, GIST indexes, ODbL & privacy rules."""
+"""Offline PostGIS integration tests verifying 28 tables, 21 GIST indexes, ODbL & privacy rules."""
 
 from __future__ import annotations
 
@@ -17,10 +17,11 @@ from trailforge.db.session import check_db_health
 
 EXPECTED_TABLES = frozenset(
     {
-        # Tier A — Source tables (6)
+        # Tier A — Source tables (7)
         "source_tracks_osm",
         "source_tracks_vic",
         "source_tracks_nsw",
+        "source_tracks_au_state",
         "source_waterways",
         "source_pois",
         "source_capad_parks",
@@ -55,6 +56,7 @@ EXPECTED_GIST_INDEXES = frozenset(
         "ix_source_tracks_osm_geom",
         "ix_source_tracks_vic_geom",
         "ix_source_tracks_nsw_geom",
+        "ix_source_tracks_au_state_geom",
         "ix_source_waterways_geom",
         "ix_source_pois_geom",
         "ix_source_capad_parks_geom",
@@ -82,7 +84,7 @@ def test_postgis_health_and_schema_revision(postgis_engine: Engine) -> None:
     assert status.db_ok is True
     assert status.postgis_version is not None
     assert status.postgis_version.startswith("3.")
-    assert status.schema_revision == "0002_planned_routes"
+    assert status.schema_revision == "0003_pan_au_source_tracks"
 
 
 @pytest.mark.integration
@@ -97,11 +99,13 @@ def test_fastapi_health_against_live_postgis(postgis_engine: Engine) -> None:
     body = resp.json()
     assert body["status"] == "ok"
     assert body["db_ok"] is True
-    assert body["schema_revision"] == "0002_planned_routes"
+    assert body["schema_revision"] == "0003_pan_au_source_tracks"
 
 
 @pytest.mark.integration
-def test_all_27_tables_and_20_gist_indexes_exist(postgis_engine: Engine) -> None:
+def test_all_28_tables_and_21_gist_indexes_exist(postgis_engine: Engine) -> None:
+    assert len(EXPECTED_TABLES) == 28
+    assert len(EXPECTED_GIST_INDEXES) == 21
     inspector = inspect(postgis_engine)
     tables = set(inspector.get_table_names(schema="public"))
     missing_tables = EXPECTED_TABLES - tables

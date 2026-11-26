@@ -1,10 +1,9 @@
-"""SQLAlchemy 2 + GeoAlchemy2 spatial models for TrailForge (Slices 01-09).
+"""SQLAlchemy 2 + GeoAlchemy2 spatial models for TrailForge (Slices 01-09 + Phase B Pan-AU).
 
-Implements all 26 PostGIS tables specified in docs/SPEC_GIS_SCHEMA.md across
-three strict OSM ODbL separation tiers:
-  - Tier A (6 tables): Dedicated upstream source staging tables
+Implements all 28 PostGIS tables across three strict OSM ODbL separation tiers:
+  - Tier A (7 tables): Dedicated upstream source staging tables (incl. Pan-AU state tracks)
   - Tier B (5 tables): Canonical conflated network & reference tables
-  - Tier C (15 tables): Independent TrailForge grading, live feeds, telemetry & community tables
+  - Tier C (16 tables): Independent TrailForge grading, live feeds, telemetry & community tables
 """
 
 from __future__ import annotations
@@ -151,6 +150,47 @@ class SourceTrackNSW(Base):
     )
 
 
+class SourceTrackAUState(Base):
+    """Dedicated Pan-Australia (ACT/TAS/QLD/WA/SA/NT) official state tracks staging table."""
+
+    __tablename__ = "source_tracks_au_state"
+    __table_args__ = (
+        CheckConstraint(
+            "state_code IN ('ACT','TAS','QLD','WA','SA','NT')",
+            name="state_code_valid",
+        ),
+        UniqueConstraint(
+            "state_code",
+            "source_layer",
+            "source_feature_id",
+            name="uq_source_tracks_au_state_feat",
+        ),
+        Index("ix_source_tracks_au_state_geom", "geom", postgresql_using="gist"),
+        Index("ix_source_tracks_au_state_state_code", "state_code"),
+        Index("ix_source_tracks_au_state_trail_class", "trail_class"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    state_code: Mapped[str] = mapped_column(String(4), nullable=False)
+    source_layer: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_feature_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    trail_class: Mapped[str] = mapped_column(Text, nullable=False)
+    surface_raw: Mapped[str | None] = mapped_column(Text, nullable=True)
+    access_raw: Mapped[str | None] = mapped_column(Text, nullable=True)
+    properties_json: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    geom: Mapped[Any] = mapped_column(
+        Geometry("LINESTRING", srid=4326, spatial_index=False), nullable=False
+    )
+    ingested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class SourceWaterway(Base):
     """Upstream GA Surface Hydrology (CC BY 4.0) & OSM (ODbL) waterways."""
 
@@ -188,17 +228,29 @@ class SourcePOI(Base):
     __tablename__ = "source_pois"
     __table_args__ = (
         CheckConstraint(
-            "source_provider IN ('vic_foi','vic_recweb_hut','vic_recweb_site','vic_geomark',"
-            "'nsw_poi','nsw_trig','nsw_hut','ga_hydro_pt','osm')",
+            "source_provider IN ("
+            "'vic_foi','vic_recweb_hut','vic_recweb_site','vic_geomark',"
+            "'nsw_poi','nsw_trig','nsw_hut',"
+            "'act_heritage_hut','act_feature_name','act_bbq','act_shelter','act_trig',"
+            "'tas_hut','tas_nomenclature','tas_infra','tas_picnic','tas_trig',"
+            "'qld_tourist','qld_survey',"
+            "'wa_ratis_site','wa_ratis_facility','wa_fire_tower','wa_geodetic',"
+            "'sa_parks','sa_survey_mark',"
+            "'nt_placename','nt_survey_mark',"
+            "'ga_hydro_pt','osm')",
             name="source_provider_valid",
         ),
-        CheckConstraint("source_license IN ('CC-BY-4.0','ODbL')", name="source_license_valid"),
+        CheckConstraint(
+            "source_license IN ('CC-BY-4.0','CC-BY-3.0-AU','ODbL')", name="source_license_valid"
+        ),
         CheckConstraint(
             "poi_type IN ('campground','hut','trig','lookout','picnic','water_point',"
             "'gate','trailhead','fuel')",
             name="poi_type_valid",
         ),
-        CheckConstraint("state IN ('VIC','NSW','ACT')", name="state_valid"),
+        CheckConstraint(
+            "state IN ('VIC','NSW','ACT','TAS','QLD','WA','SA','NT')", name="state_valid"
+        ),
         UniqueConstraint("source_provider", "source_feature_id", name="uq_source_pois_feature"),
         Index("ix_source_pois_geom", "geom", postgresql_using="gist"),
         Index("ix_source_pois_poi_type", "poi_type"),
@@ -258,7 +310,9 @@ class CAPADPark(Base):
 
     __tablename__ = "capad_parks"
     __table_args__ = (
-        CheckConstraint("state IN ('VIC','NSW','ACT')", name="state_valid"),
+        CheckConstraint(
+            "state IN ('VIC','NSW','ACT','TAS','QLD','WA','SA','NT')", name="state_valid"
+        ),
         Index("ix_capad_parks_geom", "geom", postgresql_using="gist"),
         Index("ix_capad_parks_state_lower_name", "state", text("lower(name)")),
     )
@@ -284,8 +338,14 @@ class Track(Base):
 
     __tablename__ = "tracks"
     __table_args__ = (
-        CheckConstraint("state IN ('VIC','NSW','ACT','VIC/NSW')", name="state_valid"),
-        CheckConstraint("primary_source IN ('osm','vic','nsw')", name="primary_source_valid"),
+        CheckConstraint(
+            "state ~ '^(VIC|NSW|ACT|TAS|QLD|WA|SA|NT)(/(VIC|NSW|ACT|TAS|QLD|WA|SA|NT))*$'",
+            name="state_valid",
+        ),
+        CheckConstraint(
+            "primary_source IN ('osm','vic','nsw','act','tas','qld','wa','sa','nt')",
+            name="primary_source_valid",
+        ),
         CheckConstraint(
             "trail_class IN ('4wd_track','fire_trail','management_trail',"
             "'unsealed_road','walking_track')",
@@ -343,7 +403,9 @@ class TrackSegment(Base):
     __table_args__ = (
         CheckConstraint("length_m > 0", name="length_positive"),
         CheckConstraint("bearing_deg >= 0 AND bearing_deg < 360", name="bearing_range"),
-        CheckConstraint("state IN ('VIC','NSW','ACT')", name="state_valid"),
+        CheckConstraint(
+            "state IN ('VIC','NSW','ACT','TAS','QLD','WA','SA','NT')", name="state_valid"
+        ),
         CheckConstraint(
             "trail_class IN ('4wd_track','fire_trail','management_trail',"
             "'unsealed_road','walking_track')",
@@ -366,7 +428,10 @@ class TrackSegment(Base):
             "dem_tier IN ('5m-lidar','srtm-1s','synthetic')",
             name="dem_tier_valid",
         ),
-        CheckConstraint("primary_source IN ('osm','vic','nsw')", name="primary_source_valid"),
+        CheckConstraint(
+            "primary_source IN ('osm','vic','nsw','act','tas','qld','wa','sa','nt')",
+            name="primary_source_valid",
+        ),
         Index("ix_track_segments_geom", "geom", postgresql_using="gist"),
         Index(
             "ix_track_segments_geom_active",
@@ -509,8 +574,12 @@ class POI(Base):
             "'gate','trailhead','fuel')",
             name="poi_type_valid",
         ),
-        CheckConstraint("state IN ('VIC','NSW','ACT')", name="state_valid"),
-        CheckConstraint("source_license IN ('CC-BY-4.0','ODbL')", name="source_license_valid"),
+        CheckConstraint(
+            "state IN ('VIC','NSW','ACT','TAS','QLD','WA','SA','NT')", name="state_valid"
+        ),
+        CheckConstraint(
+            "source_license IN ('CC-BY-4.0','CC-BY-3.0-AU','ODbL')", name="source_license_valid"
+        ),
         Index("ix_pois_geom", "geom", postgresql_using="gist"),
         Index("ix_pois_type_state", "poi_type", "state"),
         Index("ix_pois_lower_name", text("lower(name)")),
@@ -623,7 +692,8 @@ class ClosureAlert(Base):
     __table_args__ = (
         CheckConstraint(
             "source_feed IN ('vic_mapshare_seasonal','vic_emergency','nsw_rfs',"
-            "'nsw_npws','osm_access')",
+            "'nsw_npws','osm_access','act_esa','tas_alert','qld_des_alerts',"
+            "'wa_emergency','sa_cfs_parks','nt_securent')",
             name="source_feed_valid",
         ),
         CheckConstraint(
@@ -638,7 +708,10 @@ class ClosureAlert(Base):
         CheckConstraint(
             "status IN ('active','scheduled','cleared','stale')", name="status_valid"
         ),
-        CheckConstraint("state IN ('VIC','NSW','ACT')", name="state_valid"),
+        CheckConstraint(
+            "state ~ '^(VIC|NSW|ACT|TAS|QLD|WA|SA|NT)(/(VIC|NSW|ACT|TAS|QLD|WA|SA|NT))*$'",
+            name="state_valid",
+        ),
         UniqueConstraint("source_feed", "external_id", name="uq_closures_alerts_feed_ext"),
         Index("ix_closures_alerts_geom", "geom", postgresql_using="gist"),
         Index("ix_closures_alerts_status_state_type", "status", "state", "alert_type"),
@@ -1281,6 +1354,7 @@ __all__ = [
     "SegmentReconciliationLog",
     "SourceCAPADPark",
     "SourcePOI",
+    "SourceTrackAUState",
     "SourceTrackNSW",
     "SourceTrackOSM",
     "SourceTrackVIC",

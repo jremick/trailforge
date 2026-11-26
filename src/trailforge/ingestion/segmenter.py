@@ -167,15 +167,31 @@ def compute_chunk_count(length_m: float) -> int:
 
 
 def infer_state_from_lonlat(lon: float, lat: float) -> str:
-    """Infer AU launch jurisdiction (VIC, NSW, ACT) from a WGS84 midpoint coordinate.
+    """Infer Australian state/territory (all 8 jurisdictions) from a WGS84 midpoint coordinate.
 
     Uses the Murray River border approximation for the Australian Alps corridor and
-    falls back cleanly across statewide VIC/NSW/ACT extents when CAPAD polygons aren't passed.
+    falls back cleanly across all 8 Australian state/territory extents when CAPAD polygons
+    aren't passed.
     """
+    # Western Australia (west of 129.0 E)
+    if lon < 129.0:
+        return "WA"
+    # Tasmania (south of Bass Strait)
+    if lat < -39.5 and 143.5 <= lon <= 148.6:
+        return "TAS"
+    # Northern Territory (129..138 E, north of 26 S)
+    if 129.0 <= lon < 138.0 and lat >= -26.0:
+        return "NT"
+    # South Australia (129..141 E, south of 26 S)
+    if 129.0 <= lon < 141.0 and lat < -26.0:
+        return "SA"
+    # Queensland (east of 138 E, north of ~29 S)
+    if lon >= 138.0 and lat > -29.0:
+        return "QLD"
     # ACT approximate box
-    if 148.74 <= lon <= 149.42 and -35.94 <= lat <= -35.10:
+    if 148.72 <= lon <= 149.42 and -35.94 <= lat <= -35.10:
         return "ACT"
-    # Murray River border along the Australian Alps corridor (147.8..149.1 E)
+    # Murray River border along the Australian Alps corridor (148.00..148.25 E)
     if 148.00 <= lon <= 148.25 and -36.75 <= lat <= -36.50:
         river_lat = -36.565 + 0.004 * math.sin((lon - 148.05) * 40.0)
         return "VIC" if lat <= river_lat else "NSW"
@@ -596,15 +612,12 @@ def _group_segments_into_tracks(
         trk_hash = hashlib.sha256(f"trailforge:trk:v1|{key}".encode()).hexdigest()[:12]
         track_id = f"tftrk_{trk_hash}"
 
+        state_order = ("VIC", "NSW", "ACT", "TAS", "QLD", "WA", "SA", "NT")
         states = {s.state for s in segs}
-        if {"VIC", "NSW"}.issubset(states):
-            track_state = "VIC/NSW"
-        elif "VIC" in states:
-            track_state = "VIC"
-        elif "NSW" in states:
-            track_state = "NSW"
-        else:
-            track_state = "ACT"
+        ordered_states = [st for st in state_order if st in states]
+        if not ordered_states:
+            ordered_states = sorted(states)
+        track_state = "/".join(ordered_states)
 
         alt_names_seen: dict[str, str] = {}
         for s in segs:
@@ -612,8 +625,11 @@ def _group_segments_into_tracks(
                 if alt.lower() != display_name.lower():
                     alt_names_seen.setdefault(alt.lower(), alt)
 
+        source_order = ("osm", "vic", "nsw", "act", "tas", "qld", "wa", "sa", "nt")
         sources = {s.primary_source for s in segs}
-        primary_source = "osm" if "osm" in sources else ("vic" if "vic" in sources else "nsw")
+        primary_source = next(
+            (src for src in source_order if src in sources), segs[0].primary_source
+        )
         has_osm = any(s.has_osm_source for s in segs)
 
         union_wgs84 = unary_union([s.geom_wgs84 for s in segs])

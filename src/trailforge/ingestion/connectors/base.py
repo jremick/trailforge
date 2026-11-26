@@ -50,11 +50,62 @@ ATTRIBUTION_VIC_DEECA: Final[str] = (
     "Victoria Trails, Huts, Sites & Closures: "
     "© State of Victoria (DEECA / DTP Vicmap) (CC BY 4.0)"
 )
+ATTRIBUTION_ACT_ACTMAPI: Final[str] = (
+    "ACT Trails, Huts & Survey Marks: "
+    "© Australian Capital Territory (ACTmapi / EPSDD) (CC BY 4.0)"
+)
+ATTRIBUTION_TAS_LIST: Final[str] = (
+    "Tasmania Trails, Huts & Survey Control: "
+    "© State of Tasmania (the LIST, NRE Tas) (CC BY 3.0 AU)"
+)
+ATTRIBUTION_QLD_QSPATIAL: Final[str] = (
+    "Queensland Trails, Parks & Survey Control: "
+    "© State of Queensland (DESI / Dept. of Natural Resources & Mines) (CC BY 4.0)"
+)
+ATTRIBUTION_WA_DBCA_SLIP: Final[str] = (
+    "Western Australia Trails, Parks & Geodetic Marks: "
+    "© State of Western Australia (DBCA & Landgate SLIP) (CC BY 4.0)"
+)
+ATTRIBUTION_SA_DEW_DHUD: Final[str] = (
+    "South Australia Trails, Parks & Survey Marks: "
+    "© Government of South Australia (DEW / DHUD) (CC BY 4.0) "
+    "& Geoscience Australia (CC BY 4.0)"
+)
+ATTRIBUTION_NT_NTLIS: Final[str] = (
+    "Northern Territory Tracks, Place Names & Survey Marks: "
+    "© Northern Territory of Australia (NTLIS / DEPWS) (CC BY 4.0) "
+    "& Geoscience Australia (CC BY 4.0)"
+)
 ATTRIBUTION_OPEN_METEO: Final[str] = "Weather & Rainfall data by Open-Meteo.com (CC BY 4.0)"
 ATTRIBUTION_STATE_FEEDS: Final[str] = (
     "Live incident & park closure alerts: VicEmergency, NSW RFS, and NSW NPWS "
     "(attributed per alert with official source URL)"
 )
+
+AU_STATE_CODES: Final[tuple[str, ...]] = ("VIC", "NSW", "ACT", "TAS", "QLD", "WA", "SA", "NT")
+AU_EXTENDED_STATE_CODES: Final[tuple[str, ...]] = ("ACT", "TAS", "QLD", "WA", "SA", "NT")
+
+STATE_ATTRIBUTIONS: Final[dict[str, str]] = {
+    "VIC": ATTRIBUTION_VIC_DEECA,
+    "NSW": ATTRIBUTION_NSW_SPATIAL,
+    "ACT": ATTRIBUTION_ACT_ACTMAPI,
+    "TAS": ATTRIBUTION_TAS_LIST,
+    "QLD": ATTRIBUTION_QLD_QSPATIAL,
+    "WA": ATTRIBUTION_WA_DBCA_SLIP,
+    "SA": ATTRIBUTION_SA_DEW_DHUD,
+    "NT": ATTRIBUTION_NT_NTLIS,
+}
+
+
+def attributions_for_states(states: Sequence[str]) -> list[str]:
+    """Return deduplicated state agency attributions strictly for ``states``."""
+    out: list[str] = []
+    for raw in states:
+        code = str(raw).strip().upper()
+        attr = STATE_ATTRIBUTIONS.get(code)
+        if attr and attr not in out:
+            out.append(attr)
+    return out
 
 # Memory-bounded GDAL /vsicurl/ settings (< 300 MB peak RAM streaming guardrail)
 GDAL_STREAMING_ENV: Final[dict[str, str]] = {
@@ -102,12 +153,14 @@ _DIRT_SURFACES: Final[frozenset[str]] = frozenset(
     {
         "unpaved",
         "unsealed",
+        "unformed",
         "dirt",
         "earth",
         "ground",
         "grass",
         "natural",
         "woodchips",
+        "boardwalk",
         "dirt_unsealed",
     }
 )
@@ -127,7 +180,7 @@ _ROUGH_SURFACES: Final[frozenset[str]] = frozenset(
     }
 )
 
-TrackSourceLiteral = Literal["osm", "vic", "nsw"]
+TrackSourceLiteral = Literal["osm", "vic", "nsw", "act", "tas", "qld", "wa", "sa", "nt"]
 TrailClassLiteral = Literal[
     "4wd_track", "fire_trail", "management_trail", "unsealed_road", "walking_track"
 ]
@@ -136,7 +189,8 @@ SurfaceClassLiteral = Literal[
 ]
 TracktypeLiteral = Literal["grade1", "grade2", "grade3", "grade4", "grade5"]
 AccessStatusLiteral = Literal["public", "seasonal", "permit", "private", "restricted", "closed"]
-StateLiteral = Literal["VIC", "NSW", "ACT"]
+StateLiteral = Literal["VIC", "NSW", "ACT", "TAS", "QLD", "WA", "SA", "NT"]
+SourceLicenseLiteral = Literal["CC-BY-4.0", "CC-BY-3.0-AU", "ODbL"]
 PoiTypeLiteral = Literal[
     "campground", "hut", "trig", "lookout", "picnic", "water_point", "gate", "trailhead", "fuel"
 ]
@@ -148,6 +202,26 @@ PoiProviderLiteral = Literal[
     "nsw_poi",
     "nsw_trig",
     "nsw_hut",
+    "act_heritage_hut",
+    "act_feature_name",
+    "act_bbq",
+    "act_shelter",
+    "act_trig",
+    "tas_hut",
+    "tas_nomenclature",
+    "tas_infra",
+    "tas_picnic",
+    "tas_trig",
+    "qld_tourist",
+    "qld_survey",
+    "wa_ratis_site",
+    "wa_ratis_facility",
+    "wa_fire_tower",
+    "wa_geodetic",
+    "sa_parks",
+    "sa_survey_mark",
+    "nt_placename",
+    "nt_survey_mark",
     "ga_hydro_pt",
     "osm",
 ]
@@ -200,6 +274,13 @@ class BBox(BaseModel):
 
 NSW_COVERAGE_BBOX: Final[BBox] = BBox(min_x=140.5, min_y=-37.8, max_x=154.0, max_y=-28.0)
 VIC_COVERAGE_BBOX: Final[BBox] = BBox(min_x=140.5, min_y=-39.4, max_x=150.2, max_y=-33.8)
+ACT_COVERAGE_BBOX: Final[BBox] = BBox(min_x=148.70, min_y=-35.95, max_x=149.45, max_y=-35.10)
+ACT_STRICT_BBOX: Final[BBox] = BBox(min_x=148.72, min_y=-35.94, max_x=149.42, max_y=-35.10)
+TAS_COVERAGE_BBOX: Final[BBox] = BBox(min_x=143.5, min_y=-43.8, max_x=148.6, max_y=-39.5)
+QLD_COVERAGE_BBOX: Final[BBox] = BBox(min_x=137.8, min_y=-29.3, max_x=154.0, max_y=-10.5)
+WA_COVERAGE_BBOX: Final[BBox] = BBox(min_x=112.9, min_y=-35.2, max_x=129.0, max_y=-13.6)
+SA_COVERAGE_BBOX: Final[BBox] = BBox(min_x=129.0, min_y=-38.1, max_x=141.0, max_y=-26.0)
+NT_COVERAGE_BBOX: Final[BBox] = BBox(min_x=129.0, min_y=-26.0, max_x=138.0, max_y=-10.9)
 AU_COVERAGE_BBOX: Final[BBox] = BBox(min_x=112.5, min_y=-44.5, max_x=154.5, max_y=-9.5)
 CORRIDOR_ALPS_BBOX: Final[BBox] = BBox(min_x=148.05, min_y=-36.68, max_x=148.20, max_y=-36.55)
 
@@ -209,7 +290,34 @@ def is_in_nsw_coverage(bbox: BBox) -> bool:
 
 
 def is_in_vic_coverage(bbox: BBox) -> bool:
-    return bbox.intersects(VIC_COVERAGE_BBOX)
+    if not bbox.intersects(VIC_COVERAGE_BBOX):
+        return False
+    # Exclude NSW/ACT northeast of the Murray River / Forest Hill border (zero VIC land)
+    return not (bbox.min_x > 148.0 and bbox.min_y > -35.95)
+
+
+def is_in_act_coverage(bbox: BBox) -> bool:
+    return bbox.intersects(ACT_COVERAGE_BBOX)
+
+
+def is_in_tas_coverage(bbox: BBox) -> bool:
+    return bbox.intersects(TAS_COVERAGE_BBOX)
+
+
+def is_in_qld_coverage(bbox: BBox) -> bool:
+    return bbox.intersects(QLD_COVERAGE_BBOX)
+
+
+def is_in_wa_coverage(bbox: BBox) -> bool:
+    return bbox.intersects(WA_COVERAGE_BBOX)
+
+
+def is_in_sa_coverage(bbox: BBox) -> bool:
+    return bbox.intersects(SA_COVERAGE_BBOX)
+
+
+def is_in_nt_coverage(bbox: BBox) -> bool:
+    return bbox.intersects(NT_COVERAGE_BBOX)
 
 
 def is_in_australia_coverage(bbox: BBox) -> bool:
@@ -316,7 +424,7 @@ class RawPoiFeature(BaseModel):
     """Normalized upstream backcountry POI feature (huts, camps, trigs, lookouts, gates)."""
 
     source_provider: PoiProviderLiteral
-    source_license: Literal["CC-BY-4.0", "ODbL"]
+    source_license: SourceLicenseLiteral
     source_feature_id: str
     name: str | None = None
     poi_type: PoiTypeLiteral
@@ -371,6 +479,7 @@ class CorridorDataset(BaseModel):
     osm_tracks: list[RawTrackFeature] = Field(default_factory=list)
     vic_tracks: list[RawTrackFeature] = Field(default_factory=list)
     nsw_tracks: list[RawTrackFeature] = Field(default_factory=list)
+    au_state_tracks: list[RawTrackFeature] = Field(default_factory=list)
     waterways: list[RawWaterwayFeature] = Field(default_factory=list)
     pois: list[RawPoiFeature] = Field(default_factory=list)
     capad_parks: list[RawCapadFeature] = Field(default_factory=list)
@@ -380,7 +489,12 @@ class CorridorDataset(BaseModel):
 
     @property
     def all_tracks(self) -> list[RawTrackFeature]:
-        return [*self.osm_tracks, *self.vic_tracks, *self.nsw_tracks]
+        return [
+            *self.osm_tracks,
+            *self.vic_tracks,
+            *self.nsw_tracks,
+            *self.au_state_tracks,
+        ]
 
 
 # -----------------------------------------------------------------------------
@@ -494,7 +608,7 @@ def dedupe_poi_features(pois: Sequence[RawPoiFeature]) -> list[RawPoiFeature]:
 
     def _priority(poi: RawPoiFeature) -> tuple[int, int]:
         return (
-            1 if poi.source_license == "CC-BY-4.0" else 0,
+            1 if poi.source_license != "ODbL" else 0,
             1 if poi.elev_m is not None else 0,
         )
 
@@ -686,21 +800,16 @@ def query_wfs_geojson(
     cache_path: Path | None = None,
     cql_filter: str | None = None,
     geom_column: str = "geom",
+    use_bbox_param: bool = False,
     max_features: int = 2500,
     timeout_s: float = 25.0,
     retries: int = 2,
     client: httpx.Client | None = None,
 ) -> list[dict[str, Any]]:
-    """Query an OGC WFS 2.0.0 GeoJSON endpoint with EPSG:4326 CQL BBOX filtering and disk cache."""
+    """Query an OGC WFS 2.0.0 GeoJSON endpoint with EPSG:4326 CQL or CRS84 bbox and disk cache."""
     cached = _read_cached_feature_list(cache_path)
     if cached is not None:
         return cached
-
-    bbox_cql = (
-        f"BBOX({geom_column},{bbox.min_x:.6f},{bbox.min_y:.6f},"
-        f"{bbox.max_x:.6f},{bbox.max_y:.6f},'EPSG:4326')"
-    )
-    full_cql = f"{bbox_cql} AND ({cql_filter})" if cql_filter else bbox_cql
 
     params: dict[str, str] = {
         "service": "WFS",
@@ -710,8 +819,18 @@ def query_wfs_geojson(
         "outputFormat": "application/json",
         "srsName": "EPSG:4326",
         "count": str(max_features),
-        "CQL_FILTER": full_cql,
     }
+    if use_bbox_param and not cql_filter:
+        params["bbox"] = (
+            f"{bbox.min_x:.6f},{bbox.min_y:.6f},{bbox.max_x:.6f},{bbox.max_y:.6f},"
+            "urn:ogc:def:crs:OGC:1.3:CRS84"
+        )
+    else:
+        bbox_cql = (
+            f"BBOX({geom_column},{bbox.min_x:.6f},{bbox.min_y:.6f},"
+            f"{bbox.max_x:.6f},{bbox.max_y:.6f},'EPSG:4326')"
+        )
+        params["CQL_FILTER"] = f"{bbox_cql} AND ({cql_filter})" if cql_filter else bbox_cql
 
     owns_client = client is None
     http = (

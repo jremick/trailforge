@@ -285,6 +285,8 @@ def _build_region_summary(
         "name": region.name,
         "description": region.description,
         "region_type": region.region_type,
+        "category": region.category,
+        "states": list(region.states),
         "bbox": list(region.bbox),
         "bounds": bounds,
         "utm_zones": list(region.utm_zones),
@@ -313,7 +315,7 @@ def list_packs(
     packs_dir: Path = Depends(get_packs_dir_dep),
     db: Session = Depends(get_db),
 ) -> dict[str, list[dict[str, Any]]]:
-    """List all 4 locked v1 regional offline packs with build status, sizes, and URLs."""
+    """List all 15 Pan-Australia offline packs with build status, sizes, and URLs."""
     rows_by_id = {
         row.pack_id: row for row in db.execute(select(OfflinePack)).scalars().all()
     }

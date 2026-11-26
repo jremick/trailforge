@@ -32,6 +32,7 @@ from trailforge.db.models import (
     SegmentReconciliationLog,
     SourceCAPADPark,
     SourcePOI,
+    SourceTrackAUState,
     SourceTrackNSW,
     SourceTrackOSM,
     SourceTrackVIC,
@@ -44,6 +45,8 @@ from trailforge.db.session import get_engine
 from trailforge.grading.baseline import SegmentGradeInput, compute_baseline_grade
 from trailforge.ingestion.conflate import conflate_tracks, to_albers
 from trailforge.ingestion.connectors.base import (
+    AU_EXTENDED_STATE_CODES,
+    AU_STATE_CODES,
     CorridorDataset,
     RawCapadFeature,
     RawPoiFeature,
@@ -91,6 +94,7 @@ class PipelineRunSummary:
     grades_upserted: int
     pois_upserted: int
     capad_parks_upserted: int
+    tier_a_au_state_tracks: int = 0
 
 
 def _as_linestring(geom: Any) -> LineString:
@@ -262,6 +266,49 @@ def _upsert_tier_a_nsw(session: Session, features: list[RawTrackFeature]) -> int
                     "is_vehicular": feat.is_vehicular,
                     "raw_props": feat.raw_props,
                     "geom": from_shape(mline, srid=4326),
+                    "ingested_at": now,
+                },
+            )
+        )
+        session.execute(stmt)
+        count += 1
+    return count
+
+
+def _upsert_tier_a_au_state(session: Session, features: list[RawTrackFeature]) -> int:
+    """Persist ACT/TAS/QLD/WA/SA/NT source tracks into Tier A ``source_tracks_au_state``."""
+    now = datetime.now(UTC)
+    count = 0
+    for feat in features:
+        state_code = feat.source.upper()
+        if state_code not in AU_EXTENDED_STATE_CODES:
+            continue
+        line = _as_linestring(feat.to_shapely())
+        layer = (feat.source_layer or f"{feat.source}_tracks")[:64]
+        feat_id = str(feat.source_id)[:128]
+        stmt = (
+            pg_insert(SourceTrackAUState)
+            .values(
+                state_code=state_code,
+                source_layer=layer,
+                source_feature_id=feat_id,
+                name=feat.name,
+                trail_class=feat.trail_class,
+                surface_raw=feat.surface_raw,
+                access_raw=feat.access_raw,
+                properties_json=feat.raw_props,
+                geom=from_shape(line, srid=4326),
+                ingested_at=now,
+            )
+            .on_conflict_do_update(
+                constraint="uq_source_tracks_au_state_feat",
+                set_={
+                    "name": feat.name,
+                    "trail_class": feat.trail_class,
+                    "surface_raw": feat.surface_raw,
+                    "access_raw": feat.access_raw,
+                    "properties_json": feat.raw_props,
+                    "geom": from_shape(line, srid=4326),
                     "ingested_at": now,
                 },
             )
@@ -513,11 +560,12 @@ def ingest_corridor_dataset(
     now = datetime.now(UTC)
 
     # -------------------------------------------------------------------------
-    # 1. Tier A — Isolated Upstream Staging Tables (ODbL & CC BY 4.0 separated)
+    # 1. Tier A — Isolated Upstream Staging Tables (ODbL & CC BY separated)
     # -------------------------------------------------------------------------
     n_osm = _upsert_tier_a_osm(session, dataset.osm_tracks)
     n_vic = _upsert_tier_a_vic(session, dataset.vic_tracks)
     n_nsw = _upsert_tier_a_nsw(session, dataset.nsw_tracks)
+    n_au_state = _upsert_tier_a_au_state(session, dataset.au_state_tracks)
     n_ww = _upsert_tier_a_waterways(session, dataset.waterways)
     n_pois_raw = _upsert_tier_a_pois(session, dataset.pois)
     n_capad, capad_id_map = _upsert_capad_parks(session, dataset.capad_parks)
@@ -529,7 +577,7 @@ def ingest_corridor_dataset(
 
     def _resolve_state(lon: float, lat: float) -> str:
         tenure = find_capad_tenure(Point(lon, lat), dataset.capad_parks)
-        if tenure and tenure.get("state") in ("VIC", "NSW", "ACT"):
+        if tenure and tenure.get("state") in AU_STATE_CODES:
             return str(tenure["state"])
         return infer_state_from_lonlat(lon, lat)
 
@@ -867,6 +915,7 @@ def ingest_corridor_dataset(
         grades_upserted=len(plan.reconciled_segments),
         pois_upserted=n_pois_canonical,
         capad_parks_upserted=n_capad,
+        tier_a_au_state_tracks=n_au_state,
     )
 
 

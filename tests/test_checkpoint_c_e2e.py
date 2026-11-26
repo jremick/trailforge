@@ -33,7 +33,7 @@ from trailforge.db.session import get_db
 from trailforge.export.formats import EXPORT_ATTRIBUTIONS, GPX_NS
 from trailforge.ingestion.connectors.fixtures import load_corridor_fixtures
 from trailforge.ingestion.pipeline import ingest_corridor_dataset
-from trailforge.packs.catalog import PACK_ATTRIBUTIONS
+from trailforge.packs.catalog import PACK_ATTRIBUTIONS, PACK_REGION_IDS
 from trailforge.tiles.builder import DEFAULT_ATTRIBUTIONS
 from trailforge.worker.seed_demo import seed_demo_telemetry
 
@@ -59,6 +59,7 @@ def _truncate_all(engine: Engine) -> None:
                     user_favorites, user_pins, vehicle_profiles, users,
                     pois, track_segments, tracks, capad_parks,
                     source_tracks_osm, source_tracks_vic, source_tracks_nsw,
+                    source_tracks_au_state,
                     source_waterways, source_pois, source_capad_parks
                 RESTART IDENTITY CASCADE
                 """
@@ -267,7 +268,9 @@ def test_checkpoint_c_full_v1_pipeline_end_to_end(
                 r_packs = client.get("/api/packs")
                 assert r_packs.status_code == 200
                 regions = {r["region_id"]: r for r in r_packs.json()["regions"]}
-                assert set(regions.keys()) == {"australian-alps", "blue-mountains", "vic", "nsw"}
+                assert set(regions.keys()) == set(PACK_REGION_IDS)
+                assert len(regions) == 15
+                assert {"australian-alps", "blue-mountains", "vic", "nsw"}.issubset(regions.keys())
                 assert regions["australian-alps"]["status"] == "ready"
                 assert regions["australian-alps"]["track_count"] >= 7
 

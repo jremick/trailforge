@@ -56,14 +56,36 @@ def _build_test_app() -> FastAPI:
     return app
 
 
-def _assert_required_attributions(attributions: list[str]) -> None:
+def _assert_required_attributions(
+    attributions: list[str], *, expected_states: tuple[str, ...] | None = None
+) -> None:
     joined = "\n".join(attributions)
     assert "OpenStreetMap" in joined and "ODbL" in joined
     assert "Geoscience Australia" in joined and "CC BY 4.0" in joined
     assert "CAPAD 2025" in joined
-    assert "New South Wales" in joined
-    assert "Victoria" in joined and "DEECA" in joined
     assert "Open-Meteo" in joined and "CC BY 4.0" in joined
+
+    state_tokens = {
+        "VIC": "Victoria",
+        "NSW": "New South Wales",
+        "ACT": "Australian Capital Territory",
+        "TAS": "Tasmania",
+        "QLD": "Queensland",
+        "WA": "Western Australia",
+        "SA": "South Australia",
+        "NT": "Northern Territory",
+    }
+    if expected_states is None:
+        assert "New South Wales" in joined
+        assert "Victoria" in joined and "DEECA" in joined
+    else:
+        for st in expected_states:
+            assert state_tokens[st] in joined, f"Missing {st} attribution in {attributions}"
+        for st, token in state_tokens.items():
+            if st not in expected_states:
+                assert token not in joined, (
+                    f"Unexpected non-intersecting state {st} attribution in {attributions}"
+                )
 
 
 # -----------------------------------------------------------------------------
@@ -73,39 +95,61 @@ def _assert_required_attributions(attributions: list[str]) -> None:
 
 def test_pack_catalog_locked_regions_bboxes_utm_and_attributions() -> None:
     regions = list_pack_regions()
-    assert [r.region_id for r in regions] == [
+    assert len(regions) == 15
+    assert len(PACK_REGION_IDS) == 15
+    assert set(list_pack_regions(category="region")[i].region_id for i in range(7)) == {
         "australian-alps",
         "blue-mountains",
+        "tasmania-wilderness",
+        "far-north-qld",
+        "flinders-ranges",
+        "red-centre",
+        "perth-hills",
+    }
+    assert {r.region_id for r in list_pack_regions(category="state")} == {
         "vic",
         "nsw",
-    ]
-    assert PACK_REGION_IDS == ("australian-alps", "blue-mountains", "vic", "nsw")
+        "act",
+        "tas",
+        "qld",
+        "wa",
+        "sa",
+        "nt",
+    }
 
     alps = get_pack_region("australian-alps")
     assert alps.bbox == (146.5, -37.6, 149.2, -35.4)
     assert alps.corridor_bbox == (148.05, -36.68, 148.20, -36.55)
     assert alps.region_type == "tactical"
+    assert alps.category == "region"
+    assert alps.states == ("VIC", "NSW")
     assert alps.utm_zones == ["55H"]
 
     bm = get_pack_region("blue-mountains")
     assert bm.bbox == (149.7, -34.2, 150.9, -32.9)
     assert bm.region_type == "tactical"
+    assert bm.category == "region"
+    assert bm.states == ("NSW",)
     assert "56H" in bm.utm_zones
 
     vic = get_pack_region("vic")
     assert vic.bbox == (140.9, -39.2, 150.1, -33.9)
     assert vic.region_type == "state"
+    assert vic.category == "state"
+    assert vic.states == ("VIC",)
     assert {"54H", "55H"}.issubset(set(vic.utm_zones))
 
     nsw = get_pack_region("nsw")
     assert nsw.bbox == (140.9, -37.6, 153.7, -28.1)
     assert nsw.region_type == "state"
+    assert nsw.category == "state"
+    assert nsw.states == ("NSW", "ACT")
     assert {"54H", "55H", "56H", "56J"}.issubset(set(nsw.utm_zones))
     assert compute_utm_zones_for_bbox(nsw.bbox) == nsw.utm_zones
 
     _assert_required_attributions(list(PACK_ATTRIBUTIONS))
     for reg in regions:
-        _assert_required_attributions(reg.attributions)
+        _assert_required_attributions(reg.attributions, expected_states=reg.states)
 
     with pytest.raises(ValueError):
         get_pack_region("unknown-region")
@@ -249,6 +293,7 @@ def _truncate_all(engine: Engine) -> None:
                     user_favorites, user_pins, vehicle_profiles, users,
                     pois, track_segments, tracks, capad_parks,
                     source_tracks_osm, source_tracks_vic, source_tracks_nsw,
+                    source_tracks_au_state,
                     source_waterways, source_pois, source_capad_parks
                 RESTART IDENTITY CASCADE
                 """
@@ -357,14 +402,20 @@ def test_all_four_regional_packs_build_checksums_tarball_snapshot_range_and_memo
                 )
                 assert r_rep.status_code == 201
 
-                # Before builds: all 4 regions listed as not_built
+                # Before builds: all 15 Pan-AU regions listed as not_built with category & states
                 r_list_before = client.get("/api/packs")
                 assert r_list_before.status_code == 200
                 before_regions = r_list_before.json()["regions"]
                 assert [r["region_id"] for r in before_regions] == list(PACK_REGION_IDS)
+                assert len(before_regions) == 15
                 assert all(r["status"] == "not_built" for r in before_regions)
+                assert all(r["category"] in ("region", "state") for r in before_regions)
+                assert all(
+                    isinstance(r["states"], list) and len(r["states"]) >= 1 for r in before_regions
+                )
 
-                # 2. Build all 4 catalog regions while tracking peak Python RAM (< 300 MB)
+                # 2. Build the 4 core VIC/NSW regions while tracking peak Python RAM (< 300 MB)
+                built_rids = ("australian-alps", "blue-mountains", "vic", "nsw")
                 dem_fixture = fixtures_dir / "dem_alps_corridor.tif"
                 tracemalloc.start()
                 try:
@@ -376,7 +427,7 @@ def test_all_four_regional_packs_build_checksums_tarball_snapshot_range_and_memo
                     assert r_build_alps.status_code == 200, r_build_alps.text
                     assert r_build_alps.json()["status"] == "ready"
 
-                    # Build remaining 3 catalog regions cleanly offline
+                    # Build remaining 3 core regions cleanly offline
                     for rid in ("blue-mountains", "vic", "nsw"):
                         build_regional_pack(
                             session,
@@ -396,8 +447,8 @@ def test_all_four_regional_packs_build_checksums_tarball_snapshot_range_and_memo
                     row.pack_id: row
                     for row in session.execute(select(OfflinePack)).scalars().all()
                 }
-                assert set(db_packs.keys()) == set(PACK_REGION_IDS)
-                for rid in PACK_REGION_IDS:
+                assert set(db_packs.keys()) == set(built_rids)
+                for rid in built_rids:
                     assert db_packs[rid].status == "ready"
                     assert db_packs[rid].sha256 is not None
                     assert len(db_packs[rid].sha256) == 64
@@ -405,15 +456,19 @@ def test_all_four_regional_packs_build_checksums_tarball_snapshot_range_and_memo
                 r_list = client.get("/api/packs")
                 assert r_list.status_code == 200
                 regions_by_id = {r["region_id"]: r for r in r_list.json()["regions"]}
-                assert all(regions_by_id[rid]["status"] == "ready" for rid in PACK_REGION_IDS)
+                assert all(regions_by_id[rid]["status"] == "ready" for rid in built_rids)
+                assert regions_by_id["tas"]["status"] == "not_built"
 
-                # 4. Verify manifest SHA-256 checksums & tarball extraction for ALL 4 regions
-                for rid in PACK_REGION_IDS:
+                # 4. Verify manifest SHA-256 checksums & tarball extraction for ALL 4 built regions
+                for rid in built_rids:
+                    reg_spec = get_pack_region(rid)
                     r_man = client.get(f"/api/packs/{rid}/manifest.json")
                     assert r_man.status_code == 200, r_man.text
                     manifest = r_man.json()
                     assert manifest["region_id"] == rid
-                    _assert_required_attributions(manifest["attributions"])
+                    _assert_required_attributions(
+                        manifest["attributions"], expected_states=reg_spec.states
+                    )
                     assert SNAPSHOT_FILENAME in manifest["files"]
 
                     # Verify every listed file's size & SHA-256 on disk
