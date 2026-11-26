@@ -5,12 +5,12 @@
 **Open-source, self-hostable 4WD & off-road mapping, live track-grading, multi-track route planning, and trail-intelligence platform across all 8 Australian states & territories (`VIC`, `NSW`, `ACT`, `TAS`, `QLD`, `WA`, `SA`, `NT`).**
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-[![Release: v1.0.1](https://img.shields.io/badge/Release-v1.0.1-16a34a)](CHANGELOG.md)
+[![Release: v1.1.0](https://img.shields.io/badge/Release-v1.1.0-16a34a)](CHANGELOG.md)
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![PostGIS 3.4 + PMTiles](https://img.shields.io/badge/PostGIS-3.4%20%2B%20PMTiles-336791?logo=postgresql&logoColor=white)](Dockerfile)
 [![MapLibre GL JS 5](https://img.shields.io/badge/MapLibre%20GL%20JS-5-396CB2?logo=maplibre&logoColor=white)](web/package.json)
 [![Multi-Arch](https://img.shields.io/badge/Docker-arm64%20%7C%20amd64-2496ED?logo=docker&logoColor=white)](docker-compose.ghcr.yml)
-[![Tests](https://img.shields.io/badge/Tests-276%2B%20passing-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-301%2B%20passing-2ea44f)](tests/)
 [![Idle RAM](https://img.shields.io/badge/Idle%20RAM-~350%20MiB-f59e0b)](docker-compose.yml)
 [![Sibling: GridForge](https://img.shields.io/badge/Sibling-GridForge-10b981)](https://github.com/jremick/gridforge)
 
@@ -121,7 +121,7 @@ Host a hardened, public-facing TrailForge instance where anyone can browse track
     python -W error::RuntimeWarning -m trailforge.auth.cli create-admin --email admin@example.com --name "Trail Admin" --password "<strong-password>"
     python -W error::RuntimeWarning -m trailforge.auth.cli create-invite --label "4WD Club Mates" --max-uses 10 --expires-days 30
     ```
-- **Zero-Redis Rate Limiting & Upload Disk Quotas:** Built-in in-process `UsageAndRateLimitMiddleware` reads `CF-Connecting-IP` / `X-Forwarded-For`, emits `X-RateLimit-Limit` / `X-RateLimit-Remaining` and HTTP `429` + `Retry-After` (while leaving `/api/health` unthrottled), enforces per-user daily upload limits (`TRAILFORGE_RATE_LIMIT_UPLOAD_PER_DAY`), and protects persistent volumes with `TRAILFORGE_UPLOADS_MAX_TOTAL_MB` (HTTP `507 Insufficient Storage`).
+- **Zero-Redis Edge Security, Rate Limiting & Privacy Hardening:** Built-in pure-ASGI middleware enforces shared origin authentication (`X-TrailForge-Origin-Secret` via `TRAILFORGE_ORIGIN_SHARED_SECRET`), fail-closed production secret validation (`create_app()` rejects dev defaults or `< 32`-char secrets), streaming request body-size limits (`413 Payload Too Large` at `16 MiB` trips / `6 MiB` reports / `1 MiB` general API), `O(1)` `OrderedDict` LRU per-IP sliding-window rate limiting (`429` + `Retry-After` + `X-RateLimit-*`), cookie CSRF protection (`Sec-Fetch-Site`/`Origin`), global security headers (CSP, `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy`, conditional HSTS), Pillow EXIF GPS/metadata stripping on uploaded report photos, server-side `token_version` logout/suspension revocation, same-origin `HttpOnly` cookie-only web sessions, per-user daily upload limits (`TRAILFORGE_RATE_LIMIT_UPLOAD_PER_DAY`), global upload volume quota (`TRAILFORGE_UPLOADS_MAX_TOTAL_MB`, HTTP `507`), disabled production OpenAPI docs (`TRAILFORGE_ENABLE_DOCS=false`), and a non-root `USER trailforge` container image.
 
 ---
 
@@ -261,7 +261,7 @@ Measured on an Apple Silicon **16 GB RAM** host running native `linux/arm64` Doc
 | **Canonical segment-ID preservation (`v2` jittered re-import)** | **`100%`** (`358 exact + 86 spatial` = `444 / 444` preserved; `0` orphaned) | Deterministic identity across OSM/state updates |
 | **Pluggable map-matching (HMM default + Valhalla sidecar)** | **`0.9739`** mean HMM confidence across **`145`** Davies Plain segments; Valhalla `/trace_attributes` + automatic `postgis_hmm_fallback` | Pluggable `TrackMatcher` protocol (`postgis_hmm` / `valhalla`) |
 | **Offline `PMTiles` serving (Nginx & Service Worker)** | **HTTP `206 Partial Content`** (`Accept-Ranges: bytes`, SHA-256 verified manifest) | Zero full-archive buffering in browser |
-| **Automated offline test suite (`pytest` + Vitest)** | **`276+` offline tests passing** (`165` isolated Docker PostGIS + `111` Vitest web across 14 files + host deploy-manifest parity checks) | 100% offline CI gate on isolated `trailforge_test` DB |
+| **Automated offline test suite (`pytest` + Vitest)** | **`301+` offline tests passing** (`183` isolated Docker PostGIS + `118` Vitest web across 15 files + `156` host unit/deploy parity checks) | 100% offline CI gate on isolated `trailforge_test` DB |
 | **Live upstream AU agency & real corridor bake tests (`@pytest.mark.live`)** | **`4/4` passing** across 8 live AU agencies (CAPAD 2025, DataVic WFS, NSW Spatial, GA Hydrology, VicEmergency, NSW RFS, NSW NPWS RSS 2.0, Open-Meteo) **plus real AU corridor bake** (Blue Mountains Narrow Neck & Alps Tom Groggin `592` real segments + `2.3 MiB` vector/`300 KiB` terrain PMTiles) | Real-data AU connector & bake verification |
 
 ---
@@ -295,10 +295,10 @@ web/
 mobile/                    # iOS Info.plist & AndroidManifest background GPS/IMU snippets, build guide & CarPlay/Android Auto spec
 deploy/                    # Production HTTPS kit (Tailscale, Caddy v2, Traefik v3, Valhalla) + Railway & Cloudflare Pages/R2/WAF playbooks
 railway.toml               # Railway Config-as-Code (Dockerfile build, Alembic boot + dynamic $PORT, /api/health)
-migrations/                # Alembic spatial migrations (0001..0004 public access control; 30 base tables, 21 GIST indexes)
+migrations/                # Alembic spatial migrations (0001..0005 incl. public access control & token_version; 30 base tables, 21 GIST indexes)
 assets/icons/              # 21 self-contained outdoor/topo/4WD SVG symbols (adapted from GridForge)
 examples/                  # Runnable walkthrough script, Davies Plain GPX & sample telemetry JSON
-tests/                     # 165+ offline Python/PostGIS tests (isolated trailforge_test DB) + cloud deploy parity + synthetic fixtures + live checks
+tests/                     # 183+ offline Python/PostGIS tests (isolated trailforge_test DB) + exploit-first security & cloud deploy suites + synthetic fixtures + live checks
 ```
 
 ```bash
@@ -314,7 +314,7 @@ make test-integration
 # Full offline Python suite (lint + host unit + isolated Docker PostGIS integration)
 make test
 
-# Web PWA TypeScript typecheck, production Vite build & 111 Vitest unit tests
+# Web PWA TypeScript typecheck, production Vite build & 118 Vitest unit tests
 make web-check
 
 # Optional live upstream connector, agency feed & real AU corridor bake tests (network required)
@@ -325,13 +325,14 @@ See [`docs/PLAN.md`](docs/PLAN.md) for the vertical-slice roadmap, [`docs/SPEC_G
 
 ---
 
-## Release Status & Roadmap (`v1.0.1` → `v1.1.0`)
+## Release Status & Roadmap (`v1.1.0`)
 
-- **Upcoming in `v1.1.0` (Ready on `main` — Public Instance Hardening & Railway + Cloudflare Kit):**
-  - **Access Control, Friend Invites & Admin Console:** Tier C `0004_public_access_control` migration (30 base tables / 21 GIST indexes), `admin`/`member` roles, instant `is_active` suspension, `TRAILFORGE_REGISTRATION_MODE=open|invite_only|closed`, `TRAILFORGE_ADMIN_EMAIL` bootstrap, `python -m trailforge.auth.cli`, admin-gated compute POST routes, `/api/admin/{stats,users,invites}`, and slide-over web Admin Console.
-  - **Zero-Redis Edge Guard, Upload Quotas & Cloudflare R2 Offload:** `CF-Connecting-IP`/`X-Forwarded-For` sliding-window rate limiter (`429` + `Retry-After` + `X-RateLimit-*`), `uploads_max_total_mb` HTTP `507` disk cap, daily trip upload quota, `TILES_PUBLIC_BASE_URL` / `PACKS_PUBLIC_BASE_URL` R2 offload (with absolute `https://` `PMTiles` support in MapLibre + `sw.js`), and pure-Python SigV4 `python -m trailforge.packs.r2_sync`.
-  - **Railway + Cloudflare Deploy Kit:** `railway.toml`, `deploy/railway/` (~$5–$10/mo hard-capped playbook & env template), `deploy/cloudflare/` (Pages `/api/*` proxy function, R2 CORS policy, Free-tier WAF/cache/Web Analytics recipe), and Compose/`.env.example` parity.
-- **Shipped in `v1.0.1` (Patch Release — publishes `:v1.0.1`, `:v1.0` & `:latest` multi-arch GHCR images):**
+- **Shipped in `v1.1.0` (Current Stable Release — publishes `:v1.1.0`, `:v1.1` & `:latest` multi-arch GHCR images):**
+  - **Access Control, Friend Invites & Admin Console:** Tier C `0004_public_access_control` & `0005_user_token_version` migrations (30 base tables / 21 GIST indexes), `admin`/`member` roles, instant `is_active` suspension & server-side `token_version` session revocation, `TRAILFORGE_REGISTRATION_MODE=open|invite_only|closed`, `TRAILFORGE_ADMIN_EMAIL` bootstrap, `python -m trailforge.auth.cli`, admin-gated compute POST routes, `/api/admin/{stats,users,invites}`, and slide-over web Admin Console.
+  - **Zero-Redis Edge Guard, Upload Quotas & Cloudflare R2 Offload:** `O(1)` LRU `CF-Connecting-IP`/`X-Forwarded-For` sliding-window rate limiter (`429` + `Retry-After` + `X-RateLimit-*`), `uploads_max_total_mb` HTTP `507` disk cap, daily per-user trip & photo upload quotas, `TILES_PUBLIC_BASE_URL` / `PACKS_PUBLIC_BASE_URL` R2 offload (with absolute `https://` `PMTiles` support in MapLibre + `sw.js`), and pure-Python SigV4 `python -m trailforge.packs.r2_sync`.
+  - **Railway + Cloudflare Deploy Kit:** `railway.toml`, `deploy/railway/` (~$5–$10/mo hard-capped playbook & env template), `deploy/cloudflare/` (Pages `/api/*` proxy function with `307 Location` origin rewrite & `X-TrailForge-Origin-Secret` injection, R2 CORS policy, Free-tier WAF/cache/Web Analytics recipe), and Compose/`.env.example` parity.
+  - **Pre-Launch OWASP/STRIDE Security Hardening (13 Findings Closed):** Shared origin secret (`X-TrailForge-Origin-Secret`), fail-closed production secret validation (`create_app()`), streaming ASGI `413` request body-size limits + `50k`/`100k` telemetry array caps, Pillow EXIF GPS/metadata stripping on report photos, same-origin `HttpOnly` cookie-only web auth + server-side `token_version` revocation on logout/role/status change, cookie CSRF guard (`Sec-Fetch-Site`/`Origin`), global security headers & MapLibre-safe CSP (`web/public/_headers`, `web/nginx.conf`, FastAPI, Pages proxy), invite-before-email enumeration & scrypt timing-oracle fixes, `NaN`/`Inf` bbox & XML `<!ENTITY` feed guards, production `/docs` disablement, and non-root `USER trailforge` container image.
+- **Previously shipped in `v1.0.1`:**
   - **Pan-Australia Live Upstream Endpoint Fixes:** Fixed NTG `ROAD_CENTRELINES` ArcGIS query (`UFI` OID field instead of nonexistent `OBJECTID`), switched QLD alerts default (`qld_des_alerts`) to Queensland Fire Department's live GeoJSON feed (`https://www.fire.qld.gov.au/data/alerts/bushfireAlert.json`), switched WA alerts (`wa_emergency`) to Emergency WA's v1 JSON API (`https://api.emergency.wa.gov.au/v1/warnings` with `geo-source` Polygon preference), and switched NT alerts (`nt_securent`) to NT DIPL's live Road Report NT API (`https://roadreport.nt.gov.au/api/Obstruction/GetAll` with LineString/Point road-closure & 4WD-access parsing), while preserving 100% backward compatibility with existing RSS/GeoJSON fixtures and verifying all 8 states live.
 - **Shipped in `v1.0.0` (Inaugural Stable GA Release):**
   - **Pan-Australia 8-State Connectors & 15-Region Pack Catalog:** Full connectors for `ACT`, `TAS`, `QLD`, `WA` (strictly excluding `CC BY-NC`), `SA`, and `NT` alongside `VIC` & `NSW` via `AutoAUStateTrailsRouter`, Tier A `0003_pan_au_source_tracks` migration (28 base tables / 21 GIST indexes), and 15 offline pack regions (`7` iconic 4WD + `8` statewide) with dynamic per-state attributions.
