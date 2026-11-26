@@ -219,20 +219,34 @@ def list_closures(
     seg_links: dict[int, list[str]] = {}
     track_links: dict[int, set[str]] = {}
     if closure_ids:
-        link_rows = session.execute(
-            select(
-                SegmentClosureLink.closure_id,
-                SegmentClosureLink.segment_id,
-                TrackSegment.track_id,
-            )
-            .join(TrackSegment, SegmentClosureLink.segment_id == TrackSegment.segment_id)
-            .where(SegmentClosureLink.closure_id.in_(closure_ids))
-            .order_by(SegmentClosureLink.segment_id.asc())
-        ).all()
-        for cid, seg_id, tid in link_rows:
-            seg_links.setdefault(cid, []).append(seg_id)
-            if tid:
-                track_links.setdefault(cid, set()).add(tid)
+        # Avoid loading tens of thousands of segment IDs for giant statewide/regional polygons
+        bounded_ids = [
+            cid
+            for cid, cnt in session.execute(
+                select(
+                    SegmentClosureLink.closure_id,
+                    func.count(SegmentClosureLink.segment_id),
+                )
+                .where(SegmentClosureLink.closure_id.in_(closure_ids))
+                .group_by(SegmentClosureLink.closure_id)
+            ).all()
+            if int(cnt) <= 500
+        ]
+        if bounded_ids:
+            link_rows = session.execute(
+                select(
+                    SegmentClosureLink.closure_id,
+                    SegmentClosureLink.segment_id,
+                    TrackSegment.track_id,
+                )
+                .join(TrackSegment, SegmentClosureLink.segment_id == TrackSegment.segment_id)
+                .where(SegmentClosureLink.closure_id.in_(bounded_ids))
+                .order_by(SegmentClosureLink.segment_id.asc())
+            ).all()
+            for cid, seg_id, tid in link_rows:
+                seg_links.setdefault(cid, []).append(seg_id)
+                if tid:
+                    track_links.setdefault(cid, set()).add(tid)
 
     sev_filter = severity.strip().lower() if severity else None
     items: list[dict[str, Any]] = []
@@ -301,65 +315,106 @@ def get_closures_geojson(
     stale_by_feed = _stale_map_by_feed(session, now=current)
     features: list[dict[str, Any]] = []
 
-    # 1. Affected track segments (dashed red/amber overlay lines on the map)
-    seg_stmt = (
+    # 1. Affected track segments (dashed red/amber overlay lines on the map).
+    # Regional/statewide polygon alerts linking >400 segments already render their polygon
+    # boundary in step 2 (and still show per-track in the Track Inspector), so exclude huge
+    # polygon fanouts here to keep /api/closures/geojson fast (<20 ms) and compact.
+    count_stmt = (
         select(
-            SegmentClosureLink,
-            ClosureAlert,
-            TrackSegment,
-            Track.name.label("track_name"),
-            func.ST_AsGeoJSON(TrackSegment.geom).label("seg_geom_json"),
+            SegmentClosureLink.closure_id,
+            func.count(SegmentClosureLink.segment_id).label("seg_cnt"),
+            ClosureAlert.geom.is_not(None).label("has_geom"),
         )
         .join(ClosureAlert, SegmentClosureLink.closure_id == ClosureAlert.id)
-        .join(TrackSegment, SegmentClosureLink.segment_id == TrackSegment.segment_id)
-        .outerjoin(Track, TrackSegment.track_id == Track.track_id)
-        .where(TrackSegment.is_active.is_(True))
-        .order_by(ClosureAlert.id.asc(), TrackSegment.segment_seq.asc().nullslast())
+        .group_by(SegmentClosureLink.closure_id, ClosureAlert.geom.is_not(None))
     )
     if active_only:
-        seg_stmt = seg_stmt.where(ClosureAlert.status != "cleared")
+        count_stmt = count_stmt.where(ClosureAlert.status != "cleared")
     if requested_states and set(requested_states) != set(ALL_AU_STATES):
-        seg_stmt = seg_stmt.where(ClosureAlert.state.in_(requested_states))
+        count_stmt = count_stmt.where(ClosureAlert.state.in_(requested_states))
 
-    for link, alert, seg, track_name, seg_geom_json in session.execute(seg_stmt).all():
-        meta = ALL_FEED_REGISTRY.get(alert.source_feed)  # type: ignore[arg-type]
-        closure_type = map_alert_to_closure_type(
-            alert.alert_type,
-            source_feed=alert.source_feed,
-            title=alert.title,
-            raw_payload=alert.raw_payload,
-            capad_park_id=alert.capad_park_id,
+    targeted_closure_ids = [
+        cid
+        for cid, seg_cnt, has_geom in session.execute(count_stmt).all()
+        if int(seg_cnt) <= 400 or not has_geom
+    ]
+
+    if targeted_closure_ids:
+        # Select only lightweight scalar columns (omit JSONB profiles & raw payloads)
+        seg_stmt = (
+            select(
+                SegmentClosureLink.link_method,
+                ClosureAlert.id.label("closure_id"),
+                ClosureAlert.source_feed,
+                ClosureAlert.alert_type,
+                ClosureAlert.severity,
+                ClosureAlert.status,
+                ClosureAlert.state,
+                ClosureAlert.title,
+                ClosureAlert.description,
+                ClosureAlert.source_url,
+                ClosureAlert.effective_from,
+                ClosureAlert.effective_to,
+                ClosureAlert.source_updated_at,
+                ClosureAlert.last_seen_at,
+                ClosureAlert.capad_park_id,
+                TrackSegment.segment_id,
+                TrackSegment.track_id,
+                TrackSegment.name.label("seg_name"),
+                Track.name.label("track_name"),
+                func.ST_AsGeoJSON(TrackSegment.geom, 5).label("seg_geom_json"),
+            )
+            .join(ClosureAlert, SegmentClosureLink.closure_id == ClosureAlert.id)
+            .join(TrackSegment, SegmentClosureLink.segment_id == TrackSegment.segment_id)
+            .outerjoin(Track, TrackSegment.track_id == Track.track_id)
+            .where(
+                SegmentClosureLink.closure_id.in_(targeted_closure_ids),
+                TrackSegment.is_active.is_(True),
+            )
+            .limit(2000)
         )
-        api_sev = map_db_to_api_severity(alert.severity)
-        features.append(
-            {
-                "type": "Feature",
-                "id": f"seg-{alert.id}-{seg.segment_id}",
-                "geometry": json.loads(seg_geom_json),
-                "properties": {
-                    "feature_kind": "segment_closure",
-                    "closure_id": alert.id,
-                    "feed_source": alert.source_feed,
-                    "closure_type": closure_type,
-                    "severity": api_sev,
-                    "status": alert.status,
-                    "state": alert.state,
-                    "title": alert.title,
-                    "description": alert.description,
-                    "agency": meta.agency if meta else alert.source_feed,
-                    "source_url": alert.source_url,
-                    "effective_from": _iso_or_none(alert.effective_from),
-                    "effective_to": _iso_or_none(alert.effective_to),
-                    "last_updated_at": _iso_or_none(alert.source_updated_at or alert.last_seen_at),
-                    "is_stale": stale_by_feed.get(alert.source_feed, False)
-                    or alert.status == "stale",
-                    "track_id": seg.track_id,
-                    "track_name": track_name or seg.name,
-                    "segment_id": seg.segment_id,
-                    "link_method": link.link_method,
-                },
-            }
-        )
+
+        for row in session.execute(seg_stmt).all():
+            meta = ALL_FEED_REGISTRY.get(row.source_feed)  # type: ignore[arg-type]
+            closure_type = map_alert_to_closure_type(
+                row.alert_type,
+                source_feed=row.source_feed,
+                title=row.title,
+                raw_payload=None,
+                capad_park_id=row.capad_park_id,
+            )
+            api_sev = map_db_to_api_severity(row.severity)
+            features.append(
+                {
+                    "type": "Feature",
+                    "id": f"seg-{row.closure_id}-{row.segment_id}",
+                    "geometry": json.loads(row.seg_geom_json),
+                    "properties": {
+                        "feature_kind": "segment_closure",
+                        "closure_id": row.closure_id,
+                        "feed_source": row.source_feed,
+                        "closure_type": closure_type,
+                        "severity": api_sev,
+                        "status": row.status,
+                        "state": row.state,
+                        "title": row.title,
+                        "description": row.description,
+                        "agency": meta.agency if meta else row.source_feed,
+                        "source_url": row.source_url,
+                        "effective_from": _iso_or_none(row.effective_from),
+                        "effective_to": _iso_or_none(row.effective_to),
+                        "last_updated_at": _iso_or_none(
+                            row.source_updated_at or row.last_seen_at
+                        ),
+                        "is_stale": stale_by_feed.get(row.source_feed, False)
+                        or row.status == "stale",
+                        "track_id": row.track_id,
+                        "track_name": row.track_name or row.seg_name,
+                        "segment_id": row.segment_id,
+                        "link_method": row.link_method,
+                    },
+                }
+            )
 
     # 2. Alert polygons & point markers (incident perimeters, gate markers, etc.)
     alert_stmt = (

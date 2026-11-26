@@ -255,58 +255,75 @@ def _propagate_segment_links(
     # 3. Spatial intersection & EPSG:3577 metric buffer match when geometry is provided
     if item.geometry is not None:
         geom_type = str(item.geometry.get("type") or "")
-        geom_json_str = json.dumps(item.geometry)
-        alert_geom_4326 = func.ST_SetSRID(func.ST_GeomFromGeoJSON(geom_json_str), 4326)
-        alert_geom_3577 = func.ST_Transform(alert_geom_4326, 3577)
-        seg_geom_3577 = func.ST_Transform(TrackSegment.geom, 3577)
+        alert_shp_4326 = shape(item.geometry)
+        alert_shp_3577 = _to_albers(alert_shp_4326)
 
-        if geom_type in ("Polygon", "MultiPolygon"):
-            buf_m = POLYGON_BUFFER_M
-        elif geom_type in ("LineString", "MultiLineString"):
-            buf_m = LINE_BUFFER_M
-        elif item.source_feed == "osm_access":
-            buf_m = GATE_POINT_BUFFER_M
-        else:
-            buf_m = POINT_INCIDENT_BUFFER_M
+        # Skip per-segment fanout for massive statewide/district weather polygons (> 5,000 km²);
+        # their polygon boundary still renders directly via closures_alerts.geom without
+        # inserting 50,000+ redundant segment_closure_links rows.
+        is_giant_regional_polygon = (
+            geom_type in ("Polygon", "MultiPolygon")
+            and float(alert_shp_3577.area) > 5_000_000_000.0
+        )
 
-        is_line_closure = geom_type in ("LineString", "MultiLineString")
-        alert_line_m: LineString | MultiLineString | None = None
-        alert_buf_m: object | None = None
-        if is_line_closure:
-            alert_line_m = _to_albers(shape(item.geometry))  # type: ignore[arg-type]
-            alert_buf_m = alert_line_m.buffer(LINE_BUFFER_M)
+        if not is_giant_regional_polygon:
+            geom_json_str = json.dumps(item.geometry)
+            alert_geom_4326 = func.ST_SetSRID(func.ST_GeomFromGeoJSON(geom_json_str), 4326)
+            alert_geom_3577 = func.ST_Transform(alert_geom_4326, 3577)
+            seg_geom_3577 = func.ST_Transform(TrackSegment.geom, 3577)
 
-        dist_expr = func.ST_Distance(seg_geom_3577, alert_geom_3577)
-        spatial_rows = session.execute(
-            select(
-                TrackSegment.segment_id,
-                TrackSegment.bearing_deg,
-                func.ST_AsGeoJSON(TrackSegment.geom).label("seg_geom_json"),
-                func.ST_Intersects(TrackSegment.geom, alert_geom_4326).label("intersects"),
-                dist_expr.label("dist_m"),
-            ).where(
-                TrackSegment.is_active.is_(True),
-                func.ST_DWithin(seg_geom_3577, alert_geom_3577, buf_m),
-            )
-        ).all()
-
-        for seg_id, seg_bearing, seg_geom_json, intersects, dist_m in spatial_rows:
-            if seg_id in links:
-                continue
-            if (
-                is_line_closure
-                and alert_line_m is not None
-                and alert_buf_m is not None
-                and not _segment_aligned_with_line_closure(
-                    json.loads(seg_geom_json), float(seg_bearing), alert_line_m, alert_buf_m
-                )
-            ):
-                continue
-            if item.source_feed == "osm_access":
-                method = "osm_access_flag"
+            if geom_type in ("Polygon", "MultiPolygon"):
+                buf_m = POLYGON_BUFFER_M
+            elif geom_type in ("LineString", "MultiLineString"):
+                buf_m = LINE_BUFFER_M
+            elif item.source_feed == "osm_access":
+                buf_m = GATE_POINT_BUFFER_M
             else:
-                method = "spatial_intersect" if bool(intersects) else "spatial_buffer"
-            links[seg_id] = (method, round(float(dist_m or 0.0), 2))
+                buf_m = POINT_INCIDENT_BUFFER_M
+
+            # Pre-filter with SRID 4326 GIST index before EPSG:3577 exact metric ST_DWithin
+            deg_pad = max(0.002, (buf_m / 85_000.0) + 0.002)
+            bbox_filter = TrackSegment.geom.op("&&")(func.ST_Expand(alert_geom_4326, deg_pad))
+
+            is_line_closure = geom_type in ("LineString", "MultiLineString")
+            alert_line_m: LineString | MultiLineString | None = None
+            alert_buf_m: object | None = None
+            if is_line_closure:
+                alert_line_m = alert_shp_3577  # type: ignore[assignment]
+                alert_buf_m = alert_line_m.buffer(LINE_BUFFER_M)
+
+            dist_expr = func.ST_Distance(seg_geom_3577, alert_geom_3577)
+            spatial_rows = session.execute(
+                select(
+                    TrackSegment.segment_id,
+                    TrackSegment.bearing_deg,
+                    func.ST_AsGeoJSON(TrackSegment.geom).label("seg_geom_json"),
+                    func.ST_Intersects(TrackSegment.geom, alert_geom_4326).label("intersects"),
+                    dist_expr.label("dist_m"),
+                ).where(
+                    TrackSegment.is_active.is_(True),
+                    bbox_filter,
+                    func.ST_DWithin(seg_geom_3577, alert_geom_3577, buf_m),
+                )
+            ).all()
+
+            for seg_id, seg_bearing, seg_geom_json, intersects, dist_m in spatial_rows:
+                if seg_id in links:
+                    continue
+                if (
+                    is_line_closure
+                    and alert_line_m is not None
+                    and alert_buf_m is not None
+                    and not _segment_aligned_with_line_closure(
+                        json.loads(seg_geom_json), float(seg_bearing), alert_line_m, alert_buf_m
+                    )
+                ):
+                    continue
+                if item.source_feed == "osm_access":
+                    method = "osm_access_flag"
+                else:
+                    method = "spatial_intersect" if bool(intersects) else "spatial_buffer"
+                links[seg_id] = (method, round(float(dist_m or 0.0), 2))
 
     for seg_id, (method, dist_m) in links.items():
         session.add(
