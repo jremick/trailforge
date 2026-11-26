@@ -245,6 +245,204 @@ SA_CFS_CRIIMSON_JSON: list[dict[str, Any]] = [
     },
 ]
 
+QLD_QFD_LIVE_GEOJSON: dict[str, Any] = {
+    "type": "FeatureCollection",
+    "name": "QFDWarnings",
+    "features": [
+        {
+            "type": "Feature",
+            "properties": {
+                "OBJECTID": 4051,
+                "UniqueID": "WARN-14232",
+                "WarningTitle": (
+                    "STAY INFORMED - Daintree National Park - fire as at 2:34pm Thursday"
+                ),
+                "WarningLevel": "Advice",
+                "CallToAction": "Stay Informed",
+                "Header": (
+                    "A fire is burning near Herberton Petford Road in Daintree National Park."
+                ),
+                "WarningText": "Full bushfire advice text.",
+                "WarningArea": "Daintree National Park",
+                "Latitude": -16.18,
+                "Longitude": 145.36,
+                "GroupedType": "FIRE VEGETATION",
+                "WarningType_Level": "Advice Fire",
+                "EventType": "Fire",
+                "ItemDateTimeLocal_ISO": "2026-11-26T14:34:51+10:00",
+                "PublishDateLocal_ISO": "2026-11-26T16:10:57+10:00",
+                "ItemExpiryDateTimeLocal_ISO": "2026-11-27T14:34:51+10:00",
+            },
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [
+                    [
+                        [145.32, -16.20],
+                        [145.40, -16.20],
+                        [145.40, -16.14],
+                        [145.32, -16.14],
+                        [145.32, -16.20],
+                    ]
+                ],
+            },
+        },
+        {
+            "type": "Feature",
+            "properties": {
+                "OBJECTID": 4052,
+                "UniqueID": "WARN-14233",
+                "WarningTitle": "AVOID SMOKE - Glass House Mountains - hazard reduction burn",
+                "WarningLevel": "Information",
+                "Header": "Smoke from hazard reduction burn near forestry tracks.",
+                "WarningArea": "Glass House Mountains",
+                "Latitude": -26.90,
+                "Longitude": 152.95,
+                "GroupedType": "FIRE VEGETATION",
+                "EventType": "Fire",
+                "ItemDateTimeLocal_ISO": "2026-11-26T12:00:00+10:00",
+            },
+            "geometry": None,
+        },
+    ],
+}
+
+WA_EMERGENCY_V1_API_JSON: dict[str, Any] = {
+    "warnings": [
+        {
+            "id": "6b0560ccb2307c57b61f0766",
+            "entityType": "warnings",
+            "entitySubType": "warnings_bushfire--advice",
+            "warning-type": "Bushfire Advice",
+            "name": "Bushfire Advice",
+            "title": "MONITOR CONDITIONS - DURACK AND LAKE ARGYLE",
+            "headline": "CAPE RANGE NATIONAL PARK",
+            "suburbs": ["DURACK", "LAKE ARGYLE"],
+            "lga": ["SHIRE OF WYNDHAM-EAST KIMBERLEY"],
+            "cap-category": "Fire",
+            "cap-event-type": ["Bushfire"],
+            "cap-severity": "Minor - minimal threat",
+            "publishing-status": "Published",
+            "alert-line": "<p>A Bushfire Advice is in place near Glen Hill Road.</p>",
+            "action-statement": "Monitor conditions",
+            "location": {
+                "latitude": -15.45194,
+                "longitude": 127.1944,
+                "value": "Durack, Western Australia",
+            },
+            "published-date-time": "2026-11-25T19:16:44.267+08:00",
+            "issued-date-time": "2026-11-26T10:53:14.956+08:00",
+            "updatedAt": "2026-11-25T11:16:45.328Z",
+            "geo-source": {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "geometry": {
+                            "type": "Point",
+                            "coordinates": [128.3439, -16.2647],
+                        },
+                        "properties": {"icon-name": "ew-bushfire--advice"},
+                    },
+                    {
+                        "type": "Feature",
+                        "geometry": {
+                            "type": "Polygon",
+                            "coordinates": [
+                                [
+                                    [128.30, -16.30],
+                                    [128.40, -16.30],
+                                    [128.40, -16.20],
+                                    [128.30, -16.20],
+                                    [128.30, -16.30],
+                                ]
+                            ],
+                        },
+                        "properties": {"icon-name": "ew-bushfire--advice"},
+                    },
+                ],
+            },
+        },
+        {
+            "id": "6affc593683a597840d081ac",
+            "entityType": "warnings",
+            "entitySubType": "warnings_heatwave--advice",
+            "warning-type": "Heatwave Advice",
+            "name": "Heatwave Advice",
+            "title": "THREAT IS REDUCED - FITZROY CROSSING",
+            "cap-category": "Met",
+            "cap-event-type": ["Extreme Heat"],
+            "cap-severity": "Minor - minimal threat",
+            "publishing-status": "Published",
+            "alert-line": "<p>Severe heatwave conditions easing.</p>",
+            "location": {
+                "latitude": -18.19,
+                "longitude": 125.56,
+                "value": "Fitzroy Crossing, Western Australia",
+            },
+            "issued-date-time": "2026-11-26T09:00:00+08:00",
+            "updatedAt": "2026-11-26T01:00:00Z",
+        },
+    ]
+}
+
+NT_ROADREPORT_API_JSON: dict[str, Any] = {
+    "$id": "1",
+    "response": [
+        {
+            "$id": "2",
+            "recordId": 8252,
+            "obstructionId": 14301,
+            "status": "CURRENT",
+            "road": 1358,
+            "roadName": "Wildman River 4Wd",
+            "obstructionType": "Flooding",
+            "restrictionType": "Road Closed",
+            "dateFrom": "2025-11-19 11:05:56",
+            "dateTo": None,
+            "dateActive": "2025-11-19 11:05:31",
+            "startPoint": [-12.7241, 131.6652],
+            "endPoint": [-12.7500, 131.6800],
+            "comment": "-",
+            "locationComment": "Closed from Arnhem Highway turnoff",
+            "dateLastUpdated": "2026-11-25 13:07:51",
+        },
+        {
+            "$id": "3",
+            "recordId": 7781,
+            "obstructionId": 13840,
+            "status": "CURRENT",
+            "road": 341,
+            "roadName": "Gosse Bluff Touracc",
+            "obstructionType": "Changing Surface Conditions",
+            "restrictionType": "High Clearance 4WD",
+            "dateFrom": "2025-04-09 13:35:38",
+            "dateTo": None,
+            "dateActive": "2025-04-09 13:38:40",
+            "startPoint": [-23.7936, 132.3613],
+            "endPoint": [-23.7936, 132.3613],
+            "comment": "Motorists are advised to drive to the conditions.",
+            "locationComment": "West MacDonnell National Park approach",
+            "dateLastUpdated": "2026-06-24 10:16:31",
+        },
+        {
+            "$id": "4",
+            "recordId": 662,
+            "obstructionId": 8785,
+            "status": "CURRENT",
+            "road": 98,
+            "roadName": "Dorat Road",
+            "obstructionType": "Maximum 7 Axles",
+            "restrictionType": "Weight And Or Vehicle Type Restriction",
+            "dateFrom": "2018-06-20 08:30:00",
+            "dateTo": None,
+            "startPoint": [-13.2419, 131.1108],
+            "endPoint": [-13.4000, 131.1200],
+            "comment": "Commercial freight axle limit.",
+            "dateLastUpdated": "2026-01-01 00:00:00",
+        },
+    ],
+}
+
 NT_SECURENT_GEOJSON: dict[str, Any] = {
     "type": "FeatureCollection",
     "features": [
@@ -319,7 +517,7 @@ def test_all_six_pan_au_adapters_parse_realistic_payloads_offline() -> None:
                 text=TAS_CAP_AU_XML,
                 headers={"Content-Type": "application/xml; charset=utf-8"},
             )
-        if "parks.desi.qld.gov.au" in url:
+        if "parks.desi.qld.gov.au" in url or "fire.qld.gov.au" in url:
             return httpx.Response(
                 200,
                 text=QLD_QPWS_RSS_XML,
@@ -329,7 +527,7 @@ def test_all_six_pan_au_adapters_parse_realistic_payloads_offline() -> None:
             return httpx.Response(200, json=WA_EMERGENCY_JSON)
         if "data.eso.sa.gov.au" in url:
             return httpx.Response(200, json=SA_CFS_CRIIMSON_JSON)
-        if "securent.nt.gov.au" in url:
+        if "securent.nt.gov.au" in url or "roadreport.nt.gov.au" in url:
             return httpx.Response(200, json=NT_SECURENT_GEOJSON)
         return httpx.Response(404)
 
@@ -407,6 +605,81 @@ def test_all_six_pan_au_adapters_parse_realistic_payloads_offline() -> None:
         assert nt_items[0].db_severity == "advisory"
         assert nt_items[0].park_name == "West MacDonnell National Park"
         assert nt_items[0].source_url == "https://securent.nt.gov.au/alerts/nt-sec-2026-77"
+
+
+def test_real_world_qld_qfd_wa_v1_and_nt_roadreport_schemas_offline() -> None:
+    """Verify exact live upstream JSON schemas for QFD (QLD), Emergency WA v1, & Road Report NT."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "fire.qld.gov.au/data/alerts/bushfireAlert.json" in url:
+            return httpx.Response(200, json=QLD_QFD_LIVE_GEOJSON)
+        if "api.emergency.wa.gov.au/v1/warnings" in url:
+            return httpx.Response(200, json=WA_EMERGENCY_V1_API_JSON)
+        if "roadreport.nt.gov.au/api/Obstruction/GetAll" in url:
+            return httpx.Response(200, json=NT_ROADREPORT_API_JSON)
+        return httpx.Response(404)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        # 1. QLD QFD GeoJSON (Polygon + Lat/Lon fallback, UniqueID, WarningLevel)
+        qld_items = QLDParksAlertsAdapter(client=client).fetch()
+        assert len(qld_items) == 2
+        assert qld_items[0].external_id == "WARN-14232"
+        assert qld_items[0].state == "QLD"
+        assert qld_items[0].alert_type == "bushfire"
+        assert qld_items[0].db_severity == "advisory"
+        assert qld_items[0].geometry is not None and qld_items[0].geometry["type"] == "Polygon"
+        assert qld_items[0].park_name == "Daintree National Park"
+        assert qld_items[0].effective_from is not None
+        assert qld_items[0].effective_to is not None
+        assert qld_items[0].source_url == "https://www.fire.qld.gov.au/current-incidents"
+        assert qld_items[1].external_id == "WARN-14233"
+        assert qld_items[1].db_severity == "info"
+        assert qld_items[1].geometry == {"type": "Point", "coordinates": [152.95, -26.9]}
+
+        # 2. Emergency WA v1 `/v1/warnings` (prefers Polygon in geo-source over Point,
+        #    preserves warning-type severity, and maps non-fire warnings to hazard_warning)
+        wa_items = EmergencyWAAdapter(client=client).fetch()
+        assert len(wa_items) == 2
+        assert wa_items[0].external_id == "6b0560ccb2307c57b61f0766"
+        assert wa_items[0].state == "WA"
+        assert wa_items[0].alert_type == "bushfire"
+        assert wa_items[0].db_severity == "advisory"
+        assert wa_items[0].geometry is not None and wa_items[0].geometry["type"] == "Polygon"
+        assert wa_items[0].park_name == "Cape Range National Park"
+        assert wa_items[0].description == "A Bushfire Advice is in place near Glen Hill Road."
+        assert (
+            wa_items[0].source_url
+            == "https://www.emergency.wa.gov.au/alerts/6b0560ccb2307c57b61f0766"
+        )
+        assert wa_items[1].external_id == "6affc593683a597840d081ac"
+        assert wa_items[1].alert_type == "hazard_warning"
+        assert wa_items[1].db_severity == "advisory"
+        assert wa_items[1].geometry == {"type": "Point", "coordinates": [125.56, -18.19]}
+
+        # 3. Road Report NT `/api/Obstruction/GetAll` (LineString + Point + axle-limit filter)
+        nt_items = NTFireParksAdapter(client=client).fetch()
+        assert len(nt_items) == 2  # Dorat Road axle mass-limit filtered out cleanly
+        assert nt_items[0].external_id == "nt-rr-14301"
+        assert nt_items[0].state == "NT"
+        assert nt_items[0].alert_type == "road_closure"
+        assert nt_items[0].db_severity == "closed"
+        assert nt_items[0].status == "active"
+        assert nt_items[0].geometry is not None
+        assert nt_items[0].geometry["type"] == "LineString"
+        assert [list(pt) for pt in nt_items[0].geometry["coordinates"]] == [
+            [131.6652, -12.7241],
+            [131.68, -12.75],
+        ]
+        assert nt_items[0].source_url == "https://roadreport.nt.gov.au/"
+
+        assert nt_items[1].external_id == "nt-rr-13840"
+        assert nt_items[1].alert_type == "hazard_warning"
+        assert nt_items[1].db_severity == "advisory"
+        assert nt_items[1].park_name == "West MacDonnell National Park"
+        assert nt_items[1].geometry is not None
+        assert nt_items[1].geometry["type"] == "Point"
+        assert list(nt_items[1].geometry["coordinates"]) == [132.3613, -23.7936]
 
 
 def test_enabled_states_scoping_and_adapter_selection(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -630,13 +903,13 @@ def test_pan_au_capad_joins_outage_retention_api_and_cli(
             )
         if "thelist.tas.gov.au" in url:
             return httpx.Response(200, json=TAS_LIST_GEOJSON)
-        if "parks.desi.qld.gov.au" in url:
+        if "parks.desi.qld.gov.au" in url or "fire.qld.gov.au" in url:
             return httpx.Response(200, json=QLD_QFES_GEOJSON)
         if "emergency.wa.gov.au" in url:
             return httpx.Response(200, json=WA_EMERGENCY_JSON)
         if "data.eso.sa.gov.au" in url:
             return httpx.Response(200, json=SA_CFS_CRIIMSON_JSON)
-        if "securent.nt.gov.au" in url:
+        if "securent.nt.gov.au" in url or "roadreport.nt.gov.au" in url:
             return httpx.Response(200, json=NT_SECURENT_GEOJSON)
         return httpx.Response(404)
 
@@ -831,10 +1104,24 @@ def test_pan_au_capad_joins_outage_retention_api_and_cli(
 
 @pytest.mark.live
 def test_live_pan_au_closure_feeds_smoke() -> None:
-    """Optional live smoke check against verified public Pan-Australia agency feeds."""
+    """Optional live smoke check verifying all 6 Pan-Australia official state/territory feeds."""
     act_items = ACTESAAlertsAdapter(timeout_s=20.0).fetch()
     tas_items = TasAlertAdapter(timeout_s=20.0).fetch()
+    qld_items = QLDParksAlertsAdapter(timeout_s=20.0).fetch()
+    wa_items = EmergencyWAAdapter(timeout_s=20.0).fetch()
     sa_items = SAAlertAdapter(timeout_s=20.0).fetch()
-    assert isinstance(act_items, list)
-    assert isinstance(tas_items, list)
-    assert isinstance(sa_items, list)
+    nt_items = NTFireParksAdapter(timeout_s=20.0).fetch()
+
+    for expected_state, items in (
+        ("ACT", act_items),
+        ("TAS", tas_items),
+        ("QLD", qld_items),
+        ("WA", wa_items),
+        ("SA", sa_items),
+        ("NT", nt_items),
+    ):
+        assert isinstance(items, list)
+        assert all(item.state == expected_state for item in items)
+
+    # Road Report NT publishes persistent active outback road closures & 4WD advisories
+    assert len(nt_items) > 0

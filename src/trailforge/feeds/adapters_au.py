@@ -144,6 +144,32 @@ def _parse_georss_polygon(text: str) -> dict[str, Any] | None:
     return normalize_geojson_geometry({"type": "Polygon", "coordinates": [ring]})
 
 
+def _extract_feature_collection_geometry(fc: Any) -> dict[str, Any] | None:
+    """Extract highest-dimensional valid GeoJSON geometry from a FeatureCollection."""
+    if not isinstance(fc, Mapping) or not isinstance(fc.get("features"), list):
+        return None
+    rank = {
+        "MultiPolygon": 5,
+        "Polygon": 4,
+        "MultiLineString": 3,
+        "LineString": 2,
+        "Point": 1,
+    }
+    best: dict[str, Any] | None = None
+    best_rank = 0
+    for feat in fc["features"]:
+        if not isinstance(feat, Mapping):
+            continue
+        geom = normalize_geojson_geometry(feat.get("geometry"))
+        if geom is None:
+            continue
+        score = rank.get(str(geom.get("type") or ""), 0)
+        if score > best_rank:
+            best = geom
+            best_rank = score
+    return best
+
+
 def _extract_geometry_from_props(
     props: Mapping[str, Any], raw_geom: Any = None
 ) -> dict[str, Any] | None:
@@ -158,6 +184,12 @@ def _extract_geometry_from_props(
         if geom is not None:
             return geom
 
+    geo_source = props.get("geo-source") or props.get("geo_source")
+    if geo_source is not None:
+        geom = _extract_feature_collection_geometry(geo_source)
+        if geom is not None:
+            return geom
+
     lat = prop_ci(props, "latitude", "lat", "y", "geo_lat")
     lon = prop_ci(props, "longitude", "lon", "lng", "long", "x", "geo_lon")
     if lat is not None and lon is not None:
@@ -169,7 +201,17 @@ def _extract_geometry_from_props(
             pass
 
     loc_str = prop_ci(props, "location", "coords", "coordinates", "point")
-    if isinstance(loc_str, str):
+    if isinstance(loc_str, Mapping):
+        mlat = prop_ci(loc_str, "latitude", "lat", "y")
+        mlon = prop_ci(loc_str, "longitude", "lon", "lng", "long", "x")
+        if mlat is not None and mlon is not None:
+            try:
+                lat_f, lon_f = float(mlat), float(mlon)
+                if -90.0 <= lat_f <= 90.0 and -180.0 <= lon_f <= 180.0:
+                    return {"type": "Point", "coordinates": [lon_f, lat_f]}
+            except (TypeError, ValueError):
+                pass
+    elif isinstance(loc_str, str):
         pair = _parse_lat_lon_pair(loc_str)
         if pair is not None:
             return {"type": "Point", "coordinates": [pair[0], pair[1]]}
@@ -444,6 +486,7 @@ class _PanAUFeedAdapter(BaseHttpFeedAdapter):
                 "events",
                 "results",
                 "data",
+                "response",
             ):
                 val = payload.get(key)
                 if isinstance(val, list):
@@ -565,25 +608,37 @@ class _PanAUFeedAdapter(BaseHttpFeedAdapter):
             desc,
         )
 
-        raw_type_blob = " ".join(
-            str(x or "")
-            for x in (
-                prop_ci(
-                    props,
-                    "alert_type",
-                    "alertType",
-                    "closure_type",
-                    "type",
-                    "incidentType",
-                    "warningType",
-                    "category",
-                    "hazard",
-                    "event",
-                ),
-                title,
+        explicit_alert_type = str(prop_ci(props, "alert_type") or "").strip().lower()
+        if explicit_alert_type in (
+            "seasonal_closure",
+            "road_closure",
+            "park_closure",
+            "bushfire",
+            "flood",
+            "hazard_warning",
+            "private_gate",
+        ):
+            alert_type: DbAlertTypeLiteral = explicit_alert_type  # type: ignore[assignment]
+        else:
+            raw_type_blob = " ".join(
+                str(x or "")
+                for x in (
+                    prop_ci(
+                        props,
+                        "alert_type",
+                        "alertType",
+                        "closure_type",
+                        "type",
+                        "incidentType",
+                        "warningType",
+                        "category",
+                        "hazard",
+                        "event",
+                    ),
+                    title,
+                )
             )
-        )
-        alert_type = normalize_alert_type(raw_type_blob, default=self.default_alert_type)
+            alert_type = normalize_alert_type(raw_type_blob, default=self.default_alert_type)
 
         raw_sev = prop_ci(
             props,
@@ -710,20 +765,97 @@ class TasAlertAdapter(_PanAUFeedAdapter):
     id_prefix: str = "tas-alert"
 
 
+def _parse_lat_lon_list_pair(value: Any) -> tuple[float, float] | None:
+    """Parse ``[lat, lon]`` or ``[lon, lat]`` numeric 2-tuples into validated ``(lon, lat)``."""
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return None
+    try:
+        a, b = float(value[0]), float(value[1])
+    except (TypeError, ValueError):
+        return None
+    if a == 0.0 and b == 0.0:
+        return None
+    if -50.0 <= a <= -5.0 and 100.0 <= b <= 165.0:
+        return (b, a)
+    if 100.0 <= a <= 165.0 and -50.0 <= b <= -5.0:
+        return (a, b)
+    if -90.0 <= a <= 90.0 and -180.0 <= b <= 180.0:
+        return (b, a)
+    return None
+
+
 class QLDParksAlertsAdapter(_PanAUFeedAdapter):
-    """QLD DESI / QPWS Park Alerts (CAPAD joined) + QFES bushfire/incident adapter."""
+    """QLD QFD live GeoJSON bushfire alerts + QPWS park alerts (RSS/JSON, CAPAD joined)."""
 
     feed_source: FeedSourceLiteral = "qld_des_alerts"
     default_state: StateLiteral = "QLD"
-    default_official_url: str = "https://parks.desi.qld.gov.au/park-alerts"
+    default_official_url: str = "https://www.fire.qld.gov.au/current-incidents"
     default_alert_type: DbAlertTypeLiteral = "hazard_warning"
     default_severity: DbSeverityLiteral = "advisory"
     filter_irrelevant_hazards: bool = False
     id_prefix: str = "qld-des"
 
+    def _parse_item(self, item: Mapping[str, Any]) -> NormalizedClosure | None:
+        # Enrich Queensland Fire Department (QFD) GeoJSON `bushfireAlert.json` features
+        if item.get("type") == "Feature":
+            raw_props = item.get("properties")
+            if isinstance(raw_props, Mapping) and (
+                "WarningTitle" in raw_props
+                or "UniqueID" in raw_props
+                or "WarningLevel" in raw_props
+            ):
+                props = dict(raw_props)
+                ext_id = str(
+                    prop_ci(props, "UniqueID", "OBJECTID", "id") or item.get("id") or ""
+                ).strip()
+                title = str(
+                    prop_ci(props, "WarningTitle", "title", "WarningArea") or ""
+                ).strip()
+                if not title:
+                    return None
+                header = str(prop_ci(props, "Header") or "").strip()
+                body = str(prop_ci(props, "WarningText") or "").strip()
+                desc_text = header or body
+                if len(desc_text) > 1200:
+                    desc_text = desc_text[:1197].rstrip() + "..."
+                event_blob = " ".join(
+                    str(v or "")
+                    for v in (
+                        prop_ci(props, "EventType"),
+                        prop_ci(props, "GroupedType"),
+                        prop_ci(props, "WarningType_Level"),
+                    )
+                ).strip()
+                props.setdefault("id", ext_id)
+                props.setdefault("title", title)
+                if desc_text:
+                    props.setdefault("description", desc_text)
+                if event_blob:
+                    props.setdefault("category", event_blob)
+                if prop_ci(props, "WarningLevel"):
+                    props.setdefault("severity", prop_ci(props, "WarningLevel"))
+                if prop_ci(props, "WarningArea"):
+                    props.setdefault("areaDesc", prop_ci(props, "WarningArea"))
+                if prop_ci(props, "ItemDateTimeLocal_ISO"):
+                    props.setdefault("effective_from", prop_ci(props, "ItemDateTimeLocal_ISO"))
+                if prop_ci(props, "ItemExpiryDateTimeLocal_ISO"):
+                    props.setdefault("effective_to", prop_ci(props, "ItemExpiryDateTimeLocal_ISO"))
+                updated = prop_ci(props, "PublishDateLocal_ISO", "ItemDateTimeLocal_ISO")
+                if updated:
+                    props.setdefault("updated", updated)
+                props.setdefault("url", self.default_official_url)
+                enriched = {
+                    "type": "Feature",
+                    "id": ext_id or item.get("id"),
+                    "properties": props,
+                    "geometry": item.get("geometry"),
+                }
+                return super()._parse_item(enriched)
+        return super()._parse_item(item)
+
 
 class EmergencyWAAdapter(_PanAUFeedAdapter):
-    """Emergency WA (DFES / DBCA Parks & Wildlife) bushfire & park alerts adapter."""
+    """Emergency WA v1 API (DFES / DBCA Parks & Wildlife) bushfire & park alerts adapter."""
 
     feed_source: FeedSourceLiteral = "wa_emergency"
     default_state: StateLiteral = "WA"
@@ -732,6 +864,102 @@ class EmergencyWAAdapter(_PanAUFeedAdapter):
     default_severity: DbSeverityLiteral = "advisory"
     filter_irrelevant_hazards: bool = True
     id_prefix: str = "wa-em"
+
+    def _parse_item(self, item: Mapping[str, Any]) -> NormalizedClosure | None:
+        # Enrich Emergency WA v1 `/v1/warnings` & `/v1/incidents` JSON records
+        if item.get("type") != "Feature" and (
+            "geo-source" in item
+            or "warning-type" in item
+            or "cap-event-type" in item
+            or "alert-line" in item
+        ):
+            props = dict(item)
+            ext_id = str(prop_ci(props, "id", "warning_id", "event") or "").strip()
+            warning_type = str(prop_ci(props, "warning-type", "name") or "").strip()
+            entity_sub = str(prop_ci(props, "entitySubType") or "").strip()
+            raw_title = str(prop_ci(props, "title", "headline") or warning_type).strip()
+            if not raw_title:
+                return None
+            if warning_type and warning_type.lower() not in raw_title.lower():
+                title = f"{warning_type} — {raw_title}"
+            else:
+                title = raw_title
+            props["title"] = title
+
+            if not props.get("description"):
+                desc_candidate = (
+                    prop_ci(props, "alert-line", "action-statement", "what-to-do-note") or ""
+                )
+                if str(desc_candidate).strip():
+                    props["description"] = str(desc_candidate)
+
+            cap_events = props.get("cap-event-type")
+            cap_event_txt = (
+                " ".join(str(x) for x in cap_events if x)
+                if isinstance(cap_events, list)
+                else str(cap_events or "")
+            )
+            cat_blob = " ".join(
+                v
+                for v in (
+                    cap_event_txt,
+                    str(props.get("cap-category") or ""),
+                    warning_type,
+                    entity_sub,
+                )
+                if v
+            ).strip()
+            if cat_blob:
+                props.setdefault("category", cat_blob)
+
+            # Avoid defaulting non-fire warnings (e.g. Heatwave/Storm Advice) to "bushfire"
+            cat_lower = cat_blob.lower()
+            if not any(
+                tok in cat_lower
+                for tok in ("fire", "burn", "smoke", "flood", "cyclone", "clos", "gate")
+            ):
+                props.setdefault("alert_type", "hazard_warning")
+
+            # Derive severity from warning-type/entitySubType before CAP minor fallback
+            sev_hint = warning_type or entity_sub or str(props.get("cap-severity") or "")
+            if sev_hint:
+                props["severity"] = sev_hint
+
+            pub_status = str(props.get("publishing-status") or "").strip().lower()
+            if pub_status == "published":
+                props.setdefault("status", "active")
+            elif pub_status:
+                props.setdefault("status", pub_status)
+
+            area_parts: list[str] = []
+            for key in ("headline", "suburbs", "lga"):
+                val = props.get(key)
+                if isinstance(val, list):
+                    area_parts.extend(str(x).strip() for x in val if str(x).strip())
+                elif isinstance(val, str) and val.strip():
+                    area_parts.append(val.strip())
+            loc_obj = props.get("location")
+            if isinstance(loc_obj, Mapping) and loc_obj.get("value"):
+                area_parts.append(str(loc_obj["value"]).strip())
+            if area_parts:
+                area_joined = ", ".join(area_parts)
+                # Include title-cased variant so ALL-CAPS WA area strings match park-name regex
+                props.setdefault("areaDesc", f"{area_joined} | {area_joined.title()}")
+
+            if not prop_ci(props, "source_url", "url", "link"):
+                props["url"] = (
+                    f"https://www.emergency.wa.gov.au/alerts/{ext_id}"
+                    if ext_id
+                    else self.default_official_url
+                )
+            eff = prop_ci(props, "issued-date-time", "published-date-time")
+            if eff:
+                props.setdefault("effective_from", eff)
+            upd = prop_ci(props, "updatedAt", "issued-date-time", "published-date-time")
+            if upd:
+                props.setdefault("updated", upd)
+            return super()._parse_item(props)
+        return super()._parse_item(item)
 
 
 class SAAlertAdapter(_PanAUFeedAdapter):
@@ -774,15 +1002,136 @@ class SAAlertAdapter(_PanAUFeedAdapter):
 
 
 class NTFireParksAdapter(_PanAUFeedAdapter):
-    """SecureNT / Bushfires NT / Parks & Wildlife Commission NT alerts adapter."""
+    """NT Road Report closures + SecureNT / Bushfires NT / Parks NT alerts adapter."""
 
     feed_source: FeedSourceLiteral = "nt_securent"
     default_state: StateLiteral = "NT"
-    default_official_url: str = "https://securent.nt.gov.au/alerts"
+    default_official_url: str = "https://roadreport.nt.gov.au/"
     default_alert_type: DbAlertTypeLiteral = "hazard_warning"
     default_severity: DbSeverityLiteral = "advisory"
     filter_irrelevant_hazards: bool = True
     id_prefix: str = "nt-securent"
+
+    def _parse_item(self, item: Mapping[str, Any]) -> NormalizedClosure | None:
+        # 1. Road Report NT public API (`https://roadreport.nt.gov.au/api/Obstruction/GetAll`)
+        if item.get("type") != "Feature" and (
+            "roadName" in item and ("obstructionId" in item or "restrictionType" in item)
+        ):
+            road_name = str(item.get("roadName") or "").strip()
+            restriction = str(item.get("restrictionType") or "").strip()
+            obstruction = str(item.get("obstructionType") or "").strip()
+            if not road_name:
+                return None
+
+            rest_low = restriction.lower()
+            obs_low = obstruction.lower()
+            # Filter out commercial heavy-vehicle axle/mass-limit advisories unrelated to 4WD access
+            if (
+                "weight" in rest_low
+                and "clos" not in rest_low
+                and "impass" not in rest_low
+                and "4wd" not in rest_low
+                and "flood" not in obs_low
+                and "fire" not in obs_low
+            ):
+                return None
+
+            if restriction and obstruction and obstruction.lower() != rest_low:
+                title = f"{road_name} — {restriction} ({obstruction})"
+            elif restriction or obstruction:
+                title = f"{road_name} — {restriction or obstruction}"
+            else:
+                title = road_name
+
+            desc_parts = [
+                str(v).strip()
+                for v in (item.get("locationComment"), item.get("comment"))
+                if v is not None and str(v).strip() not in ("", "-")
+            ]
+            desc = " | ".join(desc_parts) if desc_parts else None
+
+            if "road closed" in rest_low or "impassable" in rest_low or "closed" in rest_low:
+                alert_type: DbAlertTypeLiteral = "road_closure"
+                severity: DbSeverityLiteral = "closed"
+            elif "flood" in obs_low or "water" in obs_low:
+                alert_type = "flood"
+                severity = "advisory"
+            elif "fire" in obs_low or "smoke" in obs_low:
+                alert_type = "bushfire"
+                severity = "advisory"
+            else:
+                alert_type = "hazard_warning"
+                severity = "advisory"
+
+            raw_status = str(item.get("status") or "CURRENT").strip().upper()
+            status = "active" if raw_status == "CURRENT" else normalize_status(raw_status)
+
+            start_pt = _parse_lat_lon_list_pair(item.get("startPoint"))
+            end_pt = _parse_lat_lon_list_pair(item.get("endPoint"))
+            geom: dict[str, Any] | None = None
+            if start_pt is not None and end_pt is not None:
+                if abs(start_pt[0] - end_pt[0]) > 1e-5 or abs(start_pt[1] - end_pt[1]) > 1e-5:
+                    geom = {
+                        "type": "LineString",
+                        "coordinates": [
+                            [start_pt[0], start_pt[1]],
+                            [end_pt[0], end_pt[1]],
+                        ],
+                    }
+                else:
+                    geom = {"type": "Point", "coordinates": [start_pt[0], start_pt[1]]}
+            elif start_pt is not None:
+                geom = {"type": "Point", "coordinates": [start_pt[0], start_pt[1]]}
+            elif end_pt is not None:
+                geom = {"type": "Point", "coordinates": [end_pt[0], end_pt[1]]}
+
+            obs_id = item.get("obstructionId") or item.get("recordId")
+            props = dict(item)
+            props["id"] = f"nt-rr-{obs_id}" if obs_id is not None else ""
+            props["title"] = title
+            if desc:
+                props["description"] = desc
+            props["alert_type"] = alert_type
+            props["severity"] = severity
+            props["status"] = status
+            props["url"] = self.default_official_url
+            if geom is not None:
+                props["geometry"] = geom
+            if item.get("dateFrom") or item.get("dateActive"):
+                props["effective_from"] = item.get("dateFrom") or item.get("dateActive")
+            if item.get("dateTo"):
+                props["effective_to"] = item.get("dateTo")
+            updated = item.get("dateLastUpdated") or item.get("dateActive") or item.get("dateFrom")
+            if updated:
+                props["updated"] = updated
+            return super()._parse_item(props)
+
+        # 2. NTG Hosted ArcGIS Fire_Incidents FeatureServer GeoJSON fallback
+        if item.get("type") == "Feature":
+            raw_props = item.get("properties")
+            if isinstance(raw_props, Mapping) and (
+                "f_eventtype" in raw_props or "fire_type" in raw_props
+            ):
+                props = dict(raw_props)
+                loc = str(prop_ci(props, "location", "f_location") or "").strip()
+                ev = str(prop_ci(props, "fire_type", "f_eventtype") or "").strip()
+                props.setdefault("title", f"{loc} — {ev}" if loc and ev else (loc or ev))
+                props.setdefault("category", ev or str(props.get("f_category") or ""))
+                props.setdefault("status", prop_ci(props, "status", "f_status") or "active")
+                props.setdefault("severity", prop_ci(props, "alert_level") or "advisory")
+                props.setdefault("effective_from", prop_ci(props, "f_datenotified"))
+                props.setdefault("updated", prop_ci(props, "f_lastupdate", "f_datenotified"))
+                props.setdefault("url", "https://securent.nt.gov.au/")
+                return super()._parse_item(
+                    {
+                        "type": "Feature",
+                        "id": item.get("id") or prop_ci(props, "objectid"),
+                        "properties": props,
+                        "geometry": item.get("geometry"),
+                    }
+                )
+
+        return super()._parse_item(item)
 
 
 AU_STATE_ADAPTER_CLASSES: Final[dict[FeedSourceLiteral, type[BaseHttpFeedAdapter]]] = {

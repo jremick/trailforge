@@ -87,12 +87,12 @@ DEFAULT_TAS_ALERT_URL: Final[str] = (
     "EmergencyManagementPublic/MapServer/72/query"
     "?where=1%3D1&outFields=*&f=geojson"
 )
-DEFAULT_QLD_DES_ALERTS_URL: Final[str] = "https://parks.desi.qld.gov.au/park-alerts/rss.xml"
-DEFAULT_WA_EMERGENCY_URL: Final[str] = "https://www.emergency.wa.gov.au/data/message_DFES.json"
+DEFAULT_QLD_DES_ALERTS_URL: Final[str] = "https://www.fire.qld.gov.au/data/alerts/bushfireAlert.json"
+DEFAULT_WA_EMERGENCY_URL: Final[str] = "https://api.emergency.wa.gov.au/v1/warnings"
 DEFAULT_SA_CFS_PARKS_URL: Final[str] = (
     "https://data.eso.sa.gov.au/prod/cfs/criimson/cfs_current_incidents.json"
 )
-DEFAULT_NT_SECURENT_URL: Final[str] = "https://securent.nt.gov.au/alerts/feed"
+DEFAULT_NT_SECURENT_URL: Final[str] = "https://roadreport.nt.gov.au/api/Obstruction/GetAll"
 
 _PARK_ALERT_FEEDS: Final[frozenset[str]] = frozenset(
     {
@@ -206,13 +206,13 @@ AU_STATE_FEED_REGISTRY: Final[dict[FeedSourceLiteral, FeedMetadata]] = {
     "qld_des_alerts": FeedMetadata(
         feed_source="qld_des_alerts",
         alias="qld_parks",
-        display_name="QLD QPWS Park Alerts & QFES Incidents",
-        agency="QLD DESI / QPWS / Queensland Fire Department (QFES)",
+        display_name="QLD QFD Bushfire Alerts & QPWS Park Alerts",
+        agency="Queensland Fire Department (QFD) / QLD DESI (QPWS)",
         state="QLD",
         default_url=DEFAULT_QLD_DES_ALERTS_URL,
         env_var="TRAILFORGE_QLD_DES_ALERTS_URL",
-        sync_interval_s=3600,  # 1 hour
-        stale_after_s=14400,  # 4 hours
+        sync_interval_s=900,  # 15 minutes
+        stale_after_s=3600,  # 1 hour
     ),
     "wa_emergency": FeedMetadata(
         feed_source="wa_emergency",
@@ -239,8 +239,8 @@ AU_STATE_FEED_REGISTRY: Final[dict[FeedSourceLiteral, FeedMetadata]] = {
     "nt_securent": FeedMetadata(
         feed_source="nt_securent",
         alias="nt_alerts",
-        display_name="SecureNT & NT Parks Alerts",
-        agency="SecureNT / Bushfires NT / Parks & Wildlife Commission NT",
+        display_name="NT Road Report Closures & Bushfire/Parks Alerts",
+        agency="NT DIPL (Road Report NT) / SecureNT / Bushfires NT / Parks NT",
         state="NT",
         default_url=DEFAULT_NT_SECURENT_URL,
         env_var="TRAILFORGE_NT_SECURENT_URL",

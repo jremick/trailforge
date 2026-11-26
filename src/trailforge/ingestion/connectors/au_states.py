@@ -2398,7 +2398,7 @@ class NTTrailsConnector:
                 tile,
                 cache_path=self._cache_file(f"roads_{bhash}"),
                 where="SURFACE_TYPE IN ('4WD','UNFORMED') OR CATEGORY LIKE 'PASTORAL%'",
-                out_fields="OBJECTID,ROAD_LABEL,ROAD_NAME,ROAD_TYPE,SURFACE_TYPE,CATEGORY",
+                out_fields="UFI,ROAD_LABEL,ROAD_NAME,ROAD_TYPE,SURFACE_TYPE,CATEGORY",
                 timeout_s=self.timeout_s,
                 client=self._client,
             )
@@ -2422,7 +2422,7 @@ class NTTrailsConnector:
                     trail_class = "management_trail"
                 surface = "natural" if surf_raw == "UNFORMED" else "unsealed"
                 fid = str(
-                    prop_ci(props, "OBJECTID", "id")
+                    prop_ci(props, "UFI", "OBJECTID", "id")
                     or feat.get("id")
                     or deterministic_feature_id("nt_roads", geom, props)
                 ).strip()

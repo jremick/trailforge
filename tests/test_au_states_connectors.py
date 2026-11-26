@@ -836,9 +836,20 @@ def test_sa_trails_connector_vsizip_streaming_and_survey_filter_offline(tmp_path
 
 
 def test_nt_trails_connector_wfs_crs84_and_unformed_roads_offline(tmp_path: Path) -> None:
+    nt_roads_queries: list[dict[str, str]] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if "ROAD_CENTRELINES" in url:
+            params = dict(request.url.params)
+            nt_roads_queries.append(params)
+            out_fields = params.get("outFields", "")
+            # NTG ROAD_CENTRELINES OID field is UFI (not OBJECTID, which returns ArcGIS 400)
+            assert "UFI" in out_fields
+            assert "OBJECTID" not in out_fields
+            assert params.get("inSR") == "4326"
+            assert params.get("outSR") == "4326"
+            assert params.get("spatialRel") == "esriSpatialRelIntersects"
             return httpx.Response(
                 200,
                 json=_fc(
@@ -846,8 +857,10 @@ def test_nt_trails_connector_wfs_crs84_and_unformed_roads_offline(tmp_path: Path
                         {
                             "type": "Feature",
                             "properties": {
-                                "OBJECTID": 1,
+                                "UFI": 22350,
                                 "ROAD_LABEL": "*Finke River 4WD Track",
+                                "ROAD_NAME": "*FINKE RIVER",
+                                "ROAD_TYPE": "TRACK",
                                 "SURFACE_TYPE": "4WD",
                                 "CATEGORY": "TRACK",
                             },
@@ -859,7 +872,22 @@ def test_nt_trails_connector_wfs_crs84_and_unformed_roads_offline(tmp_path: Path
                         {
                             "type": "Feature",
                             "properties": {
-                                "OBJECTID": 2,
+                                "UFI": 22351,
+                                "ROAD_LABEL": "*REDBANK GORGE ROAD",
+                                "ROAD_NAME": "*REDBANK GORGE",
+                                "ROAD_TYPE": "ROAD",
+                                "SURFACE_TYPE": "FORMED",
+                                "CATEGORY": "PASTORAL - LOCAL",
+                            },
+                            "geometry": {
+                                "type": "LineString",
+                                "coordinates": [[132.52, -23.59], [132.54, -23.61]],
+                            },
+                        },
+                        {
+                            "type": "Feature",
+                            "properties": {
+                                "UFI": 22352,
                                 "ROAD_LABEL": "Stuart Highway",
                                 "SURFACE_TYPE": "SEALED",
                                 "CATEGORY": "HIGHWAY",
@@ -938,12 +966,18 @@ def test_nt_trails_connector_wfs_crs84_and_unformed_roads_offline(tmp_path: Path
         tracks = conn.fetch_tracks(NT_MACDONNELL_BBOX)
         pois = conn.fetch_pois(NT_MACDONNELL_BBOX)
 
-    assert len(tracks) == 2  # SEALED Stuart Hwy excluded
-    by_layer = {t.source_layer: t for t in tracks}
-    assert by_layer["nt_roads"].name == "Finke River 4WD Track"  # leading * stripped
-    assert by_layer["nt_roads"].is_4wd_only is True
-    assert by_layer["nt_ga_topo250k"].trail_class == "walking_track"
-    assert by_layer["nt_ga_topo250k"].is_vehicular is False
+    assert len(nt_roads_queries) >= 1
+    assert len(tracks) == 3  # SEALED Stuart Hwy excluded; 4WD + FORMED pastoral + GA kept
+    by_id = {t.source_id: t for t in tracks}
+    assert by_id["22350"].source_layer == "nt_roads"
+    assert by_id["22350"].name == "Finke River 4WD Track"  # leading * stripped
+    assert by_id["22350"].is_4wd_only is True
+    assert by_id["22351"].source_layer == "nt_roads"
+    assert by_id["22351"].name == "REDBANK GORGE ROAD"
+    assert by_id["22351"].trail_class == "management_trail"
+    assert by_id["10"].source_layer == "nt_ga_topo250k"
+    assert by_id["10"].trail_class == "walking_track"
+    assert by_id["10"].is_vehicular is False
     assert {p.poi_type for p in pois} == {"lookout", "trig"}
     trig = next(p for p in pois if p.poi_type == "trig")
     assert trig.elev_m == pytest.approx(1380.4)
@@ -1438,14 +1472,24 @@ def test_pan_au_source_tracks_au_state_persistence_and_idempotency(postgis_engin
 
 @pytest.mark.live
 def test_live_pan_au_connectors_smoke(tmp_path: Path) -> None:
-    """Optional live smoke test hitting official ACTmapi & Tasmania LIST open endpoints."""
+    """Optional live smoke test verifying all 6 Pan-AU state/territory connectors (ACT..NT)."""
     router = AutoAUStateTrailsRouter(cache_dir=tmp_path)
-    act_res = router.fetch(ACT_NAMADGI_BBOX, include_pois=True)
-    assert "ACT" in act_res.states_queried
-    assert len(act_res.au_state_tracks) > 0 or len(act_res.pois) > 0
-    assert ATTRIBUTION_ACT_ACTMAPI in act_res.attributions
-
-    tas_res = router.fetch(TAS_CRADLE_BBOX, include_pois=True)
-    assert "TAS" in tas_res.states_queried
-    assert len(tas_res.au_state_tracks) > 0 or len(tas_res.pois) > 0
-    assert ATTRIBUTION_TAS_LIST in tas_res.attributions
+    qld_glass_house_bbox = BBox(min_x=152.85, min_y=-27.00, max_x=153.05, max_y=-26.85)
+    checks = (
+        ("ACT", ACT_NAMADGI_BBOX, ATTRIBUTION_ACT_ACTMAPI),
+        ("TAS", TAS_CRADLE_BBOX, ATTRIBUTION_TAS_LIST),
+        ("QLD", qld_glass_house_bbox, ATTRIBUTION_QLD_QSPATIAL),
+        ("WA", WA_PERTH_HILLS_BBOX, ATTRIBUTION_WA_DBCA_SLIP),
+        ("SA", SA_FLINDERS_BBOX, ATTRIBUTION_SA_DEW_DHUD),
+        ("NT", NT_MACDONNELL_BBOX, ATTRIBUTION_NT_NTLIS),
+    )
+    for state_code, bbox, expected_attr in checks:
+        res = router.fetch(bbox, include_pois=True)
+        assert state_code in res.states_queried, f"{state_code} missing from states_queried"
+        assert len(res.au_state_tracks) > 0, f"Expected live tracks for {state_code}"
+        assert len(res.pois) > 0, f"Expected live POIs for {state_code}"
+        assert expected_attr in res.attributions, f"Missing attribution for {state_code}"
+        if state_code == "NT":
+            assert any(t.source_layer == "nt_roads" for t in res.au_state_tracks), (
+                "Expected live NTG ROAD_CENTRELINES (UFI) tracks for West MacDonnell"
+            )
