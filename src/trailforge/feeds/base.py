@@ -1,16 +1,23 @@
-"""Pluggable FeedAdapter protocol, feed registry, and normalized closure models (Slice 04)."""
+"""Pluggable FeedAdapter protocol, Pan-Australia feed registry, and normalized closure models."""
 
 from __future__ import annotations
 
+import html
 import os
+import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Literal, Protocol, runtime_checkable
 
+import httpx
 from pydantic import BaseModel, Field
+from shapely.geometry import GeometryCollection, mapping, shape
 from sqlalchemy.orm import Session
 
+from trailforge.config import get_settings
 from trailforge.db.models import FeedSyncStatus
+from trailforge.ingestion.connectors.base import USER_AGENT
 
 FeedSourceLiteral = Literal[
     "vic_mapshare_seasonal",
@@ -18,6 +25,12 @@ FeedSourceLiteral = Literal[
     "nsw_rfs",
     "nsw_npws",
     "osm_access",
+    "act_esa",
+    "tas_alert",
+    "qld_des_alerts",
+    "wa_emergency",
+    "sa_cfs_parks",
+    "nt_securent",
 ]
 DbAlertTypeLiteral = Literal[
     "seasonal_closure",
@@ -40,7 +53,19 @@ DbSeverityLiteral = Literal["info", "advisory", "watch_and_act", "closed", "emer
 ApiSeverityLiteral = Literal["critical", "warning", "info"]
 ClosureStatusLiteral = Literal["active", "scheduled", "cleared", "stale"]
 TrackClosureStatusLiteral = Literal["open", "info", "warning", "seasonal", "gated", "closed"]
-StateLiteral = Literal["VIC", "NSW", "ACT"]
+StateLiteral = Literal["VIC", "NSW", "ACT", "TAS", "QLD", "WA", "SA", "NT"]
+
+ALL_AU_STATES: Final[tuple[StateLiteral, ...]] = (
+    "VIC",
+    "NSW",
+    "ACT",
+    "TAS",
+    "QLD",
+    "WA",
+    "SA",
+    "NT",
+)
+DEFAULT_ENABLED_STATES: Final[tuple[StateLiteral, ...]] = ("VIC", "NSW")
 
 DEFAULT_VIC_SEASONAL_URL: Final[str] = (
     "https://opendata.maps.vic.gov.au/geoserver/wfs"
@@ -54,6 +79,27 @@ DEFAULT_VIC_EMERGENCY_URL: Final[str] = (
 DEFAULT_NSW_RFS_URL: Final[str] = "https://www.rfs.nsw.gov.au/feeds/majorIncidents.json"
 DEFAULT_NSW_NPWS_URL: Final[str] = "https://www.nationalparks.nsw.gov.au/api/rssfeed/get"
 DEFAULT_OSM_ACCESS_URL: Final[str] = "https://www.openstreetmap.org/copyright"
+
+# Pan-Australia official state & territory alert/closure feed defaults
+DEFAULT_ACT_ESA_URL: Final[str] = "https://www.esa.act.gov.au/feeds/currentincidents.xml"
+DEFAULT_TAS_ALERT_URL: Final[str] = (
+    "https://services.thelist.tas.gov.au/arcgis/rest/services/Public/"
+    "EmergencyManagementPublic/MapServer/72/query"
+    "?where=1%3D1&outFields=*&f=geojson"
+)
+DEFAULT_QLD_DES_ALERTS_URL: Final[str] = "https://parks.desi.qld.gov.au/park-alerts/rss.xml"
+DEFAULT_WA_EMERGENCY_URL: Final[str] = "https://www.emergency.wa.gov.au/data/message_DFES.json"
+DEFAULT_SA_CFS_PARKS_URL: Final[str] = (
+    "https://data.eso.sa.gov.au/prod/cfs/criimson/cfs_current_incidents.json"
+)
+DEFAULT_NT_SECURENT_URL: Final[str] = "https://securent.nt.gov.au/alerts/feed"
+
+_PARK_ALERT_FEEDS: Final[frozenset[str]] = frozenset(
+    {
+        "nsw_npws",
+        "qld_des_alerts",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -74,6 +120,7 @@ class FeedMetadata:
         return os.environ.get(self.env_var, self.default_url).strip() or self.default_url
 
 
+# Core v1 VIC/NSW/OSM registry (preserved 100% backward-compatible for Slice 04 tests)
 FEED_REGISTRY: Final[dict[FeedSourceLiteral, FeedMetadata]] = {
     "vic_mapshare_seasonal": FeedMetadata(
         feed_source="vic_mapshare_seasonal",
@@ -124,7 +171,7 @@ FEED_REGISTRY: Final[dict[FeedSourceLiteral, FeedMetadata]] = {
         alias="osm_access",
         display_name="OSM Gates & Private Access",
         agency="OpenStreetMap Contributors",
-        state="VIC/NSW",
+        state="AU",
         default_url=DEFAULT_OSM_ACCESS_URL,
         env_var="TRAILFORGE_OSM_ACCESS_URL",
         sync_interval_s=86400,  # 24 hours
@@ -132,9 +179,85 @@ FEED_REGISTRY: Final[dict[FeedSourceLiteral, FeedMetadata]] = {
     ),
 }
 
+# Pan-Australia expansion feeds for ACT, TAS, QLD, WA, SA, and NT (Phase B / v1.1.0)
+AU_STATE_FEED_REGISTRY: Final[dict[FeedSourceLiteral, FeedMetadata]] = {
+    "act_esa": FeedMetadata(
+        feed_source="act_esa",
+        alias="act_alerts",
+        display_name="ACT ESA & Parks Alerts",
+        agency="ACT Emergency Services Agency / Parks & Conservation Service",
+        state="ACT",
+        default_url=DEFAULT_ACT_ESA_URL,
+        env_var="TRAILFORGE_ACT_ESA_URL",
+        sync_interval_s=900,  # 15 minutes
+        stale_after_s=3600,  # 1 hour
+    ),
+    "tas_alert": FeedMetadata(
+        feed_source="tas_alert",
+        alias="tas_alerts",
+        display_name="TasALERT & PWS Tasmania Alerts",
+        agency="TasALERT / Tasmania Fire Service / Parks & Wildlife Service Tasmania",
+        state="TAS",
+        default_url=DEFAULT_TAS_ALERT_URL,
+        env_var="TRAILFORGE_TAS_ALERT_URL",
+        sync_interval_s=900,  # 15 minutes
+        stale_after_s=3600,  # 1 hour
+    ),
+    "qld_des_alerts": FeedMetadata(
+        feed_source="qld_des_alerts",
+        alias="qld_parks",
+        display_name="QLD QPWS Park Alerts & QFES Incidents",
+        agency="QLD DESI / QPWS / Queensland Fire Department (QFES)",
+        state="QLD",
+        default_url=DEFAULT_QLD_DES_ALERTS_URL,
+        env_var="TRAILFORGE_QLD_DES_ALERTS_URL",
+        sync_interval_s=3600,  # 1 hour
+        stale_after_s=14400,  # 4 hours
+    ),
+    "wa_emergency": FeedMetadata(
+        feed_source="wa_emergency",
+        alias="wa_dfes",
+        display_name="Emergency WA Bushfire & Park Alerts",
+        agency="Emergency WA (DFES / DBCA Parks & Wildlife)",
+        state="WA",
+        default_url=DEFAULT_WA_EMERGENCY_URL,
+        env_var="TRAILFORGE_WA_EMERGENCY_URL",
+        sync_interval_s=900,  # 15 minutes
+        stale_after_s=3600,  # 1 hour
+    ),
+    "sa_cfs_parks": FeedMetadata(
+        feed_source="sa_cfs_parks",
+        alias="sa_cfs",
+        display_name="SA CFS Incidents & NPWS SA Park Alerts",
+        agency="SA Country Fire Service (CFS) / National Parks & Wildlife Service SA",
+        state="SA",
+        default_url=DEFAULT_SA_CFS_PARKS_URL,
+        env_var="TRAILFORGE_SA_CFS_PARKS_URL",
+        sync_interval_s=900,  # 15 minutes
+        stale_after_s=3600,  # 1 hour
+    ),
+    "nt_securent": FeedMetadata(
+        feed_source="nt_securent",
+        alias="nt_alerts",
+        display_name="SecureNT & NT Parks Alerts",
+        agency="SecureNT / Bushfires NT / Parks & Wildlife Commission NT",
+        state="NT",
+        default_url=DEFAULT_NT_SECURENT_URL,
+        env_var="TRAILFORGE_NT_SECURENT_URL",
+        sync_interval_s=1800,  # 30 minutes
+        stale_after_s=7200,  # 2 hours
+    ),
+}
+
+# Full Pan-Australia feed registry (all 11 feeds across all 8 states & territories)
+ALL_FEED_REGISTRY: Final[dict[FeedSourceLiteral, FeedMetadata]] = {
+    **FEED_REGISTRY,
+    **AU_STATE_FEED_REGISTRY,
+}
+
 FEED_ALIAS_MAP: Final[dict[str, FeedSourceLiteral]] = {
-    **{k: k for k in FEED_REGISTRY},
-    **{meta.alias: k for k, meta in FEED_REGISTRY.items()},
+    **{k: k for k in ALL_FEED_REGISTRY},
+    **{meta.alias: k for k, meta in ALL_FEED_REGISTRY.items()},
 }
 
 
@@ -146,15 +269,116 @@ def resolve_feed_source(name: str) -> FeedSourceLiteral:
     return FEED_ALIAS_MAP[key]
 
 
+def parse_state_filter(raw: str | Sequence[str] | None) -> tuple[StateLiteral, ...]:
+    """Parse a state code, comma-separated list, or ``ALL`` into canonical AU state codes."""
+    if raw is None:
+        return ()
+
+    tokens: list[str] = []
+    if isinstance(raw, str):
+        parts = raw.split(",")
+    else:
+        parts = []
+        for entry in raw:
+            parts.extend(str(entry).split(","))
+
+    for part in parts:
+        cleaned = part.strip().upper()
+        if cleaned:
+            tokens.append(cleaned)
+
+    if not tokens:
+        return ()
+
+    if any(tok in ("ALL", "*", "AU") for tok in tokens):
+        return ALL_AU_STATES
+
+    valid_set = set(ALL_AU_STATES)
+    resolved: list[StateLiteral] = []
+    seen: set[str] = set()
+    for tok in tokens:
+        if tok not in valid_set:
+            valid_list = ", ".join(ALL_AU_STATES)
+            raise ValueError(
+                f"Unknown Australian state {tok!r}. Valid values: {valid_list}, or ALL"
+            )
+        if tok not in seen:
+            seen.add(tok)
+            resolved.append(tok)  # type: ignore[arg-type]
+    return tuple(resolved)
+
+
+def resolve_enabled_states(states: str | Sequence[str] | None = None) -> tuple[StateLiteral, ...]:
+    """Resolve enabled states from explicit override, ``TRAILFORGE_ENABLED_STATES``, or default.
+
+    Defaults to ``("VIC", "NSW")`` when unset so default homelab polling and existing
+    Slice 04 VIC/NSW tests stay lean and 100% backward-compatible. Set
+    ``TRAILFORGE_ENABLED_STATES=VIC,NSW,ACT`` or ``ALL`` to opt into additional states.
+    """
+    if states is not None:
+        parsed = parse_state_filter(states)
+        if parsed:
+            return parsed
+
+    env_val = os.environ.get("TRAILFORGE_ENABLED_STATES")
+    if env_val is not None and env_val.strip():
+        return parse_state_filter(env_val)
+
+    try:
+        settings_val = getattr(get_settings(), "enabled_states", None)
+    except Exception:
+        settings_val = None
+    if settings_val:
+        parsed_settings = parse_state_filter(settings_val)
+        if parsed_settings:
+            return parsed_settings
+
+    return DEFAULT_ENABLED_STATES
+
+
+def get_feeds_for_states(
+    states: Sequence[str],
+    *,
+    include_national: bool = True,
+) -> tuple[FeedSourceLiteral, ...]:
+    """Return feed keys from ``ALL_FEED_REGISTRY`` matching the given AU state codes."""
+    state_set = {s.strip().upper() for s in states if s and s.strip()}
+    if "ALL" in state_set or "AU" in state_set or "*" in state_set:
+        state_set = set(ALL_AU_STATES)
+        include_national = True
+
+    selected: list[FeedSourceLiteral] = []
+    for feed_key, meta in ALL_FEED_REGISTRY.items():
+        if meta.state in state_set or (include_national and meta.state in ("AU", "VIC/NSW")):
+            selected.append(feed_key)
+    return tuple(selected)
+
+
 def parse_iso_datetime(value: Any) -> datetime | None:
-    """Parse ISO-8601 or RFC-2822 timestamps cleanly into UTC-aware ``datetime``."""
+    """Parse ISO-8601, epoch-ms, or RFC-2822 timestamps cleanly into UTC-aware ``datetime``."""
     if value is None or value == "":
         return None
     if isinstance(value, datetime):
         return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        ts = float(value)
+        if ts > 1e11:  # ArcGIS epoch milliseconds
+            ts /= 1000.0
+        try:
+            return datetime.fromtimestamp(ts, tz=UTC)
+        except (OSError, OverflowError, ValueError):
+            return None
     raw = str(value).strip()
     if not raw:
         return None
+    if raw.isdigit() and len(raw) >= 10:
+        try:
+            ts = float(raw)
+            if ts > 1e11:
+                ts /= 1000.0
+            return datetime.fromtimestamp(ts, tz=UTC)
+        except (OSError, OverflowError, ValueError):
+            pass
     normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
     try:
         dt = datetime.fromisoformat(normalized)
@@ -168,6 +392,196 @@ def parse_iso_datetime(value: Any) -> datetime | None:
         return dt.astimezone(UTC) if dt.tzinfo else dt.replace(tzinfo=UTC)
     except Exception:
         return None
+
+
+def normalize_geojson_geometry(raw_geom: Any) -> dict[str, Any] | None:
+    """Validate/normalize GeoJSON or ArcGIS geometry; unwrap GeometryCollection cleanly."""
+    if not isinstance(raw_geom, Mapping):
+        return None
+
+    geom_obj: Mapping[str, Any] = raw_geom
+    if "type" not in geom_obj:
+        # Handle ArcGIS JSON geometry fallbacks (x/y, rings, paths in WGS84)
+        if "x" in geom_obj and "y" in geom_obj:
+            try:
+                geom_obj = {
+                    "type": "Point",
+                    "coordinates": [float(geom_obj["x"]), float(geom_obj["y"])],
+                }
+            except (TypeError, ValueError):
+                return None
+        elif isinstance(geom_obj.get("rings"), list) and geom_obj["rings"]:
+            geom_obj = {"type": "Polygon", "coordinates": geom_obj["rings"]}
+        elif isinstance(geom_obj.get("paths"), list) and geom_obj["paths"]:
+            paths = geom_obj["paths"]
+            if len(paths) == 1:
+                geom_obj = {"type": "LineString", "coordinates": paths[0]}
+            else:
+                geom_obj = {"type": "MultiLineString", "coordinates": paths}
+        else:
+            return None
+
+    try:
+        shp = shape(geom_obj)
+    except Exception:
+        return None
+    if shp.is_empty:
+        return None
+    if isinstance(shp, GeometryCollection):
+        for wanted in ("MultiPolygon", "Polygon", "MultiLineString", "LineString", "Point"):
+            for part in shp.geoms:
+                if part.geom_type == wanted and not part.is_empty:
+                    return dict(mapping(part))
+        return None
+    return dict(mapping(shp))
+
+
+def normalize_state(raw: Any, default: StateLiteral) -> StateLiteral:
+    val = str(raw or "").strip().upper()
+    if val in ALL_AU_STATES:
+        return val  # type: ignore[return-value]
+    return default
+
+
+def normalize_status(raw: Any, default: ClosureStatusLiteral = "active") -> ClosureStatusLiteral:
+    val = str(raw or "").strip().lower()
+    if val in ("active", "scheduled", "cleared", "stale"):
+        return val  # type: ignore[return-value]
+    if val in (
+        "safe",
+        "under control",
+        "closed_incident",
+        "resolved",
+        "complete",
+        "completed",
+        "all clear",
+        "cancelled",
+        "expired",
+    ):
+        return "cleared"
+    if val in ("planned", "upcoming", "future", "pending"):
+        return "scheduled"
+    return default
+
+
+def normalize_alert_type(raw: Any, default: DbAlertTypeLiteral) -> DbAlertTypeLiteral:
+    val = str(raw or "").strip().lower()
+    valid = (
+        "seasonal_closure",
+        "road_closure",
+        "park_closure",
+        "bushfire",
+        "flood",
+        "hazard_warning",
+        "private_gate",
+    )
+    if val in valid:
+        return val  # type: ignore[return-value]
+    if "seasonal" in val:
+        return "seasonal_closure"
+    if ("park" in val or "reserve" in val or "camp" in val or "trail" in val) and "clos" in val:
+        return "park_closure"
+    if ("road" in val or "track" in val or "highway" in val or "bridge" in val) and "clos" in val:
+        return "road_closure"
+    if "fire" in val or "burn" in val or "smoke" in val or "bushfire" in val:
+        return "bushfire"
+    if "flood" in val or "water" in val or "cyclone" in val or "river" in val:
+        return "flood"
+    if "gate" in val or "private" in val:
+        return "private_gate"
+    if "clos" in val:
+        return "road_closure"
+    return default
+
+
+def normalize_db_severity(raw: Any, default: DbSeverityLiteral) -> DbSeverityLiteral:
+    val = str(raw or "").strip().lower()
+    if val in ("info", "advisory", "watch_and_act", "closed", "emergency"):
+        return val  # type: ignore[return-value]
+    if "emergency" in val or "evacuate" in val or val == "critical":
+        return "emergency"
+    if ("watch" in val and "act" in val) or "severe" in val:
+        return "watch_and_act"
+    if "extreme" in val:
+        return "emergency"
+    if "clos" in val:
+        return "closed"
+    if (
+        "advic" in val
+        or "advis" in val
+        or "warn" in val
+        or "caution" in val
+        or "moderate" in val
+        or "alert" in val
+    ):
+        return "advisory"
+    if "minor" in val or "info" in val or "community" in val:
+        return "info"
+    return default
+
+
+_HTML_TAG_RE: Final[re.Pattern[str]] = re.compile(r"<[^>]+>")
+_WS_COLLAPSE_RE: Final[re.Pattern[str]] = re.compile(r"\s+")
+
+
+def strip_html(raw: str) -> str:
+    """Decode HTML entities and strip markup into normalized whitespace text."""
+    unescaped = html.unescape(raw)
+    cleaned = _HTML_TAG_RE.sub(" ", unescaped)
+    return _WS_COLLAPSE_RE.sub(" ", cleaned).strip()
+
+
+class BaseHttpFeedAdapter:
+    """Shared HTTP fetch + offline fixture support for official AU feed adapters."""
+
+    feed_source: FeedSourceLiteral
+
+    def __init__(
+        self,
+        *,
+        source_url: str | None = None,
+        timeout_s: float = 20.0,
+        client: httpx.Client | None = None,
+        fixture_items: Sequence[Mapping[str, Any]] | None = None,
+        fixture_payload: Mapping[str, Any] | str | None = None,
+    ) -> None:
+        meta = ALL_FEED_REGISTRY[self.feed_source]
+        self.display_name = meta.display_name
+        self.agency = meta.agency
+        self.state = meta.state
+        self.source_url = source_url or meta.resolve_url()
+        self.sync_interval_s = meta.sync_interval_s
+        self.stale_after_s = meta.stale_after_s
+        self.timeout_s = timeout_s
+        self._client = client
+        self._fixture_items = list(fixture_items) if fixture_items is not None else None
+        if isinstance(fixture_payload, Mapping):
+            self._fixture_payload: dict[str, Any] | str | None = dict(fixture_payload)
+        else:
+            self._fixture_payload = fixture_payload
+
+    def _http_get(self, url: str | None = None) -> httpx.Response:
+        target = url or self.source_url
+        owns_client = self._client is None
+        http = (
+            self._client
+            if self._client is not None
+            else httpx.Client(
+                timeout=httpx.Timeout(self.timeout_s, connect=min(8.0, self.timeout_s)),
+                follow_redirects=True,
+                headers={"User-Agent": USER_AGENT},
+            )
+        )
+        try:
+            resp = http.get(target, headers={"User-Agent": USER_AGENT})
+            resp.raise_for_status()
+            return resp
+        finally:
+            if owns_client:
+                http.close()
+
+    def _fetch_json(self) -> Any:
+        return self._http_get().json()
 
 
 def map_db_to_api_severity(db_severity: str) -> ApiSeverityLiteral:
@@ -187,7 +601,7 @@ def map_alert_to_closure_type(
     raw_payload: dict[str, Any] | None = None,
     capad_park_id: int | None = None,
 ) -> ApiClosureTypeLiteral:
-    """Map DB ``alert_type`` + feed context to the locked Slice 04 API ``closure_type``."""
+    """Map DB ``alert_type`` + feed context to the locked API ``closure_type``."""
     payload = raw_payload or {}
     explicit = payload.get("closure_type")
     if explicit in (
@@ -211,7 +625,11 @@ def map_alert_to_closure_type(
         if payload.get("has_gate_barrier") or "gate" in title.lower():
             return "locked_gate"
         return "private_access"
-    if at == "hazard_warning" and (source_feed == "nsw_npws" or capad_park_id is not None):
+    if at == "hazard_warning" and (
+        source_feed in _PARK_ALERT_FEEDS
+        or capad_park_id is not None
+        or bool(payload.get("park_alert"))
+    ):
         return "park_alert"
     return "incident"
 
@@ -258,7 +676,7 @@ class NormalizedClosure(BaseModel):
 
 @runtime_checkable
 class FeedAdapter(Protocol):
-    """Pluggable feed connector protocol for VIC/NSW agency feeds and OSM access propagation."""
+    """Pluggable feed connector protocol for Australian agency feeds and OSM access propagation."""
 
     feed_source: FeedSourceLiteral
     display_name: str

@@ -1,4 +1,4 @@
-"""REST API for live VIC & NSW closures, incident alerts, GeoJSON overlays, and feed status."""
+"""REST API for Pan-Australia closures, incident alerts, GeoJSON overlays, and feed status."""
 
 from __future__ import annotations
 
@@ -70,19 +70,29 @@ class ClosureSyncRequest(BaseModel):
     )
     feeds: list[str] | None = Field(
         default=None,
-        description="Optional subset of feed names to sync.",
+        description="Optional subset of feed names or aliases to sync.",
+    )
+    states: list[str] | None = Field(
+        default=None,
+        description=(
+            "Optional list of Australian state codes (or ['ALL']) to sync; "
+            "defaults to TRAILFORGE_ENABLED_STATES."
+        ),
     )
 
 
 @router.get("")
 def get_closures(
     active_only: bool = Query(default=True),
-    state: str | None = Query(default=None),
+    state: str | None = Query(
+        default=None,
+        description="Optional AU state code or comma-separated list (e.g. QLD or VIC,NSW,QLD).",
+    ),
     severity: str | None = Query(default=None),
     feed_source: str | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """List normalized VIC/NSW closures, emergency incidents, park alerts, and OSM gates."""
+    """List normalized Australian closures, emergency incidents, park alerts, and OSM gates."""
     try:
         return list_closures(
             db,
@@ -100,17 +110,36 @@ def get_closures(
 @router.get("/geojson")
 def get_closures_feature_collection(
     active_only: bool = Query(default=True),
-    state: str | None = Query(default=None),
+    state: str | None = Query(
+        default=None,
+        description="Optional AU state code or comma-separated list (e.g. QLD or VIC,NSW,QLD).",
+    ),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Return RFC 7946 FeatureCollection of affected track segments & alert geometries."""
-    return get_closures_geojson(db, active_only=active_only, state=state)
+    try:
+        return get_closures_geojson(db, active_only=active_only, state=state)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
 
 
 @router.get("/status")
-def get_closures_status(db: Session = Depends(get_db)) -> dict[str, Any]:
-    """Return live feed sync health and staleness indicators for all configured feeds."""
-    return get_feed_health_summary(db)
+def get_closures_status(
+    state: str | None = Query(
+        default=None,
+        description="Optional AU state code, comma-separated list, or ALL.",
+    ),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Return live feed sync health and staleness indicators for configured AU feeds."""
+    try:
+        return get_feed_health_summary(db, state=state)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
 
 
 @router.post("/sync", response_model=SyncRunSummary)
@@ -123,9 +152,9 @@ def trigger_closures_sync(
     try:
         if req.use_fixtures:
             fpath = _resolve_confined_fixtures_path(req.fixtures_path)
-            return sync_from_fixtures(db, fpath, only_feeds=req.feeds)
+            return sync_from_fixtures(db, fpath, only_feeds=req.feeds, states=req.states)
 
-        adapters = build_default_adapters(only_feeds=req.feeds)
+        adapters = build_default_adapters(only_feeds=req.feeds, states=req.states)
         return sync_configured_feeds(db, adapters=adapters)
     except ValueError as exc:
         raise HTTPException(

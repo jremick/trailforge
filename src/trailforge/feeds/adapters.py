@@ -1,12 +1,13 @@
-"""Concrete VIC & NSW closure, incident, park-alert, and OSM access feed adapters (Slice 04).
+"""Concrete Pan-Australia closure, incident, park-alert, and OSM access feed adapters.
 
+Preserves the 5 v1 VIC/NSW/OSM adapters 100% intact and registers all 6 additional Australian
+state & territory adapters (ACT, TAS, QLD, WA, SA, NT) in ``ADAPTER_REGISTRY``.
 All HTTP adapters accept an injectable ``httpx.Client`` and optional offline fixture payloads so
-CI tests run 100% offline while live production runs talk directly to official VIC/NSW feeds.
+CI tests run 100% offline while live production runs talk directly to official AU agency feeds.
 """
 
 from __future__ import annotations
 
-import html
 import json
 import logging
 import re
@@ -17,24 +18,48 @@ from pathlib import Path
 from typing import Any, Final
 
 import httpx
-from shapely.geometry import GeometryCollection, mapping, shape
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from trailforge.db.models import POI, Track, TrackSegment
+from trailforge.feeds.adapters_au import (
+    ACTESAAlertsAdapter,
+    EmergencyWAAdapter,
+    NTFireParksAdapter,
+    QLDParksAlertsAdapter,
+    SAAlertAdapter,
+    TasAlertAdapter,
+)
 from trailforge.feeds.base import (
+    ALL_FEED_REGISTRY,
     FEED_REGISTRY,
-    ClosureStatusLiteral,
-    DbAlertTypeLiteral,
+    BaseHttpFeedAdapter,
     DbSeverityLiteral,
     FeedSourceLiteral,
     NormalizedClosure,
-    StateLiteral,
+    get_feeds_for_states,
+    normalize_alert_type,
+    normalize_db_severity,
+    normalize_geojson_geometry,
+    normalize_state,
+    normalize_status,
     parse_iso_datetime,
+    resolve_enabled_states,
+    resolve_feed_source,
+    strip_html,
 )
 from trailforge.ingestion.connectors.base import USER_AGENT, prop_ci
 
 logger = logging.getLogger(__name__)
+
+# Backward-compatible internal helper aliases
+_normalize_geojson_geometry = normalize_geojson_geometry
+_normalize_state = normalize_state
+_normalize_status = normalize_status
+_normalize_alert_type = normalize_alert_type
+_normalize_db_severity = normalize_db_severity
+_strip_html = strip_html
+_BaseHttpFeedAdapter = BaseHttpFeedAdapter
 
 _RELEVANT_VIC_CATEGORIES: Final[tuple[str, ...]] = (
     "fire",
@@ -48,131 +73,6 @@ _RELEVANT_VIC_CATEGORIES: Final[tuple[str, ...]] = (
     "hazard",
     "closure",
 )
-
-
-def _normalize_geojson_geometry(raw_geom: Any) -> dict[str, Any] | None:
-    """Validate/normalize GeoJSON geometry; unwrap GeometryCollection to its best polygon/line."""
-    if not isinstance(raw_geom, Mapping) or "type" not in raw_geom:
-        return None
-    try:
-        shp = shape(raw_geom)
-    except Exception:
-        return None
-    if shp.is_empty:
-        return None
-    if isinstance(shp, GeometryCollection):
-        # Prefer Polygon/MultiPolygon > LineString > Point inside NSW RFS GeometryCollections
-        for wanted in ("MultiPolygon", "Polygon", "MultiLineString", "LineString", "Point"):
-            for part in shp.geoms:
-                if part.geom_type == wanted and not part.is_empty:
-                    return dict(mapping(part))
-        return None
-    return dict(mapping(shp))
-
-
-def _normalize_state(raw: Any, default: StateLiteral) -> StateLiteral:
-    val = str(raw or "").strip().upper()
-    if val in ("VIC", "NSW", "ACT"):
-        return val  # type: ignore[return-value]
-    return default
-
-
-def _normalize_status(raw: Any, default: ClosureStatusLiteral = "active") -> ClosureStatusLiteral:
-    val = str(raw or "").strip().lower()
-    if val in ("active", "scheduled", "cleared", "stale"):
-        return val  # type: ignore[return-value]
-    if val in ("safe", "under control", "closed_incident", "resolved"):
-        return "cleared"
-    return default
-
-
-def _normalize_alert_type(raw: Any, default: DbAlertTypeLiteral) -> DbAlertTypeLiteral:
-    val = str(raw or "").strip().lower()
-    valid = (
-        "seasonal_closure",
-        "road_closure",
-        "park_closure",
-        "bushfire",
-        "flood",
-        "hazard_warning",
-        "private_gate",
-    )
-    if val in valid:
-        return val  # type: ignore[return-value]
-    if "seasonal" in val:
-        return "seasonal_closure"
-    if "park" in val and "clos" in val:
-        return "park_closure"
-    if "road" in val and "clos" in val:
-        return "road_closure"
-    if "fire" in val or "burn" in val:
-        return "bushfire"
-    if "flood" in val or "water" in val:
-        return "flood"
-    if "gate" in val or "private" in val:
-        return "private_gate"
-    return default
-
-
-def _normalize_db_severity(raw: Any, default: DbSeverityLiteral) -> DbSeverityLiteral:
-    val = str(raw or "").strip().lower()
-    if val in ("info", "advisory", "watch_and_act", "closed", "emergency"):
-        return val  # type: ignore[return-value]
-    if "emergency" in val or "evacuate" in val or val == "critical":
-        return "emergency"
-    if "watch" in val and "act" in val:
-        return "watch_and_act"
-    if "clos" in val:
-        return "closed"
-    if "advic" in val or "advis" in val or "warn" in val or "caution" in val:
-        return "advisory"
-    return default
-
-
-class _BaseHttpFeedAdapter:
-    """Shared HTTP fetch + offline fixture support for official VIC/NSW feed adapters."""
-
-    feed_source: FeedSourceLiteral
-
-    def __init__(
-        self,
-        *,
-        source_url: str | None = None,
-        timeout_s: float = 20.0,
-        client: httpx.Client | None = None,
-        fixture_items: Sequence[Mapping[str, Any]] | None = None,
-        fixture_payload: Mapping[str, Any] | None = None,
-    ) -> None:
-        meta = FEED_REGISTRY[self.feed_source]
-        self.display_name = meta.display_name
-        self.agency = meta.agency
-        self.state = meta.state
-        self.source_url = source_url or meta.resolve_url()
-        self.sync_interval_s = meta.sync_interval_s
-        self.stale_after_s = meta.stale_after_s
-        self.timeout_s = timeout_s
-        self._client = client
-        self._fixture_items = list(fixture_items) if fixture_items is not None else None
-        self._fixture_payload = dict(fixture_payload) if fixture_payload is not None else None
-
-    def _fetch_json(self) -> Any:
-        owns_client = self._client is None
-        http = (
-            self._client
-            if self._client is not None
-            else httpx.Client(
-                timeout=httpx.Timeout(self.timeout_s, connect=min(8.0, self.timeout_s)),
-                follow_redirects=True,
-                headers={"User-Agent": USER_AGENT},
-            )
-        )
-        try:
-            resp = http.get(self.source_url, headers={"User-Agent": USER_AGENT})
-            resp.raise_for_status()
-            return resp.json()
-        finally:
-            if owns_client:
-                http.close()
 
 
 class VicSeasonalClosuresAdapter(_BaseHttpFeedAdapter):
@@ -429,14 +329,6 @@ class NSWRFSAdapter(_BaseHttpFeedAdapter):
 _HTML_STRONG_RE: Final[re.Pattern[str]] = re.compile(
     r"<strong[^>]*>(.*?)</strong>", re.IGNORECASE | re.DOTALL
 )
-_HTML_TAG_RE: Final[re.Pattern[str]] = re.compile(r"<[^>]+>")
-_WS_COLLAPSE_RE: Final[re.Pattern[str]] = re.compile(r"\s+")
-
-
-def _strip_html(raw: str) -> str:
-    unescaped = html.unescape(raw)
-    cleaned = _HTML_TAG_RE.sub(" ", unescaped)
-    return _WS_COLLAPSE_RE.sub(" ", cleaned).strip()
 
 
 class NSWNPWSAdapter(_BaseHttpFeedAdapter):
@@ -752,62 +644,80 @@ class OSMAccessAdapter:
         return out
 
 
+# Full Pan-Australia adapter registry (5 core VIC/NSW/OSM + 6 ACT/TAS/QLD/WA/SA/NT)
+ADAPTER_REGISTRY: Final[dict[FeedSourceLiteral, type[Any]]] = {
+    "vic_mapshare_seasonal": VicSeasonalClosuresAdapter,
+    "vic_emergency": VicEmergencyAdapter,
+    "nsw_rfs": NSWRFSAdapter,
+    "nsw_npws": NSWNPWSAdapter,
+    "osm_access": OSMAccessAdapter,
+    "act_esa": ACTESAAlertsAdapter,
+    "tas_alert": TasAlertAdapter,
+    "qld_des_alerts": QLDParksAlertsAdapter,
+    "wa_emergency": EmergencyWAAdapter,
+    "sa_cfs_parks": SAAlertAdapter,
+    "nt_securent": NTFireParksAdapter,
+}
+
+
 def build_default_adapters(
     *,
     client: httpx.Client | None = None,
     fixtures_path: Path | str | None = None,
     only_feeds: Sequence[str] | None = None,
+    states: str | Sequence[str] | None = None,
+    include_osm: bool = True,
 ) -> list[Any]:
-    """Instantiate the 5 Slice 04 feed adapters (offline fixture-backed or live HTTP)."""
+    """Instantiate configured closure feed adapters (offline fixture-backed or live HTTP).
+
+    Selection precedence:
+    1. ``only_feeds`` (explicit feed names/aliases from any of the 11 registered adapters)
+    2. ``states`` (explicit AU state codes or ``"ALL"``)
+    3. ``TRAILFORGE_ENABLED_STATES`` env var / settings (defaults to ``"VIC,NSW"`` -> 5 core feeds)
+    """
     fixture_feeds: dict[str, list[Mapping[str, Any]]] | None = None
     if fixtures_path is not None:
         raw = json.loads(Path(fixtures_path).read_text(encoding="utf-8"))
         fixture_feeds = dict(raw.get("feeds") or {})
 
-    selected: set[str] | None = None
     if only_feeds:
-        from trailforge.feeds.base import resolve_feed_source
-
-        selected = {resolve_feed_source(name) for name in only_feeds}
+        selected_keys = [resolve_feed_source(name) for name in only_feeds]
+        selected_set = set(selected_keys)
+        ordered_keys = [k for k in ALL_FEED_REGISTRY if k in selected_set]
+    else:
+        enabled_states = resolve_enabled_states(states)
+        ordered_keys = list(get_feeds_for_states(enabled_states, include_national=include_osm))
 
     adapters: list[Any] = []
-    if selected is None or "vic_mapshare_seasonal" in selected:
-        adapters.append(
-            VicSeasonalClosuresAdapter(
-                client=client,
-                fixture_items=fixture_feeds.get("vic_mapshare_seasonal", [])
-                if fixture_feeds is not None
-                else None,
+    for feed_key in ordered_keys:
+        adapter_cls = ADAPTER_REGISTRY[feed_key]
+        if feed_key == "osm_access":
+            adapters.append(adapter_cls())
+        else:
+            adapters.append(
+                adapter_cls(
+                    client=client,
+                    fixture_items=fixture_feeds.get(feed_key, [])
+                    if fixture_feeds is not None
+                    else None,
+                )
             )
-        )
-    if selected is None or "vic_emergency" in selected:
-        adapters.append(
-            VicEmergencyAdapter(
-                client=client,
-                fixture_items=fixture_feeds.get("vic_emergency", [])
-                if fixture_feeds is not None
-                else None,
-            )
-        )
-    if selected is None or "nsw_rfs" in selected:
-        adapters.append(
-            NSWRFSAdapter(
-                client=client,
-                fixture_items=fixture_feeds.get("nsw_rfs", [])
-                if fixture_feeds is not None
-                else None,
-            )
-        )
-    if selected is None or "nsw_npws" in selected:
-        adapters.append(
-            NSWNPWSAdapter(
-                client=client,
-                fixture_items=fixture_feeds.get("nsw_npws", [])
-                if fixture_feeds is not None
-                else None,
-            )
-        )
-    if selected is None or "osm_access" in selected:
-        adapters.append(OSMAccessAdapter())
 
     return adapters
+
+
+__all__ = [
+    "ACTESAAlertsAdapter",
+    "ADAPTER_REGISTRY",
+    "EmergencyWAAdapter",
+    "NSWNPWSAdapter",
+    "NSWRFSAdapter",
+    "NTFireParksAdapter",
+    "OSMAccessAdapter",
+    "QLDParksAlertsAdapter",
+    "SAAlertAdapter",
+    "TasAlertAdapter",
+    "VicEmergencyAdapter",
+    "VicSeasonalClosuresAdapter",
+    "build_default_adapters",
+]

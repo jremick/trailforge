@@ -1,10 +1,11 @@
-"""Outage-resilient closure feed sync engine and spatial segment propagation (Slice 04)."""
+"""Outage-resilient Pan-Australia closure feed sync engine and spatial segment propagation."""
 
 from __future__ import annotations
 
 import json
 import logging
 import math
+import re
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -43,6 +44,12 @@ POINT_INCIDENT_BUFFER_M: float = 500.0
 GATE_POINT_BUFFER_M: float = 60.0
 
 _TO_ALBERS = Transformer.from_crs("EPSG:4326", "EPSG:3577", always_xy=True)
+
+_PARK_SUFFIX_RE = re.compile(
+    r"\s+(?:National Park|Conservation Park|Nature Reserve|State Forest|State Reserve|"
+    r"Regional Park|Wilderness Area|Recreation Park|Conservation Reserve|Resources Reserve)$",
+    re.IGNORECASE,
+)
 
 
 def _to_albers(geom: LineString | MultiLineString) -> LineString | MultiLineString:
@@ -147,15 +154,26 @@ def _get_or_create_sync_status(session: Session, adapter: FeedAdapter) -> FeedSy
 
 
 def _resolve_capad_park_id(session: Session, item: NormalizedClosure) -> int | None:
-    """Resolve matching CAPAD 2025 park ID by exact/substring name or spatial intersection."""
+    """Resolve matching CAPAD protected-area ID by exact/fuzzy name or spatial intersection."""
     if item.park_name:
         cleaned = item.park_name.strip()
+        # 1. Exact state-scoped name match
+        exact_state = session.execute(
+            select(CAPADPark.id)
+            .where(func.lower(CAPADPark.name) == cleaned.lower(), CAPADPark.state == item.state)
+            .limit(1)
+        ).scalar_one_or_none()
+        if exact_state is not None:
+            return int(exact_state)
+
+        # 2. Exact cross-state name match (e.g. border parks)
         exact = session.execute(
             select(CAPADPark.id).where(func.lower(CAPADPark.name) == cleaned.lower()).limit(1)
         ).scalar_one_or_none()
         if exact is not None:
             return int(exact)
 
+        # 3. Substring match within the alert's state
         fuzzy = session.execute(
             select(CAPADPark.id)
             .where(CAPADPark.name.ilike(f"%{cleaned}%"), CAPADPark.state == item.state)
@@ -163,6 +181,17 @@ def _resolve_capad_park_id(session: Session, item: NormalizedClosure) -> int | N
         ).scalar_one_or_none()
         if fuzzy is not None:
             return int(fuzzy)
+
+        # 4. Suffix-stripped match (e.g. "Daintree National Park" -> CAPAD "Daintree")
+        stem = _PARK_SUFFIX_RE.sub("", cleaned).strip()
+        if stem and stem.lower() != cleaned.lower():
+            stem_hit = session.execute(
+                select(CAPADPark.id)
+                .where(CAPADPark.name.ilike(f"%{stem}%"), CAPADPark.state == item.state)
+                .limit(1)
+            ).scalar_one_or_none()
+            if stem_hit is not None:
+                return int(stem_hit)
 
     if item.geometry is not None and item.alert_type == "park_closure":
         geom_wkb = from_shape(shape(item.geometry), srid=4326)
@@ -205,8 +234,12 @@ def _propagate_segment_links(
         for seg_id in existing_ids:
             links[seg_id] = ("osm_access_flag", 0.0)
 
-    # 2. CAPAD Park tenure join (e.g., NSW NPWS park alerts without narrower geometry)
-    if alert.capad_park_id is not None and item.geometry is None:
+    # 2. CAPAD Park tenure join (park alerts without narrower geometry, or park-wide Point closures)
+    use_capad_join = alert.capad_park_id is not None and (
+        item.geometry is None
+        or (item.alert_type == "park_closure" and item.geometry.get("type") == "Point")
+    )
+    if use_capad_join and alert.capad_park_id is not None:
         park_seg_ids = session.execute(
             select(TrackSegment.segment_id)
             .join(CAPADPark, CAPADPark.id == alert.capad_park_id)
@@ -424,12 +457,15 @@ def sync_configured_feeds(
     session: Session,
     *,
     adapters: Sequence[FeedAdapter] | None = None,
+    states: str | Sequence[str] | None = None,
     now: datetime | None = None,
     commit: bool = True,
 ) -> SyncRunSummary:
-    """Run sync across all provided (or default configured) feed adapters."""
+    """Run sync across all provided (or state-scoped configured) feed adapters."""
     ts = now or datetime.now(UTC)
-    active_adapters = list(adapters) if adapters is not None else build_default_adapters()
+    active_adapters = (
+        list(adapters) if adapters is not None else build_default_adapters(states=states)
+    )
     results = [sync_feed(session, adapter, now=ts, commit=commit) for adapter in active_adapters]
     return SyncRunSummary(
         synced_at=ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -443,9 +479,14 @@ def sync_from_fixtures(
     fixtures_path: Path | str,
     *,
     only_feeds: Sequence[str] | None = None,
+    states: str | Sequence[str] | None = None,
     now: datetime | None = None,
     commit: bool = True,
 ) -> SyncRunSummary:
-    """Sync all VIC/NSW closure feeds + OSM access flags offline from ``closures_sample.json``."""
-    adapters = build_default_adapters(fixtures_path=fixtures_path, only_feeds=only_feeds)
+    """Sync configured AU closure feeds + OSM access flags offline from a fixture payload."""
+    adapters = build_default_adapters(
+        fixtures_path=fixtures_path,
+        only_feeds=only_feeds,
+        states=states,
+    )
     return sync_configured_feeds(session, adapters=adapters, now=now, commit=commit)

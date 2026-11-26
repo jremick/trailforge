@@ -1,8 +1,9 @@
-"""CLI entry point for syncing VIC & NSW closures, incidents, park alerts, and OSM gates.
+"""CLI entry point for syncing Pan-Australia closures, incidents, park alerts, and OSM gates.
 
 Examples:
     python -m trailforge.feeds.cli --fixtures tests/fixtures/closures_sample.json
-    python -m trailforge.feeds.cli --live
+    python -m trailforge.feeds.cli --states ALL --fixtures tests/fixtures/closures_sample.json
+    python -m trailforge.feeds.cli --states QLD,TAS --live
 """
 
 from __future__ import annotations
@@ -22,7 +23,10 @@ from trailforge.feeds.sync import sync_configured_feeds, sync_from_fixtures
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m trailforge.feeds.cli",
-        description="Sync official VIC/NSW closure & emergency feeds plus OSM gate/access flags.",
+        description=(
+            "Sync official Australian state/territory closure & emergency feeds "
+            "plus OSM gate/access flags."
+        ),
     )
     parser.add_argument(
         "--fixtures",
@@ -33,13 +37,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--live",
         action="store_true",
-        help="Fetch live upstream VIC/NSW agency feeds instead of offline fixtures.",
+        help="Fetch live upstream official Australian agency feeds instead of offline fixtures.",
+    )
+    parser.add_argument(
+        "--states",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated AU state codes (VIC,NSW,ACT,TAS,QLD,WA,SA,NT) or ALL "
+            "(defaults to TRAILFORGE_ENABLED_STATES / VIC,NSW)."
+        ),
     )
     parser.add_argument(
         "--feeds",
         type=str,
         default=None,
-        help="Optional comma-separated subset of feed names to sync.",
+        help="Optional comma-separated subset of feed names or aliases to sync.",
     )
     parser.add_argument(
         "--database-url",
@@ -60,14 +73,17 @@ def main(argv: list[str] | None = None) -> int:
     only_feeds = (
         [f.strip() for f in args.feeds.split(",") if f.strip()] if args.feeds else None
     )
+    states = args.states.strip() if args.states and args.states.strip() else None
 
     engine = get_engine(args.database_url)
     try:
         with Session(engine) as session:
             if args.fixtures is not None:
-                summary = sync_from_fixtures(session, args.fixtures, only_feeds=only_feeds)
+                summary = sync_from_fixtures(
+                    session, args.fixtures, only_feeds=only_feeds, states=states
+                )
             else:
-                adapters = build_default_adapters(only_feeds=only_feeds)
+                adapters = build_default_adapters(only_feeds=only_feeds, states=states)
                 summary = sync_configured_feeds(session, adapters=adapters)
     finally:
         engine.dispose()

@@ -1,4 +1,4 @@
-"""Read/query helpers for closures, GeoJSON overlays, feed staleness, and track enrichment."""
+"""Read/query helpers for Pan-Australia closures, GeoJSON overlays, feed staleness, and tracks."""
 
 from __future__ import annotations
 
@@ -19,13 +19,18 @@ from trailforge.db.models import (
     TrackSegment,
 )
 from trailforge.feeds.base import (
-    FEED_REGISTRY,
+    ALL_AU_STATES,
+    ALL_FEED_REGISTRY,
     ApiClosureTypeLiteral,
     ApiSeverityLiteral,
+    FeedSourceLiteral,
     TrackClosureStatusLiteral,
     compute_feed_is_stale,
+    get_feeds_for_states,
     map_alert_to_closure_type,
     map_db_to_api_severity,
+    parse_state_filter,
+    resolve_enabled_states,
     resolve_feed_source,
 )
 
@@ -60,16 +65,16 @@ def _closure_to_track_status(
     return "info"
 
 
-def get_feed_health_summary(
-    session: Session, *, now: datetime | None = None
-) -> dict[str, Any]:
-    """Return feed status and staleness summary for ``GET /api/closures/status``."""
-    current = now or datetime.now(UTC)
+def _build_feeds_health_rows(
+    session: Session,
+    feed_keys: Sequence[FeedSourceLiteral],
+    *,
+    now: datetime,
+) -> tuple[str, list[dict[str, Any]]]:
     rows = {
         row.feed_name: row
         for row in session.execute(select(FeedSyncStatus)).scalars().all()
     }
-
     counts_by_feed = {
         feed: int(cnt)
         for feed, cnt in session.execute(
@@ -83,9 +88,10 @@ def get_feed_health_summary(
     any_degraded = False
     any_stale = False
 
-    for feed_source, meta in FEED_REGISTRY.items():
+    for feed_source in feed_keys:
+        meta = ALL_FEED_REGISTRY[feed_source]
         row = rows.get(feed_source)
-        is_stale = compute_feed_is_stale(row, now=current)
+        is_stale = compute_feed_is_stale(row, now=now)
         status_str = row.last_status if row is not None else "never_run"
         if status_str in ("failed", "degraded"):
             any_degraded = True
@@ -115,8 +121,43 @@ def get_feed_health_summary(
         overall = "stale"
     else:
         overall = "healthy"
+    return overall, feeds_payload
 
-    return {"overall_status": overall, "feeds": feeds_payload}
+
+def get_feed_health_summary(
+    session: Session,
+    *,
+    state: str | Sequence[str] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Return feed status, staleness, and available/enabled AU states for ``/api/closures/status``.
+
+    When ``state`` is omitted, scopes to ``TRAILFORGE_ENABLED_STATES`` (default ``VIC,NSW`` +
+    ``osm_access`` = 5 core feeds) so default homelab status stays lean and Slice 04 compatible.
+    When ``state`` is provided (e.g. ``"QLD"``, ``"VIC,NSW,QLD"``, or ``"ALL"``), returns health
+    metadata strictly matching those state(s) across all 11 Pan-Australia feeds.
+    """
+    current = now or datetime.now(UTC)
+    enabled_states = resolve_enabled_states()
+    requested_states = parse_state_filter(state)
+
+    if requested_states:
+        include_national = set(requested_states) == set(ALL_AU_STATES)
+        feed_keys = get_feeds_for_states(requested_states, include_national=include_national)
+    else:
+        feed_keys = get_feeds_for_states(enabled_states, include_national=True)
+
+    overall, feeds_payload = _build_feeds_health_rows(session, feed_keys, now=current)
+
+    payload: dict[str, Any] = {
+        "overall_status": overall,
+        "available_states": list(ALL_AU_STATES),
+        "enabled_states": list(enabled_states),
+        "feeds": feeds_payload,
+    }
+    if requested_states:
+        payload["filtered_states"] = list(requested_states)
+    return payload
 
 
 def _stale_map_by_feed(
@@ -129,7 +170,7 @@ def _stale_map_by_feed(
     }
     return {
         feed_source: compute_feed_is_stale(rows.get(feed_source), now=current)
-        for feed_source in FEED_REGISTRY
+        for feed_source in ALL_FEED_REGISTRY
     }
 
 
@@ -137,15 +178,23 @@ def list_closures(
     session: Session,
     *,
     active_only: bool = True,
-    state: str | None = None,
+    state: str | Sequence[str] | None = None,
     severity: str | None = None,
     feed_source: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Return normalized closure list + feed health metadata for ``GET /api/closures``."""
     current = now or datetime.now(UTC)
-    health = get_feed_health_summary(session, now=current)
-    stale_by_feed = {f["feed_source"]: bool(f["is_stale"]) for f in health["feeds"]}
+    enabled_states = resolve_enabled_states()
+    requested_states = parse_state_filter(state)
+
+    # Always compute staleness across all 11 Pan-AU feeds so every alert gets exact is_stale
+    stale_by_feed = _stale_map_by_feed(session, now=current)
+
+    # Include feeds for enabled states PLUS any explicitly requested extra state(s)
+    feed_states = tuple(dict.fromkeys([*enabled_states, *requested_states]))
+    feed_keys = get_feeds_for_states(feed_states, include_national=True)
+    _, feeds_payload = _build_feeds_health_rows(session, feed_keys, now=current)
 
     stmt = (
         select(
@@ -158,8 +207,8 @@ def list_closures(
     )
     if active_only:
         stmt = stmt.where(ClosureAlert.status != "cleared")
-    if state:
-        stmt = stmt.where(ClosureAlert.state == state.strip().upper())
+    if requested_states and set(requested_states) != set(ALL_AU_STATES):
+        stmt = stmt.where(ClosureAlert.state.in_(requested_states))
     if feed_source:
         resolved = resolve_feed_source(feed_source)
         stmt = stmt.where(ClosureAlert.source_feed == resolved)
@@ -193,7 +242,7 @@ def list_closures(
         if sev_filter and sev_filter not in (api_sev, alert.severity.lower()):
             continue
 
-        meta = FEED_REGISTRY.get(alert.source_feed)  # type: ignore[arg-type]
+        meta = ALL_FEED_REGISTRY.get(alert.source_feed)  # type: ignore[arg-type]
         closure_type = map_alert_to_closure_type(
             alert.alert_type,
             source_feed=alert.source_feed,
@@ -228,18 +277,27 @@ def list_closures(
             }
         )
 
-    return {"items": items, "feeds": health["feeds"]}
+    result: dict[str, Any] = {
+        "items": items,
+        "feeds": feeds_payload,
+        "available_states": list(ALL_AU_STATES),
+        "enabled_states": list(enabled_states),
+    }
+    if requested_states:
+        result["filtered_states"] = list(requested_states)
+    return result
 
 
 def get_closures_geojson(
     session: Session,
     *,
     active_only: bool = True,
-    state: str | None = None,
+    state: str | Sequence[str] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Build RFC 7946 FeatureCollection of affected track segments + incident/gate geometries."""
     current = now or datetime.now(UTC)
+    requested_states = parse_state_filter(state)
     stale_by_feed = _stale_map_by_feed(session, now=current)
     features: list[dict[str, Any]] = []
 
@@ -260,11 +318,11 @@ def get_closures_geojson(
     )
     if active_only:
         seg_stmt = seg_stmt.where(ClosureAlert.status != "cleared")
-    if state:
-        seg_stmt = seg_stmt.where(ClosureAlert.state == state.strip().upper())
+    if requested_states and set(requested_states) != set(ALL_AU_STATES):
+        seg_stmt = seg_stmt.where(ClosureAlert.state.in_(requested_states))
 
     for link, alert, seg, track_name, seg_geom_json in session.execute(seg_stmt).all():
-        meta = FEED_REGISTRY.get(alert.source_feed)  # type: ignore[arg-type]
+        meta = ALL_FEED_REGISTRY.get(alert.source_feed)  # type: ignore[arg-type]
         closure_type = map_alert_to_closure_type(
             alert.alert_type,
             source_feed=alert.source_feed,
@@ -285,6 +343,7 @@ def get_closures_geojson(
                     "closure_type": closure_type,
                     "severity": api_sev,
                     "status": alert.status,
+                    "state": alert.state,
                     "title": alert.title,
                     "description": alert.description,
                     "agency": meta.agency if meta else alert.source_feed,
@@ -310,14 +369,14 @@ def get_closures_geojson(
     )
     if active_only:
         alert_stmt = alert_stmt.where(ClosureAlert.status != "cleared")
-    if state:
-        alert_stmt = alert_stmt.where(ClosureAlert.state == state.strip().upper())
+    if requested_states and set(requested_states) != set(ALL_AU_STATES):
+        alert_stmt = alert_stmt.where(ClosureAlert.state.in_(requested_states))
 
     for alert, geom_json in session.execute(alert_stmt).all():
         geom_obj = json.loads(geom_json)
         if geom_obj.get("type") not in ("Point", "Polygon", "MultiPolygon"):
             continue
-        meta = FEED_REGISTRY.get(alert.source_feed)  # type: ignore[arg-type]
+        meta = ALL_FEED_REGISTRY.get(alert.source_feed)  # type: ignore[arg-type]
         closure_type = map_alert_to_closure_type(
             alert.alert_type,
             source_feed=alert.source_feed,
@@ -338,6 +397,7 @@ def get_closures_geojson(
                     "closure_type": closure_type,
                     "severity": api_sev,
                     "status": alert.status,
+                    "state": alert.state,
                     "title": alert.title,
                     "description": alert.description,
                     "agency": meta.agency if meta else alert.source_feed,
@@ -399,7 +459,7 @@ def get_closures_for_track_ids(
             continue
         seen_pairs.add((tid, alert.id))
 
-        meta = FEED_REGISTRY.get(alert.source_feed)  # type: ignore[arg-type]
+        meta = ALL_FEED_REGISTRY.get(alert.source_feed)  # type: ignore[arg-type]
         closure_type = map_alert_to_closure_type(
             alert.alert_type,
             source_feed=alert.source_feed,
