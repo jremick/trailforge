@@ -9,6 +9,7 @@ export type CanonicalGrade = "Easy" | "Medium" | "Hard" | "Extreme";
 export type LayerKey =
   | "tracks"
   | "steepHighlights"
+  | "closures"
   | "contoursHillshade"
   | "snowLine"
   | "parksWaterways"
@@ -17,6 +18,7 @@ export type LayerKey =
 export interface LayerVisibilityState {
   tracks: boolean;
   steepHighlights: boolean;
+  closures: boolean;
   contoursHillshade: boolean;
   snowLine: boolean;
   snowLineElevationM: number;
@@ -117,6 +119,188 @@ export interface TileManifestResponse {
 
 export type TileMode = "loading" | "pmtiles" | "geojson-fallback" | "offline";
 
+/* ---------- Slice 04 Closures & Agency Feed Types ---------- */
+
+export type ClosureType =
+  | "closed"
+  | "seasonal"
+  | "incident"
+  | "park_alert"
+  | "locked_gate"
+  | "private_access"
+  | string;
+
+export type ClosureSeverity = "critical" | "warning" | "info" | string;
+
+export type TrackClosureStatus =
+  | "open"
+  | "info"
+  | "warning"
+  | "seasonal"
+  | "gated"
+  | "closed"
+  | string;
+
+export interface ClosureItem {
+  closure_id?: number | string;
+  id?: number | string;
+  feed_source?: string | null;
+  agency?: string | null;
+  external_id?: string | null;
+  title: string;
+  description?: string | null;
+  closure_type: ClosureType;
+  severity: ClosureSeverity;
+  status?: string | null;
+  state?: string | null;
+  effective_from?: string | null;
+  effective_to?: string | null;
+  source_url?: string | null;
+  last_updated_at?: string | null;
+  is_stale?: boolean;
+  affected_segment_ids?: string[];
+  affected_track_ids?: string[];
+  capad_park_name?: string | null;
+  geometry?: unknown;
+}
+
+export interface FeedStatusItem {
+  feed_source: string;
+  display_name?: string | null;
+  state?: string | null;
+  status: string;
+  last_attempt_at?: string | null;
+  last_success_at?: string | null;
+  consecutive_failures?: number;
+  record_count?: number;
+  is_stale: boolean;
+  last_error?: string | null;
+  source_url?: string | null;
+}
+
+export interface ClosuresStatusResponse {
+  overall_status: "healthy" | "degraded" | "stale" | string;
+  feeds: FeedStatusItem[];
+}
+
+export interface ClosuresListResponse {
+  items: ClosureItem[];
+  feeds?: FeedStatusItem[];
+}
+
+/* ---------- Slice 05 Auth, Vehicle Profiles, Favorites & Pins ---------- */
+
+export type VehicleCapabilityClass =
+  | "AWD"
+  | "Stock 4WD"
+  | "Touring 4WD"
+  | "Modified 4WD";
+
+export type DrivetrainType = "awd" | "4wd_part_time" | "4wd_full_time";
+
+export type TireClassType = "HT" | "AT" | "MT";
+
+export type PinCategory =
+  | "waypoint"
+  | "camp"
+  | "hazard"
+  | "photo"
+  | "water"
+  | "recovery";
+
+export interface TrackSuitability {
+  vehicle_class: VehicleCapabilityClass | string;
+  vehicle_name?: string | null;
+  rating: string;
+  reason?: string | null;
+  warnings?: string[];
+}
+
+export interface AuthUser {
+  id: string;
+  email: string;
+  display_name: string;
+  active_vehicle_profile_id?: string | null;
+}
+
+export interface AuthMeResponse {
+  authenticated: boolean;
+  user: AuthUser | null;
+}
+
+export interface AuthTokenResponse {
+  user: AuthUser;
+  access_token: string;
+}
+
+export interface VehicleProfileInput {
+  name: string;
+  drivetrain: DrivetrainType;
+  low_range: boolean;
+  lift_mm: number;
+  clearance_mm: number;
+  tire_class: TireClassType;
+  front_locker: boolean;
+  rear_locker: boolean;
+  has_winch: boolean;
+  has_snorkel: boolean;
+  is_active?: boolean;
+}
+
+export interface VehicleProfileItem {
+  id: string;
+  name: string;
+  drivetrain: DrivetrainType;
+  low_range?: boolean;
+  has_low_range?: boolean;
+  lift_mm: number;
+  clearance_mm?: number;
+  ground_clearance_mm?: number;
+  tire_class: TireClassType;
+  front_locker: boolean;
+  rear_locker: boolean;
+  has_winch: boolean;
+  has_snorkel: boolean;
+  capability_class: VehicleCapabilityClass;
+  classification_reasons?: string[];
+  is_active?: boolean;
+  is_default?: boolean;
+}
+
+export interface UserFavoriteItem {
+  id?: number;
+  track_id: string;
+  track_name?: string | null;
+  name?: string | null;
+  grade?: string | null;
+  state?: string | null;
+  total_length_m?: number | null;
+  notes?: string | null;
+  created_at?: string | null;
+}
+
+export interface UserPinInput {
+  name: string;
+  category: PinCategory;
+  notes?: string | null;
+  lon: number;
+  lat: number;
+  track_id?: string | null;
+}
+
+export interface UserPinItem {
+  id: string;
+  name?: string;
+  title?: string;
+  category: PinCategory;
+  notes?: string | null;
+  lon: number;
+  lat: number;
+  elev_m?: number | null;
+  track_id?: string | null;
+  created_at?: string | null;
+}
+
 /* ---------- Slice 03 Track Inspector & Search Types ---------- */
 
 export interface ParkTenureItem {
@@ -167,6 +351,7 @@ export interface BaselineBreakdown {
   reasons?: string[];
   dem_tier?: string | null;
   worst_segment_id?: string | null;
+  hardest_segment_id?: string | null;
   segment_grade_counts?: Record<string, number>;
 }
 
@@ -266,6 +451,9 @@ export interface TrackInspectorDetail {
   is_4wd_only?: boolean;
   has_gate_barrier?: boolean;
   access_status?: string;
+  closure_status?: TrackClosureStatus | null;
+  active_closures?: ClosureItem[];
+  suitability?: TrackSuitability | null;
   bbox?: BBoxTuple | null;
   baseline_breakdown?: BaselineBreakdown | null;
   elevation_profile?: ElevationProfilePoint[];

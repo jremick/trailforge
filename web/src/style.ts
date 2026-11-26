@@ -23,7 +23,9 @@ import type {
   LayerVisibilityState,
   PoiItem,
   TileManifestResponse,
+  UserPinItem,
 } from "./types";
+import { getPinCategoryColor } from "./vehicleHelpers";
 
 export const EMPTY_FEATURE_COLLECTION: FeatureCollection = {
   type: "FeatureCollection",
@@ -92,6 +94,67 @@ export function buildGradeColorExpression(): ExpressionSpecification {
     "#EF4444",
     "#94A3B8",
   ];
+}
+
+/**
+ * Color expression for Slice 04 closures, incidents, seasonal restrictions, and locked gates.
+ */
+export function buildClosureColorExpression(): ExpressionSpecification {
+  return [
+    "case",
+    [
+      "in",
+      ["downcase", ["coalesce", ["get", "closure_type"], ""]],
+      ["literal", ["closed", "road_closure", "park_closure", "incident", "bushfire", "flood"]],
+    ],
+    "#EF4444",
+    [
+      "in",
+      ["downcase", ["coalesce", ["get", "severity"], ""]],
+      ["literal", ["critical", "emergency", "closed"]],
+    ],
+    "#EF4444",
+    [
+      "in",
+      ["downcase", ["coalesce", ["get", "closure_type"], ""]],
+      ["literal", ["seasonal", "seasonal_closure", "locked_gate", "private_gate", "private_access"]],
+    ],
+    "#F59E0B",
+    [
+      "in",
+      ["downcase", ["coalesce", ["get", "severity"], ""]],
+      ["literal", ["warning", "watch_and_act"]],
+    ],
+    "#F59E0B",
+    "#38BDF8",
+  ];
+}
+
+/**
+ * Convert signed-in user personal pins into a GeoJSON FeatureCollection for MapLibre rendering.
+ */
+export function userPinsToGeoJson(
+  pins: readonly UserPinItem[]
+): FeatureCollection<Point> {
+  return {
+    type: "FeatureCollection",
+    features: pins
+      .filter((p) => Number.isFinite(p.lon) && Number.isFinite(p.lat))
+      .map((p) => ({
+        type: "Feature",
+        properties: {
+          id: p.id,
+          name: p.name ?? p.title ?? "Pin",
+          category: p.category,
+          notes: p.notes ?? null,
+          color: getPinCategoryColor(p.category),
+        },
+        geometry: {
+          type: "Point",
+          coordinates: [p.lon, p.lat],
+        },
+      })),
+  };
 }
 
 /**
@@ -343,6 +406,14 @@ export function buildTrailForgeStyle(
       data: EMPTY_FEATURE_COLLECTION,
     },
     "tf-pois": {
+      type: "geojson",
+      data: EMPTY_FEATURE_COLLECTION,
+    },
+    "tf-closures": {
+      type: "geojson",
+      data: EMPTY_FEATURE_COLLECTION,
+    },
+    "tf-user-pins": {
       type: "geojson",
       data: EMPTY_FEATURE_COLLECTION,
     },
@@ -888,6 +959,107 @@ export function buildTrailForgeStyle(
       }
     );
   }
+
+  const closureColor = buildClosureColorExpression();
+
+  // Slice 04 Live Closures, Seasonal Restrictions, Incidents & Gates hazard overlays
+  styleLayers.push(
+    {
+      id: "tf-closures-polygon-fill",
+      type: "fill",
+      source: "tf-closures",
+      filter: ["==", ["geometry-type"], "Polygon"],
+      layout: { visibility: vis(layers.closures) },
+      paint: {
+        "fill-color": closureColor,
+        "fill-opacity": 0.18,
+      },
+    },
+    {
+      id: "tf-closures-polygon-outline",
+      type: "line",
+      source: "tf-closures",
+      filter: ["==", ["geometry-type"], "Polygon"],
+      layout: { visibility: vis(layers.closures) },
+      paint: {
+        "line-color": closureColor,
+        "line-width": 2.2,
+        "line-dasharray": [4, 2],
+        "line-opacity": 0.92,
+      },
+    },
+    {
+      id: "tf-closures-line-casing",
+      type: "line",
+      source: "tf-closures",
+      filter: ["==", ["geometry-type"], "LineString"],
+      layout: {
+        visibility: vis(layers.closures),
+        "line-cap": "round",
+        "line-join": "round",
+      },
+      paint: {
+        "line-color": "#090F14",
+        "line-width": 8.2,
+        "line-opacity": 0.84,
+      },
+    },
+    {
+      id: "tf-closures-line",
+      type: "line",
+      source: "tf-closures",
+      filter: ["==", ["geometry-type"], "LineString"],
+      layout: {
+        visibility: vis(layers.closures),
+        "line-cap": "butt",
+        "line-join": "round",
+      },
+      paint: {
+        "line-color": closureColor,
+        "line-width": 4.8,
+        "line-dasharray": [2.2, 1.6],
+        "line-opacity": 0.98,
+      },
+    },
+    {
+      id: "tf-closures-points",
+      type: "circle",
+      source: "tf-closures",
+      filter: ["==", ["geometry-type"], "Point"],
+      layout: { visibility: vis(layers.closures) },
+      paint: {
+        "circle-radius": 7.5,
+        "circle-color": closureColor,
+        "circle-stroke-color": "#F8FAFC",
+        "circle-stroke-width": 2,
+      },
+    }
+  );
+
+  // Slice 05 Personal User Pins (always visible when signed in)
+  styleLayers.push(
+    {
+      id: "tf-user-pins-halo",
+      type: "circle",
+      source: "tf-user-pins",
+      paint: {
+        "circle-radius": 11,
+        "circle-color": ["coalesce", ["get", "color"], "#EC4899"],
+        "circle-opacity": 0.24,
+      },
+    },
+    {
+      id: "tf-user-pins-dot",
+      type: "circle",
+      source: "tf-user-pins",
+      paint: {
+        "circle-radius": 6,
+        "circle-color": ["coalesce", ["get", "color"], "#EC4899"],
+        "circle-stroke-color": "#FFFFFF",
+        "circle-stroke-width": 2,
+      },
+    }
+  );
 
   // Coordinate / MGRS / POI search target pin (always on top)
   styleLayers.push(

@@ -12,6 +12,7 @@ import {
   buildTrailForgeStyle,
   poisToGeoJson,
   toPmtilesUrl,
+  userPinsToGeoJson,
 } from "./style";
 import type { TileManifestResponse } from "./types";
 
@@ -120,6 +121,38 @@ describe("MapLibre 5 PMTiles & offline fallback style builder", () => {
     expect(byId.get("tf-pois-icons")).toMatchObject({
       source: "tf-vector",
       "source-layer": "pois",
+    });
+    // Slice 04 closure hazard & Slice 05 personal pin layers mounted
+    expect(byId.get("tf-closures-line")).toMatchObject({
+      source: "tf-closures",
+      layout: { visibility: "visible" },
+    });
+    expect(byId.get("tf-closures-polygon-fill")).toMatchObject({
+      source: "tf-closures",
+      layout: { visibility: "visible" },
+    });
+    expect(byId.get("tf-user-pins-dot")).toMatchObject({
+      source: "tf-user-pins",
+    });
+  });
+
+  it("converts Slice 05 personal user pins into category-colored GeoJSON", () => {
+    const fc = userPinsToGeoJson([
+      {
+        id: "pin-1",
+        name: "Murray Crossing Camp",
+        category: "camp",
+        notes: "Flat riverside clearing",
+        lon: 148.121,
+        lat: -36.565,
+      },
+    ]);
+    expect(fc.features).toHaveLength(1);
+    expect(fc.features[0]?.properties).toMatchObject({
+      id: "pin-1",
+      name: "Murray Crossing Camp",
+      category: "camp",
+      color: "#22C55E",
     });
   });
 

@@ -1,4 +1,11 @@
 import {
+  formatClosureDateRange,
+  formatClosureTypeLabel,
+  formatRelativeTimestamp,
+  getClosureStatusBadge,
+  getClosureTone,
+} from "../closuresHelpers";
+import {
   buildElevationProfileSvg,
   formatBreakdownFactors,
   formatOverrideLabel,
@@ -9,19 +16,45 @@ import {
   getGradeColor,
   resolvePoiIconName,
 } from "../presets";
-import type { BBoxTuple, PoiItem, TrackInspectorDetail } from "../types";
+import type {
+  BBoxTuple,
+  PoiItem,
+  TrackInspectorDetail,
+  VehicleCapabilityClass,
+} from "../types";
+import {
+  computeClientSuitability,
+  getSuitabilityTone,
+} from "../vehicleHelpers";
+
+export interface TrackInspectorContext {
+  snowLineElevationM: number;
+  activeVehicleClass: VehicleCapabilityClass;
+  activeVehicleName: string | null;
+  isFavorite: boolean;
+  isAuthenticated: boolean;
+}
 
 export interface TrackInspectorCallbacks {
   onClose: () => void;
   onZoomToTrack: (bbox: BBoxTuple) => void;
   onPoiSelect: (poi: PoiItem) => void;
+  onOpenRigPanel: () => void;
+  onToggleFavorite: (trackId: string, currentlyFavorite: boolean) => void;
+  onExportTrack: (trackId: string, format: "gpx" | "geojson") => void;
 }
 
 export class TrackInspectorDrawer {
   private readonly root: HTMLElement;
   private readonly callbacks: TrackInspectorCallbacks;
   private currentDetail: TrackInspectorDetail | null = null;
-  private currentSnowLineM = 1000;
+  private context: TrackInspectorContext = {
+    snowLineElevationM: 1000,
+    activeVehicleClass: "Stock 4WD",
+    activeVehicleName: null,
+    isFavorite: false,
+    isAuthenticated: false,
+  };
   private isOpen = false;
 
   constructor(container: HTMLElement, callbacks: TrackInspectorCallbacks) {
@@ -37,11 +70,19 @@ export class TrackInspectorDrawer {
     return this.isOpen;
   }
 
-  setSnowLineElevation(elevationM: number): void {
-    this.currentSnowLineM = elevationM;
+  getCurrentTrackId(): string | null {
+    return this.currentDetail?.track_id ?? null;
+  }
+
+  updateContext(patch: Partial<TrackInspectorContext>): void {
+    this.context = { ...this.context, ...patch };
     if (this.isOpen && this.currentDetail) {
       this.renderDetail(this.currentDetail);
     }
+  }
+
+  setSnowLineElevation(elevationM: number): void {
+    this.updateContext({ snowLineElevationM: elevationM });
   }
 
   showLoading(trackLabel?: string): void {
@@ -57,7 +98,7 @@ export class TrackInspectorDrawer {
         <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Track Inspector">×</button>
       </div>
       <div class="tf-inspector-body">
-        <div class="tf-inspector-loading">Fetching canonical segments, elevation profile &amp; grade breakdown…</div>
+        <div class="tf-inspector-loading">Fetching canonical segments, closures, rig suitability &amp; elevation profile…</div>
       </div>
     `;
     this.bindClose();
@@ -82,10 +123,15 @@ export class TrackInspectorDrawer {
     this.bindClose();
   }
 
-  showTrack(detail: TrackInspectorDetail, snowLineElevationM: number): void {
+  showTrack(
+    detail: TrackInspectorDetail,
+    contextPatch?: Partial<TrackInspectorContext>
+  ): void {
     this.isOpen = true;
     this.currentDetail = detail;
-    this.currentSnowLineM = snowLineElevationM;
+    if (contextPatch) {
+      this.context = { ...this.context, ...contextPatch };
+    }
     this.root.setAttribute("aria-hidden", "false");
     this.renderDetail(detail);
   }
@@ -106,7 +152,7 @@ export class TrackInspectorDrawer {
         <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Track Inspector">×</button>
       </div>
       <div class="tf-inspector-body">
-        <p class="tf-inspector-muted">Click any graded track on the map or search by track name to inspect elevation profile, explainable difficulty breakdown, creek crossings, nearby POIs, and CAPAD park tenure.</p>
+        <p class="tf-inspector-muted">Click any graded track on the map or search by track name to inspect elevation profile, closures &amp; alerts, rig suitability, explainable difficulty breakdown, creek crossings, nearby POIs, and CAPAD park tenure.</p>
       </div>
     `;
     this.bindClose();
@@ -119,32 +165,134 @@ export class TrackInspectorDrawer {
     const overrides = norm.breakdown?.overrides ?? [];
     const reasons = norm.breakdown?.reasons ?? [];
     const chart = buildElevationProfileSvg(norm.profile, {
-      snowLineElevationM: this.currentSnowLineM,
+      snowLineElevationM: this.context.snowLineElevationM,
       crossings: norm.crossings,
     });
 
     const aboveSnowline =
-      norm.maxElevM !== null && norm.maxElevM >= this.currentSnowLineM;
+      norm.maxElevM !== null &&
+      norm.maxElevM >= this.context.snowLineElevationM;
     const accessWarning =
       norm.hasGateBarrier ||
       ["private", "restricted", "closed"].includes(
         norm.accessStatus.toLowerCase()
       );
 
+    const closureStatus = detail.closure_status ?? "open";
+    const closureBadge = getClosureStatusBadge(closureStatus);
+    const activeClosures = detail.active_closures ?? [];
+
     const badgesHtml = [
+      closureBadge.tone !== "open"
+        ? `<span class="tf-pill tf-pill-${closureBadge.tone === "critical" ? "red" : closureBadge.tone === "warning" ? "amber" : "ice"}">⚠ ${escapeHtml(closureBadge.label)}</span>`
+        : "",
       `<span class="tf-pill mono">${escapeHtml(norm.state)}</span>`,
       norm.is4wdOnly
         ? `<span class="tf-pill tf-pill-amber">4WD Only</span>`
         : "",
-      accessWarning
+      accessWarning && closureBadge.tone === "open"
         ? `<span class="tf-pill tf-pill-red">${norm.hasGateBarrier ? "Gate / " : ""}${escapeHtml(norm.accessStatus)}</span>`
         : "",
       aboveSnowline
-        ? `<span class="tf-pill tf-pill-ice">Alpine &gt; ${this.currentSnowLineM} m</span>`
+        ? `<span class="tf-pill tf-pill-ice">Alpine &gt; ${this.context.snowLineElevationM} m</span>`
         : "",
     ]
       .filter(Boolean)
       .join("");
+
+    // Slice 05 Personalized Rig Suitability Card (server-authoritative when returned, client fallback offline)
+    const suitability =
+      detail.suitability ??
+      computeClientSuitability(norm.grade, this.context.activeVehicleClass, {
+        vehicleName: this.context.activeVehicleName,
+        closureStatus,
+      });
+    const suitTone = getSuitabilityTone(suitability.rating);
+    const rigSubtitle = suitability.vehicle_name
+      ? `${suitability.vehicle_name} (${suitability.vehicle_class})`
+      : `${suitability.vehicle_class} profile`;
+
+    const suitabilityHtml = `
+      <section class="tf-suitability-card tone-${suitTone}">
+        <div class="tf-suit-head">
+          <div>
+            <div class="tf-suit-kicker">Rig Suitability · ${escapeHtml(rigSubtitle)}</div>
+            <div class="tf-suit-rating">${escapeHtml(suitability.rating)}</div>
+          </div>
+          <button type="button" class="tf-mini-btn" data-role="change-rig">Change Rig</button>
+        </div>
+        ${
+          suitability.reason
+            ? `<div class="tf-suit-reason">${escapeHtml(suitability.reason)}</div>`
+            : ""
+        }
+        ${
+          suitability.warnings && suitability.warnings.length > 0
+            ? `<ul class="tf-suit-warnings">
+                ${suitability.warnings.map((w) => `<li>⚠ ${escapeHtml(w)}</li>`).join("")}
+              </ul>`
+            : ""
+        }
+      </section>
+    `;
+
+    // Slice 04 Official Closures & Access Alerts Panel
+    const closuresPanelHtml =
+      activeClosures.length > 0
+        ? `
+          <section class="tf-insp-section tf-closures-panel">
+            <div class="tf-insp-sec-head">
+              <h3>⚠ Closures &amp; Access Alerts</h3>
+              <span class="mono tf-insp-meta">${activeClosures.length}</span>
+            </div>
+            <div class="tf-card-stack">
+              ${activeClosures
+                .map((c) => {
+                  const tone = getClosureTone(c.closure_type, c.severity);
+                  const typeLabel = formatClosureTypeLabel(c.closure_type);
+                  const dateSpan = formatClosureDateRange(
+                    c.effective_from,
+                    c.effective_to
+                  );
+                  const updatedAgo = formatRelativeTimestamp(c.last_updated_at);
+                  const safeUrl =
+                    c.source_url && /^https?:\/\//i.test(c.source_url)
+                      ? c.source_url
+                      : null;
+                  return `
+                    <div class="tf-closure-card tone-${tone}">
+                      <div class="tf-closure-top">
+                        <span class="tf-closure-type">${escapeHtml(typeLabel)}</span>
+                        ${
+                          c.is_stale
+                            ? `<span class="tf-stale-badge" title="Upstream agency feed had errors; displaying last-known cached closure">STALE CACHE</span>`
+                            : ""
+                        }
+                      </div>
+                      <div class="tf-closure-title">${escapeHtml(c.title)}</div>
+                      ${
+                        c.description
+                          ? `<p class="tf-closure-desc">${escapeHtml(c.description)}</p>`
+                          : ""
+                      }
+                      <div class="tf-closure-meta">
+                        ${c.agency ? `<span>${escapeHtml(c.agency)}</span>` : ""}
+                        ${dateSpan ? `<span>· ${escapeHtml(dateSpan)}</span>` : ""}
+                        ${c.last_updated_at ? `<span>· Updated ${escapeHtml(updatedAgo)}</span>` : ""}
+                      </div>
+                      ${
+                        safeUrl
+                          ? `<a class="tf-closure-link" href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">Official Agency Source ↗</a>`
+                          : ""
+                      }
+                    </div>
+                  `;
+                })
+                .join("")}
+            </div>
+          </section>
+        `
+        : "";
 
     const elevRangeText =
       norm.minElevM !== null && norm.maxElevM !== null
@@ -260,7 +408,12 @@ export class TrackInspectorDrawer {
       norm.parks.length > 0
         ? norm.parks
             .map((pk) => {
-              const meta = [pk.park_type, pk.type_abbr, pk.iucn ? `IUCN ${pk.iucn}` : null, pk.state]
+              const meta = [
+                pk.park_type,
+                pk.type_abbr,
+                pk.iucn ? `IUCN ${pk.iucn}` : null,
+                pk.state,
+              ]
                 .filter(Boolean)
                 .join(" · ");
               return `
@@ -289,6 +442,24 @@ export class TrackInspectorDrawer {
       </div>
 
       <div class="tf-inspector-body">
+        <div class="tf-inspector-actions">
+          <button
+            type="button"
+            class="tf-action-btn ${this.context.isFavorite ? "starred" : ""}"
+            data-role="toggle-fav"
+            title="${this.context.isAuthenticated ? "Toggle saved favorite" : "Sign in to save favorite"}"
+          >${this.context.isFavorite ? "★ Saved" : "☆ Save"}</button>
+          <button type="button" class="tf-action-btn" data-export-track="gpx" title="Download GridForge-compatible GPX 1.1">⬇ GPX</button>
+          <button type="button" class="tf-action-btn" data-export-track="geojson" title="Download GeoJSON FeatureCollection">⬇ GeoJSON</button>
+          ${
+            detail.bbox
+              ? `<button type="button" class="tf-action-btn" data-role="zoom-track">⌖ Zoom</button>`
+              : ""
+          }
+        </div>
+
+        ${closuresPanelHtml}
+
         <div class="tf-grade-hero" style="border-color:${gradeColor}">
           <div class="tf-grade-hero-left">
             <span class="tf-grade-swatch" style="background:${gradeColor}"></span>
@@ -303,13 +474,10 @@ export class TrackInspectorDrawer {
                 ? `<div class="tf-grade-score mono">${Math.round(norm.score)}<span>/100</span></div>`
                 : ""
             }
-            ${
-              detail.bbox
-                ? `<button type="button" class="tf-mini-btn" data-role="zoom-track">⌖ Zoom</button>`
-                : ""
-            }
           </div>
         </div>
+
+        ${suitabilityHtml}
 
         <div class="tf-stat-grid">
           <div class="tf-stat-card">
@@ -398,6 +566,28 @@ export class TrackInspectorDrawer {
     `;
 
     this.bindClose();
+
+    this.root
+      .querySelector<HTMLButtonElement>("[data-role='change-rig']")
+      ?.addEventListener("click", () => this.callbacks.onOpenRigPanel());
+
+    this.root
+      .querySelector<HTMLButtonElement>("[data-role='toggle-fav']")
+      ?.addEventListener("click", () => {
+        this.callbacks.onToggleFavorite(
+          detail.track_id,
+          this.context.isFavorite
+        );
+      });
+
+    this.root
+      .querySelectorAll<HTMLButtonElement>("[data-export-track]")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const fmt = btn.dataset.exportTrack as "gpx" | "geojson";
+          this.callbacks.onExportTrack(detail.track_id, fmt);
+        });
+      });
 
     const zoomBtn = this.root.querySelector<HTMLButtonElement>(
       "[data-role='zoom-track']"

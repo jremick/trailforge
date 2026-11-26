@@ -1,4 +1,8 @@
 import {
+  formatRelativeTimestamp,
+  summarizeFeedStatus,
+} from "../closuresHelpers";
+import {
   DEFAULT_SNOWLINE_BANDS_M,
   DIFFICULTY_META,
   OUTDOOR_POI_ICONS,
@@ -7,6 +11,7 @@ import {
 } from "../presets";
 import type { SwStatus } from "../pwa";
 import type {
+  ClosuresStatusResponse,
   HealthState,
   LayerKey,
   LayerVisibilityState,
@@ -38,6 +43,11 @@ const LAYER_TOGGLES: readonly LayerToggleDef[] = [
     hint: "Highlighted sustained & max gradient hazard pitches",
   },
   {
+    key: "closures",
+    label: "Closures & Gates",
+    hint: "Official VIC/NSW seasonal closures, fire/park alerts & locked gates",
+  },
+  {
     key: "contoursHillshade",
     label: "Contours & Hillshade",
     hint: "20 m minor / 100 m index topo contours + Terrain-RGB shaded relief",
@@ -67,6 +77,9 @@ export class Sidebar {
   private readonly snowValEl: HTMLElement;
   private readonly snowTicksEl: HTMLElement;
   private readonly tileModePillEl: HTMLElement;
+  private readonly feedsSectionEl: HTMLDetailsElement;
+  private readonly feedsPillEl: HTMLElement;
+  private readonly feedsListEl: HTMLElement;
   private readonly regionNameEl: HTMLElement;
   private readonly regionTagEl: HTMLElement;
   private readonly regionDescEl: HTMLElement;
@@ -180,10 +193,24 @@ export class Sidebar {
           </div>
         </details>
 
-        <details class="tf-section" open>
+        <details class="tf-section" data-role="feeds-section">
           <summary class="tf-section-summary">
             <span class="tf-section-title-group">
               <span class="tf-section-index">02</span>
+              <span class="tf-section-title">VIC &amp; NSW Feeds</span>
+            </span>
+            <span class="tf-section-pill mono" data-role="feeds-pill">Checking…</span>
+          </summary>
+
+          <div class="tf-section-body" data-role="feeds-list">
+            <div class="tf-inspector-muted">Loading official agency closure feeds…</div>
+          </div>
+        </details>
+
+        <details class="tf-section" open>
+          <summary class="tf-section-summary">
+            <span class="tf-section-title-group">
+              <span class="tf-section-index">03</span>
               <span class="tf-section-title">Active Corridor</span>
             </span>
             <span class="tf-section-pill mono" data-role="region-tag">${escapeHtml(initialPreset.stateTag)}</span>
@@ -207,7 +234,7 @@ export class Sidebar {
         <details class="tf-section">
           <summary class="tf-section-summary">
             <span class="tf-section-title-group">
-              <span class="tf-section-index">03</span>
+              <span class="tf-section-index">04</span>
               <span class="tf-section-title">Stack &amp; Offline Telemetry</span>
             </span>
             <span class="tf-section-pill">v0.1</span>
@@ -238,6 +265,9 @@ export class Sidebar {
     this.snowValEl = this.q("[data-role='snow-val']");
     this.snowTicksEl = this.q("[data-role='snow-ticks']");
     this.tileModePillEl = this.q("[data-role='tile-mode-pill']");
+    this.feedsSectionEl = this.q<HTMLDetailsElement>("[data-role='feeds-section']");
+    this.feedsPillEl = this.q("[data-role='feeds-pill']");
+    this.feedsListEl = this.q("[data-role='feeds-list']");
     this.regionNameEl = this.q("[data-role='region-name']");
     this.regionTagEl = this.q("[data-role='region-tag']");
     this.regionDescEl = this.q("[data-role='region-desc']");
@@ -275,6 +305,62 @@ export class Sidebar {
     this.q("[data-role='reset-region']").addEventListener("click", () => {
       callbacks.onResetRegion();
     });
+  }
+
+  openFeedsSection(): void {
+    this.feedsSectionEl.open = true;
+    this.feedsSectionEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
+  updateFeedStatus(status: ClosuresStatusResponse | null): void {
+    const summary = summarizeFeedStatus(status);
+    this.feedsPillEl.textContent = summary.label;
+    this.feedsPillEl.classList.toggle(
+      "tf-pill-warn-text",
+      summary.kind === "degraded" || summary.kind === "stale"
+    );
+
+    if (!status || status.feeds.length === 0) {
+      this.feedsListEl.innerHTML = `<div class="tf-inspector-muted">${escapeHtml(summary.tooltip)}</div>`;
+      return;
+    }
+
+    const bannerHtml =
+      summary.kind === "degraded" || summary.kind === "stale"
+        ? `<div class="tf-feed-warn-banner">⚠ ${escapeHtml(summary.tooltip)}</div>`
+        : "";
+
+    this.feedsListEl.innerHTML = `
+      ${bannerHtml}
+      <div class="tf-feed-rows">
+        ${status.feeds
+          .map((feed) => {
+            const name = feed.display_name ?? feed.feed_source;
+            const dotCls =
+              feed.is_stale ||
+              feed.status === "degraded" ||
+              feed.status === "failed"
+                ? "degraded"
+                : feed.status === "ok"
+                  ? "online"
+                  : "connecting";
+            const updated = formatRelativeTimestamp(feed.last_success_at);
+            return `
+              <div class="tf-feed-row" title="${escapeHtml(feed.last_error ?? feed.source_url ?? name)}">
+                <div class="tf-feed-row-head">
+                  <span class="tf-feed-name"><span class="tf-status-dot ${dotCls}"></span>${escapeHtml(name)}</span>
+                  <span class="mono tf-feed-count">${feed.record_count ?? 0}</span>
+                </div>
+                <div class="tf-feed-row-sub">
+                  <span>${escapeHtml(feed.state ?? "AU")} · ${escapeHtml(feed.status)}${feed.is_stale ? " (STALE)" : ""}</span>
+                  <span class="mono">${escapeHtml(updated)}</span>
+                </div>
+              </div>
+            `;
+          })
+          .join("")}
+      </div>
+    `;
   }
 
   setSnowLineBands(bands: readonly number[], currentElevationM: number): void {

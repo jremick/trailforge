@@ -1,6 +1,13 @@
+import { summarizeFeedStatus } from "../closuresHelpers";
 import { REGION_PRESETS, escapeHtml, getGradeColor } from "../presets";
 import { resolveLocalSearch, runUnifiedSearch } from "../search";
-import type { HealthState, RegionPreset, UnifiedSearchItem } from "../types";
+import type {
+  ClosuresStatusResponse,
+  HealthState,
+  RegionPreset,
+  UnifiedSearchItem,
+  VehicleCapabilityClass,
+} from "../types";
 
 export interface TopBarCallbacks {
   onSearchSelect: (item: UnifiedSearchItem) => void;
@@ -8,6 +15,8 @@ export interface TopBarCallbacks {
   onSearchClear: () => void;
   onPresetChange: (presetId: string) => void;
   onHealthClick: () => void;
+  onFeedStatusClick: () => void;
+  onRigAccountClick: () => void;
 }
 
 const SEARCH_DEBOUNCE_MS = 180;
@@ -20,6 +29,11 @@ export class TopBar {
   private readonly searchClearBtn: HTMLButtonElement;
   private readonly searchMenuEl: HTMLElement;
   private readonly presetSelectEl: HTMLSelectElement;
+  private readonly feedPillEl: HTMLButtonElement;
+  private readonly feedDotEl: HTMLElement;
+  private readonly feedTextEl: HTMLElement;
+  private readonly rigBtnEl: HTMLButtonElement;
+  private readonly rigLabelEl: HTMLElement;
   private readonly healthPillEl: HTMLButtonElement;
   private readonly healthDotEl: HTMLElement;
   private readonly healthTextEl: HTMLElement;
@@ -109,6 +123,27 @@ export class TopBar {
 
         <button
           type="button"
+          class="tf-rig-btn"
+          data-role="rig-btn"
+          title="Vehicle Profiles, Rig Suitability, Saved Tracks & Account"
+        >
+          <span class="tf-rig-icon" aria-hidden="true">⚙</span>
+          <span data-role="rig-label">Stock 4WD</span>
+        </button>
+
+        <button
+          type="button"
+          class="tf-health-pill tf-feed-pill"
+          data-role="feed-pill"
+          title="Official VIC & NSW closure feeds status"
+          aria-live="polite"
+        >
+          <span class="tf-status-dot connecting" data-role="feed-dot"></span>
+          <span class="mono" data-role="feed-text">Feeds …</span>
+        </button>
+
+        <button
+          type="button"
           class="tf-health-pill"
           data-role="health-pill"
           title="Backend /api/health status — click to refresh"
@@ -126,6 +161,11 @@ export class TopBar {
     this.searchClearBtn = this.q<HTMLButtonElement>("[data-role='search-clear']");
     this.searchMenuEl = this.q("[data-role='search-menu']");
     this.presetSelectEl = this.q<HTMLSelectElement>("[data-role='preset-select']");
+    this.feedPillEl = this.q<HTMLButtonElement>("[data-role='feed-pill']");
+    this.feedDotEl = this.q("[data-role='feed-dot']");
+    this.feedTextEl = this.q("[data-role='feed-text']");
+    this.rigBtnEl = this.q<HTMLButtonElement>("[data-role='rig-btn']");
+    this.rigLabelEl = this.q("[data-role='rig-label']");
     this.healthPillEl = this.q<HTMLButtonElement>("[data-role='health-pill']");
     this.healthDotEl = this.q("[data-role='health-dot']");
     this.healthTextEl = this.q("[data-role='health-text']");
@@ -142,7 +182,6 @@ export class TopBar {
         this.hideMenu();
         return;
       }
-      // Show instant local coordinate/MGRS/preset preview before debounced remote fetch
       const instant = resolveLocalSearch(q);
       if (instant.length > 0) {
         this.renderMenu(instant, false);
@@ -183,6 +222,14 @@ export class TopBar {
       callbacks.onPresetChange(this.presetSelectEl.value);
     });
 
+    this.feedPillEl.addEventListener("click", () => {
+      callbacks.onFeedStatusClick();
+    });
+
+    this.rigBtnEl.addEventListener("click", () => {
+      callbacks.onRigAccountClick();
+    });
+
     this.healthPillEl.addEventListener("click", () => {
       callbacks.onHealthClick();
     });
@@ -200,6 +247,39 @@ export class TopBar {
 
   setSelectedPreset(presetId: string): void {
     this.presetSelectEl.value = presetId;
+  }
+
+  updateRigSummary(
+    vehicleClass: VehicleCapabilityClass,
+    vehicleName: string | null,
+    userName: string | null,
+    savedCount: number
+  ): void {
+    const rigText = vehicleName ? `${vehicleName}` : vehicleClass;
+    const suffix = savedCount > 0 ? ` · ★${savedCount}` : "";
+    this.rigLabelEl.textContent = `${rigText}${suffix}`;
+    this.rigBtnEl.classList.toggle("signed-in", Boolean(userName));
+    this.rigBtnEl.title = userName
+      ? `Signed in as ${userName} · Active rig: ${vehicleName ?? vehicleClass}`
+      : `Anonymous mode · Rig preview: ${vehicleClass} (click to switch rig or sign in)`;
+  }
+
+  updateFeedStatus(status: ClosuresStatusResponse | null): void {
+    const summary = summarizeFeedStatus(status);
+    this.feedDotEl.className = "tf-status-dot";
+    if (summary.kind === "healthy") {
+      this.feedDotEl.classList.add("online");
+    } else if (summary.kind === "degraded" || summary.kind === "stale") {
+      this.feedDotEl.classList.add("degraded");
+    } else {
+      this.feedDotEl.classList.add("offline");
+    }
+    this.feedTextEl.textContent = summary.label;
+    this.feedPillEl.title = `${summary.tooltip} (click to refresh)`;
+    this.feedPillEl.classList.toggle(
+      "warn",
+      summary.kind === "degraded" || summary.kind === "stale"
+    );
   }
 
   updateHealth(state: HealthState): void {

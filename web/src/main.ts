@@ -1,11 +1,33 @@
 import "./styles.css";
 import {
+  activateVehicle,
+  addFavorite,
+  createPin,
+  createVehicle,
+  deletePin,
+  deleteVehicle,
+  downloadAuthenticatedExport,
+  fetchAuthMe,
+  fetchClosuresGeoJson,
+  fetchClosuresStatus,
+  fetchFavorites,
   fetchHealth,
+  fetchPins,
   fetchPois,
   fetchTileManifest,
   fetchTrackDetail,
   fetchTracksGeoJson,
+  fetchVehicles,
+  loginAccount,
+  logoutAccount,
+  registerAccount,
+  removeFavorite,
+  updateVehicle,
 } from "./api";
+import {
+  RigAccountPanel,
+  type AccountPanelTab,
+} from "./components/accountPanel";
 import { renderAttributionFooter } from "./components/footer";
 import { TrackInspectorDrawer } from "./components/inspector";
 import { Sidebar } from "./components/sidebar";
@@ -26,25 +48,60 @@ import {
 } from "./presets";
 import { registerServiceWorker, subscribeNetworkStatus } from "./pwa";
 import type {
+  AuthUser,
   BasemapId,
   HealthState,
   LayerVisibilityState,
   RegionPreset,
   UnifiedSearchItem,
+  UserFavoriteItem,
+  UserPinItem,
+  VehicleCapabilityClass,
+  VehicleProfileItem,
 } from "./types";
+import {
+  VEHICLE_CLASSES,
+  buildTrackExportUrl,
+  buildUserExportUrl,
+  isVehicleActive,
+} from "./vehicleHelpers";
 
 const HEALTH_POLL_INTERVAL_MS = 15000;
+const CLOSURES_POLL_INTERVAL_MS = 60000;
+const ANON_RIG_STORAGE_KEY = "trailforge.anon_rig_class";
+
+function loadStoredAnonRig(): VehicleCapabilityClass {
+  try {
+    const raw = window.localStorage.getItem(ANON_RIG_STORAGE_KEY);
+    if (raw && (VEHICLE_CLASSES as readonly string[]).includes(raw)) {
+      return raw as VehicleCapabilityClass;
+    }
+  } catch {
+    // Ignore storage errors
+  }
+  return "Stock 4WD";
+}
+
+function saveStoredAnonRig(cls: VehicleCapabilityClass): void {
+  try {
+    window.localStorage.setItem(ANON_RIG_STORAGE_KEY, cls);
+  } catch {
+    // Ignore storage errors
+  }
+}
 
 class TrailForgeApp {
   private readonly shellEl: HTMLElement;
   private readonly topbar: TopBar;
   private readonly sidebar: Sidebar;
   private readonly inspector: TrackInspectorDrawer;
+  private readonly accountPanel: RigAccountPanel;
   private readonly map: TrailForgeMap;
   private readonly collapseBtnEl: HTMLButtonElement;
   private readonly cursorCoordsEl: HTMLElement;
   private readonly cursorMgrsEl: HTMLElement;
   private readonly offlineBannerEl: HTMLElement;
+  private readonly pinDropBannerEl: HTMLElement;
   private readonly toastContainerEl: HTMLElement;
   private readonly basemapButtons: NodeListOf<HTMLButtonElement>;
 
@@ -54,6 +111,15 @@ class TrailForgeApp {
   private layerState: LayerVisibilityState = createInitialLayerState();
   private healthAbort: AbortController | null = null;
   private inspectorAbort: AbortController | null = null;
+
+  // Slice 05 User, Vehicle Profile, Favorites & Pins state
+  private user: AuthUser | null = null;
+  private anonymousRigClass: VehicleCapabilityClass = loadStoredAnonRig();
+  private vehicles: VehicleProfileItem[] = [];
+  private favorites: UserFavoriteItem[] = [];
+  private pins: UserPinItem[] = [];
+  private pinDropActive = false;
+  private pendingPinCoords: { lat: number; lon: number } | null = null;
 
   constructor(root: HTMLElement) {
     const initiallyOnline =
@@ -82,6 +148,7 @@ class TrailForgeApp {
 
           <aside data-role="sidebar"></aside>
           <aside data-role="inspector"></aside>
+          <aside data-role="account-panel"></aside>
 
           <div class="tf-map-toolbar">
             <div class="tf-basemap-switcher" role="group" aria-label="Basemap switcher">
@@ -99,6 +166,10 @@ class TrailForgeApp {
 
           <div class="tf-offline-banner ${initiallyOnline ? "hidden" : ""}" data-role="offline-banner" role="status">
             Offline mode — displaying built-in dark topo graticule &amp; corridor bounds
+          </div>
+
+          <div class="tf-pin-drop-banner hidden" data-role="pin-drop-banner" role="status">
+            ⌖ Pin drop mode active — click anywhere on the map to place a personal pin · Esc to cancel
           </div>
 
           <div class="tf-coord-hud" data-role="coord-hud">
@@ -121,6 +192,7 @@ class TrailForgeApp {
     this.cursorCoordsEl = this.q(root, "[data-role='cursor-coords']");
     this.cursorMgrsEl = this.q(root, "[data-role='cursor-mgrs']");
     this.offlineBannerEl = this.q(root, "[data-role='offline-banner']");
+    this.pinDropBannerEl = this.q(root, "[data-role='pin-drop-banner']");
     this.toastContainerEl = this.q(root, "[data-role='toasts']");
     this.basemapButtons = root.querySelectorAll<HTMLButtonElement>("[data-basemap]");
 
@@ -140,6 +212,20 @@ class TrailForgeApp {
         onSearchClear: () => this.map.clearSearchPin(),
         onPresetChange: (presetId) => this.selectPreset(presetId),
         onHealthClick: () => void this.refreshHealth(true),
+        onFeedStatusClick: () => {
+          if (this.sidebarCollapsed) {
+            this.collapseBtnEl.click();
+          }
+          this.sidebar.openFeedsSection();
+          void this.refreshClosures(true);
+        },
+        onRigAccountClick: () => {
+          if (this.accountPanel.isPanelOpen()) {
+            this.closeAccountPanel();
+          } else {
+            this.openAccountPanel("rig");
+          }
+        },
       }
     );
 
@@ -181,6 +267,136 @@ class TrailForgeApp {
           this.updateCursorReadout(poi.lat, poi.lon);
           this.showToast(`Located ${poi.name}`, "info");
         },
+        onOpenRigPanel: () => {
+          this.openAccountPanel("rig");
+        },
+        onToggleFavorite: (trackId, currentlyFav) => {
+          void this.handleToggleFavorite(trackId, currentlyFav);
+        },
+        onExportTrack: (trackId, fmt) => {
+          void this.handleExportTrack(trackId, fmt);
+        },
+      }
+    );
+
+    this.accountPanel = new RigAccountPanel(
+      this.q(root, "[data-role='account-panel']"),
+      this.buildAccountPanelState(),
+      {
+        onClose: () => this.closeAccountPanel(),
+        onSelectAnonymousRig: (cls) => {
+          this.anonymousRigClass = cls;
+          saveStoredAnonRig(cls);
+          this.syncRigUiState();
+          this.showToast(`Rig suitability preview set to ${cls}`, "info");
+          this.refreshOpenInspectorForRig();
+        },
+        onLogin: async (email, password) => {
+          const res = await loginAccount({ email, password });
+          this.user = res.user;
+          await this.loadSignedInUserData();
+          this.showToast(`Signed in as ${res.user.display_name}`, "success");
+          this.refreshOpenInspectorForRig();
+        },
+        onRegister: async (displayName, email, password) => {
+          const res = await registerAccount({
+            display_name: displayName,
+            email,
+            password,
+          });
+          this.user = res.user;
+          await this.loadSignedInUserData();
+          this.showToast(`Account created for ${res.user.display_name}`, "success");
+          this.refreshOpenInspectorForRig();
+        },
+        onLogout: async () => {
+          await logoutAccount();
+          this.user = null;
+          this.vehicles = [];
+          this.favorites = [];
+          this.pins = [];
+          this.setPinDropMode(false);
+          this.map.setUserPins([]);
+          this.syncRigUiState();
+          this.showToast("Signed out — anonymous browsing active", "info");
+          this.refreshOpenInspectorForRig();
+        },
+        onSaveVehicle: async (payload, editingId) => {
+          if (editingId) {
+            await updateVehicle(editingId, payload);
+            this.showToast(`Updated ${payload.name}`, "success");
+          } else {
+            await createVehicle(payload);
+            this.showToast(`Saved vehicle profile ${payload.name}`, "success");
+          }
+          await this.reloadVehicles();
+          this.refreshOpenInspectorForRig();
+        },
+        onActivateVehicle: async (id) => {
+          const updated = await activateVehicle(id);
+          await this.reloadVehicles();
+          this.showToast(
+            `Active rig: ${updated.name} (${updated.capability_class})`,
+            "success"
+          );
+          this.refreshOpenInspectorForRig();
+        },
+        onDeleteVehicle: async (id) => {
+          await deleteVehicle(id);
+          await this.reloadVehicles();
+          this.showToast("Vehicle profile deleted", "info");
+          this.refreshOpenInspectorForRig();
+        },
+        onOpenFavoriteTrack: (trackId) => {
+          this.closeAccountPanel();
+          void this.openTrackInspector(trackId);
+        },
+        onRemoveFavorite: async (trackId) => {
+          await removeFavorite(trackId);
+          this.favorites = this.favorites.filter((f) => f.track_id !== trackId);
+          this.syncRigUiState();
+          this.showToast("Removed track from favorites", "info");
+        },
+        onTogglePinDropMode: (active) => {
+          this.setPinDropMode(active);
+          if (active) {
+            // Collapse right panel temporarily so user has a wide map view to click
+            this.shellEl.classList.remove("account-open");
+          }
+        },
+        onCreatePin: async (payload) => {
+          const created = await createPin(payload);
+          this.pins = [created, ...this.pins];
+          this.pendingPinCoords = null;
+          this.setPinDropMode(false);
+          this.map.setUserPins(this.pins);
+          this.syncRigUiState();
+          this.showToast(`Dropped pin "${created.name ?? created.title ?? payload.name}"`, "success");
+        },
+        onSelectPin: (pin) => {
+          this.map.flyToCoordinate(
+            pin.lat,
+            pin.lon,
+            pin.name ?? pin.title ?? "Pin",
+            14
+          );
+          this.updateCursorReadout(pin.lat, pin.lon);
+        },
+        onDeletePin: async (id) => {
+          await deletePin(id);
+          this.pins = this.pins.filter((p) => p.id !== id);
+          this.map.setUserPins(this.pins);
+          this.syncRigUiState();
+          this.showToast("Personal pin deleted", "info");
+        },
+        onExportUser: async (fmt) => {
+          const url = buildUserExportUrl(fmt);
+          await downloadAuthenticatedExport(
+            url,
+            `trailforge_saved.${fmt === "gpx" ? "gpx" : "geojson"}`
+          );
+          this.showToast(`Exported saved tracks & pins (${fmt.toUpperCase()})`, "success");
+        },
       }
     );
 
@@ -196,7 +412,17 @@ class TrailForgeApp {
           this.offlineBannerEl.classList.remove("hidden");
         },
         onTrackClick: (trackId) => {
+          this.closeAccountPanel();
           void this.openTrackInspector(trackId);
+        },
+        onPinDropClick: (lat, lon) => {
+          this.pendingPinCoords = { lat, lon };
+          this.setPinDropMode(false);
+          this.openAccountPanel("saved");
+          this.showToast(
+            `Pin location picked (${lat.toFixed(4)}, ${lon.toFixed(4)})`,
+            "info"
+          );
         },
       },
       {
@@ -209,7 +435,85 @@ class TrailForgeApp {
 
     this.bindEvents(root);
     this.sidebar.updateNetworkStatus(initiallyOnline);
+    this.syncRigUiState();
     this.bootstrap();
+  }
+
+  private getActiveRigInfo(): {
+    vehicleClass: VehicleCapabilityClass;
+    vehicleName: string | null;
+  } {
+    if (this.user && this.vehicles.length > 0) {
+      const active =
+        this.vehicles.find((v) => isVehicleActive(v)) ?? this.vehicles[0]!;
+      return {
+        vehicleClass: active.capability_class,
+        vehicleName: active.name,
+      };
+    }
+    return {
+      vehicleClass: this.anonymousRigClass,
+      vehicleName: null,
+    };
+  }
+
+  private buildAccountPanelState() {
+    return {
+      user: this.user,
+      anonymousRigClass: this.anonymousRigClass,
+      vehicles: this.vehicles,
+      favorites: this.favorites,
+      pins: this.pins,
+      pinDropActive: this.pinDropActive,
+      pendingPinCoords: this.pendingPinCoords,
+    };
+  }
+
+  private syncRigUiState(): void {
+    const rig = this.getActiveRigInfo();
+    this.topbar.updateRigSummary(
+      rig.vehicleClass,
+      rig.vehicleName,
+      this.user?.display_name ?? null,
+      this.favorites.length + this.pins.length
+    );
+    this.accountPanel.updateState(this.buildAccountPanelState());
+
+    const openTrackId = this.inspector.getCurrentTrackId();
+    this.inspector.updateContext({
+      snowLineElevationM: this.layerState.snowLineElevationM,
+      activeVehicleClass: rig.vehicleClass,
+      activeVehicleName: rig.vehicleName,
+      isFavorite: Boolean(
+        openTrackId && this.favorites.some((f) => f.track_id === openTrackId)
+      ),
+      isAuthenticated: Boolean(this.user),
+    });
+  }
+
+  private openAccountPanel(tab?: AccountPanelTab): void {
+    if (this.inspector.openState()) {
+      this.inspector.close();
+      this.shellEl.classList.remove("inspector-open");
+    }
+    this.accountPanel.updateState(this.buildAccountPanelState());
+    this.accountPanel.open(tab);
+    this.shellEl.classList.add("account-open");
+  }
+
+  private closeAccountPanel(): void {
+    this.accountPanel.close();
+    this.shellEl.classList.remove("account-open");
+  }
+
+  private setPinDropMode(active: boolean): void {
+    this.pinDropActive = active;
+    if (!active && !this.pendingPinCoords) {
+      // Keep clean state
+    }
+    this.map.setPinDropMode(active);
+    this.pinDropBannerEl.classList.toggle("hidden", !active);
+    this.accountPanel.updateState(this.buildAccountPanelState());
   }
 
   private bindEvents(root: HTMLElement): void {
@@ -254,10 +558,17 @@ class TrailForgeApp {
       if (e.key === "/" && !inInput) {
         e.preventDefault();
         this.topbar.focusSearch();
-      } else if (e.key === "Escape" && this.inspector.openState()) {
-        this.inspector.close();
-        this.shellEl.classList.remove("inspector-open");
-        this.map.setSelectedTrackId(null);
+      } else if (e.key === "Escape") {
+        if (this.pinDropActive) {
+          this.setPinDropMode(false);
+          this.openAccountPanel("saved");
+        } else if (this.accountPanel.isPanelOpen()) {
+          this.closeAccountPanel();
+        } else if (this.inspector.openState()) {
+          this.inspector.close();
+          this.shellEl.classList.remove("inspector-open");
+          this.map.setSelectedTrackId(null);
+        }
       }
     });
 
@@ -271,6 +582,7 @@ class TrailForgeApp {
       } else {
         this.offlineBannerEl.classList.add("hidden");
         void this.refreshHealth(false);
+        void this.refreshClosures(false);
       }
     });
   }
@@ -287,15 +599,81 @@ class TrailForgeApp {
 
     void this.refreshHealth(false);
     void this.loadVectorAndTerrainLayers();
+    void this.refreshClosures(false);
+    void this.hydrateAuthSession();
 
     window.setInterval(
       () => void this.refreshHealth(false),
       HEALTH_POLL_INTERVAL_MS
     );
+    window.setInterval(
+      () => void this.refreshClosures(false),
+      CLOSURES_POLL_INTERVAL_MS
+    );
 
     void registerServiceWorker((status) => {
       this.sidebar.updateSwStatus(status);
     });
+  }
+
+  private async hydrateAuthSession(): Promise<void> {
+    try {
+      const me = await fetchAuthMe();
+      if (me.authenticated && me.user) {
+        this.user = me.user;
+        await this.loadSignedInUserData();
+      } else {
+        this.user = null;
+        this.syncRigUiState();
+      }
+    } catch {
+      // Anonymous browsing works seamlessly even if auth API is unreachable
+      this.syncRigUiState();
+    }
+  }
+
+  private async loadSignedInUserData(): Promise<void> {
+    try {
+      const [vehicles, favorites, pins] = await Promise.all([
+        fetchVehicles().catch(() => []),
+        fetchFavorites().catch(() => []),
+        fetchPins().catch(() => []),
+      ]);
+      this.vehicles = vehicles;
+      this.favorites = favorites;
+      this.pins = pins;
+      this.map.setUserPins(pins);
+    } finally {
+      this.syncRigUiState();
+    }
+  }
+
+  private async reloadVehicles(): Promise<void> {
+    this.vehicles = await fetchVehicles();
+    this.syncRigUiState();
+  }
+
+  private async refreshClosures(announce: boolean): Promise<void> {
+    try {
+      const [status, geojson] = await Promise.all([
+        fetchClosuresStatus(),
+        fetchClosuresGeoJson().catch(() => null),
+      ]);
+      this.topbar.updateFeedStatus(status);
+      this.sidebar.updateFeedStatus(status);
+      if (geojson) {
+        this.map.setClosuresGeoJson(geojson);
+      }
+      if (announce) {
+        this.showToast(
+          `Closure feeds status: ${status.overall_status.toUpperCase()}`,
+          status.overall_status === "healthy" ? "success" : "info"
+        );
+      }
+    } catch {
+      this.topbar.updateFeedStatus(null);
+      this.sidebar.updateFeedStatus(null);
+    }
   }
 
   private async loadVectorAndTerrainLayers(): Promise<void> {
@@ -319,7 +697,6 @@ class TrailForgeApp {
               : "PMTiles (Terrain) + GeoJSON";
         this.sidebar.updateTileMode("pmtiles", modeLabel);
 
-        // If terrain is present but vector PMTiles missing, hydrate tracks/POIs via GeoJSON
         if (!manifest.vector_available) {
           await this.loadGeoJsonFallback();
         }
@@ -348,6 +725,13 @@ class TrailForgeApp {
     }
   }
 
+  private refreshOpenInspectorForRig(): void {
+    const trackId = this.inspector.getCurrentTrackId();
+    if (trackId && this.inspector.openState()) {
+      void this.openTrackInspector(trackId);
+    }
+  }
+
   private async openTrackInspector(
     trackId: string,
     trackLabel?: string
@@ -356,19 +740,79 @@ class TrailForgeApp {
     const controller = new AbortController();
     this.inspectorAbort = controller;
 
+    this.closeAccountPanel();
     this.shellEl.classList.add("inspector-open");
     this.map.setSelectedTrackId(trackId);
     this.inspector.showLoading(trackLabel);
 
+    const rig = this.getActiveRigInfo();
     try {
-      const detail = await fetchTrackDetail(trackId, controller.signal);
+      // Pass explicit vehicle_class when anonymous or signed-in with no saved profile
+      const queryVehicleClass =
+        this.user && this.vehicles.length > 0 ? null : rig.vehicleClass;
+      const detail = await fetchTrackDetail(trackId, {
+        vehicleClass: queryVehicleClass,
+        signal: controller.signal,
+      });
       if (controller.signal.aborted) return;
-      this.inspector.showTrack(detail, this.layerState.snowLineElevationM);
+
+      this.inspector.showTrack(detail, {
+        snowLineElevationM: this.layerState.snowLineElevationM,
+        activeVehicleClass: rig.vehicleClass,
+        activeVehicleName: rig.vehicleName,
+        isFavorite: this.favorites.some((f) => f.track_id === trackId),
+        isAuthenticated: Boolean(this.user),
+      });
     } catch (err) {
       if (controller.signal.aborted) return;
       const msg =
         err instanceof Error ? err.message : "Failed to fetch track details";
       this.inspector.showError(msg);
+    }
+  }
+
+  private async handleToggleFavorite(
+    trackId: string,
+    currentlyFavorite: boolean
+  ): Promise<void> {
+    if (!this.user) {
+      this.showToast("Sign in to save favorite tracks across sessions", "info");
+      this.openAccountPanel("account");
+      return;
+    }
+
+    try {
+      if (currentlyFavorite) {
+        await removeFavorite(trackId);
+        this.favorites = this.favorites.filter((f) => f.track_id !== trackId);
+        this.showToast("Removed track from favorites", "info");
+      } else {
+        const added = await addFavorite(trackId);
+        this.favorites = [added, ...this.favorites];
+        this.showToast("Saved track to favorites", "success");
+      }
+      this.syncRigUiState();
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : "Failed to update favorite";
+      this.showToast(msg, "error");
+    }
+  }
+
+  private async handleExportTrack(
+    trackId: string,
+    format: "gpx" | "geojson"
+  ): Promise<void> {
+    try {
+      const url = buildTrackExportUrl(trackId, format);
+      await downloadAuthenticatedExport(
+        url,
+        `${trackId}.${format === "gpx" ? "gpx" : "geojson"}`
+      );
+      this.showToast(`Downloaded track ${format.toUpperCase()}`, "success");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Export failed";
+      this.showToast(msg, "error");
     }
   }
 
