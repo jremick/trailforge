@@ -20,10 +20,13 @@ from pydantic import (
 )
 from shapely.geometry import Point
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+from trailforge.api.middleware import check_upload_quota
 from trailforge.auth.dependencies import get_current_user, get_optional_current_user
+from trailforge.config import get_settings
 from trailforge.db.models import (
     ConditionReport,
     ConditionReportVote,
@@ -165,6 +168,16 @@ class ConditionReportResponse(BaseModel):
     last_confirmed_at: str | None = None
     expires_at: str | None = None
     user_vote: str | None = None
+
+
+def _enforce_photo_upload_quota(request: Request, current_user: User) -> None:
+    """Enforce daily per-member photo upload quota (skipping admins or when disabled)."""
+    cfg = getattr(getattr(request.app, "state", None), "custom_settings", None) or get_settings()
+    if not cfg.rate_limit_enabled:
+        return
+    if getattr(current_user, "role", "member") == "admin":
+        return
+    check_upload_quota(current_user.id, limit_per_day=cfg.rate_limit_upload_per_day)
 
 
 def _get_user_default_vehicle_class(db: Session, user: User) -> str | None:
@@ -424,10 +437,11 @@ async def create_report(
             db, segment_id=resolved_segment_id, track_id=resolved_track_id
         )
 
-    # Save optional validated photo only after all input/FK validations succeed
+    # Enforce per-user daily photo upload quota & save EXIF-stripped photo after validations pass
     saved_photo_path = None
     photo_url: str | None = None
     if photo_bytes is not None:
+        _enforce_photo_upload_quota(request, user)
         try:
             saved = save_report_photo(photo_bytes)
             saved_photo_path = saved.path
@@ -518,16 +532,33 @@ def vote_on_report(
     if existing_vote is not None:
         existing_vote.vote_type = payload.vote
         existing_vote.created_at = now
+        db.flush()
     else:
-        db.add(
-            ConditionReportVote(
-                report_id=rid,
-                user_id=user.id,
-                vote_type=payload.vote,
-                created_at=now,
-            )
-        )
-    db.flush()
+        try:
+            with db.begin_nested():
+                db.add(
+                    ConditionReportVote(
+                        report_id=rid,
+                        user_id=user.id,
+                        vote_type=payload.vote,
+                        created_at=now,
+                    )
+                )
+                db.flush()
+        except IntegrityError:
+            existing_vote = db.execute(
+                select(ConditionReportVote)
+                .where(
+                    ConditionReportVote.report_id == rid,
+                    ConditionReportVote.user_id == user.id,
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            if existing_vote is None:
+                raise
+            existing_vote.vote_type = payload.vote
+            existing_vote.created_at = now
+            db.flush()
 
     votes = db.execute(
         select(ConditionReportVote.vote_type, ConditionReportVote.created_at).where(

@@ -5,13 +5,14 @@ from __future__ import annotations
 import html
 import os
 import re
+import xml.etree.ElementTree as ET
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Literal, Protocol, runtime_checkable
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from shapely.geometry import GeometryCollection, mapping, shape
 from sqlalchemy.orm import Session
 
@@ -522,6 +523,9 @@ def normalize_db_severity(raw: Any, default: DbSeverityLiteral) -> DbSeverityLit
 
 _HTML_TAG_RE: Final[re.Pattern[str]] = re.compile(r"<[^>]+>")
 _WS_COLLAPSE_RE: Final[re.Pattern[str]] = re.compile(r"\s+")
+_UNSAFE_XML_PATTERN: Final[re.Pattern[str]] = re.compile(r"<!(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
+_SAFE_HTTP_URL_RE: Final[re.Pattern[str]] = re.compile(r"^https?://", re.IGNORECASE)
+MAX_FEED_BODY_BYTES: Final[int] = 10 * 1024 * 1024  # 10 MiB upstream feed response cap
 
 
 def strip_html(raw: str) -> str:
@@ -529,6 +533,28 @@ def strip_html(raw: str) -> str:
     unescaped = html.unescape(raw)
     cleaned = _HTML_TAG_RE.sub(" ", unescaped)
     return _WS_COLLAPSE_RE.sub(" ", cleaned).strip()
+
+
+def parse_safe_xml(xml_text: str) -> ET.Element:
+    """Parse upstream XML feed text while rejecting ``<!DOCTYPE`` / ``<!ENTITY`` declarations."""
+    if _UNSAFE_XML_PATTERN.search(xml_text):
+        raise ValueError("XML DOCTYPE/ENTITY declarations are not permitted in upstream XML feeds")
+    return ET.fromstring(xml_text)
+
+
+def sanitize_source_url(url: Any, *, fallback: str | None = None) -> str | None:
+    """Return the first valid ``http(s)://`` URL (stripping control chars), else ``None``."""
+    for candidate in (url, fallback):
+        if candidate is None:
+            continue
+        cleaned = str(candidate).strip()
+        if not cleaned:
+            continue
+        if any(ch in cleaned for ch in ("\r", "\n", "\x00")):
+            continue
+        if _SAFE_HTTP_URL_RE.match(cleaned):
+            return cleaned
+    return None
 
 
 class BaseHttpFeedAdapter:
@@ -560,7 +586,12 @@ class BaseHttpFeedAdapter:
         else:
             self._fixture_payload = fixture_payload
 
-    def _http_get(self, url: str | None = None) -> httpx.Response:
+    def _http_get(
+        self,
+        url: str | None = None,
+        *,
+        max_bytes: int = MAX_FEED_BODY_BYTES,
+    ) -> httpx.Response:
         target = url or self.source_url
         owns_client = self._client is None
         http = (
@@ -573,8 +604,39 @@ class BaseHttpFeedAdapter:
             )
         )
         try:
+            if hasattr(http, "stream"):
+                with http.stream("GET", target, headers={"User-Agent": USER_AGENT}) as resp:
+                    resp.raise_for_status()
+                    raw_cl = resp.headers.get("content-length")
+                    if raw_cl:
+                        try:
+                            declared = int(raw_cl)
+                        except ValueError:
+                            declared = -1
+                        if declared > max_bytes:
+                            raise ValueError(
+                                f"Upstream feed response exceeds {max_bytes} byte limit"
+                            )
+                    chunks: list[bytes] = []
+                    total_bytes = 0
+                    for chunk in resp.iter_bytes():
+                        total_bytes += len(chunk)
+                        if total_bytes > max_bytes:
+                            raise ValueError(
+                                f"Upstream feed response exceeds {max_bytes} byte limit"
+                            )
+                        chunks.append(chunk)
+                    return httpx.Response(
+                        status_code=resp.status_code,
+                        headers=resp.headers,
+                        content=b"".join(chunks),
+                        request=resp.request,
+                    )
+
             resp = http.get(target, headers={"User-Agent": USER_AGENT})
             resp.raise_for_status()
+            if len(resp.content) > max_bytes:
+                raise ValueError(f"Upstream feed response exceeds {max_bytes} byte limit")
             return resp
         finally:
             if owns_client:
@@ -672,6 +734,11 @@ class NormalizedClosure(BaseModel):
 
     # Optional pre-resolved links (used by osm_access adapter)
     direct_segment_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("source_url", mode="before")
+    @classmethod
+    def _validate_source_url(cls, value: Any) -> str | None:
+        return sanitize_source_url(value)
 
 
 @runtime_checkable

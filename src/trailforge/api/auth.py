@@ -30,6 +30,14 @@ from trailforge.db.session import get_db
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
+# Pre-formatted dummy scrypt hash matching hash_password() parameters (N=16384, r=8, p=1, dklen=32)
+# so login_user always runs full scrypt work even when an email does not exist (closes M-6 oracle).
+_DUMMY_PASSWORD_HASH = (
+    "scrypt$16384$8$1$"
+    "000102030405060708090a0b0c0d0e0f$"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+)
+
 
 class RegisterRequest(BaseModel):
     email: str = Field(..., min_length=5, max_length=254)
@@ -138,15 +146,7 @@ def register_user(
             detail="Registration is closed",
         )
 
-    existing = db.execute(
-        select(User).where(func.lower(User.email) == email).limit(1)
-    ).scalar_one_or_none()
-    if existing is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="An account with this email already exists",
-        )
-
+    # First-admin bootstrap is only allowed when zero admins exist AND email matches admin_email.
     bootstrap_email = get_admin_email()
     is_admin_bootstrap = False
     if bootstrap_email and email == bootstrap_email:
@@ -159,7 +159,10 @@ def register_user(
     assigned_role = "member"
     used_invite_code: str | None = None
     raw_code = normalize_invite_code(payload.invite_code) if payload.invite_code else ""
+    invite: InviteCode | None = None
 
+    # Validate invite code BEFORE checking email uniqueness to prevent unauthenticated
+    # email enumeration in invite_only mode (M-6).
     if is_admin_bootstrap:
         assigned_role = "admin"
     elif mode == "invite_only" and not raw_code:
@@ -201,6 +204,16 @@ def register_user(
                 detail="Invite code has reached its maximum uses",
             )
 
+    existing = db.execute(
+        select(User).where(func.lower(User.email) == email).limit(1)
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An account with this email already exists",
+        )
+
+    if invite is not None:
         updated = db.execute(
             update(InviteCode)
             .where(
@@ -237,7 +250,11 @@ def register_user(
         ) from exc
     db.refresh(user)
 
-    token = create_access_token(str(user.id), user.email)
+    token = create_access_token(
+        str(user.id),
+        user.email,
+        token_version=int(getattr(user, "token_version", 1) or 1),
+    )
     _set_session_cookie(response, token)
     return AuthTokenResponse(user=_to_user_public(db, user), access_token=token)
 
@@ -252,6 +269,7 @@ def login_user(
     try:
         email = normalize_email(payload.email)
     except ValueError as exc:
+        verify_password(payload.password, _DUMMY_PASSWORD_HASH)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
@@ -260,7 +278,14 @@ def login_user(
     user = db.execute(
         select(User).where(func.lower(User.email) == email).limit(1)
     ).scalar_one_or_none()
-    if user is None or not verify_password(payload.password, user.password_hash):
+    if user is None:
+        # Constant-work dummy scrypt verification closes the user-existence timing oracle (M-6)
+        verify_password(payload.password, _DUMMY_PASSWORD_HASH)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+        )
+    if not verify_password(payload.password, user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
@@ -271,14 +296,27 @@ def login_user(
             detail="Account is suspended",
         )
 
-    token = create_access_token(str(user.id), user.email)
+    token = create_access_token(
+        str(user.id),
+        user.email,
+        token_version=int(getattr(user, "token_version", 1) or 1),
+    )
     _set_session_cookie(response, token)
     return AuthTokenResponse(user=_to_user_public(db, user), access_token=token)
 
 
 @router.post("/logout")
-def logout_user(response: Response) -> dict[str, bool]:
-    """Clear the HttpOnly session cookie."""
+def logout_user(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> dict[str, bool]:
+    """Revoke active tokens server-side (incrementing ``token_version``) and clear cookie."""
+    user = resolve_token_user(request, db)
+    if user is not None:
+        user.token_version = int(getattr(user, "token_version", 1) or 1) + 1
+        user.updated_at = datetime.now(UTC)
+        db.commit()
     cfg = get_settings()
     response.delete_cookie(key=cfg.auth_cookie_name, path="/")
     return {"ok": True}

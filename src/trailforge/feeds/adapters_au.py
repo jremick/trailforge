@@ -33,6 +33,8 @@ from trailforge.feeds.base import (
     normalize_state,
     normalize_status,
     parse_iso_datetime,
+    parse_safe_xml,
+    sanitize_source_url,
     strip_html,
 )
 from trailforge.ingestion.connectors.base import prop_ci
@@ -431,8 +433,8 @@ def _parse_rss_or_atom_xml(root: ET.Element, *, default_url: str) -> list[dict[s
 
 
 def _parse_xml_feed(xml_text: str, *, default_url: str) -> list[dict[str, Any]]:
-    """Auto-detect CAP-AU 1.2 XML vs RSS/GeoRSS/Atom XML."""
-    root = ET.fromstring(xml_text)
+    """Auto-detect CAP-AU 1.2 XML vs RSS/GeoRSS/Atom XML (blocking DOCTYPE/ENTITY)."""
+    root = parse_safe_xml(xml_text)
     lname = _xml_local_name(root.tag)
     if lname == "alert" or any(_xml_local_name(n.tag) == "alert" for n in root.iter()):
         cap_items = _parse_cap_au_xml(root, default_url=default_url)
@@ -665,10 +667,10 @@ class _PanAUFeedAdapter(BaseHttpFeedAdapter):
         closure_status = normalize_status(raw_status, default="active")
 
         geom = _extract_geometry_from_props(props, raw_geom=raw_geom)
-        source_url = str(
-            prop_ci(props, "source_url", "url", "link", "web", "more_info", "moreInfo")
-            or self.default_official_url
-        ).strip()
+        source_url = sanitize_source_url(
+            prop_ci(props, "source_url", "url", "link", "web", "more_info", "moreInfo"),
+            fallback=self.default_official_url,
+        )
 
         effective_from = parse_iso_datetime(
             prop_ci(

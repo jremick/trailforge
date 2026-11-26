@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
+import io
 import json
-import struct
 import uuid
-import zlib
 from collections.abc import Generator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,6 +13,7 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from PIL import Image
 from sqlalchemy import Engine, text
 from sqlalchemy.orm import Session
 
@@ -46,34 +46,27 @@ from trailforge.reports.queries import get_reports_for_track, snap_point_to_near
 
 
 def _make_valid_png_bytes() -> bytes:
-    """Build a valid 1x1 RGB PNG image in memory (zero external dependencies)."""
-
-    def _chunk(chunk_type: bytes, data: bytes) -> bytes:
-        crc = zlib.crc32(chunk_type + data) & 0xFFFFFFFF
-        return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", crc)
-
-    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
-    raw_scanline = b"\x00\x34\x88\x55"
-    idat = zlib.compress(raw_scanline)
-    return (
-        b"\x89PNG\r\n\x1a\n"
-        + _chunk(b"IHDR", ihdr)
-        + _chunk(b"IDAT", idat)
-        + _chunk(b"IEND", b"")
-    )
+    """Build a valid 4x4 RGB PNG image in memory using Pillow."""
+    buf = io.BytesIO()
+    with Image.new("RGB", (4, 4), color=(52, 136, 85)) as img:
+        img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def _make_valid_jpeg_bytes() -> bytes:
-    """Build a minimal valid JPEG SOI + APP0 + EOI byte stream."""
-    return (
-        b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
-        b"\xff\xd9"
-    )
+    """Build a valid 4x4 RGB JPEG image in memory using Pillow."""
+    buf = io.BytesIO()
+    with Image.new("RGB", (4, 4), color=(140, 90, 45)) as img:
+        img.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
 
 
 def _make_valid_webp_bytes() -> bytes:
-    """Build a minimal RIFF/WEBP header byte stream."""
-    return b"RIFF\x1a\x00\x00\x00WEBPVP8 \x0e\x00\x00\x00\x30\x01\x00\x9d\x01\x2a\x01\x00\x01\x00"
+    """Build a valid 4x4 RGB WebP image in memory using Pillow."""
+    buf = io.BytesIO()
+    with Image.new("RGB", (4, 4), color=(30, 110, 160)) as img:
+        img.save(buf, format="WEBP", quality=85)
+    return buf.getvalue()
 
 
 def _build_test_app() -> FastAPI:
@@ -258,11 +251,25 @@ def test_photo_magic_bytes_size_limit_and_path_confinement(tmp_path: Path) -> No
     assert saved_png.media_type == "image/png"
     assert saved_png.url == f"/api/reports/photos/{saved_png.filename}"
     resolved, mime = resolve_photo_path(saved_png.filename, uploads_dir=tmp_path)
-    assert resolved.read_bytes() == png_bytes
     assert mime == "image/png"
+    with Image.open(io.BytesIO(resolved.read_bytes())) as clean_png:
+        assert clean_png.format == "PNG"
+        assert clean_png.size == (4, 4)
+        assert not getattr(clean_png, "text", {})
+
+    saved_jpg = save_report_photo(jpg_bytes, uploads_dir=tmp_path)
+    assert saved_jpg.filename.endswith(".jpg")
+    with Image.open(io.BytesIO(saved_jpg.path.read_bytes())) as clean_jpg:
+        assert clean_jpg.format == "JPEG"
+        assert clean_jpg.size == (4, 4)
+        assert len(clean_jpg.getexif()) == 0
 
     saved_webp = save_report_photo(webp_bytes, uploads_dir=tmp_path)
     assert saved_webp.filename.endswith(".webp")
+    with Image.open(io.BytesIO(saved_webp.path.read_bytes())) as clean_webp:
+        assert clean_webp.format == "WEBP"
+        assert clean_webp.size == (4, 4)
+        assert len(clean_webp.getexif()) == 0
 
     # Reject empty, fake non-image, and oversized (> 5 MB)
     with pytest.raises(PhotoValidationError):
@@ -397,8 +404,8 @@ def test_reports_api_end_to_end_photos_voting_decay_snapping_and_privacy(
                 carol_headers = _register_user(
                     client, email=emails[2], display_name="Carol Patrol"
                 )
-                # Clear cookie so Bearer headers govern each user deterministically
-                client.post("/api/auth/logout")
+                # Clear cookie jar without revoking Carol's Bearer token via /logout (M-4)
+                client.cookies.clear()
 
                 veh_resp = client.post(
                     "/api/vehicles",
@@ -534,12 +541,15 @@ def test_reports_api_end_to_end_photos_voting_decay_snapping_and_privacy(
                 assert priv_body["photo_url"].startswith("/api/reports/photos/")
                 assert priv_body["photo_url"].endswith(".png")
 
-                # Fetch uploaded PNG photo safely
+                # Fetch uploaded PNG photo safely (re-encoded & metadata-stripped via Pillow)
                 r_fetch_png = client.get(priv_body["photo_url"])
                 assert r_fetch_png.status_code == 200
-                assert r_fetch_png.content == png_bytes
                 assert r_fetch_png.headers["content-type"] == "image/png"
                 assert r_fetch_png.headers["x-content-type-options"] == "nosniff"
+                with Image.open(io.BytesIO(r_fetch_png.content)) as fetched_png:
+                    assert fetched_png.format == "PNG"
+                    assert fetched_png.size == (4, 4)
+                    assert not getattr(fetched_png, "text", {})
 
                 # Upload valid JPEG photo
                 jpg_bytes = _make_valid_jpeg_bytes()
@@ -560,8 +570,11 @@ def test_reports_api_end_to_end_photos_voting_decay_snapping_and_privacy(
                 assert r_jpg.json()["photo_url"].endswith(".jpg")
                 r_fetch_jpg = client.get(r_jpg.json()["photo_url"])
                 assert r_fetch_jpg.status_code == 200
-                assert r_fetch_jpg.content == jpg_bytes
                 assert r_fetch_jpg.headers["content-type"] == "image/jpeg"
+                with Image.open(io.BytesIO(r_fetch_jpg.content)) as fetched_jpg:
+                    assert fetched_jpg.format == "JPEG"
+                    assert fetched_jpg.size == (4, 4)
+                    assert len(fetched_jpg.getexif()) == 0
 
                 # Reject fake non-image masquerading as PNG -> 422
                 r_fake = client.post(

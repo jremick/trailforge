@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -477,13 +477,25 @@ def get_admin_stats(
 
 @router.get("/users", response_model=AdminUserListResponse)
 def list_admin_users(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     _admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> AdminUserListResponse:
-    """List all registered accounts for admin moderation."""
-    rows = db.execute(select(User).order_by(User.created_at.desc())).scalars().all()
+    """List registered accounts for admin moderation with bounded pagination."""
+    total = int(db.execute(select(func.count(User.id))).scalar_one())
+    rows = (
+        db.execute(
+            select(User)
+            .order_by(User.created_at.desc(), User.id.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+        .scalars()
+        .all()
+    )
     items = [_to_admin_user(u) for u in rows]
-    return AdminUserListResponse(users=items, total=len(items))
+    return AdminUserListResponse(users=items, total=total)
 
 
 @router.patch("/users/{user_id}", response_model=AdminUserItem)
@@ -493,7 +505,7 @@ def update_admin_user(
     _admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> AdminUserItem:
-    """Update a user's role or suspension state while guarding the last active admin."""
+    """Update a user's role or suspension state while atomically guarding the last active admin."""
     target = db.get(User, user_id)
     if target is None:
         raise HTTPException(
@@ -507,26 +519,41 @@ def update_admin_user(
     stays_active_admin = resulting_role == "admin" and bool(resulting_active)
 
     if was_active_admin and not stays_active_admin:
-        active_admins = int(
+        # Lock all active admin rows in canonical ID order to prevent concurrent mutual demotion
+        locked_admin_ids = (
             db.execute(
-                select(func.count(User.id)).where(
-                    User.role == "admin",
-                    User.is_active.is_(True),
-                )
-            ).scalar_one()
+                select(User.id)
+                .where(User.role == "admin", User.is_active.is_(True))
+                .order_by(User.id.asc())
+                .with_for_update()
+            )
+            .scalars()
+            .all()
         )
-        if active_admins <= 1:
+        db.refresh(target)
+        was_active_admin = target.role == "admin" and bool(target.is_active)
+        if was_active_admin and len(locked_admin_ids) <= 1:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Cannot suspend or demote the last active admin",
             )
+    else:
+        db.execute(select(User.id).where(User.id == user_id).with_for_update()).scalar_one_or_none()
+        db.refresh(target)
 
     now = datetime.now(UTC)
+    role_changed = payload.role is not None and payload.role != target.role
+    active_changed = payload.is_active is not None and bool(payload.is_active) != bool(
+        target.is_active
+    )
+
     if payload.role is not None:
         target.role = payload.role
     if payload.is_active is not None:
         target.is_active = payload.is_active
         target.disabled_at = None if payload.is_active else now
+    if role_changed or active_changed:
+        target.token_version = int(getattr(target, "token_version", 1) or 1) + 1
     target.updated_at = now
 
     db.commit()
@@ -536,14 +563,26 @@ def update_admin_user(
 
 @router.get("/invites", response_model=AdminInviteListResponse)
 def list_admin_invites(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     _admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> AdminInviteListResponse:
-    """List all invite codes with computed active/exhausted/expired/revoked status."""
+    """List invite codes with bounded pagination and computed active/exhausted/expired/revoked."""
     now = datetime.now(UTC)
-    rows = db.execute(select(InviteCode).order_by(InviteCode.created_at.desc())).scalars().all()
+    total = int(db.execute(select(func.count(InviteCode.id))).scalar_one())
+    rows = (
+        db.execute(
+            select(InviteCode)
+            .order_by(InviteCode.created_at.desc(), InviteCode.id.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+        .scalars()
+        .all()
+    )
     items = [_to_admin_invite(inv, now=now) for inv in rows]
-    return AdminInviteListResponse(invites=items, total=len(items))
+    return AdminInviteListResponse(invites=items, total=total)
 
 
 @router.post("/invites", response_model=AdminInviteItem, status_code=status.HTTP_201_CREATED)

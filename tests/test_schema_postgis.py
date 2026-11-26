@@ -86,7 +86,7 @@ def test_postgis_health_and_schema_revision(postgis_engine: Engine) -> None:
     assert status.db_ok is True
     assert status.postgis_version is not None
     assert status.postgis_version.startswith("3.")
-    assert status.schema_revision == "0004_public_access_control"
+    assert status.schema_revision == "0005_user_token_version"
 
 
 @pytest.mark.integration
@@ -101,7 +101,7 @@ def test_fastapi_health_against_live_postgis(postgis_engine: Engine) -> None:
     body = resp.json()
     assert body["status"] == "ok"
     assert body["db_ok"] is True
-    assert body["schema_revision"] == "0004_public_access_control"
+    assert body["schema_revision"] == "0005_user_token_version"
 
 
 @pytest.mark.integration

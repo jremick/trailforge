@@ -14,11 +14,14 @@ import re
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Final
 
 from pydantic import BaseModel, Field
 
 from trailforge.matching.protocol import GpsPoint
+
+MAX_TRACE_POINTS: Final[int] = 50_000
+MAX_IMU_SAMPLES: Final[int] = 100_000
 
 _UNSAFE_XML_PATTERN = re.compile(r"<!(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
 
@@ -27,7 +30,7 @@ class ParsedTrace(BaseModel):
     """Validated trace name and chronologically ordered GPS point sequence."""
 
     name: str | None = None
-    points: list[GpsPoint] = Field(..., min_length=2)
+    points: list[GpsPoint] = Field(..., min_length=2, max_length=MAX_TRACE_POINTS)
 
 
 def _local_tag(tag: str) -> str:
@@ -223,6 +226,10 @@ def parse_gpx(raw: bytes | str) -> ParsedTrace:
                 elif t_tag == "trkseg":
                     for pt_el in t_el:
                         if _local_tag(pt_el.tag) == "trkpt":
+                            if len(trkpts) >= MAX_TRACE_POINTS:
+                                raise ValueError(
+                                    f"GPX trace exceeds maximum allowed {MAX_TRACE_POINTS} points"
+                                )
                             trkpts.append(pt_el)
         elif tag == "rte":
             for r_el in child:
@@ -230,11 +237,17 @@ def parse_gpx(raw: bytes | str) -> ParsedTrace:
                 if r_tag == "name" and (r_el.text or "").strip() and rte_name is None:
                     rte_name = (r_el.text or "").strip()
                 elif r_tag == "rtept":
+                    if len(rtepts) >= MAX_TRACE_POINTS:
+                        raise ValueError(
+                            f"GPX trace exceeds maximum allowed {MAX_TRACE_POINTS} points"
+                        )
                     rtepts.append(r_el)
 
     selected_pts = trkpts if trkpts else rtepts
     if len(selected_pts) < 2:
         raise ValueError("GPX trace must contain at least 2 trackpoints (<trkpt> or <rtept>)")
+    if len(selected_pts) > MAX_TRACE_POINTS:
+        raise ValueError(f"GPX trace exceeds maximum allowed {MAX_TRACE_POINTS} points")
 
     raw_entries: list[
         tuple[float, float, datetime | None, float | None, float | None, float | None, float | None]
@@ -308,6 +321,10 @@ def parse_telemetry_json(
             geom = decoded["geometry"]
             if geom.get("type") != "LineString" or not isinstance(geom.get("coordinates"), list):
                 raise ValueError("GeoJSON Feature geometry must be a LineString")
+            if len(geom["coordinates"]) > MAX_TRACE_POINTS:
+                raise ValueError(
+                    f"Telemetry JSON trace exceeds maximum allowed {MAX_TRACE_POINTS} points"
+                )
             point_items = [
                 {
                     "lon": coord[0],
@@ -318,6 +335,10 @@ def parse_telemetry_json(
                 if isinstance(coord, Sequence) and len(coord) >= 2
             ]
         elif decoded.get("type") == "LineString" and isinstance(decoded.get("coordinates"), list):
+            if len(decoded["coordinates"]) > MAX_TRACE_POINTS:
+                raise ValueError(
+                    f"Telemetry JSON trace exceeds maximum allowed {MAX_TRACE_POINTS} points"
+                )
             point_items = [
                 {
                     "lon": coord[0],
@@ -343,6 +364,10 @@ def parse_telemetry_json(
 
     if len(point_items) < 2:
         raise ValueError("Telemetry JSON trace must contain at least 2 points")
+    if len(point_items) > MAX_TRACE_POINTS:
+        raise ValueError(
+            f"Telemetry JSON trace exceeds maximum allowed {MAX_TRACE_POINTS} points"
+        )
 
     raw_entries: list[
         tuple[float, float, datetime | None, float | None, float | None, float | None, float | None]

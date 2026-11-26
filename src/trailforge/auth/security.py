@@ -6,16 +6,70 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
+import os
 import secrets
 import time
-from typing import Any
+from typing import Any, Final
 
 from trailforge.config import Settings, get_settings
+
+logger = logging.getLogger(__name__)
 
 _SCRYPT_N = 16384
 _SCRYPT_R = 8
 _SCRYPT_P = 1
 _SCRYPT_DKLEN = 32
+
+DEV_DEFAULT_AUTH_SECRET: Final[str] = "trailforge-dev-secret-change-in-production"
+DEV_DEFAULT_PRIVACY_SECRET: Final[str] = "trailforge-dev-privacy-secret-change-in-production"
+MIN_PRODUCTION_SECRET_LENGTH: Final[int] = 32
+
+
+def validate_production_secrets(settings: Settings | None = None) -> None:
+    """Fail closed in production when auth or privacy secrets use dev defaults or <32 chars.
+
+    In local development mode, logs a clear warning instead of raising so local Compose
+    and offline tests continue to work smoothly.
+    """
+    cfg = settings or get_settings()
+    is_prod = bool(
+        getattr(cfg, "is_production_mode", False)
+        or getattr(cfg, "auth_cookie_secure", False)
+        or bool((os.environ.get("RAILWAY_ENVIRONMENT") or "").strip())
+        or getattr(cfg, "registration_mode", "open") != "open"
+    )
+
+    auth_key = str(getattr(cfg, "auth_secret_key", "") or "").strip()
+    privacy_key = str(getattr(cfg, "privacy_secret_key", "") or "").strip()
+
+    problems: list[str] = []
+    if auth_key == DEV_DEFAULT_AUTH_SECRET or len(auth_key) < MIN_PRODUCTION_SECRET_LENGTH:
+        problems.append(
+            "AUTH_SECRET_KEY must be set to a unique secret of at least "
+            f"{MIN_PRODUCTION_SECRET_LENGTH} characters (not the development default)"
+        )
+    if (
+        privacy_key == DEV_DEFAULT_PRIVACY_SECRET
+        or len(privacy_key) < MIN_PRODUCTION_SECRET_LENGTH
+    ):
+        problems.append(
+            "TRAILFORGE_PRIVACY_SECRET must be set to a unique secret of at least "
+            f"{MIN_PRODUCTION_SECRET_LENGTH} characters (not the development default)"
+        )
+
+    if not problems:
+        return
+
+    detail = "; ".join(problems)
+    if is_prod:
+        raise RuntimeError(f"Insecure production secret configuration: {detail}")
+
+    logger.warning(
+        "TrailForge is running with insecure development secrets (%s). "
+        "Set strong 32+ character secrets before deploying publicly.",
+        detail,
+    )
 
 
 def normalize_email(email: str) -> str:
@@ -82,6 +136,7 @@ def create_access_token(
     user_id: str,
     email: str,
     *,
+    token_version: int = 1,
     settings: Settings | None = None,
     ttl_seconds: int | None = None,
 ) -> str:
@@ -92,6 +147,7 @@ def create_access_token(
     payload = {
         "sub": str(user_id),
         "email": email,
+        "tv": int(token_version),
         "iat": now,
         "exp": now + ttl,
     }
@@ -135,8 +191,12 @@ def verify_access_token(
         return None
     exp = payload.get("exp")
     sub = payload.get("sub")
-    if not isinstance(exp, int) or not isinstance(sub, str):
+    if isinstance(exp, bool) or not isinstance(exp, int) or not isinstance(sub, str):
         return None
+    if "tv" in payload:
+        tv = payload["tv"]
+        if isinstance(tv, bool) or not isinstance(tv, int):
+            return None
     if int(time.time()) >= exp:
         return None
     return payload

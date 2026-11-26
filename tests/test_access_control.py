@@ -222,6 +222,10 @@ def test_registration_modes_invites_suspension_last_admin_and_admin_gating(
     monkeypatch.setenv("TRAILFORGE_ADMIN_EMAIL", "owner@example.com")
     monkeypatch.setenv("TRAILFORGE_REGISTRATION_MODE", "invite_only")
     monkeypatch.setenv("TRAILFORGE_DEMO_BANNER", "Public preview — invite required to sign up")
+    monkeypatch.setenv("AUTH_SECRET_KEY", "test-access-control-auth-secret-32chars-minimum-01")
+    monkeypatch.setenv(
+        "TRAILFORGE_PRIVACY_SECRET", "test-access-control-privacy-secret-32chars-min-01"
+    )
     get_settings.cache_clear()
 
     try:
@@ -507,7 +511,8 @@ def test_registration_modes_invites_suspension_last_admin_and_admin_gating(
                 )
                 assert r_self_demote.status_code == 400
 
-                # 9. Suspend member -> existing Bearer token, cookie, & login immediately return 403
+                # 9. Suspend member -> token_version bump immediately revokes existing tokens (401)
+                #    and login returns 403 while suspended (M-4)
                 assert client.get("/api/vehicles", headers=m1_headers).status_code == 200
                 r_susp = client.patch(
                     f"/api/admin/users/{m1_id}",
@@ -518,17 +523,17 @@ def test_registration_modes_invites_suspension_last_admin_and_admin_gating(
                 assert r_susp.json()["is_active"] is False
                 assert r_susp.json()["disabled_at"] is not None
 
-                # Existing Bearer token immediately rejected with 403
+                # Existing Bearer token immediately revoked with 401 (token_version incremented)
                 r_veh_susp = client.get("/api/vehicles", headers=m1_headers)
-                assert r_veh_susp.status_code == 403
-                assert "suspended" in r_veh_susp.json()["detail"].lower()
+                assert r_veh_susp.status_code == 401
 
                 r_me_susp = client.get("/api/auth/me", headers=m1_headers)
-                assert r_me_susp.status_code == 403
+                assert r_me_susp.status_code == 200
+                assert r_me_susp.json()["authenticated"] is False
 
-                # Existing HttpOnly cookie also immediately rejected with 403
+                # Existing HttpOnly cookie also immediately revoked with 401
                 r_cookie_susp = client.get("/api/vehicles", cookies=m1_cookie)
-                assert r_cookie_susp.status_code == 403
+                assert r_cookie_susp.status_code == 401
 
                 # Suspended user login rejected with 403 (valid pw) / 401 (bad pw)
                 r_login_susp = client.post(
@@ -544,7 +549,7 @@ def test_registration_modes_invites_suspension_last_admin_and_admin_gating(
                     == 401
                 )
 
-                # Re-enable member -> immediately restored
+                # Re-enable member -> old pre-suspension token stays revoked (401), fresh login ok
                 r_reenable = client.patch(
                     f"/api/admin/users/{m1_id}",
                     headers=admin_headers,
@@ -553,7 +558,16 @@ def test_registration_modes_invites_suspension_last_admin_and_admin_gating(
                 assert r_reenable.status_code == 200
                 assert r_reenable.json()["is_active"] is True
                 assert r_reenable.json()["disabled_at"] is None
-                assert client.get("/api/vehicles", headers=m1_headers).status_code == 200
+                assert client.get("/api/vehicles", headers=m1_headers).status_code == 401
+
+                r_relogin = client.post(
+                    "/api/auth/login",
+                    json={"email": "mate1@example.com", "password": "MatePassword123!"},
+                )
+                assert r_relogin.status_code == 200
+                m1_fresh_headers = {"Authorization": f"Bearer {r_relogin.json()['access_token']}"}
+                client.cookies.clear()
+                assert client.get("/api/vehicles", headers=m1_fresh_headers).status_code == 200
 
                 # Promote mate2 to admin -> now owner can be demoted cleanly (2 active admins)
                 r_prom = client.patch(

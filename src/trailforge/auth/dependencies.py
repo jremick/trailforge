@@ -29,7 +29,7 @@ def extract_token(request: Request) -> str | None:
 
 
 def resolve_token_user(request: Request, db: Session) -> User | None:
-    """Resolve a User row from a valid Bearer/cookie token without filtering ``is_active``."""
+    """Resolve a User row from a valid Bearer/cookie token, enforcing ``token_version``."""
     token = extract_token(request)
     if not token:
         return None
@@ -40,7 +40,16 @@ def resolve_token_user(request: Request, db: Session) -> User | None:
         user_uuid = uuid.UUID(str(payload["sub"]))
     except (KeyError, ValueError):
         return None
-    return db.get(User, user_uuid)
+    user = db.get(User, user_uuid)
+    if user is None:
+        return None
+    raw_tv = payload.get("tv", 1)
+    if isinstance(raw_tv, bool) or not isinstance(raw_tv, int):
+        return None
+    user_tv = int(getattr(user, "token_version", 1) or 1)
+    if int(raw_tv) != user_tv:
+        return None
+    return user
 
 
 def get_optional_current_user(

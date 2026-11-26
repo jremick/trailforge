@@ -52,6 +52,7 @@ from trailforge.matching import (
     trim_privacy_buffer,
 )
 from trailforge.matching import get_track_matcher as build_track_matcher
+from trailforge.matching.parser import MAX_IMU_SAMPLES, MAX_TRACE_POINTS
 from trailforge.vehicles.classifier import CapabilityClassLiteral, normalize_capability_class
 
 router = APIRouter(prefix="/api", tags=["trips"])
@@ -126,8 +127,8 @@ class TripUploadJsonRequest(BaseModel):
         default=None,
         validation_alias=AliasChoices("name", "title"),
     )
-    points: list[TripPointJsonInput] = Field(..., min_length=2)
-    imu_samples: list[ImuSample] | None = None
+    points: list[TripPointJsonInput] = Field(..., min_length=2, max_length=MAX_TRACE_POINTS)
+    imu_samples: list[ImuSample] | None = Field(default=None, max_length=MAX_IMU_SAMPLES)
     vehicle_profile_id: str | None = None
     vehicle_class: str | None = None
     visibility: TripVisibilityLiteral = "private"
@@ -141,8 +142,8 @@ class MobileSyncRequest(BaseModel):
         default=None,
         validation_alias=AliasChoices("name", "title"),
     )
-    points: list[TripPointJsonInput] = Field(..., min_length=2)
-    imu_samples: list[ImuSample] | None = None
+    points: list[TripPointJsonInput] = Field(..., min_length=2, max_length=MAX_TRACE_POINTS)
+    imu_samples: list[ImuSample] | None = Field(default=None, max_length=MAX_IMU_SAMPLES)
     vehicle_profile_id: str | None = None
     vehicle_class: str | None = None
     visibility: TripVisibilityLiteral = "private"

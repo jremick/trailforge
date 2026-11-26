@@ -269,12 +269,13 @@ def test_auth_vehicle_profiles_and_track_suitability_end_to_end(
                 assert r_me_auth.json()["authenticated"] is True
                 assert r_me_auth.json()["user"]["email"] == "driver@highcountry.au"
 
-                # Logout clears cookie; Bearer token still authenticates statelessly
+                # Logout clears cookie AND revokes prior Bearer tokens server-side (M-4)
                 assert client.post("/api/auth/logout").status_code == 200
                 assert client.get("/api/auth/me").json()["authenticated"] is False
 
                 headers = {"Authorization": f"Bearer {token}"}
-                assert client.get("/api/auth/me", headers=headers).json()["authenticated"] is True
+                assert client.get("/api/auth/me", headers=headers).json()["authenticated"] is False
+                assert client.get("/api/vehicles", headers=headers).status_code == 401
 
                 # Bad password rejected with 401; valid login restores cookie
                 assert (

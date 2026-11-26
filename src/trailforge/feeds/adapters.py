@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import xml.etree.ElementTree as ET
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,11 +43,13 @@ from trailforge.feeds.base import (
     normalize_state,
     normalize_status,
     parse_iso_datetime,
+    parse_safe_xml,
     resolve_enabled_states,
     resolve_feed_source,
+    sanitize_source_url,
     strip_html,
 )
-from trailforge.ingestion.connectors.base import USER_AGENT, prop_ci
+from trailforge.ingestion.connectors.base import prop_ci
 
 logger = logging.getLogger(__name__)
 
@@ -124,9 +125,10 @@ class VicSeasonalClosuresAdapter(_BaseHttpFeedAdapter):
             title=title,
             description=raw_desc or None,
             state=_normalize_state(prop_ci(props, "state"), default="VIC"),
-            source_url=str(
-                prop_ci(props, "source_url", "url", "url_string") or self.source_url
-            ).strip(),
+            source_url=sanitize_source_url(
+                prop_ci(props, "source_url", "url", "url_string"),
+                fallback=self.source_url,
+            ),
             geometry=geom,
             effective_from=parse_iso_datetime(
                 prop_ci(props, "effective_from", "start_date", "closure_date")
@@ -218,9 +220,10 @@ class VicEmergencyAdapter(_BaseHttpFeedAdapter):
             title=title,
             description=str(prop_ci(props, "description", "webBody", "text") or "").strip() or None,
             state=_normalize_state(prop_ci(props, "state"), default="VIC"),
-            source_url=str(
-                prop_ci(props, "source_url", "url") or "https://emergency.vic.gov.au/respond/"
-            ).strip(),
+            source_url=sanitize_source_url(
+                prop_ci(props, "source_url", "url"),
+                fallback="https://emergency.vic.gov.au/respond/",
+            ),
             geometry=geom,
             effective_from=parse_iso_datetime(prop_ci(props, "effective_from", "created")),
             effective_to=parse_iso_datetime(prop_ci(props, "effective_to")),
@@ -289,10 +292,10 @@ class NSWRFSAdapter(_BaseHttpFeedAdapter):
             title=title,
             description=str(prop_ci(props, "description") or "").strip() or None,
             state=_normalize_state(prop_ci(props, "state"), default="NSW"),
-            source_url=str(
-                prop_ci(props, "source_url", "link", "url")
-                or "https://www.rfs.nsw.gov.au/fire-information/fires-near-me"
-            ).strip(),
+            source_url=sanitize_source_url(
+                prop_ci(props, "source_url", "link", "url"),
+                fallback="https://www.rfs.nsw.gov.au/fire-information/fires-near-me",
+            ),
             geometry=geom,
             effective_from=parse_iso_datetime(prop_ci(props, "effective_from", "pubDate")),
             effective_to=parse_iso_datetime(prop_ci(props, "effective_to")),
@@ -341,14 +344,14 @@ class NSWNPWSAdapter(_BaseHttpFeedAdapter):
     feed_source: FeedSourceLiteral = "nsw_npws"
 
     def _parse_rss_items(self, xml_text: str) -> list[dict[str, Any]]:
-        root = ET.fromstring(xml_text)
+        root = parse_safe_xml(xml_text)
         parsed_items: list[dict[str, Any]] = []
         for elem in root.findall(".//item"):
             park_name = (elem.findtext("title") or "").strip()
             if not park_name:
                 continue
             guid = (elem.findtext("guid") or "").strip()
-            link = (elem.findtext("link") or "").strip() or self.source_url
+            link = sanitize_source_url(elem.findtext("link"), fallback=self.source_url) or ""
             pub_date = (elem.findtext("pubDate") or "").strip()
             raw_desc = elem.findtext("description") or ""
 
@@ -390,31 +393,16 @@ class NSWNPWSAdapter(_BaseHttpFeedAdapter):
         return parsed_items
 
     def _fetch_npws_payload(self) -> Any:
-        owns_client = self._client is None
-        http = (
-            self._client
-            if self._client is not None
-            else httpx.Client(
-                timeout=httpx.Timeout(self.timeout_s, connect=min(8.0, self.timeout_s)),
-                follow_redirects=True,
-                headers={"User-Agent": USER_AGENT},
-            )
-        )
-        try:
-            resp = http.get(self.source_url, headers={"User-Agent": USER_AGENT})
-            resp.raise_for_status()
-            content_type = (resp.headers.get("content-type") or "").lower()
-            body_text = resp.text
-            if (
-                "xml" in content_type
-                or "rss" in content_type
-                or body_text.lstrip().startswith("<")
-            ):
-                return self._parse_rss_items(body_text)
-            return resp.json()
-        finally:
-            if owns_client:
-                http.close()
+        resp = self._http_get()
+        content_type = (resp.headers.get("content-type") or "").lower()
+        body_text = resp.text
+        if (
+            "xml" in content_type
+            or "rss" in content_type
+            or body_text.lstrip().startswith("<")
+        ):
+            return self._parse_rss_items(body_text)
+        return resp.json()
 
     def _parse_item(self, item: Mapping[str, Any]) -> NormalizedClosure | None:
         if item.get("type") == "Feature":
@@ -451,7 +439,10 @@ class NSWNPWSAdapter(_BaseHttpFeedAdapter):
             title=title,
             description=str(prop_ci(props, "description", "details", "body") or "").strip() or None,
             state=_normalize_state(prop_ci(props, "state"), default="NSW"),
-            source_url=str(prop_ci(props, "source_url", "url") or self.source_url).strip(),
+            source_url=sanitize_source_url(
+                prop_ci(props, "source_url", "url"),
+                fallback=self.source_url,
+            ),
             park_name=park_name,
             geometry=geom,
             effective_from=parse_iso_datetime(prop_ci(props, "effective_from", "startDate")),

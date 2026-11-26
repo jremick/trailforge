@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections import Counter
 from typing import Any
 
@@ -74,10 +75,18 @@ def _parse_bbox(bbox: str | None) -> tuple[float, float, float, float] | None:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="bbox coordinates must be valid floats",
         ) from exc
-    if min_lon >= max_lon or min_lat >= max_lat:
+    if not all(math.isfinite(v) for v in (min_lon, min_lat, max_lon, max_lat)):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="bbox min coordinates must be strictly less than max coordinates",
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="bbox coordinates must be finite numbers",
+        )
+    if not (-180.0 <= min_lon < max_lon <= 180.0 and -90.0 <= min_lat < max_lat <= 90.0):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "bbox must satisfy -180 <= min_lon < max_lon <= 180 "
+                "and -90 <= min_lat < max_lat <= 90"
+            ),
         )
     return (min_lon, min_lat, max_lon, max_lat)
 
