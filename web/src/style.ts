@@ -1129,10 +1129,21 @@ export function buildTrailForgeStyle(
       filter: ["==", ["geometry-type"], "Point"],
       layout: { visibility: vis(layers.hotspots) },
       paint: {
-        "circle-radius": 7.4,
+        "circle-radius": [
+          "interpolate",
+          ["linear"],
+          ["zoom"],
+          10,
+          3.2,
+          13,
+          4.5,
+          16,
+          6.5,
+        ],
         "circle-color": "#FF6B00",
+        "circle-opacity": 0.88,
         "circle-stroke-color": "#FEF08A",
-        "circle-stroke-width": 2.2,
+        "circle-stroke-width": 1.2,
       },
     }
   );

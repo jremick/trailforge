@@ -45,6 +45,10 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
       PRIVACY_TRIM_METERS: ${PRIVACY_TRIM_METERS:-250}
       SNOW_LINE_DEFAULT_M: ${SNOW_LINE_DEFAULT_M:-1000}
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:-trailforge-dev-secret-change-in-production}
+      TRAILFORGE_PRIVACY_SECRET: ${TRAILFORGE_PRIVACY_SECRET:-trailforge-dev-privacy-secret-change-in-production}
+      AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
+      TRAILFORGE_ENABLE_LIVE_FEEDS: ${TRAILFORGE_ENABLE_LIVE_FEEDS:-false}
       TILES_DIR: ${TILES_DIR:-/data/tiles}
       PACKS_DIR: ${PACKS_DIR:-/data/packs}
       TRAILFORGE_PACKS_DIR: ${TRAILFORGE_PACKS_DIR:-/data/packs}
@@ -81,6 +85,8 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-30}
       PRIVACY_TRIM_METERS: ${PRIVACY_TRIM_METERS:-250}
+      TRAILFORGE_PRIVACY_SECRET: ${TRAILFORGE_PRIVACY_SECRET:-trailforge-dev-privacy-secret-change-in-production}
+      TRAILFORGE_ENABLE_LIVE_FEEDS: ${TRAILFORGE_ENABLE_LIVE_FEEDS:-false}
       TILES_DIR: ${TILES_DIR:-/data/tiles}
       PACKS_DIR: ${PACKS_DIR:-/data/packs}
       TRAILFORGE_PACKS_DIR: ${TRAILFORGE_PACKS_DIR:-/data/packs}

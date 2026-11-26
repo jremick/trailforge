@@ -353,9 +353,9 @@ export class TopBar {
 
     if (state.kind === "online" && state.data) {
       this.healthDotEl.classList.add("online");
-      const ver = state.data.version ? ` v${state.data.version}` : "";
-      this.healthTextEl.textContent = `API Online${ver}`;
+      this.healthTextEl.textContent = "API Online";
       const details = [
+        state.data.version ? `Version: v${state.data.version}` : null,
         `Status: ${state.data.status}`,
         state.data.postgis_version
           ? `PostGIS: ${state.data.postgis_version}`

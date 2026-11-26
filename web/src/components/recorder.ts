@@ -459,8 +459,8 @@ export class InCabRecorderHud {
                   this.savingTrip
                     ? "Saving…"
                     : this.isOnline && this.isAuthenticated
-                      ? "↑ Upload & HMM Match"
-                      : "⧖ Queue Offline for Sync"
+                      ? "↑ Upload & Match"
+                      : "⧖ Queue Offline"
                 }
               </button>
               <button type="button" class="tf-mini-btn" data-rec-export="gpx">⬇ GPX</button>
