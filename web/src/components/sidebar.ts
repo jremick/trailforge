@@ -1,7 +1,9 @@
 import {
+  DEFAULT_SNOWLINE_BANDS_M,
   DIFFICULTY_META,
   OUTDOOR_POI_ICONS,
   escapeHtml,
+  snapSnowlineBand,
 } from "../presets";
 import type { SwStatus } from "../pwa";
 import type {
@@ -9,6 +11,7 @@ import type {
   LayerKey,
   LayerVisibilityState,
   RegionPreset,
+  TileMode,
 } from "../types";
 
 export interface SidebarCallbacks {
@@ -21,56 +24,62 @@ interface LayerToggleDef {
   key: LayerKey;
   label: string;
   hint: string;
-  tag: string;
 }
 
 const LAYER_TOGGLES: readonly LayerToggleDef[] = [
   {
     key: "tracks",
     label: "4WD Tracks (Graded)",
-    hint: "Canonical 50–100 m segments colored by Easy → Extreme difficulty",
-    tag: "Slice 03",
+    hint: "Canonical 50–100 m segments colored Easy → Extreme (click to inspect)",
   },
   {
     key: "steepHighlights",
     label: "Steep Climbs (≥14°)",
-    hint: "Highlighted sustained & max gradient hazard sections",
-    tag: "Slice 03",
+    hint: "Highlighted sustained & max gradient hazard pitches",
   },
   {
     key: "contoursHillshade",
     label: "Contours & Hillshade",
-    hint: "GA 5 m LiDAR / DEA SRTM terrain relief & index contours",
-    tag: "Slice 03",
+    hint: "20 m minor / 100 m index topo contours + Terrain-RGB shaded relief",
   },
   {
     key: "snowLine",
     label: "Alpine Snow-Line Band",
     hint: "Configurable elevation highlight (>1,000 m default)",
-    tag: "Slice 03",
+  },
+  {
+    key: "parksWaterways",
+    label: "Parks & Waterways",
+    hint: "CAPAD 2025 reserve boundaries & GA/OSM perennial/intermittent streams",
   },
   {
     key: "pois",
     label: "Outdoor POIs",
-    hint: "Campgrounds, alpine huts, trigs, water bores & fuel stops",
-    tag: "Slice 03",
+    hint: "Campgrounds, alpine huts, trigs, lookouts & access gates",
   },
 ];
 
 export class Sidebar {
   private readonly root: HTMLElement;
+  private readonly callbacks: SidebarCallbacks;
   private readonly snowSliderRowEl: HTMLElement;
+  private readonly snowSliderEl: HTMLInputElement;
   private readonly snowValEl: HTMLElement;
+  private readonly snowTicksEl: HTMLElement;
+  private readonly tileModePillEl: HTMLElement;
   private readonly regionNameEl: HTMLElement;
   private readonly regionTagEl: HTMLElement;
   private readonly regionDescEl: HTMLElement;
   private readonly regionBboxEl: HTMLElement;
   private readonly regionPackEl: HTMLElement;
+  private readonly sysTilesEl: HTMLElement;
   private readonly sysApiEl: HTMLElement;
   private readonly sysPostgisEl: HTMLElement;
   private readonly sysSchemaEl: HTMLElement;
   private readonly sysNetworkEl: HTMLElement;
   private readonly sysSwEl: HTMLElement;
+
+  private snowBands: number[] = [...DEFAULT_SNOWLINE_BANDS_M];
 
   constructor(
     container: HTMLElement,
@@ -79,10 +88,16 @@ export class Sidebar {
     callbacks: SidebarCallbacks
   ) {
     this.root = container;
+    this.callbacks = callbacks;
     this.root.className = "tf-sidebar";
     this.root.setAttribute("aria-label", "Map layers and trail controls");
 
     const previewIcons = OUTDOOR_POI_ICONS.slice(0, 7);
+    const snappedInit = snapSnowlineBand(
+      initialLayers.snowLineElevationM,
+      this.snowBands
+    );
+    const initIdx = Math.max(0, this.snowBands.indexOf(snappedInit));
 
     this.root.innerHTML = `
       <div class="tf-sidebar-scroll">
@@ -92,7 +107,7 @@ export class Sidebar {
               <span class="tf-section-index">01</span>
               <span class="tf-section-title">Map Layers</span>
             </span>
-            <span class="tf-section-pill">PMTiles Ready</span>
+            <span class="tf-section-pill" data-role="tile-mode-pill">Loading…</span>
           </summary>
 
           <div class="tf-section-body">
@@ -107,10 +122,7 @@ export class Sidebar {
                       ${initialLayers[item.key] ? "checked" : ""}
                     />
                     <span class="tf-toggle-copy">
-                      <span class="tf-toggle-head">
-                        <span class="tf-toggle-label">${escapeHtml(item.label)}</span>
-                        <span class="tf-ready-tag">${escapeHtml(item.tag)}</span>
-                      </span>
+                      <span class="tf-toggle-label">${escapeHtml(item.label)}</span>
                       <span class="tf-toggle-hint">${escapeHtml(item.hint)}</span>
                     </span>
                   </label>
@@ -121,18 +133,19 @@ export class Sidebar {
             <div class="tf-snow-control ${initialLayers.snowLine ? "" : "dimmed"}" data-role="snow-control">
               <div class="tf-snow-head">
                 <span>Snow-Line Threshold</span>
-                <span class="mono tf-accent-cyan" data-role="snow-val">&gt; ${initialLayers.snowLineElevationM.toLocaleString()} m</span>
+                <span class="mono tf-accent-cyan" data-role="snow-val">&ge; ${snappedInit.toLocaleString()} m</span>
               </div>
               <input
                 type="range"
                 class="tf-range"
                 data-role="snow-slider"
-                min="800"
-                max="1800"
-                step="50"
-                value="${initialLayers.snowLineElevationM}"
+                min="0"
+                max="${this.snowBands.length - 1}"
+                step="1"
+                value="${initIdx}"
                 aria-label="Snow-line elevation threshold in meters"
               />
+              <div class="tf-snow-ticks mono" data-role="snow-ticks"></div>
             </div>
 
             <div class="tf-legend-block">
@@ -191,17 +204,19 @@ export class Sidebar {
           </div>
         </details>
 
-        <details class="tf-section" open>
+        <details class="tf-section">
           <summary class="tf-section-summary">
             <span class="tf-section-title-group">
               <span class="tf-section-index">03</span>
-              <span class="tf-section-title">Stack &amp; Offline Shell</span>
+              <span class="tf-section-title">Stack &amp; Offline Telemetry</span>
             </span>
-            <span class="tf-section-pill">Slice 01</span>
+            <span class="tf-section-pill">v0.1</span>
           </summary>
 
           <div class="tf-section-body">
             <div class="tf-kv-grid">
+              <span class="tf-kv-key">Vector/DEM</span>
+              <span class="tf-kv-val mono" data-role="sys-tiles">Checking…</span>
               <span class="tf-kv-key">API Health</span>
               <span class="tf-kv-val mono" data-role="sys-api">Connecting…</span>
               <span class="tf-kv-key">PostGIS</span>
@@ -219,18 +234,23 @@ export class Sidebar {
     `;
 
     this.snowSliderRowEl = this.q("[data-role='snow-control']");
+    this.snowSliderEl = this.q<HTMLInputElement>("[data-role='snow-slider']");
     this.snowValEl = this.q("[data-role='snow-val']");
+    this.snowTicksEl = this.q("[data-role='snow-ticks']");
+    this.tileModePillEl = this.q("[data-role='tile-mode-pill']");
     this.regionNameEl = this.q("[data-role='region-name']");
     this.regionTagEl = this.q("[data-role='region-tag']");
     this.regionDescEl = this.q("[data-role='region-desc']");
     this.regionBboxEl = this.q("[data-role='region-bbox']");
     this.regionPackEl = this.q("[data-role='region-pack']");
+    this.sysTilesEl = this.q("[data-role='sys-tiles']");
     this.sysApiEl = this.q("[data-role='sys-api']");
     this.sysPostgisEl = this.q("[data-role='sys-postgis']");
     this.sysSchemaEl = this.q("[data-role='sys-schema']");
     this.sysNetworkEl = this.q("[data-role='sys-network']");
     this.sysSwEl = this.q("[data-role='sys-sw']");
 
+    this.renderSnowTicks();
     this.updatePreset(initialPreset);
 
     this.root
@@ -245,16 +265,39 @@ export class Sidebar {
         });
       });
 
-    const slider = this.q<HTMLInputElement>("[data-role='snow-slider']");
-    slider.addEventListener("input", () => {
-      const elev = Number(slider.value);
-      this.snowValEl.textContent = `> ${elev.toLocaleString()} m`;
-      callbacks.onSnowLineElevationChange(elev);
+    this.snowSliderEl.addEventListener("input", () => {
+      const idx = Number(this.snowSliderEl.value);
+      const elev = this.snowBands[idx] ?? 1000;
+      this.snowValEl.textContent = `≥ ${elev.toLocaleString()} m`;
+      this.callbacks.onSnowLineElevationChange(elev);
     });
 
     this.q("[data-role='reset-region']").addEventListener("click", () => {
       callbacks.onResetRegion();
     });
+  }
+
+  setSnowLineBands(bands: readonly number[], currentElevationM: number): void {
+    if (bands.length === 0) return;
+    this.snowBands = [...bands].sort((a, b) => a - b);
+    const snapped = snapSnowlineBand(currentElevationM, this.snowBands);
+    const idx = Math.max(0, this.snowBands.indexOf(snapped));
+    this.snowSliderEl.min = "0";
+    this.snowSliderEl.max = String(this.snowBands.length - 1);
+    this.snowSliderEl.value = String(idx);
+    this.snowValEl.textContent = `≥ ${snapped.toLocaleString()} m`;
+    this.renderSnowTicks();
+  }
+
+  updateTileMode(mode: TileMode, detail?: string): void {
+    const pillLabels: Record<TileMode, string> = {
+      loading: "Loading…",
+      pmtiles: "PMTiles Live",
+      "geojson-fallback": "GeoJSON Mode",
+      offline: "Offline Shell",
+    };
+    this.tileModePillEl.textContent = pillLabels[mode];
+    this.sysTilesEl.textContent = detail ?? pillLabels[mode];
   }
 
   updatePreset(preset: RegionPreset): void {
@@ -301,6 +344,13 @@ export class Sidebar {
       error: "Unavailable",
     };
     this.sysSwEl.textContent = labels[status];
+  }
+
+  private renderSnowTicks(): void {
+    const first = this.snowBands[0] ?? 800;
+    const mid = this.snowBands[Math.floor(this.snowBands.length / 2)] ?? 1100;
+    const last = this.snowBands[this.snowBands.length - 1] ?? 1600;
+    this.snowTicksEl.innerHTML = `<span>${first}m</span><span>${mid}m</span><span>${last}m</span>`;
   }
 
   private q<T extends HTMLElement = HTMLElement>(selector: string): T {

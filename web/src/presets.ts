@@ -15,7 +15,16 @@ import type {
 export const DEFAULT_PRESET_ID = "australian-alps";
 export const DEFAULT_CENTER_LON = 148.125;
 export const DEFAULT_CENTER_LAT = -36.615;
-export const DEFAULT_MAP_ZOOM = 10.2;
+export const DEFAULT_MAP_ZOOM = 11.4;
+
+/**
+ * Default snow-line elevation threshold bands (meters AHD) matching
+ * trailforge_vector.pmtiles `snowline_bands` layer (`elev_min_m`).
+ */
+export const DEFAULT_SNOWLINE_BANDS_M: readonly number[] = [
+  800, 900, 1000, 1100, 1200, 1400, 1600,
+];
+export const DEFAULT_SNOWLINE_ELEVATION_M = 1000;
 
 /**
  * Combined VIC + NSW + ACT launch bounding box [west, south, east, north].
@@ -36,7 +45,7 @@ export const REGION_PRESETS: readonly RegionPreset[] = [
     stateTag: "VIC/NSW · 55H",
     utmZones: ["55H"],
     center: [148.125, -36.615],
-    zoom: 10.2,
+    zoom: 11.4,
     bbox: [147.8, -37.1, 149.1, -35.8],
     description:
       "Davies Plain, Tom Groggin, Mt Kosciuszko, Alpine NP & Snowy Mountains 4WD corridor.",
@@ -178,8 +187,8 @@ export const BASEMAP_OPTIONS: readonly {
   { id: "satellite", label: "Imagery", hint: "Esri World Imagery (online)" },
   {
     id: "offline-topo",
-    label: "Offline Grid",
-    hint: "100% offline dark topographic graticule & corridor canvas",
+    label: "Offline Topo",
+    hint: "100% offline dark topo graticule, Terrain-RGB hillshade & vector PMTiles",
   },
 ];
 
@@ -215,13 +224,23 @@ export const DIFFICULTY_META: readonly {
   },
 ];
 
+export function getGradeColor(grade: string | null | undefined): string {
+  const norm = (grade ?? "").trim().toLowerCase();
+  if (norm === "easy") return "#22C55E";
+  if (norm === "medium") return "#38BDF8";
+  if (norm === "hard") return "#F59E0B";
+  if (norm === "extreme") return "#EF4444";
+  return "#94A3B8";
+}
+
 export function createInitialLayerState(): LayerVisibilityState {
   return {
     tracks: true,
     steepHighlights: true,
     contoursHillshade: true,
     snowLine: false,
-    snowLineElevationM: 1000,
+    snowLineElevationM: DEFAULT_SNOWLINE_ELEVATION_M,
+    parksWaterways: true,
     pois: true,
   };
 }
@@ -241,7 +260,73 @@ export const OUTDOOR_POI_ICONS: readonly PoiIconMeta[] = [
   { id: "hospital", label: "Hospital", iconPath: "/icons/hospital.svg" },
   { id: "police", label: "Police", iconPath: "/icons/police.svg" },
   { id: "comm_tower", label: "Comm Tower", iconPath: "/icons/comm_tower.svg" },
+  { id: "obstacle_tower", label: "Gate / Barrier", iconPath: "/icons/obstacle_tower.svg" },
 ];
+
+const POI_CATEGORY_TO_ICON: Record<string, string> = {
+  campground: "campground",
+  camp: "campground",
+  campsite: "campground",
+  hut: "hut",
+  alpine_hut: "hut",
+  shelter: "shelter",
+  trig: "trig",
+  survey_mark: "trig",
+  peak: "trig",
+  lookout: "saddle",
+  saddle: "saddle",
+  pass: "saddle",
+  water: "water_bore",
+  water_bore: "water_bore",
+  bore: "water_bore",
+  fuel: "fuel",
+  gate: "obstacle_tower",
+  obstacle_tower: "obstacle_tower",
+  fire_station: "fire_station",
+  helipad: "helipad",
+  homestead: "homestead",
+  airfield: "airfield",
+  hospital: "hospital",
+  police: "police",
+  comm_tower: "comm_tower",
+};
+
+/**
+ * Resolve a POI category or explicit icon name to an adapted SVG icon ID under `/icons/`.
+ */
+export function resolvePoiIconName(
+  categoryOrIcon: string | null | undefined
+): string {
+  const key = (categoryOrIcon ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\.svg$/, "");
+  if (key in POI_CATEGORY_TO_ICON) {
+    return POI_CATEGORY_TO_ICON[key]!;
+  }
+  return "trig";
+}
+
+/**
+ * Snap a numeric elevation threshold to the closest available snow-line band
+ * in `snowline_bands` (default `[800, 900, 1000, 1100, 1200, 1400, 1600]`).
+ */
+export function snapSnowlineBand(
+  elevationM: number,
+  availableBands: readonly number[] = DEFAULT_SNOWLINE_BANDS_M
+): number {
+  if (availableBands.length === 0) return DEFAULT_SNOWLINE_ELEVATION_M;
+  let best = availableBands[0]!;
+  let bestDiff = Math.abs(elevationM - best);
+  for (const band of availableBands) {
+    const diff = Math.abs(elevationM - band);
+    if (diff < bestDiff) {
+      best = band;
+      bestDiff = diff;
+    }
+  }
+  return best;
+}
 
 /**
  * Required open-data attributions (AGENTS.md License & Data Hygiene).

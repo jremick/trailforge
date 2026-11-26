@@ -1,13 +1,19 @@
 import "./styles.css";
-import { fetchHealth } from "./api";
+import {
+  fetchHealth,
+  fetchPois,
+  fetchTileManifest,
+  fetchTrackDetail,
+  fetchTracksGeoJson,
+} from "./api";
 import { renderAttributionFooter } from "./components/footer";
+import { TrackInspectorDrawer } from "./components/inspector";
 import { Sidebar } from "./components/sidebar";
 import { TopBar } from "./components/topbar";
 import {
   formatCoords,
   isWithinVicNswRegion,
   latLonToMgrs,
-  parseSearchCoordinate,
 } from "./coords";
 import { TrailForgeMap } from "./map";
 import {
@@ -24,6 +30,7 @@ import type {
   HealthState,
   LayerVisibilityState,
   RegionPreset,
+  UnifiedSearchItem,
 } from "./types";
 
 const HEALTH_POLL_INTERVAL_MS = 15000;
@@ -32,6 +39,7 @@ class TrailForgeApp {
   private readonly shellEl: HTMLElement;
   private readonly topbar: TopBar;
   private readonly sidebar: Sidebar;
+  private readonly inspector: TrackInspectorDrawer;
   private readonly map: TrailForgeMap;
   private readonly collapseBtnEl: HTMLButtonElement;
   private readonly cursorCoordsEl: HTMLElement;
@@ -45,6 +53,7 @@ class TrailForgeApp {
   private activeBasemap: BasemapId;
   private layerState: LayerVisibilityState = createInitialLayerState();
   private healthAbort: AbortController | null = null;
+  private inspectorAbort: AbortController | null = null;
 
   constructor(root: HTMLElement) {
     const initiallyOnline =
@@ -72,6 +81,7 @@ class TrailForgeApp {
           >${this.sidebarCollapsed ? "▸" : "◂"}</button>
 
           <aside data-role="sidebar"></aside>
+          <aside data-role="inspector"></aside>
 
           <div class="tf-map-toolbar">
             <div class="tf-basemap-switcher" role="group" aria-label="Basemap switcher">
@@ -118,7 +128,15 @@ class TrailForgeApp {
       this.q(root, "[data-role='topbar']"),
       DEFAULT_PRESET_ID,
       {
-        onSearchSubmit: (query) => this.handleSearch(query),
+        onSearchSelect: (item) => this.handleSearchSelect(item),
+        onSearchNoMatch: (query, remoteError) => {
+          this.showToast(
+            remoteError
+              ? `Offline search: no local match for "${query}". Try lat,lon or MGRS.`
+              : `No tracks, POIs, or parks found for "${query}".`,
+            "info"
+          );
+        },
         onSearchClear: () => this.map.clearSearchPin(),
         onPresetChange: (presetId) => this.selectPreset(presetId),
         onHealthClick: () => void this.refreshHealth(true),
@@ -137,12 +155,31 @@ class TrailForgeApp {
         onSnowLineElevationChange: (elevationM) => {
           this.layerState = { ...this.layerState, snowLineElevationM: elevationM };
           this.map.setLayerVisibility(this.layerState);
+          this.inspector.setSnowLineElevation(elevationM);
         },
         onResetRegion: () => {
           this.map.flyToPreset(
             this.activePreset,
             this.sidebarCollapsed ? 16 : 340
           );
+        },
+      }
+    );
+
+    this.inspector = new TrackInspectorDrawer(
+      this.q(root, "[data-role='inspector']"),
+      {
+        onClose: () => {
+          this.shellEl.classList.remove("inspector-open");
+          this.map.setSelectedTrackId(null);
+        },
+        onZoomToTrack: (bbox) => {
+          this.map.fitBBox(bbox, this.sidebarCollapsed ? 24 : 360, 420);
+        },
+        onPoiSelect: (poi) => {
+          this.map.flyToCoordinate(poi.lat, poi.lon, poi.name, 14);
+          this.updateCursorReadout(poi.lat, poi.lon);
+          this.showToast(`Located ${poi.name}`, "info");
         },
       }
     );
@@ -155,8 +192,11 @@ class TrailForgeApp {
         onCursorMove: (lat, lon) => this.updateCursorReadout(lat, lon),
         onBasemapTileError: () => {
           this.offlineBannerEl.textContent =
-            "External map tiles unreachable — showing offline topo grid fallback";
+            "External basemap tiles unreachable — rendering corridor PMTiles & offline topo grid";
           this.offlineBannerEl.classList.remove("hidden");
+        },
+        onTrackClick: (trackId) => {
+          void this.openTrackInspector(trackId);
         },
       },
       {
@@ -214,6 +254,10 @@ class TrailForgeApp {
       if (e.key === "/" && !inInput) {
         e.preventDefault();
         this.topbar.focusSearch();
+      } else if (e.key === "Escape" && this.inspector.openState()) {
+        this.inspector.close();
+        this.shellEl.classList.remove("inspector-open");
+        this.map.setSelectedTrackId(null);
       }
     });
 
@@ -222,7 +266,7 @@ class TrailForgeApp {
       if (!online) {
         this.setActiveBasemap("offline-topo");
         this.offlineBannerEl.textContent =
-          "Offline mode — displaying built-in dark topo graticule & corridor bounds";
+          "Offline mode — displaying corridor PMTiles & built-in topo grid";
         this.offlineBannerEl.classList.remove("hidden");
       } else {
         this.offlineBannerEl.classList.add("hidden");
@@ -242,11 +286,121 @@ class TrailForgeApp {
     this.sidebar.updateHealth(initialHealth);
 
     void this.refreshHealth(false);
-    window.setInterval(() => void this.refreshHealth(false), HEALTH_POLL_INTERVAL_MS);
+    void this.loadVectorAndTerrainLayers();
+
+    window.setInterval(
+      () => void this.refreshHealth(false),
+      HEALTH_POLL_INTERVAL_MS
+    );
 
     void registerServiceWorker((status) => {
       this.sidebar.updateSwStatus(status);
     });
+  }
+
+  private async loadVectorAndTerrainLayers(): Promise<void> {
+    this.sidebar.updateTileMode("loading");
+    try {
+      const manifest = await fetchTileManifest();
+      if (manifest.snowline_bands_m && manifest.snowline_bands_m.length > 0) {
+        this.sidebar.setSnowLineBands(
+          manifest.snowline_bands_m,
+          this.layerState.snowLineElevationM
+        );
+      }
+
+      if (manifest.vector_available || manifest.terrain_available) {
+        this.map.applyTileManifest(manifest);
+        const modeLabel =
+          manifest.vector_available && manifest.terrain_available
+            ? "PMTiles (Vector + DEM)"
+            : manifest.vector_available
+              ? "PMTiles (Vector)"
+              : "PMTiles (Terrain) + GeoJSON";
+        this.sidebar.updateTileMode("pmtiles", modeLabel);
+
+        // If terrain is present but vector PMTiles missing, hydrate tracks/POIs via GeoJSON
+        if (!manifest.vector_available) {
+          await this.loadGeoJsonFallback();
+        }
+        return;
+      }
+    } catch {
+      // Manifest unavailable — fall through to GeoJSON fallback cleanly
+    }
+
+    await this.loadGeoJsonFallback();
+  }
+
+  private async loadGeoJsonFallback(): Promise<void> {
+    try {
+      const [tracksFc, pois] = await Promise.all([
+        fetchTracksGeoJson(),
+        fetchPois(),
+      ]);
+      this.map.setFallbackData(tracksFc, pois);
+      this.sidebar.updateTileMode(
+        "geojson-fallback",
+        `GeoJSON (${tracksFc.features.length} segs)`
+      );
+    } catch {
+      this.sidebar.updateTileMode("offline", "Offline graticule shell");
+    }
+  }
+
+  private async openTrackInspector(
+    trackId: string,
+    trackLabel?: string
+  ): Promise<void> {
+    this.inspectorAbort?.abort();
+    const controller = new AbortController();
+    this.inspectorAbort = controller;
+
+    this.shellEl.classList.add("inspector-open");
+    this.map.setSelectedTrackId(trackId);
+    this.inspector.showLoading(trackLabel);
+
+    try {
+      const detail = await fetchTrackDetail(trackId, controller.signal);
+      if (controller.signal.aborted) return;
+      this.inspector.showTrack(detail, this.layerState.snowLineElevationM);
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      const msg =
+        err instanceof Error ? err.message : "Failed to fetch track details";
+      this.inspector.showError(msg);
+    }
+  }
+
+  private handleSearchSelect(item: UnifiedSearchItem): void {
+    if (item.kind === "preset" && item.presetId) {
+      this.selectPreset(item.presetId);
+      return;
+    }
+
+    if (item.kind === "track") {
+      if (item.bbox) {
+        this.map.fitBBox(item.bbox, this.sidebarCollapsed ? 24 : 360, 420);
+      } else if (item.lat !== null && item.lon !== null) {
+        this.map.flyToCoordinate(item.lat, item.lon, item.title, 13.2);
+      }
+      void this.openTrackInspector(item.id, item.title);
+      return;
+    }
+
+    if (item.lat !== null && item.lon !== null) {
+      this.map.flyToCoordinate(
+        item.lat,
+        item.lon,
+        item.title,
+        item.kind === "park" ? 11.5 : 13.8
+      );
+      this.updateCursorReadout(item.lat, item.lon);
+      const regionNote = isWithinVicNswRegion(item.lat, item.lon)
+        ? ""
+        : " (outside VIC/NSW launch area)";
+      this.showToast(`Located ${item.title}${regionNote}`, "success");
+    }
   }
 
   private setActiveBasemap(basemap: BasemapId): void {
@@ -257,7 +411,7 @@ class TrailForgeApp {
     );
     if (basemap === "offline-topo") {
       this.offlineBannerEl.textContent =
-        "Offline Topo Grid active — zero external tile requests";
+        "Offline Topo active — zero external raster tile requests";
       this.offlineBannerEl.classList.remove("hidden");
     } else if (typeof navigator === "undefined" || navigator.onLine) {
       this.offlineBannerEl.classList.add("hidden");
@@ -272,34 +426,6 @@ class TrailForgeApp {
     this.sidebar.updatePreset(preset);
     this.map.flyToPreset(preset, this.sidebarCollapsed ? 16 : 340);
     this.showToast(`Centered on ${preset.shortLabel}`, "info");
-  }
-
-  private handleSearch(query: string): void {
-    const parsed = parseSearchCoordinate(query);
-    if (parsed) {
-      const label =
-        parsed.kind === "mgrs" ? parsed.formatted : parsed.canonical;
-      this.map.flyToCoordinate(parsed.lat, parsed.lon, label, 13);
-      this.updateCursorReadout(parsed.lat, parsed.lon);
-      const regionNote = isWithinVicNswRegion(parsed.lat, parsed.lon)
-        ? ""
-        : " (outside VIC/NSW launch area)";
-      this.showToast(`Located ${label}${regionNote}`, "success");
-      return;
-    }
-
-    // Match built-in VIC/NSW region or landmark presets offline
-    const lower = query.toLowerCase();
-    const matchedPreset = getPresetById(lower);
-    if (matchedPreset) {
-      this.selectPreset(matchedPreset.id);
-      return;
-    }
-
-    this.showToast(
-      `Track & POI search ("${query}") arrives in Slice 03 — enter lat,lon or MGRS now.`,
-      "info"
-    );
   }
 
   private updateCursorReadout(lat: number, lon: number): void {

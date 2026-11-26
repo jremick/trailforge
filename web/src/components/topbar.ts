@@ -1,21 +1,34 @@
-import { REGION_PRESETS, escapeHtml } from "../presets";
-import type { HealthState, RegionPreset } from "../types";
+import { REGION_PRESETS, escapeHtml, getGradeColor } from "../presets";
+import { resolveLocalSearch, runUnifiedSearch } from "../search";
+import type { HealthState, RegionPreset, UnifiedSearchItem } from "../types";
 
 export interface TopBarCallbacks {
-  onSearchSubmit: (query: string) => void;
+  onSearchSelect: (item: UnifiedSearchItem) => void;
+  onSearchNoMatch: (query: string, remoteError: boolean) => void;
   onSearchClear: () => void;
   onPresetChange: (presetId: string) => void;
   onHealthClick: () => void;
 }
 
+const SEARCH_DEBOUNCE_MS = 180;
+
 export class TopBar {
   private readonly root: HTMLElement;
+  private readonly callbacks: TopBarCallbacks;
+  private readonly searchWrapEl: HTMLElement;
   private readonly searchInputEl: HTMLInputElement;
   private readonly searchClearBtn: HTMLButtonElement;
+  private readonly searchMenuEl: HTMLElement;
   private readonly presetSelectEl: HTMLSelectElement;
   private readonly healthPillEl: HTMLButtonElement;
   private readonly healthDotEl: HTMLElement;
   private readonly healthTextEl: HTMLElement;
+
+  private searchTimer: number | null = null;
+  private searchAbort: AbortController | null = null;
+  private results: UnifiedSearchItem[] = [];
+  private activeIdx = -1;
+  private lastRemoteError = false;
 
   constructor(
     container: HTMLElement,
@@ -23,6 +36,7 @@ export class TopBar {
     callbacks: TopBarCallbacks
   ) {
     this.root = container;
+    this.callbacks = callbacks;
     this.root.className = "tf-topbar";
 
     const regions = REGION_PRESETS.filter((p) => p.group === "region");
@@ -52,28 +66,33 @@ export class TopBar {
         </div>
       </div>
 
-      <form class="tf-search-form" data-role="search-form" role="search">
-        <span class="tf-search-icon" aria-hidden="true">⌕</span>
-        <input
-          type="text"
-          class="tf-search-input mono"
-          data-role="search-input"
-          placeholder="Search lat,lon · MGRS (55H FV 0064 4755) · tracks (Slice 03)…"
-          aria-label="Search coordinates, MGRS, or VIC/NSW tracks"
-          autocomplete="off"
-          spellcheck="false"
-        />
-        <button
-          type="button"
-          class="tf-search-clear hidden"
-          data-role="search-clear"
-          title="Clear search pin"
-          aria-label="Clear search"
-        >×</button>
-        <button type="submit" class="tf-search-submit" title="Go to coordinate or search">
-          Go
-        </button>
-      </form>
+      <div class="tf-search-wrap" data-role="search-wrap">
+        <form class="tf-search-form" data-role="search-form" role="search">
+          <span class="tf-search-icon" aria-hidden="true">⌕</span>
+          <input
+            type="text"
+            class="tf-search-input mono"
+            data-role="search-input"
+            placeholder="Search tracks, huts, camps, lat,lon or MGRS…"
+            aria-label="Search VIC/NSW tracks, camps, huts, coordinates, or MGRS"
+            aria-autocomplete="list"
+            aria-expanded="false"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <button
+            type="button"
+            class="tf-search-clear hidden"
+            data-role="search-clear"
+            title="Clear search"
+            aria-label="Clear search"
+          >×</button>
+          <button type="submit" class="tf-search-submit" title="Search or jump to coordinate">
+            Go
+          </button>
+        </form>
+        <div class="tf-search-menu hidden" data-role="search-menu" role="listbox"></div>
+      </div>
 
       <div class="tf-topbar-controls">
         <label class="tf-preset-wrap" aria-label="Select VIC/NSW region preset">
@@ -101,9 +120,11 @@ export class TopBar {
       </div>
     `;
 
+    this.searchWrapEl = this.q("[data-role='search-wrap']");
     const searchForm = this.q<HTMLFormElement>("[data-role='search-form']");
     this.searchInputEl = this.q<HTMLInputElement>("[data-role='search-input']");
     this.searchClearBtn = this.q<HTMLButtonElement>("[data-role='search-clear']");
+    this.searchMenuEl = this.q("[data-role='search-menu']");
     this.presetSelectEl = this.q<HTMLSelectElement>("[data-role='preset-select']");
     this.healthPillEl = this.q<HTMLButtonElement>("[data-role='health-pill']");
     this.healthDotEl = this.q("[data-role='health-dot']");
@@ -111,22 +132,49 @@ export class TopBar {
 
     searchForm.addEventListener("submit", (e) => {
       e.preventDefault();
-      const query = this.searchInputEl.value.trim();
-      if (query) {
-        callbacks.onSearchSubmit(query);
-      }
+      void this.handleSubmit();
     });
 
     this.searchInputEl.addEventListener("input", () => {
-      this.searchClearBtn.classList.toggle(
-        "hidden",
-        this.searchInputEl.value.trim().length === 0
-      );
+      const q = this.searchInputEl.value.trim();
+      this.searchClearBtn.classList.toggle("hidden", q.length === 0);
+      if (!q) {
+        this.hideMenu();
+        return;
+      }
+      // Show instant local coordinate/MGRS/preset preview before debounced remote fetch
+      const instant = resolveLocalSearch(q);
+      if (instant.length > 0) {
+        this.renderMenu(instant, false);
+      }
+      this.scheduleSearch(q);
+    });
+
+    this.searchInputEl.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown" && this.results.length > 0) {
+        e.preventDefault();
+        this.activeIdx = (this.activeIdx + 1) % this.results.length;
+        this.highlightMenuOption();
+      } else if (e.key === "ArrowUp" && this.results.length > 0) {
+        e.preventDefault();
+        this.activeIdx =
+          (this.activeIdx - 1 + this.results.length) % this.results.length;
+        this.highlightMenuOption();
+      } else if (e.key === "Escape") {
+        this.hideMenu();
+      }
+    });
+
+    document.addEventListener("click", (e) => {
+      if (!this.searchWrapEl.contains(e.target as Node)) {
+        this.hideMenu();
+      }
     });
 
     this.searchClearBtn.addEventListener("click", () => {
       this.searchInputEl.value = "";
       this.searchClearBtn.classList.add("hidden");
+      this.hideMenu();
       callbacks.onSearchClear();
       this.searchInputEl.focus();
     });
@@ -196,6 +244,134 @@ export class TopBar {
     this.healthPillEl.title = state.error
       ? `Offline: ${state.error} (click to retry)`
       : "Backend unreachable — operating in offline shell mode";
+  }
+
+  private scheduleSearch(query: string): void {
+    if (this.searchTimer !== null) {
+      window.clearTimeout(this.searchTimer);
+    }
+    this.searchTimer = window.setTimeout(() => {
+      this.searchTimer = null;
+      void this.executeSearch(query);
+    }, SEARCH_DEBOUNCE_MS);
+  }
+
+  private async executeSearch(query: string): Promise<UnifiedSearchItem[]> {
+    this.searchAbort?.abort();
+    const controller = new AbortController();
+    this.searchAbort = controller;
+
+    try {
+      const { items, remoteError } = await runUnifiedSearch(query, {
+        limit: 10,
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) return [];
+      this.lastRemoteError = remoteError;
+      this.renderMenu(items, remoteError);
+      return items;
+    } catch {
+      return [];
+    }
+  }
+
+  private async handleSubmit(): Promise<void> {
+    const query = this.searchInputEl.value.trim();
+    if (!query) return;
+
+    if (this.activeIdx >= 0 && this.results[this.activeIdx]) {
+      this.selectResult(this.results[this.activeIdx]!);
+      return;
+    }
+
+    const items = await this.executeSearch(query);
+    if (items.length > 0 && items[0]) {
+      this.selectResult(items[0]);
+    } else {
+      this.hideMenu();
+      this.callbacks.onSearchNoMatch(query, this.lastRemoteError);
+    }
+  }
+
+  private selectResult(item: UnifiedSearchItem): void {
+    this.setSearchValue(item.title);
+    this.hideMenu();
+    this.callbacks.onSearchSelect(item);
+  }
+
+  private renderMenu(items: UnifiedSearchItem[], remoteError: boolean): void {
+    this.results = items;
+    this.activeIdx = items.length > 0 ? 0 : -1;
+
+    if (items.length === 0) {
+      this.searchMenuEl.innerHTML = `<div class="tf-search-empty">${
+        remoteError
+          ? "Offline — enter lat,lon, MGRS, or a region name."
+          : "No matching tracks, POIs, or parks."
+      }</div>`;
+      this.searchMenuEl.classList.remove("hidden");
+      this.searchInputEl.setAttribute("aria-expanded", "true");
+      return;
+    }
+
+    this.searchMenuEl.innerHTML = items
+      .map((item, idx) => {
+        const kindBadge =
+          item.kind === "track" && item.grade
+            ? `<span class="tf-search-badge" style="border-color:${getGradeColor(item.grade)};color:${getGradeColor(item.grade)}">${escapeHtml(item.grade)}</span>`
+            : `<span class="tf-search-badge">${escapeHtml(item.kind.toUpperCase())}</span>`;
+
+        const iconImg = item.iconKey
+          ? `<img class="tf-search-item-icon" src="/icons/${escapeHtml(item.iconKey)}.svg" alt="" width="16" height="16" />`
+          : "";
+
+        return `
+          <button
+            type="button"
+            class="tf-search-option ${idx === this.activeIdx ? "active" : ""}"
+            role="option"
+            aria-selected="${idx === this.activeIdx}"
+            data-search-idx="${idx}"
+          >
+            ${iconImg}
+            <span class="tf-search-option-copy">
+              <span class="tf-search-option-title">${escapeHtml(item.title)}</span>
+              <span class="tf-search-option-sub">${escapeHtml(item.subtitle)}</span>
+            </span>
+            ${kindBadge}
+          </button>
+        `;
+      })
+      .join("");
+
+    this.searchMenuEl
+      .querySelectorAll<HTMLButtonElement>("[data-search-idx]")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const idx = Number(btn.dataset.searchIdx);
+          const item = this.results[idx];
+          if (item) this.selectResult(item);
+        });
+      });
+
+    this.searchMenuEl.classList.remove("hidden");
+    this.searchInputEl.setAttribute("aria-expanded", "true");
+  }
+
+  private highlightMenuOption(): void {
+    this.searchMenuEl
+      .querySelectorAll<HTMLButtonElement>("[data-search-idx]")
+      .forEach((btn, idx) => {
+        const active = idx === this.activeIdx;
+        btn.classList.toggle("active", active);
+        btn.setAttribute("aria-selected", String(active));
+      });
+  }
+
+  private hideMenu(): void {
+    this.searchMenuEl.classList.add("hidden");
+    this.searchInputEl.setAttribute("aria-expanded", "false");
+    this.activeIdx = -1;
   }
 
   private q<T extends HTMLElement = HTMLElement>(selector: string): T {

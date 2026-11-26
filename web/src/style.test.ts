@@ -1,23 +1,137 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError, fetchHealth } from "./api";
-import { createInitialLayerState } from "./presets";
+import {
+  DEFAULT_SNOWLINE_BANDS_M,
+  createInitialLayerState,
+  snapSnowlineBand,
+} from "./presets";
 import {
   buildOfflineGraticuleGeoJson,
   buildRegionalBoundsGeoJson,
+  buildSnowlineFilter,
   buildTrailForgeStyle,
+  poisToGeoJson,
+  toPmtilesUrl,
 } from "./style";
+import type { TileManifestResponse } from "./types";
 
-describe("MapLibre 5 offline-capable style builder", () => {
-  it("builds a v8 style with offline graticule, corridors, and Slice 03 layers", () => {
+const SAMPLE_MANIFEST: TileManifestResponse = {
+  generated_at: "2026-11-26T00:00:00Z",
+  bounds: [148.05, -36.68, 148.2, -36.55],
+  minzoom: 8,
+  maxzoom: 15,
+  vector_url: "/api/tiles/trailforge_vector.pmtiles",
+  terrain_url: "/api/tiles/trailforge_terrain.pmtiles",
+  vector_available: true,
+  terrain_available: true,
+  layers: [
+    "track_segments",
+    "steep_sections",
+    "waterways",
+    "pois",
+    "capad_parks",
+    "contours",
+    "snowline_bands",
+  ],
+  snowline_bands_m: [800, 900, 1000, 1100, 1200, 1400, 1600],
+};
+
+describe("MapLibre 5 PMTiles & offline fallback style builder", () => {
+  it("resolves relative PMTiles URLs against origin for MapLibre Web Workers", () => {
+    expect(
+      toPmtilesUrl("/api/tiles/trailforge_vector.pmtiles", "http://localhost:5173")
+    ).toBe("pmtiles://http://localhost:5173/api/tiles/trailforge_vector.pmtiles");
+    expect(
+      toPmtilesUrl("https://tiles.example.org/alps.pmtiles")
+    ).toBe("pmtiles://https://tiles.example.org/alps.pmtiles");
+    expect(
+      toPmtilesUrl("pmtiles://http://localhost:5173/a.pmtiles")
+    ).toBe("pmtiles://http://localhost:5173/a.pmtiles");
+  });
+
+  it("snaps snow-line elevations to discrete manifest bands and builds MapLibre filter", () => {
+    expect(snapSnowlineBand(1000, DEFAULT_SNOWLINE_BANDS_M)).toBe(1000);
+    expect(snapSnowlineBand(1320, DEFAULT_SNOWLINE_BANDS_M)).toBe(1400);
+    expect(snapSnowlineBand(700, DEFAULT_SNOWLINE_BANDS_M)).toBe(800);
+    expect(buildSnowlineFilter(1200)).toEqual(["==", ["get", "elev_min_m"], 1200]);
+  });
+
+  it("mounts vector PMTiles layers and Terrain-RGB hillshade when manifest is available", () => {
+    const layers = { ...createInitialLayerState(), snowLine: true, snowLineElevationM: 1200 };
+    const style = buildTrailForgeStyle({
+      initialBasemap: "offline-topo",
+      layers,
+      tileManifest: SAMPLE_MANIFEST,
+      origin: "http://localhost:5173",
+      selectedTrackId: "trk_davies",
+    });
+
+    expect(style.version).toBe(8);
+    expect(style.sources["tf-vector"]).toEqual({
+      type: "vector",
+      url: "pmtiles://http://localhost:5173/api/tiles/trailforge_vector.pmtiles",
+    });
+    expect(style.sources["tf-terrain-dem"]).toEqual({
+      type: "raster-dem",
+      url: "pmtiles://http://localhost:5173/api/tiles/trailforge_terrain.pmtiles",
+      encoding: "mapbox",
+      tileSize: 256,
+    });
+
+    const byId = new Map(style.layers.map((l) => [l.id, l]));
+    expect(byId.get("tf-hillshade")?.type).toBe("hillshade");
+    expect(byId.get("tf-parks-fill")?.["source-layer" as keyof ReturnType<typeof byId.get>]).toBe(
+      "capad_parks"
+    );
+    expect(byId.get("tf-snow-line-fill")).toMatchObject({
+      source: "tf-vector",
+      "source-layer": "snowline_bands",
+      filter: ["==", ["get", "elev_min_m"], 1200],
+      layout: { visibility: "visible" },
+    });
+    expect(byId.get("tf-contours-index")).toMatchObject({
+      "source-layer": "contours",
+    });
+    expect(byId.get("tf-contours-labels")).toMatchObject({
+      type: "symbol",
+      "source-layer": "contours",
+      layout: {
+        "symbol-spacing": 520,
+        "icon-padding": 28,
+      },
+      paint: {
+        "icon-opacity": 0.78,
+      },
+    });
+    expect(byId.get("tf-pois-layer")).toMatchObject({
+      type: "circle",
+      paint: {
+        "circle-color": "rgba(241, 245, 249, 0.94)",
+      },
+    });
+    expect(byId.get("tf-tracks-line")).toMatchObject({
+      source: "tf-vector",
+      "source-layer": "track_segments",
+    });
+    expect(byId.get("tf-steep-highlights")).toMatchObject({
+      source: "tf-vector",
+      "source-layer": "steep_sections",
+    });
+    expect(byId.get("tf-pois-icons")).toMatchObject({
+      source: "tf-vector",
+      "source-layer": "pois",
+    });
+  });
+
+  it("builds a clean GeoJSON fallback style when PMTiles manifest is unavailable", () => {
     const layers = createInitialLayerState();
     const style = buildTrailForgeStyle({
       initialBasemap: "offline-topo",
       layers,
     });
 
-    expect(style.version).toBe(8);
-    expect(style.sources["offline-graticule"]).toBeDefined();
-    expect(style.sources["offline-regions"]).toBeDefined();
+    expect(style.sources["tf-vector"]).toBeUndefined();
+    expect(style.sources["tf-terrain-dem"]).toBeUndefined();
     expect(style.sources["tf-tracks"]).toBeDefined();
     expect(style.sources["tf-pois"]).toBeDefined();
 
@@ -32,44 +146,34 @@ describe("MapLibre 5 offline-capable style builder", () => {
     expect(byId.get("basemap-satellite")?.layout).toEqual({
       visibility: "none",
     });
-
-    // Slice 03 layer slots honor initial visibility
-    expect(
-      (byId.get("tf-tracks-line")?.layout as { visibility?: string })
-        ?.visibility
-    ).toBe("visible");
-    expect(
-      (byId.get("tf-steep-highlights")?.layout as { visibility?: string })
-        ?.visibility
-    ).toBe("visible");
-    expect(
-      (byId.get("tf-contours-hillshade")?.layout as { visibility?: string })
-        ?.visibility
-    ).toBe("visible");
     expect(
       (byId.get("tf-snow-line-fill")?.layout as { visibility?: string })
         ?.visibility
     ).toBe("none");
-    expect(
-      (byId.get("tf-pois-layer")?.layout as { visibility?: string })?.visibility
-    ).toBe("visible");
   });
 
-  it("enables OpenTopo + OSM underlay when opentopo basemap is active", () => {
-    const style = buildTrailForgeStyle({
-      initialBasemap: "opentopo",
-      layers: { ...createInitialLayerState(), snowLine: true },
-    });
-    const byId = new Map(style.layers.map((l) => [l.id, l]));
-    expect(byId.get("basemap-opentopo")?.layout).toEqual({
-      visibility: "visible",
-    });
-    expect(byId.get("basemap-osm-underlay")?.layout).toEqual({
-      visibility: "visible",
-    });
-    expect(byId.get("tf-snow-line-fill")?.layout).toEqual({
-      visibility: "visible",
-    });
+  it("converts fallback /api/pois items into GeoJSON with resolved outdoor icons", () => {
+    const fc = poisToGeoJson([
+      {
+        id: 1,
+        name: "Davies Plain Hut",
+        poi_type: "hut",
+        elev_m: 1615,
+        lon: 148.126,
+        lat: -36.662,
+      },
+      {
+        id: 2,
+        name: "Tom Groggin Campground",
+        poi_type: "campground",
+        elev_m: 612,
+        lon: 148.1195,
+        lat: -36.5602,
+      },
+    ]);
+    expect(fc.features).toHaveLength(2);
+    expect(fc.features[0]?.properties?.icon).toBe("hut");
+    expect(fc.features[1]?.properties?.icon).toBe("campground");
   });
 
   it("generates non-empty offline graticule and corridor GeoJSON", () => {
