@@ -25,6 +25,8 @@ from trailforge.tiles.builder import (
     POI_CATEGORY_TO_ICON,
     TERRAIN_PMTILES_FILENAME,
     VECTOR_PMTILES_FILENAME,
+    _parse_postgis_box2d,
+    _StreamGeoJSONWriter,
     build_terrain_pmtiles,
     build_tiles,
     export_postgis_vector_layers,
@@ -99,6 +101,43 @@ def test_cli_argument_parser_defaults() -> None:
     assert args.minzoom == 8
     assert args.maxzoom == 15
     assert args.contour_interval == 20.0
+
+
+def test_parse_postgis_box2d_and_stream_geojson_writer(tmp_path: Path) -> None:
+    assert _parse_postgis_box2d("BOX(146.4 -37.6,148.45 -36.35)") == (
+        146.4,
+        -37.6,
+        148.45,
+        -36.35,
+    )
+    assert _parse_postgis_box2d(None) is None
+    assert _parse_postgis_box2d("INVALID") is None
+
+    empty_path = tmp_path / "empty.geojson"
+    with _StreamGeoJSONWriter(empty_path) as writer:
+        assert writer.count == 0
+    assert not empty_path.exists()
+
+    out_path = tmp_path / "streamed.geojson"
+    with _StreamGeoJSONWriter(out_path) as writer:
+        writer.write_feature(
+            {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [147.2, -37.1]},
+                "properties": {"name": "Billy Goat Bluff"},
+            }
+        )
+        writer.write_raw_feature(
+            '{"type":"Feature","geometry":{"type":"Point","coordinates":[147.3,-37.2]},'
+            '"properties":{"name":"Blue Rag"}}'
+        )
+    assert writer.count == 2
+    fc = json.loads(out_path.read_text(encoding="utf-8"))
+    assert fc["type"] == "FeatureCollection"
+    assert [f["properties"]["name"] for f in fc["features"]] == [
+        "Billy Goat Bluff",
+        "Blue Rag",
+    ]
 
 
 @pytest.mark.integration

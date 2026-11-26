@@ -410,6 +410,13 @@ def compute_segment_live_grade(
     )
 
 
+_MAX_SQL_IN_PARAMS: Final[int] = 10_000
+
+
+def _chunked(items: Sequence[str], size: int = _MAX_SQL_IN_PARAMS) -> list[list[str]]:
+    return [list(items[i : i + size]) for i in range(0, len(items), size)]
+
+
 def recompute_live_grades(
     session: Session,
     *,
@@ -426,7 +433,7 @@ def recompute_live_grades(
     """
     ref_now = (now or datetime.now(UTC)).astimezone(UTC)
 
-    seg_query = (
+    base_seg_query = (
         select(
             TrackSegment.segment_id,
             TrackSegment.track_id,
@@ -441,10 +448,19 @@ def recompute_live_grades(
         .join(TrackSegmentGrade, TrackSegmentGrade.segment_id == TrackSegment.segment_id)
         .where(TrackSegment.is_active.is_(True), TrackSegment.is_vehicular.is_(True))
     )
-    if segment_ids is not None:
-        seg_query = seg_query.where(TrackSegment.segment_id.in_(list(segment_ids)))
 
-    seg_rows = session.execute(seg_query).all()
+    if segment_ids is None:
+        seg_rows = session.execute(base_seg_query).all()
+    else:
+        unique_target_ids = list(dict.fromkeys(segment_ids))
+        seg_rows = []
+        for id_chunk in _chunked(unique_target_ids):
+            seg_rows.extend(
+                session.execute(
+                    base_seg_query.where(TrackSegment.segment_id.in_(id_chunk))
+                ).all()
+            )
+
     if not seg_rows:
         return LiveGradingRecomputeSummary(
             segments_evaluated=0,
@@ -455,22 +471,34 @@ def recompute_live_grades(
             rainfall_summary=get_rainfall_summary(session, now=ref_now),
         )
 
-    target_seg_ids = [row.segment_id for row in seg_rows]
-
-    # 1. Batch-load anonymized telemetry observations for all target segments
-    obs_rows = session.execute(
-        select(
-            TelemetryObservation.segment_id,
-            TelemetryObservation.vehicle_capability_class,
-            TelemetryObservation.observed_at,
-            TelemetryObservation.traversal_duration_s,
-            TelemetryObservation.avg_speed_kmh,
-            TelemetryObservation.min_speed_kmh,
-            TelemetryObservation.roughness_rms,
-            TelemetryObservation.roughness_p95,
-            TelemetryObservation.match_confidence,
-        ).where(TelemetryObservation.segment_id.in_(target_seg_ids))
-    ).all()
+    # 1. Batch-load anonymized telemetry observations without exceeding PostgreSQL's
+    #    65,535 bind-parameter limit on large (>65k segment) regional/statewide networks.
+    obs_cols = (
+        TelemetryObservation.segment_id,
+        TelemetryObservation.vehicle_capability_class,
+        TelemetryObservation.observed_at,
+        TelemetryObservation.traversal_duration_s,
+        TelemetryObservation.avg_speed_kmh,
+        TelemetryObservation.min_speed_kmh,
+        TelemetryObservation.roughness_rms,
+        TelemetryObservation.roughness_p95,
+        TelemetryObservation.match_confidence,
+    )
+    if segment_ids is None:
+        obs_rows = session.execute(
+            select(*obs_cols)
+            .join(TrackSegment, TrackSegment.segment_id == TelemetryObservation.segment_id)
+            .where(TrackSegment.is_active.is_(True), TrackSegment.is_vehicular.is_(True))
+        ).all()
+    else:
+        target_seg_ids = [row.segment_id for row in seg_rows]
+        obs_rows = []
+        for id_chunk in _chunked(target_seg_ids):
+            obs_rows.extend(
+                session.execute(
+                    select(*obs_cols).where(TelemetryObservation.segment_id.in_(id_chunk))
+                ).all()
+            )
 
     samples_by_seg: dict[str, list[ObservationSample]] = defaultdict(list)
     for obs in obs_rows:

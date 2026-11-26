@@ -487,6 +487,7 @@ def _run_post_ingestion_steps(
             session.flush()
         rainfall_cells_updated = rsum.rainfall_cells_updated
 
+    built_tile_bounds: list[float] | None = None
     settings = get_settings()
     if options.build_tiles:
         target_tiles_dir = (
@@ -517,6 +518,7 @@ def _run_post_ingestion_steps(
             terrain_pmtiles_path = (
                 str(tile_res.terrain_pmtiles) if tile_res.terrain_pmtiles is not None else None
             )
+            built_tile_bounds = list(tile_res.manifest.bounds)
         else:
             logger.warning(
                 "Skipping --build-tiles because tippecanoe/gdalwarp/pmtiles are not installed."
@@ -534,6 +536,9 @@ def _run_post_ingestion_steps(
             output_dir=target_packs_dir,
             dem_path=dem_path,
             skip_tiles=not options.build_tiles,
+            prebuilt_vector_pmtiles=vector_pmtiles_path,
+            prebuilt_terrain_pmtiles=terrain_pmtiles_path,
+            prebuilt_tile_bounds=built_tile_bounds,
         )
         pack_built = True
         pack_manifest_path = str(pack_res.manifest_path)

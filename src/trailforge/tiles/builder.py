@@ -29,7 +29,7 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, TextIO
 
 import numpy as np
 from pydantic import BaseModel, Field
@@ -163,6 +163,71 @@ def _write_geojson_fc(path: Path, features: list[dict[str, Any]]) -> Path:
     return path
 
 
+class _StreamGeoJSONWriter:
+    """Write an RFC 7946 FeatureCollection directly to disk in O(1) RAM."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.count = 0
+        self._fh: TextIO | None = None
+
+    def __enter__(self) -> _StreamGeoJSONWriter:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = self.path.open("w", encoding="utf-8")
+        self._fh.write('{"type":"FeatureCollection","features":[')
+        return self
+
+    def write_raw_feature(self, raw_json: str) -> None:
+        if self._fh is None:
+            raise RuntimeError("_StreamGeoJSONWriter must be entered as a context manager")
+        if self.count > 0:
+            self._fh.write(",\n")
+        self._fh.write(raw_json)
+        self.count += 1
+
+    def write_feature(self, feature: dict[str, Any]) -> None:
+        self.write_raw_feature(json.dumps(feature, separators=(",", ":")))
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._fh is not None:
+            self._fh.write("]}\n")
+            self._fh.close()
+            self._fh = None
+        if exc_type is not None or self.count == 0:
+            self.path.unlink(missing_ok=True)
+
+
+def _parse_postgis_box2d(raw: str | None) -> tuple[float, float, float, float] | None:
+    """Parse PostGIS ``ST_Extent`` text ``BOX(minx miny,maxx maxy)`` into a float tuple."""
+    if not raw:
+        return None
+    text = str(raw).strip()
+    if text.upper().startswith("BOX(") and text.endswith(")"):
+        inner = text[4:-1]
+    else:
+        return None
+    parts = inner.split(",")
+    if len(parts) != 2:
+        return None
+    lo = parts[0].strip().split()
+    hi = parts[1].strip().split()
+    if len(lo) != 2 or len(hi) != 2:
+        return None
+    return (float(lo[0]), float(lo[1]), float(hi[0]), float(hi[1]))
+
+
+def _query_layer_extent(
+    session: Session,
+    geom_col: Any,
+    *where_clauses: Any,
+) -> tuple[float, float, float, float] | None:
+    stmt = select(func.ST_Extent(geom_col))
+    if where_clauses:
+        stmt = stmt.where(*where_clauses)
+    raw = session.execute(stmt).scalar_one_or_none()
+    return _parse_postgis_box2d(raw)
+
+
 def _update_bounds(
     acc: list[float] | None, geom_bounds: tuple[float, float, float, float]
 ) -> list[float]:
@@ -183,7 +248,7 @@ def export_postgis_vector_layers(
     *,
     bbox: tuple[float, float, float, float] | None = None,
 ) -> tuple[dict[str, Path], dict[str, int], list[float] | None]:
-    """Export canonical PostGIS vector layers into per-layer GeoJSON files for Tippecanoe.
+    """Stream canonical PostGIS vector layers into per-layer GeoJSON files in O(1) RAM.
 
     Returns ``(layer_paths, layer_counts, computed_bounds_wgs84)``.
     """
@@ -196,207 +261,272 @@ def export_postgis_vector_layers(
         func.ST_MakeEnvelope(bbox[0], bbox[1], bbox[2], bbox[3], 4326) if bbox is not None else None
     )
 
-    # 1. track_segments + steep_sections
+    # 1. track_segments + steep_sections (lightweight scalar projection, streamed to disk)
+    seg_where: list[Any] = [TrackSegment.is_active.is_(True)]
+    if env_geom is not None:
+        seg_where.append(func.ST_Intersects(TrackSegment.geom, env_geom))
+
+    seg_extent = _query_layer_extent(session, TrackSegment.geom, *seg_where)
+    if seg_extent is not None:
+        bounds_acc = _update_bounds(bounds_acc, seg_extent)
+
     seg_stmt = (
         select(
-            TrackSegment,
-            func.ST_AsGeoJSON(TrackSegment.geom).label("geom_json"),
-            TrackSegmentGrade,
+            TrackSegment.segment_id,
+            TrackSegment.track_id,
+            TrackSegment.name.label("seg_name"),
+            TrackSegment.max_slope_deg,
+            TrackSegment.sustained_slope_deg,
+            TrackSegment.elev_min_m,
+            TrackSegment.elev_max_m,
+            TrackSegment.is_steep_highlight,
+            TrackSegment.is_above_snowline,
+            TrackSegment.waterway_crossing_count,
+            TrackSegment.surface_class,
+            TrackSegment.tracktype,
+            TrackSegment.is_4wd_only,
+            TrackSegment.has_gate_barrier,
+            TrackSegment.access_status,
+            func.ST_AsGeoJSON(TrackSegment.geom, 6).label("geom_json"),
+            TrackSegmentGrade.effective_grade,
+            TrackSegmentGrade.baseline_grade,
+            TrackSegmentGrade.live_grade,
+            TrackSegmentGrade.live_score,
+            TrackSegmentGrade.baseline_score,
+            TrackSegmentGrade.confidence_level,
+            TrackSegmentGrade.wet_risk_level,
+            TrackSegmentGrade.live_breakdown,
+            TrackSegmentGrade.rainfall_context,
             Track.name.label("track_name"),
         )
         .outerjoin(TrackSegmentGrade, TrackSegment.segment_id == TrackSegmentGrade.segment_id)
         .outerjoin(Track, TrackSegment.track_id == Track.track_id)
-        .where(TrackSegment.is_active.is_(True))
-        .order_by(TrackSegment.track_id.asc(), TrackSegment.segment_seq.asc().nullslast())
+        .where(*seg_where)
+        .execution_options(yield_per=2000)
     )
-    if env_geom is not None:
-        seg_stmt = seg_stmt.where(func.ST_Intersects(TrackSegment.geom, env_geom))
 
-    seg_features: list[dict[str, Any]] = []
-    steep_features: list[dict[str, Any]] = []
-    for seg, geom_json, grd, track_name in session.execute(seg_stmt).all():
-        geom_obj = json.loads(geom_json)
-        shp = shape(geom_obj)
-        if not shp.is_empty:
-            bounds_acc = _update_bounds(bounds_acc, shp.bounds)
+    seg_out = work_dir / "track_segments.geojson"
+    steep_out = work_dir / "steep_sections.geojson"
+    with (
+        _StreamGeoJSONWriter(seg_out) as seg_writer,
+        _StreamGeoJSONWriter(steep_out) as steep_writer,
+    ):
+        for row in session.execute(seg_stmt):
+            geom_json = row.geom_json
+            if not geom_json:
+                continue
+            resolved_name = row.track_name or row.seg_name or "Unnamed Track"
+            grade_val = (
+                row.effective_grade
+                if row.effective_grade
+                else (row.baseline_grade if row.baseline_grade else "Easy")
+            )
+            score_val = (
+                float(row.live_score)
+                if row.live_score is not None
+                else (float(row.baseline_score) if row.baseline_score is not None else 0.0)
+            )
+            live_bd = row.live_breakdown if isinstance(row.live_breakdown, dict) else {}
+            rain_ctx = row.rainfall_context if isinstance(row.rainfall_context, dict) else {}
+            raw_conf = row.confidence_level or "baseline_only"
+            conf_level = "none" if raw_conf in ("", "baseline_only") else raw_conf
+            wet_risk = str(rain_ctx.get("wet_risk_level") or (row.wet_risk_level or "dry"))
 
-        resolved_name = track_name or seg.name or "Unnamed Track"
-        grade_val = (
-            grd.effective_grade
-            if grd is not None and grd.effective_grade
-            else (grd.baseline_grade if grd is not None else "Easy")
-        )
-        score_val = (
-            float(grd.live_score)
-            if grd is not None and grd.live_score is not None
-            else (float(grd.baseline_score) if grd is not None else 0.0)
-        )
-        live_bd = (
-            grd.live_breakdown
-            if grd is not None and isinstance(grd.live_breakdown, dict)
-            else {}
-        )
-        rain_ctx = (
-            grd.rainfall_context
-            if grd is not None and isinstance(grd.rainfall_context, dict)
-            else {}
-        )
-        raw_conf = grd.confidence_level if grd is not None else "baseline_only"
-        conf_level = "none" if raw_conf in (None, "", "baseline_only") else raw_conf
-        wet_risk = str(
-            rain_ctx.get("wet_risk_level") or (grd.wet_risk_level if grd is not None else "dry")
-        )
+            seg_props: dict[str, Any] = {
+                "segment_id": row.segment_id,
+                "track_id": row.track_id,
+                "track_name": resolved_name,
+                "grade": grade_val,
+                "score": round(score_val, 1),
+                "live_grade": row.live_grade,
+                "live_score": (
+                    round(float(row.live_score), 1) if row.live_score is not None else None
+                ),
+                "confidence_level": conf_level,
+                "is_obstacle_hotspot": bool(live_bd.get("is_obstacle_hotspot", False)),
+                "wet_risk_level": wet_risk,
+                "max_slope_deg": round(row.max_slope_deg, 2)
+                if row.max_slope_deg is not None
+                else 0.0,
+                "sustained_slope_deg": (
+                    round(row.sustained_slope_deg, 2)
+                    if row.sustained_slope_deg is not None
+                    else 0.0
+                ),
+                "min_elev_m": round(row.elev_min_m, 1) if row.elev_min_m is not None else None,
+                "max_elev_m": round(row.elev_max_m, 1) if row.elev_max_m is not None else None,
+                "is_steep_highlight": bool(row.is_steep_highlight),
+                "is_above_snowline": bool(row.is_above_snowline),
+                "waterway_crossing_count": int(row.waterway_crossing_count or 0),
+                "surface_class": row.surface_class,
+                "tracktype": row.tracktype,
+                "is_4wd_only": bool(row.is_4wd_only),
+                "has_gate_barrier": bool(row.has_gate_barrier),
+                "access_status": row.access_status,
+            }
+            seg_props_json = json.dumps(seg_props, separators=(",", ":"))
+            seg_writer.write_raw_feature(
+                f'{{"type":"Feature","geometry":{geom_json},"properties":{seg_props_json}}}'
+            )
 
-        seg_props: dict[str, Any] = {
-            "segment_id": seg.segment_id,
-            "track_id": seg.track_id,
-            "track_name": resolved_name,
-            "grade": grade_val,
-            "score": round(score_val, 1),
-            "live_grade": grd.live_grade if grd is not None else None,
-            "live_score": (
-                round(float(grd.live_score), 1)
-                if grd is not None and grd.live_score is not None
-                else None
-            ),
-            "confidence_level": conf_level,
-            "is_obstacle_hotspot": bool(live_bd.get("is_obstacle_hotspot", False)),
-            "wet_risk_level": wet_risk,
-            "max_slope_deg": round(seg.max_slope_deg, 2) if seg.max_slope_deg is not None else 0.0,
-            "sustained_slope_deg": (
-                round(seg.sustained_slope_deg, 2) if seg.sustained_slope_deg is not None else 0.0
-            ),
-            "min_elev_m": round(seg.elev_min_m, 1) if seg.elev_min_m is not None else None,
-            "max_elev_m": round(seg.elev_max_m, 1) if seg.elev_max_m is not None else None,
-            "is_steep_highlight": bool(seg.is_steep_highlight),
-            "is_above_snowline": bool(seg.is_above_snowline),
-            "waterway_crossing_count": int(seg.waterway_crossing_count),
-            "surface_class": seg.surface_class,
-            "tracktype": seg.tracktype,
-            "is_4wd_only": bool(seg.is_4wd_only),
-            "has_gate_barrier": bool(seg.has_gate_barrier),
-            "access_status": seg.access_status,
-        }
-        seg_features.append({"type": "Feature", "geometry": geom_obj, "properties": seg_props})
-
-        if seg.is_steep_highlight:
-            steep_features.append(
-                {
-                    "type": "Feature",
-                    "geometry": geom_obj,
-                    "properties": {
-                        "segment_id": seg.segment_id,
-                        "track_id": seg.track_id,
+            if row.is_steep_highlight:
+                steep_props_json = json.dumps(
+                    {
+                        "segment_id": row.segment_id,
+                        "track_id": row.track_id,
                         "track_name": resolved_name,
                         "max_slope_deg": (
-                            round(seg.max_slope_deg, 2) if seg.max_slope_deg is not None else 0.0
+                            round(row.max_slope_deg, 2) if row.max_slope_deg is not None else 0.0
                         ),
                         "grade": grade_val,
                     },
-                }
-            )
+                    separators=(",", ":"),
+                )
+                steep_writer.write_raw_feature(
+                    f'{{"type":"Feature","geometry":{geom_json},"properties":{steep_props_json}}}'
+                )
 
-    layer_counts["track_segments"] = len(seg_features)
-    if seg_features:
-        layer_paths["track_segments"] = _write_geojson_fc(
-            work_dir / "track_segments.geojson", seg_features
-        )
+    layer_counts["track_segments"] = seg_writer.count
+    if seg_writer.count > 0:
+        layer_paths["track_segments"] = seg_out
 
-    layer_counts["steep_sections"] = len(steep_features)
-    if steep_features:
-        layer_paths["steep_sections"] = _write_geojson_fc(
-            work_dir / "steep_sections.geojson", steep_features
-        )
+    layer_counts["steep_sections"] = steep_writer.count
+    if steep_writer.count > 0:
+        layer_paths["steep_sections"] = steep_out
+
+    logger.info(
+        "Exported %d track_segments and %d steep_sections to GeoJSON",
+        seg_writer.count,
+        steep_writer.count,
+    )
 
     # 2. waterways (non-Connector)
-    ww_stmt = (
-        select(SourceWaterway, func.ST_AsGeoJSON(SourceWaterway.geom).label("geom_json"))
-        .where(func.lower(SourceWaterway.feature_type) != "connector")
-        .order_by(SourceWaterway.id.asc())
-    )
+    ww_where: list[Any] = [func.lower(SourceWaterway.feature_type) != "connector"]
     if env_geom is not None:
-        ww_stmt = ww_stmt.where(func.ST_Intersects(SourceWaterway.geom, env_geom))
+        ww_where.append(func.ST_Intersects(SourceWaterway.geom, env_geom))
+    ww_extent = _query_layer_extent(session, SourceWaterway.geom, *ww_where)
+    if ww_extent is not None:
+        bounds_acc = _update_bounds(bounds_acc, ww_extent)
 
-    ww_features: list[dict[str, Any]] = []
-    for ww, geom_json in session.execute(ww_stmt).all():
-        geom_obj = json.loads(geom_json)
-        shp = shape(geom_obj)
-        if not shp.is_empty:
-            bounds_acc = _update_bounds(bounds_acc, shp.bounds)
-        ww_features.append(
-            {
-                "type": "Feature",
-                "geometry": geom_obj,
-                "properties": {
-                    "name": ww.name,
-                    "waterway_type": ww.feature_type,
-                    "perennial": ww.perenniality.strip().lower() == "perennial",
-                },
-            }
+    ww_stmt = (
+        select(
+            SourceWaterway.name,
+            SourceWaterway.feature_type,
+            SourceWaterway.perenniality,
+            func.ST_AsGeoJSON(SourceWaterway.geom, 6).label("geom_json"),
         )
-    layer_counts["waterways"] = len(ww_features)
-    if ww_features:
-        layer_paths["waterways"] = _write_geojson_fc(work_dir / "waterways.geojson", ww_features)
+        .where(*ww_where)
+        .execution_options(yield_per=2000)
+    )
+    ww_out = work_dir / "waterways.geojson"
+    with _StreamGeoJSONWriter(ww_out) as ww_writer:
+        for row in session.execute(ww_stmt):
+            if not row.geom_json:
+                continue
+            ww_props_json = json.dumps(
+                {
+                    "name": row.name,
+                    "waterway_type": row.feature_type,
+                    "perennial": (row.perenniality or "").strip().lower() == "perennial",
+                },
+                separators=(",", ":"),
+            )
+            ww_writer.write_raw_feature(
+                f'{{"type":"Feature","geometry":{row.geom_json},"properties":{ww_props_json}}}'
+            )
+    layer_counts["waterways"] = ww_writer.count
+    if ww_writer.count > 0:
+        layer_paths["waterways"] = ww_out
 
     # 3. pois
-    poi_stmt = select(POI, func.ST_AsGeoJSON(POI.geom).label("geom_json")).order_by(POI.id.asc())
+    poi_where: list[Any] = []
     if env_geom is not None:
-        poi_stmt = poi_stmt.where(func.ST_Intersects(POI.geom, env_geom))
+        poi_where.append(func.ST_Intersects(POI.geom, env_geom))
+    poi_extent = _query_layer_extent(session, POI.geom, *poi_where)
+    if poi_extent is not None:
+        bounds_acc = _update_bounds(bounds_acc, poi_extent)
 
-    poi_features: list[dict[str, Any]] = []
-    for poi, geom_json in session.execute(poi_stmt).all():
-        geom_obj = json.loads(geom_json)
-        shp = shape(geom_obj)
-        if not shp.is_empty:
-            bounds_acc = _update_bounds(bounds_acc, shp.bounds)
-        poi_features.append(
-            {
-                "type": "Feature",
-                "geometry": geom_obj,
-                "properties": {
-                    "poi_id": str(poi.id),
-                    "name": poi.name,
-                    "category": poi.poi_type,
-                    "elevation_m": round(poi.elev_m, 1) if poi.elev_m is not None else None,
-                    "icon": POI_CATEGORY_TO_ICON.get(poi.poi_type, "saddle"),
-                },
-            }
+    poi_stmt = (
+        select(
+            POI.id,
+            POI.name,
+            POI.poi_type,
+            POI.elev_m,
+            func.ST_AsGeoJSON(POI.geom, 6).label("geom_json"),
         )
-    layer_counts["pois"] = len(poi_features)
-    if poi_features:
-        layer_paths["pois"] = _write_geojson_fc(work_dir / "pois.geojson", poi_features)
+        .where(*poi_where)
+        .execution_options(yield_per=2000)
+    )
+    poi_out = work_dir / "pois.geojson"
+    with _StreamGeoJSONWriter(poi_out) as poi_writer:
+        for row in session.execute(poi_stmt):
+            if not row.geom_json:
+                continue
+            poi_props_json = json.dumps(
+                {
+                    "poi_id": str(row.id),
+                    "name": row.name,
+                    "category": row.poi_type,
+                    "elevation_m": round(row.elev_m, 1) if row.elev_m is not None else None,
+                    "icon": POI_CATEGORY_TO_ICON.get(row.poi_type, "saddle"),
+                },
+                separators=(",", ":"),
+            )
+            poi_writer.write_raw_feature(
+                f'{{"type":"Feature","geometry":{row.geom_json},"properties":{poi_props_json}}}'
+            )
+    layer_counts["pois"] = poi_writer.count
+    if poi_writer.count > 0:
+        layer_paths["pois"] = poi_out
 
     # 4. capad_parks
-    park_stmt = select(
-        CAPADPark, func.ST_AsGeoJSON(CAPADPark.geom).label("geom_json")
-    ).order_by(CAPADPark.id.asc())
+    park_where: list[Any] = []
     if env_geom is not None:
-        park_stmt = park_stmt.where(func.ST_Intersects(CAPADPark.geom, env_geom))
+        park_where.append(func.ST_Intersects(CAPADPark.geom, env_geom))
+    park_extent = _query_layer_extent(session, CAPADPark.geom, *park_where)
+    if park_extent is not None:
+        bounds_acc = _update_bounds(bounds_acc, park_extent)
 
-    park_features: list[dict[str, Any]] = []
-    for park, geom_json in session.execute(park_stmt).all():
-        geom_obj = json.loads(geom_json)
-        shp = shape(geom_obj)
-        if not shp.is_empty:
-            bounds_acc = _update_bounds(bounds_acc, shp.bounds)
-        park_features.append(
-            {
-                "type": "Feature",
-                "geometry": geom_obj,
-                "properties": {
-                    "name": park.name,
-                    "park_type": park.park_type,
-                    "type_abbr": park.type_abbr,
-                    "state": park.state,
-                    "iucn": park.iucn,
+    park_stmt = (
+        select(
+            CAPADPark.name,
+            CAPADPark.park_type,
+            CAPADPark.type_abbr,
+            CAPADPark.state,
+            CAPADPark.iucn,
+            func.ST_AsGeoJSON(CAPADPark.geom, 5).label("geom_json"),
+        )
+        .where(*park_where)
+        .execution_options(yield_per=200)
+    )
+    park_out = work_dir / "capad_parks.geojson"
+    with _StreamGeoJSONWriter(park_out) as park_writer:
+        for row in session.execute(park_stmt):
+            if not row.geom_json:
+                continue
+            park_props_json = json.dumps(
+                {
+                    "name": row.name,
+                    "park_type": row.park_type,
+                    "type_abbr": row.type_abbr,
+                    "state": row.state,
+                    "iucn": row.iucn,
                 },
-            }
-        )
-    layer_counts["capad_parks"] = len(park_features)
-    if park_features:
-        layer_paths["capad_parks"] = _write_geojson_fc(
-            work_dir / "capad_parks.geojson", park_features
-        )
+                separators=(",", ":"),
+            )
+            park_writer.write_raw_feature(
+                f'{{"type":"Feature","geometry":{row.geom_json},"properties":{park_props_json}}}'
+            )
+    layer_counts["capad_parks"] = park_writer.count
+    if park_writer.count > 0:
+        layer_paths["capad_parks"] = park_out
+
+    logger.info(
+        "Exported waterways=%d pois=%d capad_parks=%d",
+        ww_writer.count,
+        poi_writer.count,
+        park_writer.count,
+    )
 
     return (layer_paths, layer_counts, bounds_acc)
 
@@ -408,7 +538,7 @@ def generate_contours_geojson(
     interval_m: float = DEFAULT_CONTOUR_INTERVAL_M,
     index_interval_m: float = DEFAULT_CONTOUR_INDEX_M,
 ) -> int:
-    """Generate topographic contour lines via ``gdal_contour`` with ``elev_m`` and ``is_index``."""
+    """Generate topographic contour lines via ``gdal_contour`` streaming in O(1) RAM."""
     if shutil.which("gdal_contour") is None:
         raise RuntimeError("gdal_contour binary not found in PATH")
 
@@ -417,8 +547,8 @@ def generate_contours_geojson(
         raise FileNotFoundError(f"DEM file not found for contour generation: {src}")
 
     out_geojson.parent.mkdir(parents=True, exist_ok=True)
-    raw_geojson = out_geojson.with_suffix(".raw.geojson")
-    raw_geojson.unlink(missing_ok=True)
+    raw_seq = out_geojson.with_suffix(".raw.geojsonseq")
+    raw_seq.unlink(missing_ok=True)
     try:
         _run_cmd(
             [
@@ -428,41 +558,48 @@ def generate_contours_geojson(
                 "-i",
                 f"{interval_m:g}",
                 "-f",
-                "GeoJSON",
+                "GeoJSONSeq",
                 str(src),
-                str(raw_geojson),
+                str(raw_seq),
             ],
             step="gdal_contour",
         )
-        raw_fc = json.loads(raw_geojson.read_text(encoding="utf-8"))
+        with (
+            raw_seq.open("r", encoding="utf-8") as raw_fh,
+            _StreamGeoJSONWriter(out_geojson) as writer,
+        ):
+            for raw_line in raw_fh:
+                line = raw_line.lstrip("\x1e").strip()
+                if not line:
+                    continue
+                feat = json.loads(line)
+                geom = feat.get("geometry")
+                if not geom:
+                    continue
+                props = feat.get("properties") or {}
+                raw_elev = props.get("elev_m")
+                if raw_elev is None:
+                    continue
+                elev_f = float(raw_elev)
+                elev_int = int(round(elev_f))
+                is_index = abs(elev_f - round(elev_f / index_interval_m) * index_interval_m) < 1e-3
+                writer.write_feature(
+                    {
+                        "type": "Feature",
+                        "tippecanoe": {"minzoom": 9 if is_index else 11},
+                        "geometry": geom,
+                        "properties": {
+                            "elev_m": elev_int,
+                            "is_index": is_index,
+                        },
+                    }
+                )
+        count = writer.count
     finally:
-        raw_geojson.unlink(missing_ok=True)
+        raw_seq.unlink(missing_ok=True)
 
-    features: list[dict[str, Any]] = []
-    for feat in raw_fc.get("features") or []:
-        geom = feat.get("geometry")
-        if not geom:
-            continue
-        props = feat.get("properties") or {}
-        raw_elev = props.get("elev_m")
-        if raw_elev is None:
-            continue
-        elev_f = float(raw_elev)
-        elev_int = int(round(elev_f))
-        is_index = abs(elev_f - round(elev_f / index_interval_m) * index_interval_m) < 1e-3
-        features.append(
-            {
-                "type": "Feature",
-                "geometry": geom,
-                "properties": {
-                    "elev_m": elev_int,
-                    "is_index": is_index,
-                },
-            }
-        )
-
-    _write_geojson_fc(out_geojson, features)
-    return len(features)
+    logger.info("Generated %d contour lines from %s", count, src.name)
+    return count
 
 
 def _polygonize_mask_pure_python(
@@ -541,12 +678,28 @@ def generate_snowline_bands_geojson(
 
     if use_rasterio:
         import rasterio  # type: ignore[import-not-found]
+        import rasterio.enums  # type: ignore[import-not-found]
         import rasterio.features  # type: ignore[import-not-found]
 
         with rasterio.open(src) as ds:
-            arr = ds.read(1).astype(np.float32, copy=False)
+            max_pixels = 2_000_000
+            total_pixels = int(ds.width) * int(ds.height)
+            if total_pixels > max_pixels:
+                scale = math.sqrt(max_pixels / total_pixels)
+                out_h = max(64, int(round(ds.height * scale)))
+                out_w = max(64, int(round(ds.width * scale)))
+                arr = ds.read(
+                    1,
+                    out_shape=(out_h, out_w),
+                    resampling=rasterio.enums.Resampling.bilinear,
+                ).astype(np.float32, copy=False)
+                transform = ds.transform * ds.transform.scale(
+                    ds.width / float(out_w), ds.height / float(out_h)
+                )
+            else:
+                arr = ds.read(1).astype(np.float32, copy=False)
+                transform = ds.transform
             nodata = float(ds.nodata) if ds.nodata is not None else None
-            transform = ds.transform
             dx = abs(float(transform.a))
             bounds = [
                 round(float(ds.bounds.left), 6),
@@ -647,8 +800,8 @@ def build_vector_pmtiles(
         "--force",
         f"--minimum-zoom={minzoom}",
         f"--maximum-zoom={maxzoom}",
-        "--no-feature-limit",
-        "--no-tile-size-limit",
+        "--drop-densest-as-needed",
+        "--maximum-tile-bytes=1500000",
         "--detect-shared-borders",
         "--name=TrailForge Vector Tiles",
         f"--attribution={ATTRIBUTION_OSM}",
@@ -656,6 +809,13 @@ def build_vector_pmtiles(
     for layer_name, geojson_path in valid_layers:
         cmd.extend(["-L", f"{layer_name}:{geojson_path}"])
 
+    logger.info(
+        "Running tippecanoe across %d layers (z%d..z%d) -> %s",
+        len(valid_layers),
+        minzoom,
+        maxzoom,
+        out_pmtiles.name,
+    )
     try:
         _run_cmd(cmd, step="tippecanoe vector PMTiles")
         tmp_pmtiles.replace(out_pmtiles)
@@ -663,6 +823,11 @@ def build_vector_pmtiles(
         tmp_pmtiles.unlink(missing_ok=True)
         raise
 
+    logger.info(
+        "Built vector PMTiles %s (%.2f MB)",
+        out_pmtiles.name,
+        out_pmtiles.stat().st_size / (1024.0 * 1024.0),
+    )
     return out_pmtiles
 
 
@@ -673,21 +838,16 @@ def _encode_dem_to_terrain_rgb_geotiff(
     base_val: float = TERRAIN_RGB_BASE_VAL,
     interval: float = TERRAIN_RGB_INTERVAL,
 ) -> Path:
-    """Encode a Web Mercator Float32 DEM GeoTIFF into 3-band uint8 Mapbox Terrain-RGB."""
+    """Encode a Web Mercator Float32 DEM GeoTIFF into 3-band uint8 Mapbox Terrain-RGB in strips."""
     try:
         import rasterio  # type: ignore[import-not-found]
+        from rasterio.windows import Window  # type: ignore[import-not-found]
         from rio_rgbify.encoders import data_to_rgb  # type: ignore[import-not-found]
 
         with rasterio.open(dem_3857_tif) as src:
-            arr = src.read(1).astype(np.float32, copy=False)
             nodata = src.nodata
-            invalid = ~np.isfinite(arr)
-            if nodata is not None and math.isfinite(float(nodata)):
-                invalid |= np.abs(arr - np.float32(nodata)) < 1e-3
-            if np.any(invalid):
-                arr = np.where(invalid, np.float32(0.0), arr)
-
-            rgb = data_to_rgb(arr, baseval=base_val, interval=interval).astype(np.uint8, copy=False)
+            has_finite_nodata = nodata is not None and math.isfinite(float(nodata))
+            nodata_f32 = np.float32(nodata) if has_finite_nodata else np.float32(0.0)
             profile = src.profile.copy()
             profile.update(
                 driver="GTiff",
@@ -697,8 +857,21 @@ def _encode_dem_to_terrain_rgb_geotiff(
                 tiled=True,
                 compress="deflate",
             )
+            strip_rows = 512
             with rasterio.open(out_rgb_tif, "w", **profile) as dst:
-                dst.write(rgb)
+                for row_off in range(0, src.height, strip_rows):
+                    win_h = min(strip_rows, src.height - row_off)
+                    window = Window(0, row_off, src.width, win_h)
+                    arr = src.read(1, window=window).astype(np.float32, copy=False)
+                    invalid = ~np.isfinite(arr)
+                    if has_finite_nodata:
+                        invalid |= np.abs(arr - nodata_f32) < 1e-3
+                    if np.any(invalid):
+                        arr = np.where(invalid, np.float32(0.0), arr)
+                    rgb = data_to_rgb(arr, baseval=base_val, interval=interval).astype(
+                        np.uint8, copy=False
+                    )
+                    dst.write(rgb, window=window)
         return out_rgb_tif
     except ImportError:
         # CLI fallback using gdal_translate + rio rgbify
@@ -861,19 +1034,26 @@ def build_terrain_pmtiles(
                 )
 
                 z_conn = sqlite3.connect(str(mb_z))
+                tile_count = 0
                 try:
-                    rows = z_conn.execute(
+                    z_cur = z_conn.execute(
                         "SELECT zoom_level, tile_column, tile_row, tile_data FROM tiles"
-                    ).fetchall()
+                    )
+                    while True:
+                        batch = z_cur.fetchmany(500)
+                        if not batch:
+                            break
+                        merged_conn.executemany(
+                            "INSERT OR REPLACE INTO tiles "
+                            "(zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)",
+                            batch,
+                        )
+                        tile_count += len(batch)
                 finally:
                     z_conn.close()
 
-                merged_conn.executemany(
-                    "INSERT OR REPLACE INTO tiles "
-                    "(zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)",
-                    rows,
-                )
                 merged_conn.commit()
+                logger.info("Built Terrain-RGB z%d (%d PNG tiles)", z, tile_count)
 
                 # Reclaim per-zoom temp files immediately to stay well below memory/disk caps
                 dem_z.unlink(missing_ok=True)

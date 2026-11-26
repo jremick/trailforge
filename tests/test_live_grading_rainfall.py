@@ -29,8 +29,10 @@ from trailforge.db.models import (
 from trailforge.db.session import get_db
 from trailforge.grading.cli import build_parser
 from trailforge.grading.live import (
+    _MAX_SQL_IN_PARAMS,
     LIVE_FORMULA_VERSION,
     ObservationSample,
+    _chunked,
     compute_segment_live_grade,
     get_obstacle_hotspots_geojson,
     get_track_live_summary,
@@ -79,6 +81,14 @@ def _make_reading(
 # -----------------------------------------------------------------------------
 # Pure Offline Unit Tests (zero database required)
 # -----------------------------------------------------------------------------
+
+
+def test_chunked_segment_id_batches_stay_under_postgres_param_limit() -> None:
+    ids = [f"seg_{i}" for i in range(72_500)]
+    chunks = _chunked(ids)
+    assert len(chunks) == 8
+    assert all(len(c) <= _MAX_SQL_IN_PARAMS for c in chunks)
+    assert [item for chunk in chunks for item in chunk] == ids
 
 
 def test_rainfall_classification_and_surface_crossing_modulation() -> None:

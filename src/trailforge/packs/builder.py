@@ -505,7 +505,7 @@ def _write_region_snapshot_streaming(
         if track_id_set:
             report_spatial_filter = or_(
                 report_spatial_filter,
-                ConditionReport.track_id.in_(track_id_set),
+                ConditionReport.track_id.in_(track_ids_from_segs),
             )
         region_report_ids = set(
             session.execute(
@@ -738,6 +738,9 @@ def build_regional_pack(
     dem_path: Path | str | None = None,
     version: str | None = None,
     skip_tiles: bool = False,
+    prebuilt_vector_pmtiles: Path | str | None = None,
+    prebuilt_terrain_pmtiles: Path | str | None = None,
+    prebuilt_tile_bounds: list[float] | None = None,
 ) -> PackBuildResult:
     """Build a regional offline pack streaming disk-to-disk and record it in ``offline_packs``."""
     region = get_pack_region(region_id)
@@ -766,18 +769,43 @@ def build_regional_pack(
             generated_at=generated_at,
         )
 
-        # 2. Build region-clipped vector & terrain PMTiles (if tools & region data exist)
+        # 2. Reuse pre-built region PMTiles if supplied, otherwise build region-clipped PMTiles
         vector_available = False
         terrain_available = False
-        tile_bounds = list(region.bbox)
+        tile_bounds = list(prebuilt_tile_bounds) if prebuilt_tile_bounds else list(region.bbox)
+        prebuilt_vec = (
+            Path(prebuilt_vector_pmtiles).expanduser().resolve()
+            if prebuilt_vector_pmtiles is not None
+            else None
+        )
+        prebuilt_ter = (
+            Path(prebuilt_terrain_pmtiles).expanduser().resolve()
+            if prebuilt_terrain_pmtiles is not None
+            else None
+        )
         if not skip_tiles:
-            intersecting_dem = _resolve_intersecting_dem(region, dem_path)
-            vector_available, terrain_available, tile_bounds = _build_region_pmtiles(
-                session,
-                region,
-                staging_dir,
-                dem_path=intersecting_dem,
-            )
+            if (
+                prebuilt_vec is not None
+                and prebuilt_vec.is_file()
+                and prebuilt_vec.stat().st_size > 0
+            ):
+                shutil.copy2(prebuilt_vec, staging_dir / VECTOR_TILE_FILENAME)
+                vector_available = True
+                if (
+                    prebuilt_ter is not None
+                    and prebuilt_ter.is_file()
+                    and prebuilt_ter.stat().st_size > 0
+                ):
+                    shutil.copy2(prebuilt_ter, staging_dir / TERRAIN_TILE_FILENAME)
+                    terrain_available = True
+            else:
+                intersecting_dem = _resolve_intersecting_dem(region, dem_path)
+                vector_available, terrain_available, tile_bounds = _build_region_pmtiles(
+                    session,
+                    region,
+                    staging_dir,
+                    dem_path=intersecting_dem,
+                )
 
         terrain_rel = f"{region.region_id}/{TERRAIN_TILE_FILENAME}" if terrain_available else None
 
