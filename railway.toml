@@ -1,0 +1,19 @@
+# TrailForge Railway Config-as-Code (API service default)
+# Reference: https://docs.railway.com/reference/config-as-code
+# Full Railway + Cloudflare playbook: deploy/railway/README.md
+#
+# Note: The companion `worker` service uses the same Dockerfile/image with a
+# service-level custom start command: `python -m trailforge.worker.main`
+
+"$schema" = "https://railway.com/railway.schema.json"
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "sh -c 'alembic upgrade head && exec uvicorn trailforge.api.main:app --host 0.0.0.0 --port ${PORT:-8000}'"
+healthcheckPath = "/api/health"
+healthcheckTimeout = 120
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
