@@ -1990,7 +1990,7 @@ button {
   transition: transform 0.22s ease, visibility 0s linear 0.22s;
 }
 
-.tf-shell.account-open .tf-account-panel:not(.tf-packs-panel):not(.tf-route-panel) {
+.tf-shell.account-open .tf-account-panel:not(.tf-packs-panel):not(.tf-route-panel):not(.tf-admin-panel) {
   transform: translateX(0);
   visibility: visible;
   pointer-events: auto;
@@ -3602,4 +3602,255 @@ button {
   gap: 5px;
   font-size: 10px;
   color: var(--text-muted);
+}
+
+
+/* ---------- v1.1.0 Public Demo Banner, Invite UX & Admin Console ---------- */
+
+.tf-demo-banner {
+  flex-shrink: 0;
+  min-height: 28px;
+  padding: 4px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  background: linear-gradient(
+    90deg,
+    rgba(14, 42, 62, 0.96),
+    rgba(22, 37, 49, 0.96)
+  );
+  border-bottom: 1px solid rgba(56, 189, 248, 0.35);
+  color: #e0f2fe;
+  font-size: 11.5px;
+  line-height: 1.3;
+  z-index: 34;
+}
+
+.tf-demo-banner-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.tf-demo-banner-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent-cyan);
+  box-shadow: 0 0 0 3px var(--accent-cyan-soft);
+  flex-shrink: 0;
+}
+
+.tf-demo-banner-dismiss {
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(11, 17, 23, 0.5);
+  color: var(--text-secondary);
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-sm);
+  display: grid;
+  place-items: center;
+  font-size: 13px;
+  line-height: 1;
+  flex-shrink: 0;
+  transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease;
+}
+
+.tf-demo-banner-dismiss:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent-cyan);
+  color: var(--text-primary);
+}
+
+.tf-admin-btn {
+  padding: 4px 7px;
+  font-size: 11px;
+  border-color: rgba(245, 158, 11, 0.5);
+  background: var(--accent-amber-soft);
+  color: var(--accent-amber-bright);
+  max-width: 84px;
+}
+
+.tf-admin-btn.active-admin,
+.tf-admin-btn:hover {
+  background: var(--accent-amber);
+  border-color: var(--accent-amber-bright);
+  color: #0b1117;
+}
+
+.tf-admin-hdr-btn {
+  border-color: rgba(245, 158, 11, 0.5);
+  background: var(--accent-amber-soft);
+  color: var(--accent-amber-bright);
+  white-space: nowrap;
+}
+
+.tf-admin-hdr-btn:hover {
+  background: var(--accent-amber);
+  color: #0b1117;
+}
+
+.tf-shell.admin-open .tf-admin-panel {
+  transform: translateX(0);
+  visibility: visible;
+  pointer-events: auto;
+  transition: transform 0.22s ease, visibility 0s linear 0s;
+}
+
+.tf-shell.admin-open .tf-map-toolbar,
+.tf-shell.admin-open .tf-offline-banner,
+.tf-shell.admin-open .tf-coord-hud {
+  right: calc(var(--inspector-w) + 12px);
+}
+
+.tf-invite-input {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.tf-pack-admin-note {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  border: 1px dashed var(--border-strong);
+}
+
+.tf-admin-kpi-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.tf-admin-kpi-sub {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.tf-admin-kpi-dim {
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+.tf-admin-warn-val {
+  color: var(--accent-amber-bright);
+}
+
+.tf-admin-crit-val {
+  color: #fca5a5;
+}
+
+.tf-admin-table-wrap {
+  overflow-x: auto;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-panel);
+}
+
+.tf-admin-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.tf-admin-table th,
+.tf-admin-table td {
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border-subtle);
+  text-align: left;
+}
+
+.tf-admin-table th {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  background: var(--bg-topbar);
+}
+
+.tf-admin-table tr:last-child td {
+  border-bottom: none;
+}
+
+.tf-admin-table .num {
+  text-align: right;
+}
+
+.tf-quota-block {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 7px 9px;
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+}
+
+.tf-quota-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.tf-quota-pct.tone-emerald {
+  color: var(--accent-emerald);
+}
+
+.tf-quota-pct.tone-amber {
+  color: var(--accent-amber-bright);
+}
+
+.tf-quota-pct.tone-red {
+  color: #fca5a5;
+}
+
+.tf-quota-fill.tone-emerald {
+  background: var(--accent-emerald);
+}
+
+.tf-quota-fill.tone-amber {
+  background: var(--accent-amber);
+}
+
+.tf-quota-fill.tone-red {
+  background: var(--accent-red);
+}
+
+.tf-admin-code-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-base);
+  border: 1px solid rgba(34, 197, 94, 0.45);
+}
+
+.tf-admin-code {
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: var(--accent-emerald);
+}
+
+.tf-admin-code-inline {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: var(--text-primary);
+}
+
+.tf-admin-user-suspended {
+  border-color: rgba(239, 68, 68, 0.4);
+  background: rgba(239, 68, 68, 0.06);
 }

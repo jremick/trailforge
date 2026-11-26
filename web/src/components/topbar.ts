@@ -19,6 +19,7 @@ export interface TopBarCallbacks {
   onFeedStatusClick: () => void;
   onRigAccountClick: () => void;
   onOfflinePacksClick: () => void;
+  onAdminClick?: () => void;
 }
 
 const SEARCH_DEBOUNCE_MS = 180;
@@ -38,6 +39,7 @@ export class TopBar {
   private readonly feedTextEl: HTMLElement;
   private readonly rigBtnEl: HTMLButtonElement;
   private readonly rigLabelEl: HTMLElement;
+  private readonly adminBtnEl: HTMLButtonElement;
   private readonly packsBtnEl: HTMLButtonElement;
   private readonly packsDotEl: HTMLElement;
   private readonly packsLabelEl: HTMLElement;
@@ -169,6 +171,16 @@ export class TopBar {
 
         <button
           type="button"
+          class="tf-rig-btn tf-admin-btn hidden"
+          data-role="admin-btn"
+          title="Admin Console — Traffic, Storage, Friend Invites & Users"
+        >
+          <span aria-hidden="true">🛡</span>
+          <span>Admin</span>
+        </button>
+
+        <button
+          type="button"
           class="tf-health-pill tf-feed-pill"
           data-role="feed-pill"
           title="Official Pan-Australia closure & emergency feeds status"
@@ -204,6 +216,7 @@ export class TopBar {
     this.feedTextEl = this.q("[data-role='feed-text']");
     this.rigBtnEl = this.q<HTMLButtonElement>("[data-role='rig-btn']");
     this.rigLabelEl = this.q("[data-role='rig-label']");
+    this.adminBtnEl = this.q<HTMLButtonElement>("[data-role='admin-btn']");
     this.packsBtnEl = this.q<HTMLButtonElement>("[data-role='packs-btn']");
     this.packsDotEl = this.q("[data-role='packs-dot']");
     this.packsLabelEl = this.q("[data-role='packs-label']");
@@ -273,6 +286,10 @@ export class TopBar {
 
     this.rigBtnEl.addEventListener("click", () => {
       callbacks.onRigAccountClick();
+    });
+
+    this.adminBtnEl.addEventListener("click", () => {
+      callbacks.onAdminClick?.();
     });
 
     this.packsBtnEl.addEventListener("click", () => {
@@ -352,6 +369,11 @@ export class TopBar {
       Boolean(params.activePackId || params.downloadedCount > 0)
     );
     this.packsBtnEl.title = `${params.online ? "Online" : "Offline"} · ${params.downloadedCount} regional pack(s) cached · ${params.pendingSyncCount} pending sync item(s)`;
+  }
+
+  updateAdminAccess(isAdmin: boolean, panelOpen = false): void {
+    this.adminBtnEl.classList.toggle("hidden", !isAdmin);
+    this.adminBtnEl.classList.toggle("active-admin", isAdmin && panelOpen);
   }
 
   updateRigSummary(

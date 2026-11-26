@@ -1,5 +1,11 @@
 import type { FeatureCollection } from "geojson";
 import {
+  DEFAULT_AUTH_CONFIG,
+  getApiBaseUrl,
+  normalizeAuthConfig,
+  resolveApiUrl,
+} from "./adminHelpers";
+import {
   getActiveOfflinePackId,
   getOfflineClosuresGeoJson,
   getOfflineHotspotsGeoJson,
@@ -11,8 +17,15 @@ import {
   searchOfflineSnapshots,
 } from "./offline/packStore";
 import type {
+  AdminComputeActionResponse,
+  AdminInviteCreateInput,
+  AdminInviteItem,
+  AdminStatsResponse,
+  AdminUserItem,
+  AdminUserPatchInput,
   ApiHealthResponse,
   ApiSearchResponse,
+  AuthConfigResponse,
   AuthMeResponse,
   AuthTokenResponse,
   ClosuresListResponse,
@@ -45,6 +58,8 @@ import type {
   VehicleProfileInput,
   VehicleProfileItem,
 } from "./types";
+
+export { getApiBaseUrl, resolveApiUrl };
 import {
   slugifyExportFilename,
   triggerClientFileDownload,
@@ -131,6 +146,10 @@ async function parseErrorDetail(res: Response): Promise<string> {
   return `HTTP ${res.status} ${res.statusText}`;
 }
 
+function fetchCredentialsMode(): RequestCredentials {
+  return getApiBaseUrl() ? "include" : "same-origin";
+}
+
 async function requestJson<T>(
   url: string,
   options?: {
@@ -140,12 +159,12 @@ async function requestJson<T>(
   }
 ): Promise<T> {
   const hasBody = options?.body !== undefined;
-  const res = await fetch(url, {
+  const res = await fetch(resolveApiUrl(url), {
     method: options?.method ?? "GET",
     headers: buildHeaders(
       hasBody ? { "Content-Type": "application/json" } : undefined
     ),
-    credentials: "same-origin",
+    credentials: fetchCredentialsMode(),
     cache: "no-store",
     body: hasBody ? JSON.stringify(options.body) : undefined,
     signal: options?.signal,
@@ -177,7 +196,7 @@ function isStructuredHealthPayload(value: unknown): value is ApiHealthResponse {
 export async function fetchHealth(
   signal?: AbortSignal
 ): Promise<ApiHealthResponse> {
-  const res = await fetch("/api/health", {
+  const res = await fetch(resolveApiUrl("/api/health"), {
     method: "GET",
     headers: { Accept: "application/json" },
     cache: "no-store",
@@ -363,6 +382,20 @@ export function fetchClosuresList(
 
 /* ---------- Slice 05 Auth, Vehicles, Favorites, Pins & Export ---------- */
 
+export async function fetchAuthConfig(
+  signal?: AbortSignal
+): Promise<AuthConfigResponse> {
+  try {
+    const raw = await requestJson<AuthConfigResponse>("/api/auth/config", {
+      signal,
+    });
+    return normalizeAuthConfig(raw);
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    return { ...DEFAULT_AUTH_CONFIG };
+  }
+}
+
 export function fetchAuthMe(signal?: AbortSignal): Promise<AuthMeResponse> {
   return requestJson<AuthMeResponse>("/api/auth/me", { signal });
 }
@@ -371,10 +404,20 @@ export async function registerAccount(payload: {
   email: string;
   display_name: string;
   password: string;
+  invite_code?: string | null;
 }): Promise<AuthTokenResponse> {
+  const body: Record<string, string> = {
+    email: payload.email,
+    display_name: payload.display_name,
+    password: payload.password,
+  };
+  const trimmedCode = payload.invite_code?.trim();
+  if (trimmedCode) {
+    body.invite_code = trimmedCode;
+  }
   const res = await requestJson<AuthTokenResponse>("/api/auth/register", {
     method: "POST",
-    body: payload,
+    body,
   });
   setStoredAuthToken(res.access_token);
   return res;
@@ -519,10 +562,10 @@ export async function uploadTripGpx(
     form.append("vehicle_profile_id", params.vehicle_profile_id);
   }
 
-  const res = await fetch("/api/trips/upload", {
+  const res = await fetch(resolveApiUrl("/api/trips/upload"), {
     method: "POST",
     headers: buildHeaders(),
-    credentials: "same-origin",
+    credentials: fetchCredentialsMode(),
     body: form,
   });
   if (!res.ok) {
@@ -659,10 +702,10 @@ export async function createConditionReport(
     if (input.client_uuid) form.append("client_uuid", input.client_uuid);
     form.append("photo", input.photo, input.photo.name);
 
-    const res = await fetch("/api/reports", {
+    const res = await fetch(resolveApiUrl("/api/reports"), {
       method: "POST",
       headers: buildHeaders(),
-      credentials: "same-origin",
+      credentials: fetchCredentialsMode(),
       body: form,
     });
     if (!res.ok) {
@@ -743,10 +786,10 @@ export async function downloadAuthenticatedExport(
   url: string,
   fallbackFilename: string
 ): Promise<void> {
-  const res = await fetch(url, {
+  const res = await fetch(resolveApiUrl(url), {
     method: "GET",
     headers: buildHeaders({ Accept: "*/*" }),
-    credentials: "same-origin",
+    credentials: fetchCredentialsMode(),
   });
   if (!res.ok) {
     const detail = await parseErrorDetail(res);
@@ -834,14 +877,14 @@ export async function exportPlannedRoute(
 
   try {
     const res = await fetch(
-      `/api/routes/plan/export?format=${encodeURIComponent(format)}`,
+      resolveApiUrl(`/api/routes/plan/export?format=${encodeURIComponent(format)}`),
       {
         method: "POST",
         headers: buildHeaders({
           "Content-Type": "application/json",
           Accept: "*/*",
         }),
-        credentials: "same-origin",
+        credentials: fetchCredentialsMode(),
         body: JSON.stringify(payload),
       }
     );
@@ -932,4 +975,75 @@ export function getSavedRouteExportUrl(
   format: "gpx" | "geojson"
 ): string {
   return `/api/routes/${encodeURIComponent(id)}/export?format=${encodeURIComponent(format)}`;
+}
+
+/* ---------- v1.1.0 Admin Console: Traffic, Invites, Users & Compute Actions ---------- */
+
+export function fetchAdminStats(
+  signal?: AbortSignal
+): Promise<AdminStatsResponse> {
+  return requestJson<AdminStatsResponse>("/api/admin/stats", { signal });
+}
+
+export async function fetchAdminUsers(
+  signal?: AbortSignal
+): Promise<AdminUserItem[]> {
+  const data = await requestJson<
+    AdminUserItem[] | { items?: AdminUserItem[]; users?: AdminUserItem[] }
+  >("/api/admin/users", { signal });
+  if (Array.isArray(data)) return data;
+  return data.items ?? data.users ?? [];
+}
+
+export function patchAdminUser(
+  userId: string,
+  patch: AdminUserPatchInput
+): Promise<AdminUserItem> {
+  return requestJson<AdminUserItem>(
+    `/api/admin/users/${encodeURIComponent(userId)}`,
+    {
+      method: "PATCH",
+      body: patch,
+    }
+  );
+}
+
+export async function fetchAdminInvites(
+  signal?: AbortSignal
+): Promise<AdminInviteItem[]> {
+  const data = await requestJson<
+    AdminInviteItem[] | { items?: AdminInviteItem[]; invites?: AdminInviteItem[] }
+  >("/api/admin/invites", { signal });
+  if (Array.isArray(data)) return data;
+  return data.items ?? data.invites ?? [];
+}
+
+export function createAdminInvite(
+  payload: AdminInviteCreateInput
+): Promise<AdminInviteItem> {
+  return requestJson<AdminInviteItem>("/api/admin/invites", {
+    method: "POST",
+    body: payload,
+  });
+}
+
+export function revokeAdminInvite(
+  inviteId: string
+): Promise<AdminInviteItem | void> {
+  return requestJson<AdminInviteItem | void>(
+    `/api/admin/invites/${encodeURIComponent(inviteId)}`,
+    { method: "DELETE" }
+  );
+}
+
+export function triggerAdminClosuresSync(): Promise<AdminComputeActionResponse> {
+  return requestJson<AdminComputeActionResponse>("/api/closures/sync", {
+    method: "POST",
+  });
+}
+
+export function triggerAdminGradingRecompute(): Promise<AdminComputeActionResponse> {
+  return requestJson<AdminComputeActionResponse>("/api/grading/recompute", {
+    method: "POST",
+  });
 }

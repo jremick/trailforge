@@ -105,7 +105,7 @@ function parseByteRange(rangeHeader, totalLength) {
 async function respondFromCachedPackTile(request) {
   const cache = await caches.open(PACKS_CACHE);
   const url = new URL(request.url);
-  const cached = await cache.match(url.pathname);
+  const cached = (await cache.match(url.pathname)) || (await cache.match(request.url));
   if (!cached) {
     return null;
   }
@@ -168,7 +168,11 @@ self.addEventListener("fetch", (event) => {
 
   const url = new URL(request.url);
 
-  // Never intercept cross-origin requests (external raster tiles fail gracefully in MapLibre)
+  // Never intercept cross-origin requests:
+  // - External raster basemaps fail gracefully inside MapLibre
+  // - Cloudflare R2 absolute PMTiles URLs (e.g. https://tiles.example.com/*.pmtiles)
+  //   stream HTTP 206 Range requests directly from R2 edge CDN; downloaded offline packs
+  //   are cached under same-origin /api/packs/<region>/tiles/*.pmtiles below.
   if (url.origin !== self.location.origin) return;
 
   // Offline regional PMTiles: serve Range 206 directly from PACKS_CACHE when downloaded!

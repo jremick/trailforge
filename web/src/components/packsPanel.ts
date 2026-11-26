@@ -1,3 +1,4 @@
+import { resolvePackBundleUrl } from "../adminHelpers";
 import {
   formatByteSize,
   type PackDownloadProgress,
@@ -17,6 +18,7 @@ import type {
 
 export interface PacksPanelState {
   online: boolean;
+  isAdmin: boolean;
   loading: boolean;
   regions: OfflinePackRegionItem[];
   downloaded: DownloadedPackRecord[];
@@ -216,17 +218,14 @@ export class OfflinePacksPanel {
             `
             : "";
 
-        const rawBundleUrl =
-          region.bundle_url ??
-          `/api/packs/${encodeURIComponent(region.region_id)}/bundle.tar.gz`;
-        const bundleUrl = rawBundleUrl.startsWith("/")
-          ? rawBundleUrl
-          : `/api/packs/${encodeURIComponent(region.region_id)}/bundle.tar.gz`;
+        const bundleUrl = resolvePackBundleUrl(region);
 
         const attributions =
           cached?.attributions?.length
             ? cached.attributions
             : (region.attributions ?? []);
+
+        const canBuild = this.state.isAdmin;
 
         return `
           <div class="tf-pack-card ${isActive ? "active" : ""}">
@@ -268,7 +267,9 @@ export class OfflinePacksPanel {
             <div class="tf-pack-actions">
               ${
                 !isReady
-                  ? `<button type="button" class="tf-btn-primary" data-build-pack="${escapeHtml(region.region_id)}" ${isBuilding || !this.state.online ? "disabled" : ""}>${isBuilding ? "Building…" : "⚙ Build Pack"}</button>`
+                  ? canBuild
+                    ? `<button type="button" class="tf-btn-primary" data-build-pack="${escapeHtml(region.region_id)}" ${isBuilding || !this.state.online ? "disabled" : ""}>${isBuilding ? "Building…" : "⚙ Build Pack"}</button>`
+                    : `<span class="tf-pack-admin-note">Not yet built by instance admin</span>`
                   : `<button type="button" class="tf-btn-primary" data-download-pack="${escapeHtml(region.region_id)}" ${isDownloading || !this.state.online ? "disabled" : ""}>${cached ? "↻ Update Offline Copy" : "⬇ Download for Offline"}</button>`
               }
               ${
@@ -282,7 +283,7 @@ export class OfflinePacksPanel {
                   : ""
               }
               ${
-                isReady && this.state.online
+                canBuild && isReady && this.state.online
                   ? `<button type="button" class="tf-mini-btn" data-build-pack="${escapeHtml(region.region_id)}" ${isBuilding ? "disabled" : ""} title="Rebuild regional pack from PostGIS">Rebuild</button>`
                   : ""
               }

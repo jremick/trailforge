@@ -1,4 +1,8 @@
 import type { Feature, FeatureCollection, Point } from "geojson";
+import {
+  buildOfflinePackTileCachePath,
+  resolvePackAssetUrl,
+} from "../adminHelpers";
 import { DEFAULT_SNOWLINE_BANDS_M } from "../presets";
 import type {
   ApiSearchResponse,
@@ -269,10 +273,14 @@ export async function downloadRegionalPackToDevice(
   onProgress?: (progress: PackDownloadProgress) => void
 ): Promise<DownloadedPackRecord> {
   const rid = encodeURIComponent(region.region_id);
-  const manifestUrl =
-    region.manifest_url ?? `/api/packs/${rid}/manifest.json`;
-  const snapshotUrl =
-    region.snapshot_url ?? `/api/packs/${rid}/snapshot.json`;
+  const manifestUrl = resolvePackAssetUrl(
+    region.manifest_url,
+    `/api/packs/${rid}/manifest.json`
+  );
+  const snapshotUrl = resolvePackAssetUrl(
+    region.snapshot_url,
+    `/api/packs/${rid}/snapshot.json`
+  );
 
   onProgress?.({ stage: "Fetching pack manifest…", pct: 10 });
   const manifestRes = await fetch(manifestUrl, { cache: "no-store" });
@@ -296,14 +304,22 @@ export async function downloadRegionalPackToDevice(
     new TextDecoder().decode(snapBuf)
   ) as OfflinePackSnapshot;
 
-  const vectorUrl =
-    manifest.vector_pmtiles_url ??
-    region.vector_pmtiles_url ??
-    `/api/packs/${rid}/tiles/vector.pmtiles`;
-  const terrainUrl =
-    manifest.terrain_pmtiles_url ??
-    region.terrain_pmtiles_url ??
-    `/api/packs/${rid}/tiles/terrain.pmtiles`;
+  const vectorCachePath = buildOfflinePackTileCachePath(
+    region.region_id,
+    "vector"
+  );
+  const terrainCachePath = buildOfflinePackTileCachePath(
+    region.region_id,
+    "terrain"
+  );
+  const vectorUrl = resolvePackAssetUrl(
+    manifest.vector_pmtiles_url ?? region.vector_pmtiles_url,
+    vectorCachePath
+  );
+  const terrainUrl = resolvePackAssetUrl(
+    manifest.terrain_pmtiles_url ?? region.terrain_pmtiles_url,
+    terrainCachePath
+  );
 
   let hasVector = false;
   let hasTerrain = false;
@@ -312,6 +328,7 @@ export async function downloadRegionalPackToDevice(
 
   const cacheTile = async (
     tileUrl: string,
+    cacheKeyPath: string,
     manifestFileName: string,
     stageLabel: string,
     pct: number
@@ -331,9 +348,8 @@ export async function downloadRegionalPackToDevice(
 
     if (typeof caches !== "undefined") {
       const cache = await caches.open(PACKS_CACHE_NAME);
-      const pathname = new URL(tileUrl, window.location.origin).pathname;
       await cache.put(
-        pathname,
+        cacheKeyPath,
         new Response(buf, {
           status: 200,
           headers: {
@@ -349,6 +365,7 @@ export async function downloadRegionalPackToDevice(
   try {
     hasVector = await cacheTile(
       vectorUrl,
+      vectorCachePath,
       "vector.pmtiles",
       "Caching vector PMTiles for offline Range 206…",
       62
@@ -360,6 +377,7 @@ export async function downloadRegionalPackToDevice(
   try {
     hasTerrain = await cacheTile(
       terrainUrl,
+      terrainCachePath,
       "terrain.pmtiles",
       "Caching terrain hillshade PMTiles…",
       86
@@ -380,8 +398,8 @@ export async function downloadRegionalPackToDevice(
     segment_count: counts.segments ?? region.segment_count ?? 0,
     poi_count: counts.pois ?? region.poi_count ?? snapshot.pois?.length ?? 0,
     bbox: (manifest.bounds ?? manifest.bbox ?? region.bbox) as BBoxTuple,
-    vector_pmtiles_url: hasVector ? vectorUrl : null,
-    terrain_pmtiles_url: hasTerrain ? terrainUrl : null,
+    vector_pmtiles_url: hasVector ? vectorCachePath : null,
+    terrain_pmtiles_url: hasTerrain ? terrainCachePath : null,
     has_vector_pmtiles: hasVector,
     has_terrain_pmtiles: hasTerrain,
     snowline_bands_m: manifest.snowline_bands_m ?? [...DEFAULT_SNOWLINE_BANDS_M],

@@ -21,6 +21,7 @@ import {
   poisToGeoJson,
   userPinsToGeoJson,
 } from "./style";
+import { getApiBaseUrl } from "./adminHelpers";
 import { formatClosureTypeLabel } from "./closuresHelpers";
 import { formatHotspotReason } from "./gradingHelpers";
 import { buildRecordedTrackGeoJson } from "./offline/recorderEngine";
@@ -349,17 +350,23 @@ export class TrailForgeMap {
 
   /**
    * Mount PMTiles vector & terrain sources from `/api/tiles/manifest.json`
-   * without resetting camera center/zoom.
+   * (or Cloudflare R2 absolute `https://` URLs) without resetting camera center/zoom.
    */
-  applyTileManifest(manifest: TileManifestResponse): void {
+  applyTileManifest(
+    manifest: TileManifestResponse,
+    options?: { isOfflinePack?: boolean }
+  ): void {
     this.currentManifest = manifest;
     this.loadedIconIds.clear();
+    const fallbackOrigin = options?.isOfflinePack
+      ? window.location.origin
+      : getApiBaseUrl() || window.location.origin;
     this.map.setStyle(
       buildTrailForgeStyle({
         initialBasemap: this.currentBasemap,
         layers: this.currentLayers,
         tileManifest: manifest,
-        origin: window.location.origin,
+        origin: fallbackOrigin,
         selectedTrackId: this.selectedTrackId,
       })
     );

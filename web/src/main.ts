@@ -1,8 +1,16 @@
 import "./styles.css";
 import {
+  DEFAULT_AUTH_CONFIG,
+  canManageAdminCompute,
+  formatFriendlyApiError,
+  isAdminUser,
+} from "./adminHelpers";
+import {
+  ApiError,
   activateVehicle,
   addFavorite,
   buildRegionPack,
+  createAdminInvite,
   createConditionReport,
   createPin,
   createVehicle,
@@ -12,6 +20,10 @@ import {
   deleteVehicle,
   downloadAuthenticatedExport,
   exportPlannedRoute,
+  fetchAdminInvites,
+  fetchAdminStats,
+  fetchAdminUsers,
+  fetchAuthConfig,
   fetchAuthMe,
   fetchClosuresGeoJson,
   fetchClosuresStatus,
@@ -33,10 +45,15 @@ import {
   listSavedRoutes,
   loginAccount,
   logoutAccount,
+  patchAdminUser,
   planRoute,
   registerAccount,
   removeFavorite,
+  revokeAdminInvite,
   saveRoute,
+  setStoredAuthToken,
+  triggerAdminClosuresSync,
+  triggerAdminGradingRecompute,
   updateSavedRoute,
   updateTrip,
   updateVehicle,
@@ -49,6 +66,10 @@ import {
   RigAccountPanel,
   type AccountPanelTab,
 } from "./components/accountPanel";
+import {
+  AdminConsolePanel,
+  type AdminPanelTab,
+} from "./components/adminPanel";
 import { renderAttributionFooter } from "./components/footer";
 import { TrackInspectorDrawer } from "./components/inspector";
 import { OfflinePacksPanel } from "./components/packsPanel";
@@ -107,6 +128,10 @@ import {
 } from "./routeHelpers";
 import { buildTripExportUrl, getTripId } from "./tripsHelpers";
 import type {
+  AdminInviteItem,
+  AdminStatsResponse,
+  AdminUserItem,
+  AuthConfigResponse,
   AuthUser,
   BasemapId,
   DownloadedPackRecord,
@@ -137,6 +162,23 @@ import {
 const HEALTH_POLL_INTERVAL_MS = 15000;
 const CLOSURES_POLL_INTERVAL_MS = 60000;
 const ANON_RIG_STORAGE_KEY = "trailforge.anon_rig_class";
+const DEMO_BANNER_DISMISSED_KEY = "trailforge.dismissed_demo_banner";
+
+function loadDismissedDemoBanner(): string {
+  try {
+    return window.sessionStorage.getItem(DEMO_BANNER_DISMISSED_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function saveDismissedDemoBanner(text: string): void {
+  try {
+    window.sessionStorage.setItem(DEMO_BANNER_DISMISSED_KEY, text);
+  } catch (err) {
+    console.debug("Unable to persist dismissed banner state:", err);
+  }
+}
 
 function loadStoredAnonRig(): VehicleCapabilityClass {
   try {
@@ -164,10 +206,13 @@ class TrailForgeApp {
   private readonly sidebar: Sidebar;
   private readonly inspector: TrackInspectorDrawer;
   private readonly accountPanel: RigAccountPanel;
+  private readonly adminPanel: AdminConsolePanel;
   private readonly packsPanel: OfflinePacksPanel;
   private readonly routePlanner: RoutePlannerDrawer;
   private readonly recorderHud: InCabRecorderHud;
   private readonly map: TrailForgeMap;
+  private readonly demoBannerEl: HTMLElement;
+  private readonly demoBannerTextEl: HTMLElement;
   private readonly collapseBtnEl: HTMLButtonElement;
   private readonly cursorCoordsEl: HTMLElement;
   private readonly cursorMgrsEl: HTMLElement;
@@ -184,8 +229,14 @@ class TrailForgeApp {
   private healthAbort: AbortController | null = null;
   private inspectorAbort: AbortController | null = null;
 
-  // Slice 05 + 06 + 08 User, Vehicle, Trips, Favorites, Pins & Report Picker state
+  // Slice 05 + 06 + 08 + v1.1.0 User, Access Control, Admin & Vehicle state
   private user: AuthUser | null = null;
+  private authConfig: AuthConfigResponse = { ...DEFAULT_AUTH_CONFIG };
+  private dismissedDemoBanner: string = loadDismissedDemoBanner();
+  private adminStats: AdminStatsResponse | null = null;
+  private adminInvites: AdminInviteItem[] = [];
+  private adminUsers: AdminUserItem[] = [];
+  private latestCreatedInvite: AdminInviteItem | null = null;
   private anonymousRigClass: VehicleCapabilityClass = loadStoredAnonRig();
   private vehicles: VehicleProfileItem[] = [];
   private trips: TripItem[] = [];
@@ -236,6 +287,20 @@ class TrailForgeApp {
       <div class="tf-shell ${this.sidebarCollapsed ? "sidebar-collapsed" : ""}" data-role="shell">
         <header data-role="topbar"></header>
 
+        <div class="tf-demo-banner hidden" data-role="demo-banner" role="status">
+          <span class="tf-demo-banner-copy">
+            <span class="tf-demo-banner-dot" aria-hidden="true"></span>
+            <span data-role="demo-banner-text"></span>
+          </span>
+          <button
+            type="button"
+            class="tf-demo-banner-dismiss"
+            data-role="demo-banner-dismiss"
+            title="Dismiss notice"
+            aria-label="Dismiss notice"
+          >×</button>
+        </div>
+
         <main class="tf-workspace">
           <div class="tf-map-container" data-role="map"></div>
 
@@ -251,6 +316,7 @@ class TrailForgeApp {
           <aside data-role="sidebar"></aside>
           <aside data-role="inspector"></aside>
           <aside data-role="account-panel"></aside>
+          <aside data-role="admin-panel"></aside>
           <aside data-role="packs-panel"></aside>
           <aside data-role="route-panel"></aside>
 
@@ -295,6 +361,8 @@ class TrailForgeApp {
     `;
 
     this.shellEl = this.q(root, "[data-role='shell']");
+    this.demoBannerEl = this.q(root, "[data-role='demo-banner']");
+    this.demoBannerTextEl = this.q(root, "[data-role='demo-banner-text']");
     this.collapseBtnEl = this.q<HTMLButtonElement>(
       root,
       "[data-role='sidebar-toggle']"
@@ -349,6 +417,13 @@ class TrailForgeApp {
             this.closePacksPanel();
           } else {
             this.openPacksPanel();
+          }
+        },
+        onAdminClick: () => {
+          if (this.adminPanel.isPanelOpen()) {
+            this.closeAdminPanel();
+          } else {
+            this.openAdminPanel("overview");
           }
         },
       }
@@ -493,6 +568,7 @@ class TrailForgeApp {
       this.buildAccountPanelState(),
       {
         onClose: () => this.closeAccountPanel(),
+        onOpenAdminConsole: () => this.openAdminPanel("overview"),
         onSelectAnonymousRig: (cls) => {
           this.anonymousRigClass = cls;
           saveStoredAnonRig(cls);
@@ -509,11 +585,12 @@ class TrailForgeApp {
           this.refreshOpenInspectorForRig();
           this.refreshPlannedRouteForRig();
         },
-        onRegister: async (displayName, email, password) => {
+        onRegister: async (displayName, email, password, inviteCode) => {
           const res = await registerAccount({
             display_name: displayName,
             email,
             password,
+            invite_code: inviteCode ?? null,
           });
           this.user = res.user;
           await this.loadSignedInUserData();
@@ -531,9 +608,15 @@ class TrailForgeApp {
           this.pins = [];
           this.savedRoutes = [];
           this.activeSavedRouteId = null;
+          this.adminStats = null;
+          this.adminInvites = [];
+          this.adminUsers = [];
+          this.latestCreatedInvite = null;
+          this.closeAdminPanel();
           this.setCoordPickMode(null);
           this.map.setUserPins([]);
           this.syncRigUiState();
+          this.syncOfflinePanelState();
           this.syncRoutePlannerUiState();
           this.showToast("Signed out — anonymous browsing active", "info");
           this.refreshOpenInspectorForRig();
@@ -738,10 +821,145 @@ class TrailForgeApp {
       }
     );
 
+    this.adminPanel = new AdminConsolePanel(
+      this.q(root, "[data-role='admin-panel']"),
+      {
+        currentUserId: null,
+        registrationMode: this.authConfig.registration_mode,
+        loading: false,
+        stats: null,
+        invites: [],
+        users: [],
+        latestCreatedInvite: null,
+        busyAction: null,
+        error: null,
+      },
+      {
+        onClose: () => this.closeAdminPanel(),
+        onRefresh: () => this.refreshAdminConsoleData(),
+        onCreateInvite: async (payload) => {
+          this.adminPanel.updateState({
+            busyAction: "create-invite",
+            error: null,
+          });
+          try {
+            const created = await createAdminInvite(payload);
+            this.latestCreatedInvite = created;
+            this.adminInvites = [created, ...this.adminInvites];
+            this.adminPanel.updateState({
+              invites: this.adminInvites,
+              latestCreatedInvite: created,
+            });
+            this.showToast(`Created invite code ${created.code}`, "success");
+            void this.refreshAdminConsoleData();
+          } catch (err) {
+            const msg = formatFriendlyApiError(err, "Failed to create invite");
+            this.adminPanel.updateState({ error: msg });
+            this.showToast(msg, "error");
+          } finally {
+            this.adminPanel.updateState({ busyAction: null });
+          }
+        },
+        onRevokeInvite: async (inviteId) => {
+          this.adminPanel.updateState({
+            busyAction: `revoke-${inviteId}`,
+            error: null,
+          });
+          try {
+            await revokeAdminInvite(inviteId);
+            await this.refreshAdminConsoleData();
+            this.showToast("Invite code revoked", "info");
+          } catch (err) {
+            const msg = formatFriendlyApiError(err, "Failed to revoke invite");
+            this.adminPanel.updateState({ error: msg });
+            this.showToast(msg, "error");
+          } finally {
+            this.adminPanel.updateState({ busyAction: null });
+          }
+        },
+        onCopyInviteCode: async (code) => {
+          await this.copyTextToClipboard(
+            code,
+            `Copied invite code ${code}`,
+            "Select and copy the invite code manually"
+          );
+        },
+        onPatchUser: async (userId, patch) => {
+          this.adminPanel.updateState({
+            busyAction: `user-${userId}`,
+            error: null,
+          });
+          try {
+            const updated = await patchAdminUser(userId, patch);
+            this.adminUsers = this.adminUsers.map((u) =>
+              u.id === updated.id ? updated : u
+            );
+            this.adminPanel.updateState({ users: this.adminUsers });
+            this.showToast(
+              `Updated ${updated.display_name} (${updated.role}, ${updated.is_active ? "active" : "suspended"})`,
+              "success"
+            );
+            void this.refreshAdminConsoleData();
+          } catch (err) {
+            const msg = formatFriendlyApiError(err, "Failed to update user");
+            this.adminPanel.updateState({ error: msg });
+            this.showToast(msg, "error");
+          } finally {
+            this.adminPanel.updateState({ busyAction: null });
+          }
+        },
+        onSyncClosures: async () => {
+          this.adminPanel.updateState({
+            busyAction: "sync-closures",
+            error: null,
+          });
+          try {
+            await triggerAdminClosuresSync();
+            await Promise.all([
+              this.refreshClosures(false),
+              this.refreshAdminConsoleData(),
+            ]);
+            this.showToast("Agency closure feeds synced", "success");
+          } catch (err) {
+            const msg = formatFriendlyApiError(err, "Closure sync failed");
+            this.adminPanel.updateState({ error: msg });
+            this.showToast(msg, "error");
+          } finally {
+            this.adminPanel.updateState({ busyAction: null });
+          }
+        },
+        onRecomputeGrades: async () => {
+          this.adminPanel.updateState({
+            busyAction: "recompute-grades",
+            error: null,
+          });
+          try {
+            await triggerAdminGradingRecompute();
+            await Promise.all([
+              this.refreshHotspotsGeoJson(),
+              this.refreshAdminConsoleData(),
+            ]);
+            this.refreshOpenInspectorForRig();
+            this.showToast("Live crowdsourced grades recomputed", "success");
+          } catch (err) {
+            const msg = formatFriendlyApiError(
+              err,
+              "Live grade recomputation failed"
+            );
+            this.adminPanel.updateState({ error: msg });
+            this.showToast(msg, "error");
+          } finally {
+            this.adminPanel.updateState({ busyAction: null });
+          }
+        },
+      }
+    );
+
     this.packsPanel = new OfflinePacksPanel(
       this.q(root, "[data-role='packs-panel']"),
       {
         online: initiallyOnline,
+        isAdmin: false,
         loading: false,
         regions: [],
         downloaded: [],
@@ -766,8 +984,7 @@ class TrailForgeApp {
             await this.refreshPacksCatalog();
             this.showToast(`Built offline regional pack: ${regionId}`, "success");
           } catch (err) {
-            const msg =
-              err instanceof Error ? err.message : "Failed to build pack";
+            const msg = formatFriendlyApiError(err, "Failed to build pack");
             this.packsPanel.updateState({ error: msg });
             this.showToast(msg, "error");
           } finally {
@@ -990,6 +1207,7 @@ class TrailForgeApp {
             return;
           }
           this.closeAccountPanel();
+          this.closeAdminPanel();
           this.closeRoutePlanner();
           void this.openTrackInspector(trackId);
         },
@@ -1048,6 +1266,7 @@ class TrailForgeApp {
   private buildAccountPanelState() {
     return {
       user: this.user,
+      authConfig: this.authConfig,
       anonymousRigClass: this.anonymousRigClass,
       vehicles: this.vehicles,
       trips: this.trips,
@@ -1066,6 +1285,7 @@ class TrailForgeApp {
   private syncOfflinePanelState(): void {
     this.packsPanel.updateState({
       online: this.isOnline,
+      isAdmin: canManageAdminCompute(this.user),
       regions: this.packRegions,
       downloaded: this.downloadedPacks,
       activeOfflinePackId: this.activeOfflinePackId,
@@ -1167,6 +1387,7 @@ class TrailForgeApp {
       this.shellEl.classList.remove("inspector-open");
     }
     this.closeAccountPanel();
+    this.closeAdminPanel();
     this.closeRoutePlanner();
     this.packsPanel.open();
     this.shellEl.classList.add("packs-open");
@@ -1223,6 +1444,7 @@ class TrailForgeApp {
       this.shellEl.classList.remove("inspector-open");
     }
     this.closeAccountPanel();
+    this.closeAdminPanel();
     this.closePacksPanel();
     this.routePlanner.updateState(this.buildRoutePlannerState());
     this.routePlanner.open();
@@ -1523,13 +1745,17 @@ class TrailForgeApp {
     }
   }
 
-  private async handleCopyGridForgeCli(cli: string): Promise<void> {
+  private async copyTextToClipboard(
+    text: string,
+    successToast: string,
+    fallbackToast: string
+  ): Promise<void> {
     try {
       if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(cli);
+        await navigator.clipboard.writeText(text);
       } else {
         const ta = document.createElement("textarea");
-        ta.value = cli;
+        ta.value = text;
         ta.style.position = "fixed";
         ta.style.opacity = "0";
         document.body.appendChild(ta);
@@ -1537,21 +1763,50 @@ class TrailForgeApp {
         document.execCommand("copy");
         ta.remove();
       }
-      this.showToast("GridForge CLI command copied to clipboard", "success");
+      this.showToast(successToast, "success");
     } catch {
-      this.showToast("Select & copy the CLI command manually", "info");
+      this.showToast(fallbackToast, "info");
+    }
+  }
+
+  private async handleCopyGridForgeCli(cli: string): Promise<void> {
+    await this.copyTextToClipboard(
+      cli,
+      "GridForge CLI command copied to clipboard",
+      "Select & copy the CLI command manually"
+    );
+  }
+
+  private syncDemoBanner(): void {
+    const text = this.authConfig.demo_banner.trim();
+    const shouldShow = Boolean(text) && text !== this.dismissedDemoBanner;
+    const wasHidden = this.demoBannerEl.classList.contains("hidden");
+    this.demoBannerTextEl.textContent = text;
+    this.demoBannerEl.classList.toggle("hidden", !shouldShow);
+    if (wasHidden !== !shouldShow) {
+      window.setTimeout(() => this.map.resize(), 60);
     }
   }
 
   private syncRigUiState(): void {
     const rig = this.getActiveRigInfo();
+    const isAdmin = isAdminUser(this.user);
     this.topbar.updateRigSummary(
       rig.vehicleClass,
       rig.vehicleName,
       this.user?.display_name ?? null,
       this.favorites.length + this.pins.length + this.offlinePins.length
     );
+    this.topbar.updateAdminAccess(isAdmin, this.adminPanel.isPanelOpen());
     this.accountPanel.updateState(this.buildAccountPanelState());
+    this.packsPanel.updateState({ isAdmin: canManageAdminCompute(this.user) });
+    this.adminPanel.updateState({
+      currentUserId: this.user?.id ?? null,
+      registrationMode: this.authConfig.registration_mode,
+    });
+    if (!isAdmin && this.adminPanel.isPanelOpen()) {
+      this.closeAdminPanel();
+    }
     this.recorderHud.updateContext({
       vehicles: this.vehicles,
       isOnline: this.isOnline,
@@ -1580,6 +1835,7 @@ class TrailForgeApp {
       this.inspector.close();
       this.shellEl.classList.remove("inspector-open");
     }
+    this.closeAdminPanel();
     this.closePacksPanel();
     this.closeRoutePlanner();
     this.accountPanel.updateState(this.buildAccountPanelState());
@@ -1590,6 +1846,59 @@ class TrailForgeApp {
   private closeAccountPanel(): void {
     this.accountPanel.close();
     this.shellEl.classList.remove("account-open");
+  }
+
+  private openAdminPanel(tab?: AdminPanelTab): void {
+    if (!isAdminUser(this.user)) {
+      this.showToast("Admin privileges required", "error");
+      return;
+    }
+    if (this.inspector.openState()) {
+      this.inspector.close();
+      this.shellEl.classList.remove("inspector-open");
+    }
+    this.closeAccountPanel();
+    this.closePacksPanel();
+    this.closeRoutePlanner();
+    this.adminPanel.open(tab);
+    this.shellEl.classList.add("admin-open");
+    this.topbar.updateAdminAccess(true, true);
+    void this.refreshAdminConsoleData();
+  }
+
+  private closeAdminPanel(): void {
+    this.adminPanel.close();
+    this.shellEl.classList.remove("admin-open");
+    this.topbar.updateAdminAccess(isAdminUser(this.user), false);
+  }
+
+  private async refreshAdminConsoleData(): Promise<void> {
+    if (!isAdminUser(this.user)) return;
+    this.adminPanel.updateState({ loading: true, error: null });
+    try {
+      const [stats, invites, users] = await Promise.all([
+        fetchAdminStats(),
+        fetchAdminInvites(),
+        fetchAdminUsers(),
+      ]);
+      this.adminStats = stats;
+      this.adminInvites = invites;
+      this.adminUsers = users;
+      this.adminPanel.updateState({
+        stats: this.adminStats,
+        invites: this.adminInvites,
+        users: this.adminUsers,
+        latestCreatedInvite: this.latestCreatedInvite,
+        registrationMode:
+          stats.registration_mode ?? this.authConfig.registration_mode,
+      });
+    } catch (err) {
+      this.adminPanel.updateState({
+        error: formatFriendlyApiError(err, "Failed to load admin console data"),
+      });
+    } finally {
+      this.adminPanel.updateState({ loading: false });
+    }
   }
 
   private setCoordPickMode(mode: "pin" | "report" | null): void {
@@ -1613,6 +1922,15 @@ class TrailForgeApp {
   }
 
   private bindEvents(root: HTMLElement): void {
+    root
+      .querySelector<HTMLButtonElement>("[data-role='demo-banner-dismiss']")
+      ?.addEventListener("click", () => {
+        const text = this.authConfig.demo_banner.trim();
+        this.dismissedDemoBanner = text;
+        saveDismissedDemoBanner(text);
+        this.syncDemoBanner();
+      });
+
     this.collapseBtnEl.addEventListener("click", () => {
       this.sidebarCollapsed = !this.sidebarCollapsed;
       this.shellEl.classList.toggle("sidebar-collapsed", this.sidebarCollapsed);
@@ -1667,6 +1985,8 @@ class TrailForgeApp {
           this.setRoutePlanMode(false);
         } else if (this.routePlanner.isPanelOpen()) {
           this.closeRoutePlanner();
+        } else if (this.adminPanel.isPanelOpen()) {
+          this.closeAdminPanel();
         } else if (this.packsPanel.isPanelOpen()) {
           this.closePacksPanel();
         } else if (this.accountPanel.isPanelOpen()) {
@@ -1713,6 +2033,7 @@ class TrailForgeApp {
 
     void this.refreshOfflineLocalState();
     void this.refreshHealth(false);
+    void this.hydrateAuthConfig();
     void this.loadVectorAndTerrainLayers();
     void this.refreshClosures(false);
     void this.refreshHotspotsGeoJson();
@@ -1735,6 +2056,17 @@ class TrailForgeApp {
     });
   }
 
+  private async hydrateAuthConfig(): Promise<void> {
+    try {
+      this.authConfig = await fetchAuthConfig();
+    } catch {
+      this.authConfig = { ...DEFAULT_AUTH_CONFIG };
+    } finally {
+      this.syncDemoBanner();
+      this.syncRigUiState();
+    }
+  }
+
   private async hydrateAuthSession(): Promise<void> {
     try {
       const me = await fetchAuthMe();
@@ -1745,7 +2077,12 @@ class TrailForgeApp {
         this.user = null;
         this.syncRigUiState();
       }
-    } catch {
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 403) {
+        setStoredAuthToken(null);
+        this.user = null;
+        this.showToast(formatFriendlyApiError(err), "error");
+      }
       this.syncRigUiState();
     }
   }
@@ -1845,7 +2182,9 @@ class TrailForgeApp {
       }
 
       if (manifest.vector_available || manifest.terrain_available) {
-        this.map.applyTileManifest(manifest);
+        const isOfflinePack =
+          Boolean(this.activeOfflinePackId) || !this.isOnline;
+        this.map.applyTileManifest(manifest, { isOfflinePack });
         const modeLabel =
           manifest.vector_available && manifest.terrain_available
             ? "PMTiles (Vector + DEM)"
@@ -1898,6 +2237,7 @@ class TrailForgeApp {
     this.inspectorAbort = controller;
 
     this.closeAccountPanel();
+    this.closeAdminPanel();
     this.closePacksPanel();
     this.closeRoutePlanner();
     this.shellEl.classList.add("inspector-open");

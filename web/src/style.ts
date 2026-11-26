@@ -34,14 +34,16 @@ export const EMPTY_FEATURE_COLLECTION: FeatureCollection = {
 
 /**
  * Convert a relative or absolute `.pmtiles` URL into a `pmtiles://` protocol URL.
- * Always resolves relative paths against `origin` so MapLibre GL JS 5 blob Web Workers
- * can fetch Range requests cleanly.
+ * Absolute `http://` / `https://` URLs (e.g. Cloudflare R2 CDN URLs) are wrapped
+ * directly as `pmtiles://${url}` WITHOUT prepending `origin`. Relative paths resolve
+ * against `origin` so MapLibre GL JS 5 blob Web Workers can fetch Range requests cleanly.
  */
 export function toPmtilesUrl(pathOrUrl: string, origin?: string): string {
-  if (pathOrUrl.startsWith("pmtiles://")) return pathOrUrl;
-  if (/^https?:\/\//i.test(pathOrUrl)) return `pmtiles://${pathOrUrl}`;
+  const trimmed = pathOrUrl.trim();
+  if (trimmed.startsWith("pmtiles://")) return trimmed;
+  if (/^https?:\/\//i.test(trimmed)) return `pmtiles://${trimmed}`;
   const cleanOrigin = (origin ?? "").replace(/\/+$/, "");
-  const cleanPath = pathOrUrl.startsWith("/") ? pathOrUrl : `/${pathOrUrl}`;
+  const cleanPath = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
   return cleanOrigin
     ? `pmtiles://${cleanOrigin}${cleanPath}`
     : `pmtiles://${cleanPath}`;

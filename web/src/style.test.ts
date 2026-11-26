@@ -40,16 +40,54 @@ const SAMPLE_MANIFEST: TileManifestResponse = {
 };
 
 describe("MapLibre 5 PMTiles & offline fallback style builder", () => {
-  it("resolves relative PMTiles URLs against origin for MapLibre Web Workers", () => {
+  it("resolves relative PMTiles URLs against origin and preserves absolute Cloudflare R2 URLs without prepending origin", () => {
     expect(
       toPmtilesUrl("/api/tiles/trailforge_vector.pmtiles", "http://localhost:5173")
     ).toBe("pmtiles://http://localhost:5173/api/tiles/trailforge_vector.pmtiles");
     expect(
+      toPmtilesUrl(
+        "https://tiles.example.com/trailforge_vector.pmtiles",
+        "https://app.example.com"
+      )
+    ).toBe("pmtiles://https://tiles.example.com/trailforge_vector.pmtiles");
+    expect(
+      toPmtilesUrl(
+        "http://192.0.2.10:9000/trailforge_terrain.pmtiles",
+        "http://localhost:5173"
+      )
+    ).toBe("pmtiles://http://192.0.2.10:9000/trailforge_terrain.pmtiles");
+    expect(
       toPmtilesUrl("https://tiles.example.org/alps.pmtiles")
     ).toBe("pmtiles://https://tiles.example.org/alps.pmtiles");
     expect(
-      toPmtilesUrl("pmtiles://http://localhost:5173/a.pmtiles")
+      toPmtilesUrl("pmtiles://http://localhost:5173/a.pmtiles", "https://app.example.com")
     ).toBe("pmtiles://http://localhost:5173/a.pmtiles");
+  });
+
+  it("mounts absolute Cloudflare R2 PMTiles URLs directly without prepending app origin", () => {
+    const r2Manifest: TileManifestResponse = {
+      ...SAMPLE_MANIFEST,
+      vector_url: "https://tiles.example.com/trailforge_vector.pmtiles",
+      terrain_url: "https://tiles.example.com/trailforge_terrain.pmtiles",
+      cdn_offload: true,
+    };
+    const style = buildTrailForgeStyle({
+      initialBasemap: "offline-topo",
+      layers: createInitialLayerState(),
+      tileManifest: r2Manifest,
+      origin: "https://app.example.com",
+    });
+
+    expect(style.sources["tf-vector"]).toEqual({
+      type: "vector",
+      url: "pmtiles://https://tiles.example.com/trailforge_vector.pmtiles",
+    });
+    expect(style.sources["tf-terrain-dem"]).toEqual({
+      type: "raster-dem",
+      url: "pmtiles://https://tiles.example.com/trailforge_terrain.pmtiles",
+      encoding: "mapbox",
+      tileSize: 256,
+    });
   });
 
   it("snaps snow-line elevations to discrete manifest bands and builds MapLibre filter", () => {

@@ -117,6 +117,7 @@ export interface TileManifestResponse {
   terrain_url: string;
   vector_available: boolean;
   terrain_available: boolean;
+  cdn_offload?: boolean;
   layers?: string[];
   snowline_bands_m?: number[];
   terrain_encoding?: string;
@@ -224,10 +225,23 @@ export interface TrackSuitability {
   warnings?: string[];
 }
 
+export type UserRole = "admin" | "member";
+
+export type RegistrationMode = "open" | "invite_only" | "closed";
+
+export interface AuthConfigResponse {
+  registration_mode: RegistrationMode;
+  demo_banner: string;
+  allow_anonymous_browsing: boolean;
+}
+
 export interface AuthUser {
   id: string;
   email: string;
   display_name: string;
+  role: UserRole;
+  is_active: boolean;
+  invited_by_code?: string | null;
   active_vehicle_profile_id?: string | null;
 }
 
@@ -239,6 +253,126 @@ export interface AuthMeResponse {
 export interface AuthTokenResponse {
   user: AuthUser;
   access_token: string;
+}
+
+/* ---------- v1.1.0 Public Instance Hardening & Admin Console Types ---------- */
+
+export interface AdminTrafficWindow {
+  requests?: number;
+  request_count?: number;
+  errors?: number;
+  error_count?: number;
+  rate_limited?: number;
+  rate_limited_count?: number;
+  bytes_out?: number;
+}
+
+export interface AdminRouteBreakdownItem {
+  route_group: string;
+  requests?: number;
+  request_count?: number;
+  requests_24h?: number;
+  errors?: number;
+  error_count?: number;
+  errors_24h?: number;
+  rate_limited?: number;
+  rate_limited_count?: number;
+  rate_limited_24h?: number;
+  bytes_out?: number;
+}
+
+export interface AdminStorageStats {
+  tiles_bytes?: number;
+  packs_bytes?: number;
+  uploads_bytes?: number;
+  uploads_quota_bytes?: number;
+  uploads_usage_pct?: number;
+  db_size_bytes?: number;
+}
+
+export interface AdminUsersSummary {
+  total: number;
+  active: number;
+  admins: number;
+  members: number;
+  suspended: number;
+}
+
+export interface AdminInvitesSummary {
+  active: number;
+  total: number;
+}
+
+export interface AdminContentSummary {
+  tracks?: number;
+  segments?: number;
+  trips?: number;
+  telemetry_observations?: number;
+  condition_reports?: number;
+  planned_routes?: number;
+}
+
+export interface AdminStatsResponse {
+  registration_mode?: RegistrationMode;
+  generated_at?: string;
+  traffic_24h?: AdminTrafficWindow;
+  traffic_7d?: AdminTrafficWindow;
+  route_breakdown?:
+    | AdminRouteBreakdownItem[]
+    | Record<string, Omit<AdminRouteBreakdownItem, "route_group">>;
+  users?: AdminUsersSummary;
+  invites?: AdminInvitesSummary;
+  content?: AdminContentSummary;
+  storage?: AdminStorageStats;
+  feeds?: unknown;
+}
+
+export interface AdminUserItem {
+  id: string;
+  email: string;
+  display_name: string;
+  role: UserRole;
+  is_active: boolean;
+  disabled_at?: string | null;
+  invited_by_code?: string | null;
+  created_at?: string | null;
+}
+
+export interface AdminUserPatchInput {
+  role?: UserRole;
+  is_active?: boolean;
+}
+
+export interface AdminInviteItem {
+  id: string;
+  code: string;
+  label?: string | null;
+  role: UserRole;
+  max_uses: number;
+  use_count: number;
+  expires_at?: string | null;
+  revoked_at?: string | null;
+  created_by_user_id?: string | null;
+  created_at?: string | null;
+  status?: string | null;
+}
+
+export interface AdminInviteCreateInput {
+  label?: string | null;
+  role?: UserRole;
+  max_uses?: number;
+  expires_in_days?: number | null;
+}
+
+export interface AdminComputeActionResponse {
+  ok?: boolean;
+  status?: string;
+  synced_feeds?: number;
+  records_upserted?: number;
+  updated_segments?: number;
+  updated_tracks?: number;
+  message?: string;
+  [key: string]: unknown;
 }
 
 export interface VehicleProfileInput {

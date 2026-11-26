@@ -1,3 +1,8 @@
+import {
+  formatFriendlyApiError,
+  getRegistrationUiState,
+  isAdminUser,
+} from "../adminHelpers";
 import { escapeHtml, getGradeColor } from "../presets";
 import {
   MIN_PRIVACY_TRIM_M,
@@ -9,6 +14,7 @@ import {
   validatePrivacyTrimMeters,
 } from "../tripsHelpers";
 import type {
+  AuthConfigResponse,
   AuthUser,
   DrivetrainType,
   PinCategory,
@@ -38,6 +44,7 @@ export type AccountPanelTab = "rig" | "trips" | "saved" | "account";
 
 export interface AccountPanelState {
   user: AuthUser | null;
+  authConfig: AuthConfigResponse;
   anonymousRigClass: VehicleCapabilityClass;
   vehicles: VehicleProfileItem[];
   trips: TripItem[];
@@ -50,12 +57,14 @@ export interface AccountPanelState {
 
 export interface AccountPanelCallbacks {
   onClose: () => void;
+  onOpenAdminConsole: () => void;
   onSelectAnonymousRig: (cls: VehicleCapabilityClass) => void;
   onLogin: (email: string, password: string) => Promise<void>;
   onRegister: (
     displayName: string,
     email: string,
-    password: string
+    password: string,
+    inviteCode?: string | null
   ) => Promise<void>;
   onLogout: () => Promise<void>;
   onSaveVehicle: (
@@ -162,6 +171,7 @@ export class RigAccountPanel {
   private render(): void {
     const { user, trips, favorites, pins } = this.state;
     const savedCount = favorites.length + pins.length;
+    const showAdminBtn = isAdminUser(user);
 
     this.root.innerHTML = `
       <div class="tf-inspector-head">
@@ -171,7 +181,14 @@ export class RigAccountPanel {
             user ? escapeHtml(user.display_name) : "Anonymous Mode"
           }</h2>
         </div>
-        <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Rig & Account panel">×</button>
+        <div class="tf-head-actions">
+          ${
+            showAdminBtn
+              ? `<button type="button" class="tf-mini-btn tf-admin-hdr-btn" data-role="open-admin" title="Open Admin Console">🛡 Admin</button>`
+              : ""
+          }
+          <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Rig & Account panel">×</button>
+        </div>
       </div>
 
       <div class="tf-panel-tabs tf-panel-tabs-4" role="tablist">
@@ -236,7 +253,7 @@ export class RigAccountPanel {
             <span class="mono tf-insp-meta">Optional Account</span>
           </div>
           <p class="tf-inspector-muted">Sign in to build custom profiles with exact lift, ground clearance, tyres (HT/AT/MT), lockers, winch &amp; snorkel, persisted across sessions.</p>
-          <button type="button" class="tf-btn-secondary" data-jump-tab="account">Sign In or Create Local Account</button>
+          <button type="button" class="tf-btn-secondary" data-jump-tab="account">${escapeHtml(getRegistrationUiState(this.state.authConfig.registration_mode).ctaLabel)}</button>
         </section>
       `;
     }
@@ -376,7 +393,7 @@ export class RigAccountPanel {
           <div class="tf-privacy-note">
             🔒 <strong>Privacy by Design:</strong> Every upload automatically trims at least <strong>${MIN_PRIVACY_TRIM_M} m</strong> from both start and end before matching. Public telemetry contains zero user or trip IDs.
           </div>
-          <button type="button" class="tf-btn-primary" data-jump-tab="account">Sign In / Create Account</button>
+          <button type="button" class="tf-btn-primary" data-jump-tab="account">${escapeHtml(getRegistrationUiState(this.state.authConfig.registration_mode).ctaLabel)}</button>
         </section>
       `;
     }
@@ -623,7 +640,7 @@ export class RigAccountPanel {
           </div>
           <p class="tf-inspector-muted">Personal pins above work 100% offline in browser storage. Sign in to save favorite VIC/NSW tracks and sync pins across devices.</p>
           <p class="tf-inspector-muted">Individual track GPX/GeoJSON exports work directly in the Track Inspector and In-Cab Recorder without an account.</p>
-          <button type="button" class="tf-btn-primary" data-jump-tab="account">Sign In / Create Account</button>
+          <button type="button" class="tf-btn-primary" data-jump-tab="account">${escapeHtml(getRegistrationUiState(this.state.authConfig.registration_mode).ctaLabel)}</button>
         </section>
       `;
     }
@@ -680,41 +697,76 @@ export class RigAccountPanel {
   }
 
   private renderAccountTab(): string {
-    const { user, vehicles, trips, favorites, pins } = this.state;
+    const { user, authConfig, vehicles, trips, favorites, pins } = this.state;
 
     if (user) {
       const activeRig = vehicles.find((v) => isVehicleActive(v));
+      const admin = isAdminUser(user);
+      const roleLabel = admin ? "Admin" : "Member";
       return `
         <section class="tf-insp-section">
           <div class="tf-insp-sec-head">
             <h3>Signed In</h3>
-            <span class="mono tf-insp-meta">Self-Hosted Auth</span>
+            <span class="tf-mini-tag ${admin ? "amber" : "cyan"} mono">${escapeHtml(roleLabel.toUpperCase())}</span>
           </div>
           <div class="tf-kv-grid">
             <span class="tf-kv-key">Name</span>
             <span class="tf-kv-val">${escapeHtml(user.display_name)}</span>
             <span class="tf-kv-key">Email</span>
             <span class="tf-kv-val mono">${escapeHtml(user.email)}</span>
+            <span class="tf-kv-key">Role</span>
+            <span class="tf-kv-val">${escapeHtml(roleLabel)} · ${user.is_active !== false ? "Active" : "Suspended"}</span>
+            ${
+              user.invited_by_code
+                ? `<span class="tf-kv-key">Invite Code</span><span class="tf-kv-val mono">${escapeHtml(user.invited_by_code)}</span>`
+                : ""
+            }
             <span class="tf-kv-key">Active Rig</span>
             <span class="tf-kv-val">${escapeHtml(activeRig ? `${activeRig.name} (${activeRig.capability_class})` : "None set")}</span>
             <span class="tf-kv-key">Data</span>
             <span class="tf-kv-val mono">${trips.length} trips · ${favorites.length} favs · ${pins.length} pins</span>
           </div>
+          ${
+            admin
+              ? `<button type="button" class="tf-btn-primary" data-role="open-admin">🛡 Open Admin Console</button>`
+              : ""
+          }
           <button type="button" class="tf-btn-secondary danger-outline" data-role="logout-btn" ${this.busy ? "disabled" : ""}>Sign Out</button>
         </section>
       `;
     }
 
+    const regUi = getRegistrationUiState(authConfig.registration_mode);
+    const effectiveMode: "login" | "register" = regUi.canRegister
+      ? this.authMode
+      : "login";
+
     return `
       <section class="tf-insp-section">
-        <div class="tf-auth-switch">
-          <button type="button" class="tf-mini-btn ${this.authMode === "login" ? "active" : ""}" data-auth-mode="login">Sign In</button>
-          <button type="button" class="tf-mini-btn ${this.authMode === "register" ? "active" : ""}" data-auth-mode="register">Create Account</button>
-        </div>
+        ${
+          regUi.canRegister
+            ? `
+              <div class="tf-auth-switch">
+                <button type="button" class="tf-mini-btn ${effectiveMode === "login" ? "active" : ""}" data-auth-mode="login">Sign In</button>
+                <button type="button" class="tf-mini-btn ${effectiveMode === "register" ? "active" : ""}" data-auth-mode="register">${regUi.showInviteField ? "Redeem Invite" : "Create Account"}</button>
+              </div>
+            `
+            : `
+              <div class="tf-privacy-note" role="status">
+                🔒 ${escapeHtml(regUi.closedNoticeText ?? "Invite/registration currently closed — public browsing remains open.")}
+              </div>
+            `
+        }
+
+        ${
+          effectiveMode === "register" && regUi.inviteHelperText
+            ? `<div class="tf-privacy-note">${escapeHtml(regUi.inviteHelperText)}</div>`
+            : ""
+        }
 
         <form class="tf-form" data-role="auth-form">
           ${
-            this.authMode === "register"
+            effectiveMode === "register"
               ? `
                 <label class="tf-field">
                   <span class="tf-label">Display Name</span>
@@ -725,17 +777,41 @@ export class RigAccountPanel {
           }
           <label class="tf-field">
             <span class="tf-label">Email</span>
-            <input type="email" class="tf-input" name="email" required placeholder="driver@trailforge.local" />
+            <input type="email" class="tf-input" name="email" required placeholder="driver@example.com" />
           </label>
           <label class="tf-field">
             <span class="tf-label">Password</span>
             <input type="password" class="tf-input" name="password" required minlength="8" placeholder="Min 8 characters" />
           </label>
+          ${
+            effectiveMode === "register" && regUi.showInviteField
+              ? `
+                <label class="tf-field">
+                  <span class="tf-label">Friend Invite Code</span>
+                  <input
+                    type="text"
+                    class="tf-input mono tf-invite-input"
+                    name="invite_code"
+                    maxlength="64"
+                    autocomplete="off"
+                    spellcheck="false"
+                    placeholder="${escapeHtml(regUi.invitePlaceholder)}"
+                  />
+                </label>
+              `
+              : ""
+          }
           <button type="submit" class="tf-btn-primary" ${this.busy ? "disabled" : ""}>
-            ${this.authMode === "register" ? "Create Local Account" : "Sign In"}
+            ${
+              effectiveMode === "register"
+                ? regUi.showInviteField
+                  ? "Create Account with Invite"
+                  : "Create Local Account"
+                : "Sign In"
+            }
           </button>
         </form>
-        <p class="tf-inspector-muted">Accounts live purely in your self-hosted TrailForge PostGIS instance. Anonymous browsing always remains available.</p>
+        <p class="tf-inspector-muted">Accounts live purely in this TrailForge PostGIS instance. Anonymous map browsing &amp; route planning always remain open.</p>
       </section>
     `;
   }
@@ -746,6 +822,14 @@ export class RigAccountPanel {
       ?.addEventListener("click", () => {
         this.close();
         this.callbacks.onClose();
+      });
+
+    this.root
+      .querySelectorAll<HTMLButtonElement>("[data-role='open-admin']")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          this.callbacks.onOpenAdminConsole();
+        });
       });
 
     this.root
@@ -806,10 +890,22 @@ export class RigAccountPanel {
         const email = String(fd.get("email") ?? "").trim();
         const password = String(fd.get("password") ?? "");
         const displayName = String(fd.get("display_name") ?? "").trim();
+        const inviteCode = String(fd.get("invite_code") ?? "").trim() || null;
+        const regUi = getRegistrationUiState(
+          this.state.authConfig.registration_mode
+        );
+        const effectiveMode: "login" | "register" = regUi.canRegister
+          ? this.authMode
+          : "login";
 
         void this.runAsync(async () => {
-          if (this.authMode === "register") {
-            await this.callbacks.onRegister(displayName, email, password);
+          if (effectiveMode === "register") {
+            await this.callbacks.onRegister(
+              displayName,
+              email,
+              password,
+              inviteCode
+            );
           } else {
             await this.callbacks.onLogin(email, password);
           }
@@ -1124,8 +1220,7 @@ export class RigAccountPanel {
     try {
       await task();
     } catch (err) {
-      this.formError =
-        err instanceof Error ? err.message : "Operation failed";
+      this.formError = formatFriendlyApiError(err, "Operation failed");
     } finally {
       this.busy = false;
       this.render();
