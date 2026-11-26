@@ -848,6 +848,7 @@ def test_full_oauth21_pkce_dcr_rotation_reuse_revoke_and_grants(
         assert login_page.status_code == 200
         assert login_page.headers["x-frame-options"] == "DENY"
         assert "frame-ancestors 'none'" in login_page.headers["content-security-policy"]
+        assert "form-action 'self';" in login_page.headers["content-security-policy"]
         assert "<script>alert(1)</script>" not in login_page.text
         assert "&lt;script&gt;alert(1)&lt;/script&gt;" in login_page.text
         login_csrf = _extract_csrf(login_page.text)
@@ -877,11 +878,23 @@ def test_full_oauth21_pkce_dcr_rotation_reuse_revoke_and_grants(
             },
         )
         assert consent_page.status_code == 200
+        assert consent_page.headers["x-frame-options"] == "DENY"
+        consent_csp = consent_page.headers["content-security-policy"]
+        assert "frame-ancestors 'none'" in consent_csp
+        assert "form-action 'self' https://claude.ai;" in consent_csp
         assert user.email in consent_page.text
         assert "Read your rigs, saved routes &amp; trip summaries" in consent_page.text
         assert "Save routes, pins &amp; favorites" in consent_page.text
         assert "<script>alert(1)</script>" not in consent_page.text
         consent_csrf = _extract_csrf(consent_page.text)
+
+        # Signed-in GET /api/oauth/authorize also includes redirect origin in CSP form-action
+        signed_in_get = client.get("/api/oauth/authorize", params=auth_params)
+        assert signed_in_get.status_code == 200
+        assert signed_in_get.headers["x-frame-options"] == "DENY"
+        signed_in_csp = signed_in_get.headers["content-security-policy"]
+        assert "frame-ancestors 'none'" in signed_in_csp
+        assert "form-action 'self' https://claude.ai;" in signed_in_csp
 
         # 8. Tampered CSRF token on consent POST rejected (403)
         tampered_post = client.post(

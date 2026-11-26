@@ -12,6 +12,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 from typing import Annotated, Any, Final
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -101,6 +102,41 @@ _CONSENT_SECURITY_HEADERS: Final[dict[str, str]] = {
     "Pragma": "no-cache",
     "Referrer-Policy": "no-referrer",
 }
+
+
+def _origin_from_redirect_uri(redirect_uri: str | None) -> str | None:
+    """Extract bare ``scheme://netloc`` origin from a validated OAuth redirect URI."""
+    if not redirect_uri:
+        return None
+    parsed = urlsplit(redirect_uri)
+    scheme = parsed.scheme.lower()
+    if scheme not in ("https", "http") or not parsed.netloc:
+        return None
+    origin = f"{scheme}://{parsed.netloc}"
+    if any(ch in origin for ch in (" ", "\t", "\r", "\n", ";", ",")):
+        return None
+    return origin
+
+
+def _build_consent_security_headers(redirect_uri: str | None = None) -> dict[str, str]:
+    """Build consent-page security headers permitting form-redirect to the validated client origin.
+
+    Chromium and Safari enforce CSP3 ``form-action`` across 302 redirects following form
+    submission, so the consent page must allow both ``'self'`` and the validated redirect
+    origin while keeping ``X-Frame-Options: DENY`` and ``frame-ancestors 'none'``.
+    """
+    redirect_origin = _origin_from_redirect_uri(redirect_uri)
+    form_action = f"'self' {redirect_origin}" if redirect_origin else "'self'"
+    return {
+        "X-Frame-Options": "DENY",
+        "Content-Security-Policy": (
+            f"default-src 'none'; style-src 'unsafe-inline'; form-action {form_action}; "
+            "frame-ancestors 'none'; base-uri 'none'"
+        ),
+        "Cache-Control": "no-store",
+        "Pragma": "no-cache",
+        "Referrer-Policy": "no-referrer",
+    }
 
 
 def _request_settings(request: Request) -> Settings:
@@ -367,7 +403,7 @@ def oauth_authorize_get(
     return HTMLResponse(
         content=render_oauth_consent_html(params=params, user=user, csrf_token=csrf_token),
         status_code=status.HTTP_200_OK,
-        headers=_CONSENT_SECURITY_HEADERS,
+        headers=_build_consent_security_headers(params.redirect_uri),
     )
 
 
@@ -510,7 +546,7 @@ async def oauth_authorize_post(
         resp = HTMLResponse(
             content=render_oauth_consent_html(params=params, user=user, csrf_token=consent_csrf),
             status_code=status.HTTP_200_OK,
-            headers=_CONSENT_SECURITY_HEADERS,
+            headers=_build_consent_security_headers(params.redirect_uri),
         )
         _set_session_cookie(resp, session_token, cfg)
         return resp
@@ -549,6 +585,7 @@ async def oauth_authorize_post(
         )
 
     decision = (form.get("decision") or "").strip().lower()
+    consent_headers = _build_consent_security_headers(params.redirect_uri)
     if decision != "approve":
         deny_params = {"error": "access_denied", "error_description": "User denied authorization"}
         if params.state:
@@ -556,7 +593,7 @@ async def oauth_authorize_post(
         return RedirectResponse(
             url=build_redirect_url(params.redirect_uri, deny_params),
             status_code=status.HTTP_302_FOUND,
-            headers=_CONSENT_SECURITY_HEADERS,
+            headers=consent_headers,
         )
 
     try:
@@ -576,7 +613,7 @@ async def oauth_authorize_post(
     return RedirectResponse(
         url=build_redirect_url(params.redirect_uri, redirect_params),
         status_code=status.HTTP_302_FOUND,
-        headers=_CONSENT_SECURITY_HEADERS,
+        headers=consent_headers,
     )
 
 
