@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  TrailForge AndroidManifest.xml Permissions & Foreground Service Snippet (Capacitor 7)
+  Merge these <uses-permission>, <uses-feature>, and <service> declarations into:
+    web/android/app/src/main/AndroidManifest.xml
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+  <!-- Network access for live closure feeds, pack downloads, and offline queue sync -->
+  <uses-permission android:name="android.permission.INTERNET" />
+  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+  <!-- High-accuracy foreground and locked-screen background GNSS breadcrumbs -->
+  <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+  <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+  <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+
+  <!-- Android 14+ (API 34+) foreground service permissions for continuous GPS logging -->
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+
+  <!-- Android 13+ (API 33+) notification permission for active recording foreground banner -->
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+  <!-- Keep screen/CPU awake during active in-cab navigation and recording -->
+  <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+  <!-- Android 12+ (API 31+) permission for 50 Hz IMU accelerometer roughness & clinometer -->
+  <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
+
+  <!-- Hardware features marked optional so tablets without cellular/barometer stay compatible -->
+  <uses-feature android:name="android.hardware.location.gps" android:required="false" />
+  <uses-feature android:name="android.hardware.sensor.accelerometer" android:required="false" />
+
+  <!--
+    Merge inside <application> for Android 14+ (API 34+) background geolocation plugin service:
+    <service
+      android:name="com.equimaps.capacitor_background_geolocation.BackgroundGeolocationService"
+      android:enabled="true"
+      android:exported="false"
+      android:foregroundServiceType="location" />
+  -->
+</manifest>

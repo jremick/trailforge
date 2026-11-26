@@ -6,7 +6,7 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
-COPY tsconfig.json vite.config.ts index.html ./
+COPY tsconfig.json vite.config.ts capacitor.config.ts index.html ./
 COPY public ./public
 COPY src ./src
 

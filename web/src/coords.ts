@@ -1,4 +1,4 @@
-import { VIC_NSW_LAUNCH_BBOX } from "./presets";
+import { AUSTRALIA_BBOX, VIC_NSW_LAUNCH_BBOX } from "./presets";
 import type {
   ParsedCoordinate,
   ParsedLatLon,
@@ -509,5 +509,10 @@ export function formatCoords(lat: number, lon: number, decimals = 5): string {
 
 export function isWithinVicNswRegion(lat: number, lon: number): boolean {
   const [west, south, east, north] = VIC_NSW_LAUNCH_BBOX;
+  return lon >= west && lon <= east && lat >= south && lat <= north;
+}
+
+export function isWithinAustralia(lat: number, lon: number): boolean {
+  const [west, south, east, north] = AUSTRALIA_BBOX;
   return lon >= west && lon <= east && lat >= south && lat <= north;
 }

@@ -51,7 +51,7 @@ const LAYER_TOGGLES: readonly LayerToggleDef[] = [
   {
     key: "closures",
     label: "Closures & Gates",
-    hint: "Official VIC/NSW seasonal closures, fire/park alerts & locked gates",
+    hint: "Official AU state seasonal closures, fire/park alerts & locked gates",
   },
   {
     key: "reports",
@@ -213,7 +213,7 @@ export class Sidebar {
           <summary class="tf-section-summary">
             <span class="tf-section-title-group">
               <span class="tf-section-index">02</span>
-              <span class="tf-section-title">VIC &amp; NSW Feeds</span>
+              <span class="tf-section-title">AU Agency Feeds</span>
             </span>
             <span class="tf-section-pill mono" data-role="feeds-pill">Checking…</span>
           </summary>

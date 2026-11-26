@@ -2,7 +2,13 @@ import {
   formatByteSize,
   type PackDownloadProgress,
 } from "../offline/packStore";
-import { REGION_PRESETS, escapeHtml } from "../presets";
+import {
+  PAN_AU_PACK_PRESETS,
+  type PackFilterCategory,
+  classifyPackCategory,
+  escapeHtml,
+  filterPackRegions,
+} from "../presets";
 import type {
   DownloadedPackRecord,
   OfflinePackRegionItem,
@@ -34,10 +40,14 @@ export interface PacksPanelCallbacks {
 }
 
 const DEFAULT_FALLBACK_REGIONS: readonly OfflinePackRegionItem[] =
-  REGION_PRESETS.filter((p) => p.group === "region").map((p) => ({
+  PAN_AU_PACK_PRESETS.map((p) => ({
     region_id: p.id,
     name: p.label,
     description: p.description,
+    category: p.packCategory ?? "region",
+    region_type: p.packCategory === "state" ? "state" : "tactical",
+    states: p.states,
+    estimated_size_hint: p.estimatedPackHint,
     bbox: p.bbox,
     status: "not_built",
   }));
@@ -47,6 +57,7 @@ export class OfflinePacksPanel {
   private readonly callbacks: PacksPanelCallbacks;
   private state: PacksPanelState;
   private isOpen = false;
+  private activeFilter: PackFilterCategory = "all";
 
   constructor(
     container: HTMLElement,
@@ -104,7 +115,10 @@ export class OfflinePacksPanel {
   }
 
   private render(): void {
-    const regions = this.mergedRegions();
+    const allRegions = this.mergedRegions();
+    const regionCount = filterPackRegions(allRegions, "region").length;
+    const stateCount = filterPackRegions(allRegions, "state").length;
+    const regions = filterPackRegions(allRegions, this.activeFilter);
     const downloadedMap = new Map(
       this.state.downloaded.map((d) => [d.region_id, d])
     );
@@ -177,9 +191,15 @@ export class OfflinePacksPanel {
           this.state.downloadingRegionId === region.region_id;
         const isActive = this.state.activeOfflinePackId === region.region_id;
         const isReady = region.status === "ready";
-        const sizeText = formatByteSize(
-          cached?.total_size_bytes ?? region.total_size_bytes
-        );
+        const sizeText =
+          cached?.total_size_bytes || region.total_size_bytes
+            ? formatByteSize(cached?.total_size_bytes ?? region.total_size_bytes)
+            : (region.estimated_size_hint ?? formatByteSize(0));
+        const category = classifyPackCategory(region);
+        const stateLabel =
+          region.states && region.states.length > 0
+            ? region.states.join("/")
+            : null;
 
         const progressHtml =
           isDownloading && this.state.downloadProgress
@@ -216,6 +236,14 @@ export class OfflinePacksPanel {
                 <div class="tf-pack-id mono">${escapeHtml(region.region_id)} · ${escapeHtml(region.bbox.map((n) => n.toFixed(2)).join(", "))}</div>
               </div>
               <div class="tf-pack-badges">
+                ${
+                  stateLabel
+                    ? `<span class="tf-mini-tag">${escapeHtml(stateLabel)}</span>`
+                    : ""
+                }
+                <span class="tf-mini-tag ${category === "state" ? "cyan" : ""}">
+                  ${category === "state" ? "STATE" : "4WD REGION"}
+                </span>
                 <span class="tf-mini-tag ${isReady ? "emerald" : "amber"}">
                   ${isBuilding ? "BUILDING…" : escapeHtml(region.status.replace(/_/g, " ").toUpperCase())}
                 </span>
@@ -278,8 +306,8 @@ export class OfflinePacksPanel {
     this.root.innerHTML = `
       <div class="tf-inspector-head">
         <div>
-          <div class="tf-inspector-kicker">Offline Packs &amp; Sync · ${this.state.online ? "Online" : "Offline Mode"}</div>
-          <h2 class="tf-inspector-title">VIC &amp; NSW Regional Packs</h2>
+          <div class="tf-inspector-kicker">Offline Packs &amp; Sync · ${allRegions.length} AU Packs · ${this.state.online ? "Online" : "Offline Mode"}</div>
+          <h2 class="tf-inspector-title">Pan-Australia Offline Packs</h2>
         </div>
         <div class="tf-head-actions">
           <button type="button" class="tf-mini-btn" data-role="refresh-packs" ${!this.state.online || this.state.loading ? "disabled" : ""}>↻</button>
@@ -298,18 +326,41 @@ export class OfflinePacksPanel {
 
         <section class="tf-insp-section">
           <div class="tf-insp-sec-head">
-            <h3>Downloadable Regional Bundles</h3>
-            <span class="mono tf-insp-meta">${this.state.downloaded.length} cached</span>
+            <h3>Downloadable AU Bundles</h3>
+            <span class="mono tf-insp-meta">${this.state.downloaded.length} cached · ${regions.length} shown</span>
           </div>
           <p class="tf-panel-hint">
-            Packs bundle vector PMTiles, Terrain-RGB hillshade PMTiles (served offline via Service Worker HTTP 206 Range slicing), graded tracks, live evidence, POIs, CAPAD parks, and closures.
+            Packs bundle vector PMTiles, Terrain-RGB hillshade PMTiles (served offline via HTTP 206 Range slicing), graded tracks, live evidence, POIs, CAPAD parks, and state agency closures.
           </p>
+          <div class="tf-pack-filter-bar" role="tablist" aria-label="Filter offline packs by category">
+            <button
+              type="button"
+              role="tab"
+              aria-selected="${this.activeFilter === "all"}"
+              class="tf-pack-filter-pill ${this.activeFilter === "all" ? "active" : ""}"
+              data-pack-filter="all"
+            >All <span class="mono">(${allRegions.length})</span></button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected="${this.activeFilter === "region"}"
+              class="tf-pack-filter-pill ${this.activeFilter === "region" ? "active" : ""}"
+              data-pack-filter="region"
+            >Iconic 4WD Regions <span class="mono">(${regionCount})</span></button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected="${this.activeFilter === "state"}"
+              class="tf-pack-filter-pill ${this.activeFilter === "state" ? "active" : ""}"
+              data-pack-filter="state"
+            >Statewide <span class="mono">(${stateCount})</span></button>
+          </div>
           <div class="tf-card-stack">${cardsHtml}</div>
         </section>
       </div>
     `;
 
-    this.bindHandlers(regions);
+    this.bindHandlers(allRegions);
   }
 
   private bindHandlers(regions: OfflinePackRegionItem[]): void {
@@ -336,6 +387,18 @@ export class OfflinePacksPanel {
       .querySelector<HTMLButtonElement>("[data-role='sync-now']")
       ?.addEventListener("click", () => {
         void this.callbacks.onSyncNow();
+      });
+
+    this.root
+      .querySelectorAll<HTMLButtonElement>("[data-pack-filter]")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const next = btn.dataset.packFilter as PackFilterCategory | undefined;
+          if (next === "all" || next === "region" || next === "state") {
+            this.activeFilter = next;
+            this.render();
+          }
+        });
       });
 
     this.root

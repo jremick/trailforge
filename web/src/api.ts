@@ -19,6 +19,7 @@ import type {
   ClosuresStatusResponse,
   ConditionReportCreateInput,
   ConditionReportItem,
+  MobileTripSyncPayload,
   OfflinePackManifest,
   OfflinePackRegionItem,
   OfflinePackSnapshot,
@@ -538,6 +539,33 @@ export function uploadTripJson(
     method: "POST",
     body: payload,
   });
+}
+
+/**
+ * Upload a mobile/PWA recorded drive session (including high-rate `imu_samples`
+ * and `recording_source`) via `POST /api/trips/mobile-sync`. Automatically falls
+ * back to `POST /api/trips/upload` when talking to a backend without mobile-sync.
+ */
+export async function uploadMobileTripSync(
+  payload: MobileTripSyncPayload
+): Promise<TripItem> {
+  const body: MobileTripSyncPayload = {
+    ...payload,
+    client_session_id: payload.client_session_id ?? payload.client_uuid ?? null,
+    recording_source: payload.recording_source ?? "pwa",
+  };
+
+  try {
+    return await requestJson<TripItem>("/api/trips/mobile-sync", {
+      method: "POST",
+      body,
+    });
+  } catch (err) {
+    if (err instanceof ApiError && (err.status === 404 || err.status === 405)) {
+      return uploadTripJson(payload);
+    }
+    throw err;
+  }
 }
 
 export function updateTrip(

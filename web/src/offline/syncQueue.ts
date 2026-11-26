@@ -34,13 +34,18 @@ export async function getSyncQueueCount(): Promise<number> {
 export async function enqueueOfflineTrip(
   payload: TripUploadJsonPayload
 ): Promise<SyncQueueItem> {
-  const clientUuid = payload.client_uuid ?? generateClientUuid();
+  const clientUuid =
+    payload.client_uuid ?? payload.client_session_id ?? generateClientUuid();
   const item: SyncQueueItem = {
     id: `trip:${clientUuid}`,
     kind: "trip",
     created_at: new Date().toISOString(),
     label: `Trip: ${payload.name}`,
-    payload: { ...payload, client_uuid: clientUuid },
+    payload: {
+      ...payload,
+      client_uuid: clientUuid,
+      client_session_id: payload.client_session_id ?? clientUuid,
+    },
     last_error: null,
   };
   await getOfflineBackend().put("sync_queue", item.id, item);

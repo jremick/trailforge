@@ -60,7 +60,12 @@ export class TopBar {
     this.callbacks = callbacks;
     this.root.className = "tf-topbar";
 
-    const regions = REGION_PRESETS.filter((p) => p.group === "region");
+    const iconicRegions = REGION_PRESETS.filter(
+      (p) => p.group === "region" && p.packCategory !== "state"
+    );
+    const stateRegions = REGION_PRESETS.filter(
+      (p) => p.group === "region" && p.packCategory === "state"
+    );
     const landmarks = REGION_PRESETS.filter((p) => p.group === "landmark");
 
     const renderOptions = (items: RegionPreset[]): string =>
@@ -83,7 +88,7 @@ export class TopBar {
         </div>
         <div class="tf-brand-text">
           <span class="tf-brand-name">TrailForge</span>
-          <span class="tf-brand-badge">VIC · NSW</span>
+          <span class="tf-brand-badge">AU · 8 STATES</span>
         </div>
       </div>
 
@@ -95,7 +100,7 @@ export class TopBar {
             class="tf-search-input mono"
             data-role="search-input"
             placeholder="Search tracks, huts, camps, lat,lon or MGRS…"
-            aria-label="Search VIC/NSW tracks, camps, huts, coordinates, or MGRS"
+            aria-label="Search Australian tracks, camps, huts, coordinates, or MGRS"
             aria-autocomplete="list"
             aria-expanded="false"
             autocomplete="off"
@@ -116,11 +121,14 @@ export class TopBar {
       </div>
 
       <div class="tf-topbar-controls">
-        <label class="tf-preset-wrap" aria-label="Select VIC/NSW region preset">
+        <label class="tf-preset-wrap" aria-label="Select Pan-Australia region preset">
           <span class="tf-preset-label">Region</span>
           <select class="tf-preset-select" data-role="preset-select">
-            <optgroup label="VIC &amp; NSW Regions">
-              ${renderOptions(regions)}
+            <optgroup label="Iconic 4WD Regions (${iconicRegions.length})">
+              ${renderOptions(iconicRegions)}
+            </optgroup>
+            <optgroup label="Australian States &amp; Territories (${stateRegions.length})">
+              ${renderOptions(stateRegions)}
             </optgroup>
             <optgroup label="4WD Corridors &amp; Landmarks">
               ${renderOptions(landmarks)}
@@ -143,7 +151,7 @@ export class TopBar {
           type="button"
           class="tf-rig-btn tf-packs-btn"
           data-role="packs-btn"
-          title="Download VIC/NSW Offline Regional Packs & Manage Sync Queue"
+          title="Download Pan-Australia Offline Regional Packs & Manage Sync Queue"
         >
           <span class="tf-status-dot online" data-role="packs-dot"></span>
           <span data-role="packs-label">Offline Packs</span>
@@ -163,7 +171,7 @@ export class TopBar {
           type="button"
           class="tf-health-pill tf-feed-pill"
           data-role="feed-pill"
-          title="Official VIC & NSW closure feeds status"
+          title="Official Pan-Australia closure & emergency feeds status"
           aria-live="polite"
         >
           <span class="tf-status-dot connecting" data-role="feed-dot"></span>

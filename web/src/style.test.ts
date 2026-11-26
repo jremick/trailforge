@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError, fetchHealth } from "./api";
+import { isWithinAustralia } from "./coords";
 import {
   DEFAULT_SNOWLINE_BANDS_M,
+  PAN_AU_PACK_PRESETS,
   createInitialLayerState,
   snapSnowlineBand,
 } from "./presets";
@@ -243,6 +245,17 @@ describe("MapLibre 5 PMTiles & offline fallback style builder", () => {
 
     const regions = buildRegionalBoundsGeoJson();
     expect(regions.features.length).toBe(3);
+  });
+
+  it("covers all 15 Pan-Australia preset centers inside Australia bounds", () => {
+    expect(PAN_AU_PACK_PRESETS).toHaveLength(15);
+    for (const preset of PAN_AU_PACK_PRESETS) {
+      expect(
+        isWithinAustralia(preset.center[1], preset.center[0]),
+        `Center out of Australia bounds for ${preset.id}`
+      ).toBe(true);
+    }
+    expect(isWithinAustralia(51.5, -0.12)).toBe(false);
   });
 });
 

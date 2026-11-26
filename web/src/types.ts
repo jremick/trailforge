@@ -37,6 +37,8 @@ export interface RegionPreset {
   label: string;
   shortLabel: string;
   group: "region" | "landmark";
+  packCategory?: "region" | "state";
+  states?: readonly string[];
   stateTag: string;
   utmZones: readonly string[];
   center: readonly [number, number]; // [lon, lat]
@@ -307,7 +309,46 @@ export interface UserPinItem {
   created_at?: string | null;
 }
 
-/* ---------- Slice 06 Telemetry, Trips & Unmapped Candidates ---------- */
+/* ---------- Slice 06 & Phase B Telemetry, IMU, Mobile Sync & Trips ---------- */
+
+export type RuntimeMode =
+  | "capacitor_ios"
+  | "capacitor_android"
+  | "pwa_browser";
+
+export type MobileRecordingSource =
+  | "pwa"
+  | "capacitor_ios"
+  | "capacitor_android";
+
+export interface ImuSample {
+  t_ms: number;
+  ax: number;
+  ay: number;
+  az: number;
+  pitch_deg?: number | null;
+  roll_deg?: number | null;
+}
+
+export interface ImuMetrics {
+  sample_count: number;
+  roughness_rms: number | null;
+  roughness_p95: number | null;
+  shock_event_count: number;
+  max_pitch_deg: number | null;
+  max_roll_deg: number | null;
+  latest_pitch_deg: number | null;
+  latest_roll_deg: number | null;
+}
+
+export interface ImuSummary {
+  sample_count: number;
+  roughness_rms: number | null;
+  roughness_p95: number | null;
+  shock_event_count: number;
+  max_pitch_deg: number | null;
+  max_roll_deg: number | null;
+}
 
 export type TripVisibility = "private" | "community_anonymous";
 
@@ -323,10 +364,19 @@ export interface TelemetryPointInput {
 export interface TripUploadJsonPayload {
   name: string;
   points: TelemetryPointInput[];
+  imu_samples?: ImuSample[];
   vehicle_profile_id?: string | null;
   visibility: TripVisibility;
   privacy_trim_m?: number;
   client_uuid?: string | null;
+  client_session_id?: string | null;
+  recording_source?: MobileRecordingSource;
+}
+
+export interface MobileTripSyncPayload extends TripUploadJsonPayload {
+  imu_samples?: ImuSample[];
+  client_session_id?: string | null;
+  recording_source?: MobileRecordingSource;
 }
 
 export interface TripMatchedSegment {
@@ -354,6 +404,9 @@ export interface TripItem {
   observations_published?: number;
   unmapped_candidate_count?: number;
   match_status?: string | null;
+  matcher_name?: string | null;
+  matcher_backend?: string | null;
+  imu_summary?: ImuSummary | null;
   created_at?: string | null;
   matched_segments?: TripMatchedSegment[];
   unmapped_candidates?: unknown[];
@@ -495,6 +548,10 @@ export interface OfflinePackRegionItem {
   region_id: string;
   name: string;
   description: string;
+  category?: "region" | "state" | string;
+  region_type?: "tactical" | "state" | "custom" | string;
+  states?: readonly string[];
+  estimated_size_hint?: string;
   bbox: BBoxTuple;
   status: PackBuildStatus;
   version?: string | null;
@@ -582,6 +639,8 @@ export interface RecordedBreadcrumbPoint {
   accuracy_m?: number | null;
   speed_mps?: number | null;
   roughness_rms?: number | null;
+  pitch_deg?: number | null;
+  roll_deg?: number | null;
 }
 
 export type SyncQueueItem =

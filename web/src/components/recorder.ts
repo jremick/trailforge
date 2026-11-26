@@ -1,4 +1,16 @@
 import {
+  type BackgroundLocationHandle,
+  type ImuCaptureHandle,
+  classifyClinometerAlert,
+  getRuntimeMode,
+  getRuntimeModeLabel,
+  releaseKeepAwake,
+  requestKeepAwake,
+  runtimeModeToRecordingSource,
+  startBackgroundLocationWatch,
+  startHighRateImuCapture,
+} from "../native/bridge";
+import {
   buildClientGeoJson,
   buildClientGpx,
   slugifyExportFilename,
@@ -8,12 +20,16 @@ import {
   SIMULATED_HIGH_COUNTRY_WAYPOINTS,
   buildBacktrackGuidance,
   computeRecorderStats,
-  computeRoughnessRms,
+  synthesizeSimulatedImuBurst,
 } from "../offline/recorderEngine";
 import { escapeHtml } from "../presets";
 import { validatePrivacyTrimMeters } from "../tripsHelpers";
 import type {
+  ImuMetrics,
+  ImuSample,
+  MobileRecordingSource,
   RecordedBreadcrumbPoint,
+  RuntimeMode,
   TripVisibility,
   VehicleProfileItem,
 } from "../types";
@@ -27,6 +43,8 @@ export interface RecorderCallbacks {
   onSaveRecordedTrip: (params: {
     name: string;
     points: RecordedBreadcrumbPoint[];
+    imu_samples: ImuSample[];
+    recording_source: MobileRecordingSource;
     visibility: TripVisibility;
     privacy_trim_m: number;
     vehicle_profile_id: string | null;
@@ -34,13 +52,18 @@ export interface RecorderCallbacks {
   onToast: (message: string, kind: "info" | "success" | "error") => void;
 }
 
-interface WakeLockSentinelLike {
-  released?: boolean;
-  release: () => Promise<void>;
-  addEventListener?: (event: string, listener: () => void) => void;
-}
-
 type RecorderPhase = "idle" | "recording" | "paused" | "stopped";
+
+const EMPTY_IMU_METRICS: ImuMetrics = {
+  sample_count: 0,
+  roughness_rms: null,
+  roughness_p95: null,
+  shock_event_count: 0,
+  max_pitch_deg: null,
+  max_roll_deg: null,
+  latest_pitch_deg: null,
+  latest_roll_deg: null,
+};
 
 function formatClock(totalSeconds: number): string {
   const s = Math.max(0, Math.round(totalSeconds));
@@ -52,9 +75,21 @@ function formatClock(totalSeconds: number): string {
   return hrs > 0 ? `${hrs}:${mm}:${ss}` : `${mm}:${ss}`;
 }
 
+function formatSignedDeg(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return "0.0°";
+  const sign = value > 0 ? "+" : "";
+  return `${sign}${value.toFixed(1)}°`;
+}
+
+function clinoBarFillPct(deg: number | null): number {
+  if (deg === null || !Number.isFinite(deg)) return 0;
+  return Math.min(100, Math.round((Math.abs(deg) / 35) * 100));
+}
+
 export class InCabRecorderHud {
   private readonly root: HTMLElement;
   private readonly callbacks: RecorderCallbacks;
+  private readonly runtimeMode: RuntimeMode;
 
   private expanded = false;
   private phase: RecorderPhase = "idle";
@@ -62,12 +97,13 @@ export class InCabRecorderHud {
   private backtrackActive = false;
   private wakeLockEnabled = false;
   private wakeLockStatus: "off" | "active" | "unsupported" = "off";
-  private wakeLockSentinel: WakeLockSentinelLike | null = null;
   private motionEnabled = false;
-  private motionSamples: number[] = [];
-  private motionListener: ((ev: DeviceMotionEvent) => void) | null = null;
+  private imuHandle: ImuCaptureHandle | null = null;
+  private recordedImuSamples: ImuSample[] = [];
+  private imuMetrics: ImuMetrics = { ...EMPTY_IMU_METRICS };
 
-  private geoWatchId: number | null = null;
+  private locationHandle: BackgroundLocationHandle | null = null;
+  private isNativeBackgroundGps = false;
   private simTimerId: number | null = null;
   private simIndex = 0;
   private isSimulating = false;
@@ -81,6 +117,7 @@ export class InCabRecorderHud {
   constructor(container: HTMLElement, callbacks: RecorderCallbacks) {
     this.root = container;
     this.callbacks = callbacks;
+    this.runtimeMode = getRuntimeMode();
     this.root.className = "tf-recorder-hud";
     this.root.setAttribute("aria-label", "In-Cab Breadcrumb Trip Recorder");
     this.render();
@@ -99,78 +136,133 @@ export class InCabRecorderHud {
     }
   }
 
-  private startGpsRecording(): void {
-    if (typeof navigator === "undefined" || !navigator.geolocation) {
-      this.errorMsg =
-        "Browser Geolocation unavailable — use 'Simulate High Country Drive' to test.";
-      this.expanded = true;
-      this.render();
-      return;
+  private async ensureImuCapture(silent: boolean): Promise<ImuCaptureHandle> {
+    if (this.imuHandle) return this.imuHandle;
+    const handle = await startHighRateImuCapture({
+      maxSamples: 1500,
+      sampleRateHz: 50,
+      onMetrics: (metrics) => {
+        this.imuMetrics = metrics;
+      },
+    });
+    this.imuHandle = handle;
+    this.motionEnabled = true;
+    if (!silent) {
+      this.callbacks.onToast(
+        handle.isNativeSensor
+          ? "Native 50 Hz IMU & 4WD clinometer active"
+          : "4WD clinometer & IMU roughness capture enabled",
+        "info"
+      );
     }
+    return handle;
+  }
 
-    this.stopTimersAndWatchers();
+  private async stopImuCapture(clearBuffer: boolean): Promise<void> {
+    if (this.imuHandle) {
+      await this.imuHandle.stop();
+      if (clearBuffer) {
+        this.imuHandle.clear();
+        this.imuMetrics = { ...EMPTY_IMU_METRICS };
+      }
+      this.imuHandle = null;
+    } else if (clearBuffer) {
+      this.imuMetrics = { ...EMPTY_IMU_METRICS };
+    }
+    this.motionEnabled = false;
+  }
+
+  private async startGpsRecording(): Promise<void> {
+    await this.stopTimersAndWatchers();
     this.errorMsg = null;
     this.isSimulating = false;
     this.phase = "recording";
     this.expanded = true;
 
-    this.geoWatchId = navigator.geolocation.watchPosition(
-      (pos) => {
+    if (!this.imuHandle) {
+      await this.ensureImuCapture(true);
+    }
+
+    const handle = await startBackgroundLocationWatch({
+      enableHighAccuracy: true,
+      distanceFilterM: 5,
+      onLocation: (loc) => {
         if (this.phase !== "recording") return;
-        const rough = this.consumeRoughnessSample();
+        const latestImu = this.imuHandle?.getMetrics() ?? this.imuMetrics;
+        this.imuMetrics = latestImu;
         const pt: RecordedBreadcrumbPoint = {
-          lon: pos.coords.longitude,
-          lat: pos.coords.latitude,
-          elev_m:
-            typeof pos.coords.altitude === "number"
-              ? Math.round(pos.coords.altitude * 10) / 10
-              : null,
-          timestamp: new Date(pos.timestamp || Date.now()).toISOString(),
-          accuracy_m: pos.coords.accuracy ?? null,
-          speed_mps: pos.coords.speed ?? null,
-          roughness_rms: rough,
+          lon: loc.lon,
+          lat: loc.lat,
+          elev_m: loc.elev_m,
+          timestamp: loc.timestamp,
+          accuracy_m: loc.accuracy_m,
+          speed_mps: loc.speed_mps,
+          roughness_rms: latestImu.roughness_rms,
+          pitch_deg: latestImu.latest_pitch_deg,
+          roll_deg: latestImu.latest_roll_deg,
         };
         this.appendPoint(pt);
       },
-      (err) => {
-        this.errorMsg = `GPS warning: ${err.message} (you can use Simulate Drive on desktop)`;
+      onError: (msg) => {
+        this.errorMsg = `GPS warning: ${msg} (you can use Simulate Drive on desktop)`;
         this.render();
       },
-      {
-        enableHighAccuracy: true,
-        maximumAge: 2000,
-        timeout: 12000,
-      }
-    );
+    });
 
+    this.locationHandle = handle;
+    this.isNativeBackgroundGps = handle.isNativeBackground;
     this.render();
-    this.callbacks.onToast("In-cab GPS breadcrumb recording started", "info");
+    this.callbacks.onToast(
+      handle.isNativeBackground
+        ? "Native locked-screen background GPS + IMU recording started"
+        : "In-cab GPS breadcrumb & clinometer recording started",
+      "info"
+    );
   }
 
-  private startSimulatedDrive(): void {
-    this.stopTimersAndWatchers();
+  private async startSimulatedDrive(): Promise<void> {
+    await this.stopTimersAndWatchers();
     this.errorMsg = null;
     this.isSimulating = true;
+    this.isNativeBackgroundGps = false;
     this.phase = "recording";
     this.expanded = true;
-    if (this.points.length === 0 || this.simIndex >= SIMULATED_HIGH_COUNTRY_WAYPOINTS.length) {
+
+    const imu = await this.ensureImuCapture(true);
+
+    if (
+      this.points.length === 0 ||
+      this.simIndex >= SIMULATED_HIGH_COUNTRY_WAYPOINTS.length
+    ) {
       this.points = [];
       this.simIndex = 0;
+      imu.clear();
+      this.imuMetrics = { ...EMPTY_IMU_METRICS };
     }
 
     const pushNext = (): void => {
       if (this.phase !== "recording") return;
       const wp = SIMULATED_HIGH_COUNTRY_WAYPOINTS[this.simIndex];
       if (!wp) {
-        this.stopRecording();
+        void this.stopRecording();
         this.callbacks.onToast(
-          "Simulated High Country drive finished — ready to save or export GPX",
+          "Simulated High Country drive finished — ready to sync or export GPX",
           "success"
         );
         return;
       }
       // Space timestamps cleanly by 25 s per simulated step for realistic 4WD speed metrics
-      const baseMs = Date.now() - (SIMULATED_HIGH_COUNTRY_WAYPOINTS.length - this.simIndex) * 25_000;
+      const baseMs =
+        Date.now() -
+        (SIMULATED_HIGH_COUNTRY_WAYPOINTS.length - this.simIndex) * 25_000;
+
+      const burst = synthesizeSimulatedImuBurst(wp, baseMs, 8);
+      let metrics = this.imuMetrics;
+      for (const sample of burst) {
+        metrics = imu.pushSample(sample);
+      }
+      this.imuMetrics = metrics;
+
       this.appendPoint({
         lon: wp.lon,
         lat: wp.lat,
@@ -178,7 +270,9 @@ export class InCabRecorderHud {
         timestamp: new Date(baseMs).toISOString(),
         accuracy_m: 4.0,
         speed_mps: wp.speed_mps,
-        roughness_rms: this.consumeRoughnessSample() ?? wp.roughness_rms,
+        roughness_rms: metrics.roughness_rms ?? wp.roughness_rms,
+        pitch_deg: wp.pitch_deg,
+        roll_deg: wp.roll_deg,
       });
       this.simIndex += 1;
     };
@@ -187,29 +281,37 @@ export class InCabRecorderHud {
     this.simTimerId = window.setInterval(pushNext, 420);
     this.render();
     this.callbacks.onToast(
-      "Simulating Davies Plain High Country drive (desktop GPS test)",
+      "Simulating Davies Plain climb with live 4WD clinometer & rock-ledge IMU shocks",
       "info"
     );
   }
 
-  private pauseRecording(): void {
+  private async pauseRecording(): Promise<void> {
     if (this.phase !== "recording") return;
     this.phase = "paused";
-    this.stopTimersAndWatchers();
+    await this.stopTimersAndWatchers();
     this.render();
   }
 
   private resumeRecording(): void {
     if (this.phase !== "paused") return;
     if (this.isSimulating) {
-      this.startSimulatedDrive();
+      void this.startSimulatedDrive();
     } else {
-      this.startGpsRecording();
+      void this.startGpsRecording();
     }
   }
 
-  private stopRecording(): void {
-    this.stopTimersAndWatchers();
+  private async stopRecording(): Promise<void> {
+    await this.stopTimersAndWatchers();
+    // Snapshot collected IMU samples & metrics for mobile-sync while releasing live listeners
+    if (this.imuHandle) {
+      this.imuMetrics = this.imuHandle.getMetrics();
+      this.recordedImuSamples = this.imuHandle.getSamples();
+      await this.imuHandle.stop();
+      this.imuHandle = null;
+    }
+    this.motionEnabled = false;
     if (this.points.length > 0) {
       this.phase = "stopped";
     } else {
@@ -219,13 +321,16 @@ export class InCabRecorderHud {
     this.render();
   }
 
-  private discardRecording(): void {
-    this.stopTimersAndWatchers();
+  private async discardRecording(): Promise<void> {
+    await this.stopTimersAndWatchers();
+    await this.stopImuCapture(true);
+    this.recordedImuSamples = [];
     this.points = [];
     this.backtrackActive = false;
     this.phase = "idle";
     this.simIndex = 0;
     this.isSimulating = false;
+    this.isNativeBackgroundGps = false;
     this.errorMsg = null;
     this.callbacks.onPointsChanged([], false);
     this.render();
@@ -240,10 +345,11 @@ export class InCabRecorderHud {
     this.render();
   }
 
-  private stopTimersAndWatchers(): void {
-    if (this.geoWatchId !== null && typeof navigator !== "undefined" && navigator.geolocation) {
-      navigator.geolocation.clearWatch(this.geoWatchId);
-      this.geoWatchId = null;
+  private async stopTimersAndWatchers(): Promise<void> {
+    if (this.locationHandle) {
+      const handle = this.locationHandle;
+      this.locationHandle = null;
+      await handle.stop();
     }
     if (this.simTimerId !== null) {
       window.clearInterval(this.simTimerId);
@@ -255,99 +361,46 @@ export class InCabRecorderHud {
     if (this.wakeLockEnabled) {
       this.wakeLockEnabled = false;
       this.wakeLockStatus = "off";
-      try {
-        await this.wakeLockSentinel?.release();
-      } catch {
-        // Ignore release errors
-      }
-      this.wakeLockSentinel = null;
+      await releaseKeepAwake();
       this.render();
       return;
     }
 
-    const nav = navigator as Navigator & {
-      wakeLock?: { request: (type: "screen") => Promise<WakeLockSentinelLike> };
-    };
-    if (!nav.wakeLock || typeof nav.wakeLock.request !== "function") {
+    const result = await requestKeepAwake(undefined, () => {
       this.wakeLockEnabled = false;
-      this.wakeLockStatus = "unsupported";
-      this.callbacks.onToast(
-        "Screen Wake Lock API not supported in this browser — keep screen awake manually",
-        "info"
-      );
+      this.wakeLockStatus = "off";
       this.render();
-      return;
-    }
+    });
 
-    try {
-      const sentinel = await nav.wakeLock.request("screen");
-      this.wakeLockSentinel = sentinel;
+    if (result.active) {
       this.wakeLockEnabled = true;
       this.wakeLockStatus = "active";
-      sentinel.addEventListener?.("release", () => {
-        this.wakeLockEnabled = false;
-        this.wakeLockStatus = "off";
-        this.render();
-      });
-      this.callbacks.onToast("Screen Wake Lock active for in-cab display", "success");
-    } catch {
+      this.callbacks.onToast(
+        result.source === "capacitor"
+          ? "Native KeepAwake active for in-cab display"
+          : "Screen Wake Lock active for in-cab display",
+        "success"
+      );
+    } else {
       this.wakeLockEnabled = false;
       this.wakeLockStatus = "unsupported";
       this.callbacks.onToast(
-        "Screen Wake Lock denied or unavailable in current context",
+        result.reason ??
+          "Screen Wake Lock unavailable in this browser — keep screen awake manually",
         "info"
       );
     }
     this.render();
   }
 
-  private toggleMotionSensor(): void {
+  private async toggleMotionSensor(): Promise<void> {
     if (this.motionEnabled) {
-      this.motionEnabled = false;
-      if (this.motionListener) {
-        window.removeEventListener("devicemotion", this.motionListener);
-        this.motionListener = null;
-      }
-      this.motionSamples = [];
+      await this.stopImuCapture(false);
       this.render();
       return;
     }
-
-    if (typeof window === "undefined" || !("DeviceMotionEvent" in window)) {
-      this.callbacks.onToast(
-        "Web DeviceMotion roughness sensor unavailable on this device",
-        "info"
-      );
-      return;
-    }
-
-    this.motionEnabled = true;
-    this.motionSamples = [];
-    this.motionListener = (ev: DeviceMotionEvent) => {
-      const acc = ev.acceleration ?? ev.accelerationIncludingGravity;
-      if (!acc) return;
-      const x = acc.x ?? 0;
-      const y = acc.y ?? 0;
-      const z = acc.z ?? 0;
-      const mag = Math.hypot(x, y, z);
-      const adjusted = ev.acceleration ? mag : Math.abs(mag - 9.80665);
-      if (Number.isFinite(adjusted)) {
-        this.motionSamples.push(adjusted);
-        if (this.motionSamples.length > 60) {
-          this.motionSamples.shift();
-        }
-      }
-    };
-    window.addEventListener("devicemotion", this.motionListener);
-    this.callbacks.onToast("DeviceMotion roughness capture enabled", "info");
+    await this.ensureImuCapture(false);
     this.render();
-  }
-
-  private consumeRoughnessSample(): number | null {
-    if (!this.motionEnabled || this.motionSamples.length === 0) return null;
-    const rms = computeRoughnessRms(this.motionSamples);
-    this.motionSamples = [];
-    return rms;
   }
 
   private exportRecorded(format: "gpx" | "geojson"): void {
@@ -364,24 +417,30 @@ export class InCabRecorderHud {
 
     if (format === "gpx") {
       const xml = buildClientGpx(title, this.points, {
-        description: "Recorded with TrailForge In-Cab PWA Breadcrumb Recorder",
+        description: "Recorded with TrailForge In-Cab Breadcrumb & IMU Recorder",
       });
       triggerClientFileDownload(
         xml,
         slugifyExportFilename(title, "gpx"),
         "application/gpx+xml"
       );
-      this.callbacks.onToast("Exported offline GPX 1.1 (GridForge-compatible)", "success");
+      this.callbacks.onToast(
+        "Exported offline GPX 1.1 (GridForge-compatible)",
+        "success"
+      );
     } else {
       const fc = buildClientGeoJson(title, this.points, {
-        description: "Recorded with TrailForge In-Cab PWA Breadcrumb Recorder",
+        description: "Recorded with TrailForge In-Cab Breadcrumb & IMU Recorder",
       });
       triggerClientFileDownload(
         JSON.stringify(fc, null, 2),
         slugifyExportFilename(title, "geojson"),
         "application/geo+json"
       );
-      this.callbacks.onToast("Exported offline GeoJSON FeatureCollection", "success");
+      this.callbacks.onToast(
+        "Exported offline GeoJSON FeatureCollection",
+        "success"
+      );
     }
   }
 
@@ -390,6 +449,23 @@ export class InCabRecorderHud {
     const backtrack = this.backtrackActive
       ? buildBacktrackGuidance(this.points)
       : null;
+
+    const latestPitch = this.imuMetrics.latest_pitch_deg;
+    const latestRoll = this.imuMetrics.latest_roll_deg;
+    const clinoAlert = classifyClinometerAlert(latestPitch, latestRoll);
+    const pitchAlert = classifyClinometerAlert(latestPitch, 0);
+    const rollAlert = classifyClinometerAlert(0, latestRoll);
+
+    const clinoBadge =
+      clinoAlert === "hazard"
+        ? "⚠ HAZARD ≥25°"
+        : clinoAlert === "caution"
+          ? "⚠ CAUTION ≥15°"
+          : "LEVEL";
+
+    const runtimeLabel = this.isNativeBackgroundGps
+      ? "Native BG GPS"
+      : getRuntimeModeLabel(this.runtimeMode);
 
     const pillLabel =
       this.phase === "recording"
@@ -415,6 +491,44 @@ export class InCabRecorderHud {
           </div>
         `
         : "";
+
+    const clinometerHtml = `
+      <div class="tf-clino-card tf-clino-${clinoAlert}" data-role="clinometer" data-severity="${clinoAlert}">
+        <div class="tf-clino-head">
+          <span class="tf-clino-title">4WD Clinometer</span>
+          <span class="tf-clino-badge mono">${escapeHtml(clinoBadge)}</span>
+        </div>
+        <div class="tf-clino-grid mono">
+          <div class="tf-clino-axis tf-clino-axis-${pitchAlert}">
+            <div class="tf-clino-row">
+              <span class="tf-stat-label">Pitch</span>
+              <strong>${escapeHtml(formatSignedDeg(latestPitch))}</strong>
+            </div>
+            <div class="tf-clino-bar">
+              <div class="tf-clino-bar-fill" style="width:${clinoBarFillPct(latestPitch)}%"></div>
+            </div>
+          </div>
+          <div class="tf-clino-axis tf-clino-axis-${rollAlert}">
+            <div class="tf-clino-row">
+              <span class="tf-stat-label">Roll</span>
+              <strong>${escapeHtml(formatSignedDeg(latestRoll))}</strong>
+            </div>
+            <div class="tf-clino-bar">
+              <div class="tf-clino-bar-fill" style="width:${clinoBarFillPct(latestRoll)}%"></div>
+            </div>
+          </div>
+        </div>
+        <div class="tf-clino-foot mono">
+          <span>Max P ${this.imuMetrics.max_pitch_deg !== null ? `${this.imuMetrics.max_pitch_deg.toFixed(1)}°` : "—"}</span>
+          <span>· Max R ${this.imuMetrics.max_roll_deg !== null ? `${this.imuMetrics.max_roll_deg.toFixed(1)}°` : "—"}</span>
+          <span>· IMU ${this.imuMetrics.sample_count} smpl</span>
+        </div>
+      </div>
+    `;
+
+    const roughDisplay =
+      this.imuMetrics.roughness_rms ?? stats.latestRoughnessRms;
+    const p95Display = this.imuMetrics.roughness_p95;
 
     const defaultTripName = `High Country Drive ${new Date().toISOString().slice(0, 10)}`;
     const saveFormHtml =
@@ -457,9 +571,9 @@ export class InCabRecorderHud {
               <button type="submit" class="tf-btn-primary" ${this.savingTrip ? "disabled" : ""}>
                 ${
                   this.savingTrip
-                    ? "Saving…"
+                    ? "Syncing…"
                     : this.isOnline && this.isAuthenticated
-                      ? "↑ Upload & Match"
+                      ? "↑ Mobile Sync"
                       : "⧖ Queue Offline"
                 }
               </button>
@@ -474,12 +588,16 @@ export class InCabRecorderHud {
       ? `
         <div class="tf-recorder-card">
           <div class="tf-recorder-card-head">
-            <span class="tf-recorder-title">In-Cab Breadcrumb Recorder</span>
+            <div class="tf-recorder-head-left">
+              <span class="tf-recorder-title">In-Cab Recorder</span>
+              <span class="tf-rec-runtime-pill mono ${this.runtimeMode !== "pwa_browser" ? "native" : ""}" data-role="runtime-mode-pill">${escapeHtml(runtimeLabel)}</span>
+            </div>
             <button type="button" class="tf-mini-btn" data-role="rec-collapse" aria-label="Collapse recorder">▾</button>
           </div>
 
           ${this.errorMsg ? `<div class="tf-inspector-error">${escapeHtml(this.errorMsg)}</div>` : ""}
           ${backtrackHud}
+          ${clinometerHtml}
 
           <div class="tf-recorder-stats mono">
             <div><span class="tf-stat-label">Dist</span><strong>${(stats.distanceM / 1000).toFixed(2)} km</strong></div>
@@ -487,14 +605,16 @@ export class InCabRecorderHud {
             <div><span class="tf-stat-label">Speed</span><strong>${stats.currentSpeedKmh.toFixed(1)} km/h</strong></div>
             <div><span class="tf-stat-label">Elev</span><strong>${stats.currentElevM !== null ? `${Math.round(stats.currentElevM)} m` : "—"}</strong></div>
             <div><span class="tf-stat-label">Pts</span><strong>${stats.pointCount}</strong></div>
-            <div><span class="tf-stat-label">Rough</span><strong>${stats.latestRoughnessRms !== null ? `${stats.latestRoughnessRms.toFixed(2)}g` : "—"}</strong></div>
+            <div><span class="tf-stat-label">Rough</span><strong>${roughDisplay !== null ? `${roughDisplay.toFixed(2)}g` : "—"}</strong></div>
+            <div><span class="tf-stat-label">Shocks</span><strong class="${this.imuMetrics.shock_event_count > 0 ? "tf-accent-amber" : ""}">${this.imuMetrics.shock_event_count}</strong></div>
+            <div><span class="tf-stat-label">P95</span><strong>${p95Display !== null ? `${p95Display.toFixed(2)}g` : "—"}</strong></div>
           </div>
 
           <div class="tf-recorder-controls">
             ${
               this.phase === "idle" || this.phase === "stopped"
                 ? `<button type="button" class="tf-btn-primary" data-role="rec-start">● Start GPS</button>
-                   <button type="button" class="tf-btn-secondary" data-role="rec-sim" title="Step along Davies Plain corridor without GPS hardware">▶ Simulate Drive</button>`
+                   <button type="button" class="tf-btn-secondary" data-role="rec-sim" title="Step along Davies Plain corridor with live 4WD clinometer & IMU shocks">▶ Simulate Drive</button>`
                 : ""
             }
             ${
@@ -518,10 +638,10 @@ export class InCabRecorderHud {
 
           <div class="tf-recorder-toggles">
             <button type="button" class="tf-mini-btn ${this.wakeLockStatus === "active" ? "active" : ""}" data-role="rec-wakelock">
-              ☀ Wake Lock: ${this.wakeLockStatus === "active" ? "ON" : this.wakeLockStatus === "unsupported" ? "N/A" : "OFF"}
+              ☀ Keep Awake: ${this.wakeLockStatus === "active" ? "ON" : this.wakeLockStatus === "unsupported" ? "N/A" : "OFF"}
             </button>
             <button type="button" class="tf-mini-btn ${this.motionEnabled ? "active" : ""}" data-role="rec-motion">
-              〰 Roughness: ${this.motionEnabled ? "ON" : "OFF"}
+              〰 50 Hz IMU: ${this.motionEnabled ? "ON" : "OFF"}
             </button>
             ${
               this.points.length >= 2 && this.phase !== "stopped"
@@ -569,15 +689,15 @@ export class InCabRecorderHud {
 
     this.root
       .querySelector<HTMLButtonElement>("[data-role='rec-start']")
-      ?.addEventListener("click", () => this.startGpsRecording());
+      ?.addEventListener("click", () => void this.startGpsRecording());
 
     this.root
       .querySelector<HTMLButtonElement>("[data-role='rec-sim']")
-      ?.addEventListener("click", () => this.startSimulatedDrive());
+      ?.addEventListener("click", () => void this.startSimulatedDrive());
 
     this.root
       .querySelector<HTMLButtonElement>("[data-role='rec-pause']")
-      ?.addEventListener("click", () => this.pauseRecording());
+      ?.addEventListener("click", () => void this.pauseRecording());
 
     this.root
       .querySelector<HTMLButtonElement>("[data-role='rec-resume']")
@@ -585,11 +705,11 @@ export class InCabRecorderHud {
 
     this.root
       .querySelector<HTMLButtonElement>("[data-role='rec-stop']")
-      ?.addEventListener("click", () => this.stopRecording());
+      ?.addEventListener("click", () => void this.stopRecording());
 
     this.root
       .querySelector<HTMLButtonElement>("[data-role='rec-discard']")
-      ?.addEventListener("click", () => this.discardRecording());
+      ?.addEventListener("click", () => void this.discardRecording());
 
     this.root
       .querySelector<HTMLButtonElement>("[data-role='rec-backtrack']")
@@ -611,7 +731,7 @@ export class InCabRecorderHud {
 
     this.root
       .querySelector<HTMLButtonElement>("[data-role='rec-motion']")
-      ?.addEventListener("click", () => this.toggleMotionSensor());
+      ?.addEventListener("click", () => void this.toggleMotionSensor());
 
     this.root
       .querySelectorAll<HTMLButtonElement>("[data-rec-export]")
@@ -646,16 +766,23 @@ export class InCabRecorderHud {
         this.errorMsg = null;
         this.render();
 
+        const imuSamples = this.imuHandle
+          ? this.imuHandle.getSamples()
+          : [...this.recordedImuSamples];
+        const recordingSource = runtimeModeToRecordingSource(this.runtimeMode);
+
         void this.callbacks
           .onSaveRecordedTrip({
             name,
             points: [...this.points],
+            imu_samples: imuSamples,
+            recording_source: recordingSource,
             visibility,
             privacy_trim_m: trimCheck.value,
             vehicle_profile_id: vehicleProfileId,
           })
-          .then(() => {
-            this.discardRecording();
+          .then(async () => {
+            await this.discardRecording();
           })
           .catch((err) => {
             this.errorMsg =

@@ -1,5 +1,5 @@
 import type { FeatureCollection, LineString, Point } from "geojson";
-import type { RecordedBreadcrumbPoint } from "../types";
+import type { ImuSample, RecordedBreadcrumbPoint } from "../types";
 
 const EARTH_RADIUS_M = 6_371_000;
 
@@ -276,38 +276,87 @@ export function buildRecordedTrackGeoJson(
   return { liveLineFc, backtrackLineFc, headPointFc };
 }
 
-/**
- * Deterministic 22-point High Country breadcrumb drive along the Davies Plain /
- * Tom Groggin corridor (~2.4 km so it cleanly survives the mandatory 250 m
- * start/end privacy trim when uploaded or tested on GPS-less desktops).
- */
-export const SIMULATED_HIGH_COUNTRY_WAYPOINTS: readonly {
+export interface SimulatedHighCountryWaypoint {
   lon: number;
   lat: number;
   elev_m: number;
   speed_mps: number;
   roughness_rms: number;
-}[] = [
-  { lon: 148.1195, lat: -36.5608, elev_m: 614, speed_mps: 6.2, roughness_rms: 0.14 },
-  { lon: 148.1202, lat: -36.5620, elev_m: 618, speed_mps: 5.8, roughness_rms: 0.18 },
-  { lon: 148.1211, lat: -36.5633, elev_m: 625, speed_mps: 5.1, roughness_rms: 0.22 },
-  { lon: 148.1219, lat: -36.5646, elev_m: 634, speed_mps: 4.5, roughness_rms: 0.29 },
-  { lon: 148.1225, lat: -36.5659, elev_m: 651, speed_mps: 4.1, roughness_rms: 0.34 },
-  { lon: 148.1230, lat: -36.5673, elev_m: 676, speed_mps: 3.6, roughness_rms: 0.41 },
-  { lon: 148.1235, lat: -36.5687, elev_m: 705, speed_mps: 2.9, roughness_rms: 0.52 },
-  { lon: 148.1241, lat: -36.5701, elev_m: 738, speed_mps: 2.4, roughness_rms: 0.61 },
-  { lon: 148.1248, lat: -36.5715, elev_m: 774, speed_mps: 2.1, roughness_rms: 0.68 },
-  { lon: 148.1254, lat: -36.5729, elev_m: 812, speed_mps: 2.6, roughness_rms: 0.55 },
-  { lon: 148.1260, lat: -36.5742, elev_m: 848, speed_mps: 3.3, roughness_rms: 0.46 },
-  { lon: 148.1266, lat: -36.5756, elev_m: 882, speed_mps: 3.9, roughness_rms: 0.38 },
-  { lon: 148.1271, lat: -36.5770, elev_m: 916, speed_mps: 4.2, roughness_rms: 0.33 },
-  { lon: 148.1277, lat: -36.5784, elev_m: 952, speed_mps: 3.8, roughness_rms: 0.39 },
-  { lon: 148.1283, lat: -36.5798, elev_m: 988, speed_mps: 3.5, roughness_rms: 0.44 },
-  { lon: 148.1289, lat: -36.5812, elev_m: 1024, speed_mps: 3.1, roughness_rms: 0.49 },
-  { lon: 148.1296, lat: -36.5825, elev_m: 1058, speed_mps: 3.6, roughness_rms: 0.42 },
-  { lon: 148.1303, lat: -36.5838, elev_m: 1091, speed_mps: 4.1, roughness_rms: 0.36 },
-  { lon: 148.1310, lat: -36.5851, elev_m: 1122, speed_mps: 4.4, roughness_rms: 0.31 },
-  { lon: 148.1318, lat: -36.5864, elev_m: 1148, speed_mps: 4.7, roughness_rms: 0.28 },
-  { lon: 148.1325, lat: -36.5877, elev_m: 1171, speed_mps: 5.0, roughness_rms: 0.24 },
-  { lon: 148.1332, lat: -36.5890, elev_m: 1194, speed_mps: 5.3, roughness_rms: 0.21 },
+  pitch_deg: number;
+  roll_deg: number;
+  shock_g?: number;
+}
+
+/**
+ * Deterministic 22-point High Country breadcrumb drive along the Davies Plain /
+ * Tom Groggin corridor (~2.4 km so it cleanly survives the mandatory 250 m
+ * start/end privacy trim when uploaded or tested on GPS-less desktops).
+ * Includes realistic steep pitch climbs, off-camber creek rolls, and rock-ledge shocks.
+ */
+export const SIMULATED_HIGH_COUNTRY_WAYPOINTS: readonly SimulatedHighCountryWaypoint[] = [
+  { lon: 148.1195, lat: -36.5608, elev_m: 614, speed_mps: 6.2, roughness_rms: 0.14, pitch_deg: 2.1, roll_deg: -1.4 },
+  { lon: 148.1202, lat: -36.5620, elev_m: 618, speed_mps: 5.8, roughness_rms: 0.18, pitch_deg: 4.5, roll_deg: 2.8 },
+  { lon: 148.1211, lat: -36.5633, elev_m: 625, speed_mps: 5.1, roughness_rms: 0.22, pitch_deg: 6.8, roll_deg: -5.2 },
+  { lon: 148.1219, lat: -36.5646, elev_m: 634, speed_mps: 4.5, roughness_rms: 0.29, pitch_deg: 9.4, roll_deg: 7.5 },
+  { lon: 148.1225, lat: -36.5659, elev_m: 651, speed_mps: 4.1, roughness_rms: 0.34, pitch_deg: 13.2, roll_deg: -10.8 },
+  { lon: 148.1230, lat: -36.5673, elev_m: 676, speed_mps: 3.6, roughness_rms: 0.41, pitch_deg: 16.4, roll_deg: 12.1 },
+  { lon: 148.1235, lat: -36.5687, elev_m: 705, speed_mps: 2.9, roughness_rms: 0.52, pitch_deg: 19.5, roll_deg: -16.8, shock_g: 1.95 },
+  { lon: 148.1241, lat: -36.5701, elev_m: 738, speed_mps: 2.4, roughness_rms: 0.61, pitch_deg: 23.8, roll_deg: 18.4, shock_g: 2.15 },
+  { lon: 148.1248, lat: -36.5715, elev_m: 774, speed_mps: 2.1, roughness_rms: 0.68, pitch_deg: 26.4, roll_deg: -20.2, shock_g: 2.28 },
+  { lon: 148.1254, lat: -36.5729, elev_m: 812, speed_mps: 2.6, roughness_rms: 0.55, pitch_deg: 21.2, roll_deg: 15.6, shock_g: 1.92 },
+  { lon: 148.1260, lat: -36.5742, elev_m: 848, speed_mps: 3.3, roughness_rms: 0.46, pitch_deg: 17.6, roll_deg: -13.4 },
+  { lon: 148.1266, lat: -36.5756, elev_m: 882, speed_mps: 3.9, roughness_rms: 0.38, pitch_deg: 14.8, roll_deg: 9.2 },
+  { lon: 148.1271, lat: -36.5770, elev_m: 916, speed_mps: 4.2, roughness_rms: 0.33, pitch_deg: 12.9, roll_deg: -8.1 },
+  { lon: 148.1277, lat: -36.5784, elev_m: 952, speed_mps: 3.8, roughness_rms: 0.39, pitch_deg: 15.7, roll_deg: 11.4 },
+  { lon: 148.1283, lat: -36.5798, elev_m: 988, speed_mps: 3.5, roughness_rms: 0.44, pitch_deg: 16.9, roll_deg: -14.2, shock_g: 1.98 },
+  { lon: 148.1289, lat: -36.5812, elev_m: 1024, speed_mps: 3.1, roughness_rms: 0.49, pitch_deg: 18.2, roll_deg: 16.1 },
+  { lon: 148.1296, lat: -36.5825, elev_m: 1058, speed_mps: 3.6, roughness_rms: 0.42, pitch_deg: 13.5, roll_deg: -9.8 },
+  { lon: 148.1303, lat: -36.5838, elev_m: 1091, speed_mps: 4.1, roughness_rms: 0.36, pitch_deg: 11.4, roll_deg: 6.5 },
+  { lon: 148.1310, lat: -36.5851, elev_m: 1122, speed_mps: 4.4, roughness_rms: 0.31, pitch_deg: 9.8, roll_deg: -5.4 },
+  { lon: 148.1318, lat: -36.5864, elev_m: 1148, speed_mps: 4.7, roughness_rms: 0.28, pitch_deg: 8.1, roll_deg: 4.1 },
+  { lon: 148.1325, lat: -36.5877, elev_m: 1171, speed_mps: 5.0, roughness_rms: 0.24, pitch_deg: 6.4, roll_deg: -3.2 },
+  { lon: 148.1332, lat: -36.5890, elev_m: 1194, speed_mps: 5.3, roughness_rms: 0.21, pitch_deg: 4.8, roll_deg: 2.0 },
 ];
+
+/**
+ * Synthesize a deterministic 50 Hz (20 ms spaced) IMU burst for a simulated High Country
+ * waypoint so desktop demos exercise live pitch/roll clinometer alerts, corrugation RMS,
+ * and rock-ledge shock event counting end-to-end.
+ */
+export function synthesizeSimulatedImuBurst(
+  wp: SimulatedHighCountryWaypoint,
+  baseTimestampMs: number,
+  samplesPerStep = 8
+): ImuSample[] {
+  const count = Math.max(4, Math.floor(samplesPerStep));
+  const pitchRad = (wp.pitch_deg * Math.PI) / 180;
+  const rollRad = (wp.roll_deg * Math.PI) / 180;
+
+  // Unit gravity vector tilted by pitch & roll
+  const gx = Math.sin(rollRad) * Math.cos(pitchRad);
+  const gy = Math.sin(pitchRad);
+  const gz = Math.cos(pitchRad) * Math.cos(rollRad);
+
+  const samples: ImuSample[] = [];
+  const shockIdx = Math.floor(count / 2);
+
+  for (let i = 0; i < count; i += 1) {
+    const phase = (i / count) * Math.PI * 2;
+    const corrugation = Math.sin(phase * 2) * wp.roughness_rms * 1.15;
+    let totalScale = 1.0 + corrugation;
+    if (typeof wp.shock_g === "number" && i === shockIdx) {
+      totalScale = wp.shock_g;
+    }
+
+    samples.push({
+      t_ms: Math.round(baseTimestampMs + i * 20),
+      ax: Math.round(gx * totalScale * 10000) / 10000,
+      ay: Math.round(gy * totalScale * 10000) / 10000,
+      az: Math.round(gz * totalScale * 10000) / 10000,
+      pitch_deg: wp.pitch_deg,
+      roll_deg: wp.roll_deg,
+    });
+  }
+
+  return samples;
+}

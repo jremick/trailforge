@@ -40,6 +40,7 @@ import {
   updateSavedRoute,
   updateTrip,
   updateVehicle,
+  uploadMobileTripSync,
   uploadTripGpx,
   uploadTripJson,
   voteConditionReport,
@@ -57,7 +58,7 @@ import { Sidebar } from "./components/sidebar";
 import { TopBar } from "./components/topbar";
 import {
   formatCoords,
-  isWithinVicNswRegion,
+  isWithinAustralia,
   latLonToMgrs,
 } from "./coords";
 import { TrailForgeMap } from "./map";
@@ -911,6 +912,7 @@ class TrailForgeApp {
           this.updateCursorReadout(lat, lon);
         },
         onSaveRecordedTrip: async (params) => {
+          const clientUuid = generateClientUuid();
           const payload = {
             name: params.name,
             points: params.points.map((p) => ({
@@ -921,21 +923,29 @@ class TrailForgeApp {
               speed_mps: p.speed_mps ?? null,
               roughness_rms: p.roughness_rms ?? null,
             })),
+            imu_samples:
+              params.imu_samples.length > 0 ? params.imu_samples : undefined,
+            recording_source: params.recording_source,
             vehicle_profile_id: params.vehicle_profile_id,
             visibility: params.visibility,
             privacy_trim_m: params.privacy_trim_m,
-            client_uuid: generateClientUuid(),
+            client_uuid: clientUuid,
+            client_session_id: clientUuid,
           };
 
           if (this.isOnline && this.user) {
             try {
-              const uploaded = await uploadTripJson(payload);
+              const uploaded = await uploadMobileTripSync(payload);
               this.latestUploadedTrip = uploaded;
               await this.reloadTrips();
               void this.refreshUnmappedCandidates();
               void this.refreshHotspotsGeoJson();
+              const shockSuffix =
+                uploaded.imu_summary && uploaded.imu_summary.shock_event_count > 0
+                  ? ` · ${uploaded.imu_summary.shock_event_count} IMU shocks`
+                  : "";
               this.showToast(
-                `Trip uploaded & matched (${uploaded.matched_segment_count ?? 0} segments)`,
+                `Mobile sync matched ${uploaded.matched_segment_count ?? 0} segments${shockSuffix}`,
                 "success"
               );
               return;
@@ -954,7 +964,7 @@ class TrailForgeApp {
           await this.refreshOfflineLocalState();
           this.showToast(
             this.user
-              ? "Offline: recorded trip queued & will sync automatically when back online"
+              ? "Offline: recorded trip & IMU telemetry queued for automatic sync"
               : "Trip queued locally — sign in & sync when online (or export GPX anytime)",
             "info"
           );
@@ -1111,7 +1121,7 @@ class TrailForgeApp {
     try {
       const result = await flushSyncQueue({
         syncTrip: async (payload) => {
-          await uploadTripJson(payload);
+          await uploadMobileTripSync(payload);
         },
         syncReport: async (payload) => {
           await createConditionReport(payload);
@@ -2045,9 +2055,9 @@ class TrailForgeApp {
         item.kind === "park" ? 11.5 : 13.8
       );
       this.updateCursorReadout(item.lat, item.lon);
-      const regionNote = isWithinVicNswRegion(item.lat, item.lon)
+      const regionNote = isWithinAustralia(item.lat, item.lon)
         ? ""
-        : " (outside VIC/NSW launch area)";
+        : " (outside Australia)";
       this.showToast(`Located ${item.title}${regionNote}`, "success");
     }
   }

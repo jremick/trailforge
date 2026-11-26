@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  TrailForge iOS Info.plist Permissions Snippet (Capacitor 7)
+  Merge these keys inside the top-level <dict> of:
+    web/ios/App/App/Info.plist
+  Also enable "Background Modes -> Location updates" under Xcode Signing & Capabilities.
+-->
+<plist version="1.0">
+<dict>
+  <!-- Required for locked-screen / background 4WD GPS track logging -->
+  <key>UIBackgroundModes</key>
+  <array>
+    <string>location</string>
+  </array>
+
+  <!-- Foreground GPS positioning, Backtrack guidance, and pin/report placement -->
+  <key>NSLocationWhenInUseUsageDescription</key>
+  <string>TrailForge uses your GPS location to show your live 4WD position on offline topo maps, record trail breadcrumbs, and provide one-tap Backtrack return guidance.</string>
+
+  <!-- Locked-screen background GPS recording on remote tracks -->
+  <key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+  <string>TrailForge uses background location so your 4WD trip breadcrumbs keep recording accurately when your screen is locked in remote areas. Mandatory start/end privacy buffer trimming (&gt;=250 m) is always enforced.</string>
+
+  <!-- 50 Hz accelerometer roughness and 4WD pitch/roll clinometer telemetry -->
+  <key>NSMotionUsageDescription</key>
+  <string>TrailForge reads motion and accelerometer sensors to display a live 4WD pitch/roll clinometer and measure trail corrugations and rock-step roughness.</string>
+
+  <!-- Dark outdoor status bar appearance and flexible iPad / dash-mount orientation -->
+  <key>UIStatusBarStyle</key>
+  <string>UIStatusBarStyleLightContent</string>
+  <key>UIRequiresFullScreen</key>
+  <false/>
+</dict>
+</plist>
