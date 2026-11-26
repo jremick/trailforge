@@ -29,6 +29,7 @@ class MatchedSegmentTraversal(BaseModel):
     """Anonymized traversal summary snapped to a canonical track_segments row."""
 
     segment_id: str
+    track_id: str | None = None
     direction: Literal["forward", "reverse"]
     entry_at: datetime
     exit_at: datetime
