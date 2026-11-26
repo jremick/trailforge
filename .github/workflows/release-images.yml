@@ -1,0 +1,175 @@
+name: Release Multi-Arch Images (GHCR)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional Git semver tag to build and publish (e.g. v1.0.0-beta.1 or v1.0.0)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  resolve-tag:
+    name: Resolve Release Tag & Semver Channel
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      minor: ${{ steps.resolve.outputs.minor }}
+      is_stable: ${{ steps.resolve.outputs.is_stable }}
+      checkout_ref: ${{ steps.resolve.outputs.checkout_ref }}
+    steps:
+      - name: Resolve release tag and guard latest for stable semver only
+        id: resolve
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ -z "${INPUT_TAG}" ]; then
+            TAG="sha-${GITHUB_SHA::7}"
+            MINOR=""
+            IS_STABLE="false"
+            CHECKOUT_REF=""
+          else
+            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+              TAG="${INPUT_TAG}"
+            else
+              TAG="${GITHUB_REF_NAME}"
+            fi
+
+            if [[ ! "${TAG}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "Invalid semver tag: ${TAG} (expected vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-prerelease)" >&2
+              exit 1
+            fi
+
+            MINOR="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+            # Pre-release tags (e.g. v1.0.0-beta.1) MUST NOT overwrite :latest or :vMAJOR.MINOR
+            if [[ -z "${BASH_REMATCH[4]}" ]]; then
+              IS_STABLE="true"
+            else
+              IS_STABLE="false"
+            fi
+            CHECKOUT_REF="${TAG}"
+          fi
+
+          {
+            echo "tag=${TAG}"
+            echo "minor=${MINOR}"
+            echo "is_stable=${IS_STABLE}"
+            echo "checkout_ref=${CHECKOUT_REF}"
+          } >> "${GITHUB_OUTPUT}"
+
+  build-backend:
+    name: Build & Push Backend Image (linux/amd64, linux/arm64)
+    needs: resolve-tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-tag.outputs.checkout_ref }}
+
+      - name: Set up QEMU for multi-arch builds
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata (tags & OCI labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/trailforge-backend
+          tags: |
+            type=raw,value=${{ needs.resolve-tag.outputs.tag }}
+            type=raw,value=${{ needs.resolve-tag.outputs.minor }},enable=${{ needs.resolve-tag.outputs.is_stable }}
+            type=raw,value=latest,enable=${{ needs.resolve-tag.outputs.is_stable }}
+          labels: |
+            org.opencontainers.image.title=TrailForge Backend
+            org.opencontainers.image.description=Open-source, self-hostable 4WD & off-road mapping, live track-grading, and trail-intelligence API & GIS worker (FastAPI + PostGIS + GDAL + tippecanoe + osmium + pmtiles)
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.resolve-tag.outputs.tag }}
+            org.opencontainers.image.licenses=GPL-3.0-or-later
+
+      - name: Build and push multi-arch backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            INSTALL_DEV=false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=trailforge-backend
+          cache-to: type=gha,mode=max,scope=trailforge-backend
+
+  build-web:
+    name: Build & Push Web PWA Image (linux/amd64, linux/arm64)
+    needs: resolve-tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-tag.outputs.checkout_ref }}
+
+      - name: Set up QEMU for multi-arch builds
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata (tags & OCI labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/trailforge-web
+          tags: |
+            type=raw,value=${{ needs.resolve-tag.outputs.tag }}
+            type=raw,value=${{ needs.resolve-tag.outputs.minor }},enable=${{ needs.resolve-tag.outputs.is_stable }}
+            type=raw,value=latest,enable=${{ needs.resolve-tag.outputs.is_stable }}
+          labels: |
+            org.opencontainers.image.title=TrailForge Web PWA
+            org.opencontainers.image.description=Offline-capable MapLibre GL JS 5 4WD trail intelligence & in-cab breadcrumb recorder PWA served via Nginx with Range-safe PMTiles proxying
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.resolve-tag.outputs.tag }}
+            org.opencontainers.image.licenses=GPL-3.0-or-later
+
+      - name: Build and push multi-arch web image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./web
+          file: ./web/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=trailforge-web
+          cache-to: type=gha,mode=max,scope=trailforge-web

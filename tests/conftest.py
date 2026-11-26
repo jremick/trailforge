@@ -4,21 +4,70 @@ from __future__ import annotations
 
 import os
 import socket
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from pathlib import Path
 from typing import Any
 
 import pytest
+from alembic import command as alembic_command
+from alembic.config import Config as AlembicConfig
+from alembic.script import ScriptDirectory
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, text
 
 from trailforge.api.health import get_health_checker
 from trailforge.api.main import create_app
-from trailforge.db.session import DbHealthStatus, get_engine
+from trailforge.config import get_settings
+from trailforge.db.session import DbHealthStatus, get_engine, reset_engine
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+DEFAULT_TEST_DATABASE_URL = "postgresql+psycopg://trailforge:trailforge@localhost:5432/trailforge_test"
 
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "db", "postgres", "testserver"})
+
+
+def resolve_test_database_url(env: Mapping[str, str] | None = None) -> str:
+    """Resolve the PostGIS database URL for integration tests.
+
+    Prefers ``TEST_DATABASE_URL`` so local runs can target an isolated ``trailforge_test``
+    database without racing the live Compose worker or mutating seeded dev data, while
+    remaining compatible with CI pipelines (GitHub Actions / Cloud Build) that point
+    ``TEST_DATABASE_URL`` and ``DATABASE_URL`` at an ephemeral CI PostGIS instance.
+    """
+    source = os.environ if env is None else env
+    for key in ("TEST_DATABASE_URL", "DATABASE_URL"):
+        val = (source.get(key) or "").strip()
+        if val:
+            return val
+    return DEFAULT_TEST_DATABASE_URL
+
+
+def _ensure_postgis_and_schema(engine: Engine) -> None:
+    """Ensure the PostGIS extension is enabled and Alembic migrations are at head."""
+    with engine.begin() as conn:
+        has_postgis = conn.execute(
+            text("SELECT 1 FROM pg_extension WHERE extname = 'postgis'")
+        ).scalar_one_or_none()
+        if has_postgis is None:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
+
+    alembic_cfg = AlembicConfig()
+    alembic_cfg.set_main_option("script_location", str(REPO_ROOT / "migrations"))
+    head_rev = ScriptDirectory.from_config(alembic_cfg).get_current_head()
+
+    with engine.connect() as conn:
+        has_alembic = conn.execute(
+            text("SELECT to_regclass('public.alembic_version')")
+        ).scalar_one_or_none()
+        current_rev: str | None = None
+        if has_alembic is not None:
+            current_rev = conn.execute(
+                text("SELECT version_num FROM alembic_version LIMIT 1")
+            ).scalar_one_or_none()
+
+    if head_rev is not None and current_rev != head_rev:
+        alembic_command.upgrade(alembic_cfg, "head")
 
 
 @pytest.fixture(autouse=True)
@@ -79,14 +128,8 @@ def degraded_client() -> Generator[TestClient, None, None]:
 
 @pytest.fixture(scope="session")
 def postgis_engine() -> Generator[Engine, None, None]:
-    """Return a SQLAlchemy Engine connected to a local/CI PostGIS database for integration tests."""
-    db_url = os.environ.get(
-        "TEST_DATABASE_URL",
-        os.environ.get(
-            "DATABASE_URL",
-            "postgresql+psycopg://trailforge:trailforge@localhost:5432/trailforge",
-        ),
-    )
+    """Return a SQLAlchemy Engine connected to an isolated/CI PostGIS database."""
+    db_url = resolve_test_database_url()
     engine = get_engine(db_url)
     try:
         with engine.connect() as conn:
@@ -94,7 +137,19 @@ def postgis_engine() -> Generator[Engine, None, None]:
     except Exception as exc:
         engine.dispose()
         pytest.skip(f"PostGIS database not reachable at configured URL: {exc}")
+
+    prev_database_url = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = db_url
+    get_settings.cache_clear()
+    reset_engine()
     try:
+        _ensure_postgis_and_schema(engine)
         yield engine
     finally:
         engine.dispose()
+        reset_engine()
+        if prev_database_url is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = prev_database_url
+        get_settings.cache_clear()

@@ -1,0 +1,53 @@
+# TrailForge Automatic HTTPS Reverse Proxy Example (Caddy v2)
+#
+# Copy to /etc/caddy/Caddyfile (or mount into a Caddy container on the same
+# Docker network as TrailForge) and replace `trails.example.com` with your domain.
+#
+# Required TrailForge `.env` settings behind HTTPS:
+#   CORS_ORIGINS=https://trails.example.com
+#   AUTH_COOKIE_SECURE=true
+#   AUTH_SECRET_KEY=<64-hex-chars from: openssl rand -hex 32>
+#   TRAILFORGE_PRIVACY_SECRET=<64-hex-chars from: openssl rand -hex 32>
+#
+# PMTiles Range / 206 Partial Content notes:
+#   - Caddy passes client `Range`, `If-Range`, and `If-None-Match` headers
+#     through untouched, and `flush_interval -1` streams 206 byte ranges and
+#     offline pack `bundle.tar.gz` archives without proxy buffering.
+#   - Compression (`encode`) is explicitly excluded from `/api/tiles/*` and
+#     `/api/packs/*/tiles/*` so binary PMTiles byte ranges are never re-encoded.
+
+trails.example.com {
+	# Match web/nginx.conf (`client_max_body_size 15m`) for GPX trace uploads
+	# and community condition report photo attachments.
+	request_body {
+		max_size 15MB
+	}
+
+	# Compress HTML/JS/CSS/JSON/SVG while keeping PMTiles Range endpoints and
+	# pre-compressed offline pack archives byte-exact for HTTP 206 responses.
+	@compressible {
+		not path /api/tiles/* /api/packs/*/tiles/* /api/packs/*/bundle.tar.gz
+	}
+	encode @compressible zstd gzip
+
+	header {
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+	}
+
+	# Use `web:80` if Caddy shares the Docker Compose network, or
+	# `127.0.0.1:5173` when running Caddy directly on the Docker host.
+	reverse_proxy 127.0.0.1:5173 {
+		flush_interval -1
+		header_up Host {http.request.host}
+		header_up X-Forwarded-Proto {http.request.scheme}
+		# Client `Range`, `If-Range`, and `If-None-Match` headers are forwarded
+		# verbatim by Caddy for PMTiles HTTP 206 Partial Content streaming.
+		transport http {
+			read_timeout 180s
+			write_timeout 180s
+		}
+	}
+}

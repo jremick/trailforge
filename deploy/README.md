@@ -1,0 +1,165 @@
+# TrailForge Production Self-Hosting Guide
+
+This guide covers running **TrailForge** in production on a homelab server, mini-PC, Raspberry Pi 5 (arm64), or 16 GB laptop using prebuilt multi-arch (`linux/amd64` + `linux/arm64`) images from GitHub Container Registry (`ghcr.io`) — **no local Docker builds required**.
+
+## Resource Budget (Homelab & 16 GB Laptop Friendly)
+
+`docker-compose.ghcr.yml` enforces lean container memory caps with zero Redis/Kafka brokers:
+
+| Service | Image | Default Binding | Memory Limit | Purpose |
+| --- | --- | --- | --- | --- |
+| `db` | `imresamu/postgis:16-3.4` | Internal network only | `512m` | PostgreSQL 16 + PostGIS 3.4 |
+| `api` | `ghcr.io/jremick/trailforge-backend` | Internal network only | `512m` | FastAPI, Alembic, GDAL/PMTiles API |
+| `worker` | `ghcr.io/jremick/trailforge-backend` | Internal network only | `512m` | Closure sync, live grading, rainfall ticks |
+| `web` | `ghcr.io/jremick/trailforge-web` | `127.0.0.1:5173 -> 80` | `128m` | MapLibre GL JS 5 PWA + Range-safe Nginx proxy |
+
+---
+
+## Production Homelab Checklist
+
+### 1. Generate Strong Secrets
+
+Copy `.env.example` to `.env` and replace all default credentials before first boot:
+
+```bash
+cp .env.example .env
+
+# Generate cryptographically strong random secrets:
+openssl rand -hex 32   # -> AUTH_SECRET_KEY
+openssl rand -hex 32   # -> TRAILFORGE_PRIVACY_SECRET
+openssl rand -hex 24   # -> POSTGRES_PASSWORD
+```
+
+Update `.env`:
+
+```dotenv
+# Optional: pin a specific release tag (required for pre-releases like v1.0.0-beta.1,
+# since pre-release tags intentionally do not overwrite :latest)
+TRAILFORGE_IMAGE_TAG=v1.0.0-beta.1
+
+POSTGRES_DB=trailforge
+POSTGRES_USER=trailforge
+POSTGRES_PASSWORD=<generated-db-password>
+DATABASE_URL=postgresql+psycopg://trailforge:<generated-db-password>@db:5432/trailforge
+
+AUTH_SECRET_KEY=<generated-auth-secret>
+TRAILFORGE_PRIVACY_SECRET=<generated-privacy-secret>
+
+# Required behind HTTPS reverse proxy so session cookies are TLS-only
+AUTH_COOKIE_SECURE=true
+CORS_ORIGINS=https://trails.example.com
+
+# Enable live VIC/NSW closure feeds & Open-Meteo 72h rainfall sync
+# (kept false by default so fresh installs stay offline-safe)
+TRAILFORGE_ENABLE_LIVE_FEEDS=true
+```
+
+> **Note:** Keep `TRAILFORGE_PRIVACY_SECRET` backed up safely. Changing it rotates anonymous telemetry `contribution_hash` derivation for future uploads (existing anonymized observations remain intact).
+
+### 2. Choose an HTTPS Reverse Proxy
+
+HTTPS is mandatory for in-cab mobile/tablet PWA features (**Service Worker offline packs**, **Geolocation API**, **Screen Wake Lock**, and **`AUTH_COOKIE_SECURE=true`**). Pick one of the three included setups:
+
+- **Private Tailnet (zero port forwarding, recommended for personal/club rigs):** follow [`deploy/tailscale-serve.md`](./tailscale-serve.md).
+- **Automatic public HTTPS via Caddy v2:** adapt [`deploy/Caddyfile.example`](./Caddyfile.example) (preserves `Host`, `X-Forwarded-Proto`, `Range` / HTTP `206 Partial Content`, and `15MB` upload limit).
+- **Existing Traefik v3 stack:** layer [`deploy/traefik-compose.override.yml`](./traefik-compose.override.yml):
+  ```bash
+  TRAILFORGE_HOST=trails.example.com \
+  docker compose -f docker-compose.ghcr.yml -f deploy/traefik-compose.override.yml up -d
+  ```
+
+### 3. Start the Stack & Verify Health
+
+```bash
+docker compose -f docker-compose.ghcr.yml up -d
+docker compose -f docker-compose.ghcr.yml ps
+curl -fsS http://127.0.0.1:5173/api/health
+```
+
+`api` automatically runs `alembic upgrade head` on startup before serving traffic, and `worker` waits until both `db` and `api` report healthy.
+
+### 4. Seed or Bake Australian Trail Data
+
+- **Quick offline demo corridor (Australian Alps fixtures):**
+  ```bash
+  docker compose -f docker-compose.ghcr.yml exec -T api \
+    python -m trailforge.ingestion.pipeline --fixtures tests/fixtures
+  ```
+- **Real open-data regional bake (VIC/NSW):** run `trailforge.ingestion.bake_cli` inside the `api` container (e.g. `--region australian-alps` or `--region blue-mountains` with `--build-tiles --build-pack`; pass `--pbf /data/australia.osm.pbf` for streaming statewide bakes under 300 MB RAM).
+
+---
+
+## Backups & Restores
+
+All persistent state lives in five named Docker volumes:
+
+- `trailforge-pgdata` — PostgreSQL/PostGIS database (tracks, grades, trips, users, reports, planned routes)
+- `trailforge_uploads` (`/data/uploads`) — validated condition report photo attachments
+- `trailforge_packs` (`/data/packs`) — built offline regional pack bundles & manifests
+- `trailforge_tiles` (`/data/tiles`) — generated vector & terrain PMTiles (re-buildable from PostGIS + DEM)
+- `trailforge-data` (`/data`) — cache & working files
+
+### Backup PostGIS Database
+
+```bash
+mkdir -p backups
+docker compose -f docker-compose.ghcr.yml exec -T db sh -ec \
+  'pg_dump -U "${POSTGRES_USER:-trailforge}" -d "${POSTGRES_DB:-trailforge}" -Fc' \
+  > "backups/trailforge-db-$(date +%Y%m%d-%H%M%S).dump"
+```
+
+### Restore PostGIS Database
+
+```bash
+docker compose -f docker-compose.ghcr.yml stop api worker
+docker compose -f docker-compose.ghcr.yml exec -T db sh -ec \
+  'pg_restore -U "${POSTGRES_USER:-trailforge}" -d "${POSTGRES_DB:-trailforge}" --clean --if-exists' \
+  < backups/trailforge-db-YYYYMMDD-HHMMSS.dump
+docker compose -f docker-compose.ghcr.yml start api worker
+```
+
+### Backup `/data/uploads` and `/data/packs`
+
+```bash
+# Condition report photos (/data/uploads)
+docker compose -f docker-compose.ghcr.yml exec -T api \
+  tar -czf - -C /data uploads > "backups/trailforge-uploads-$(date +%Y%m%d-%H%M%S).tar.gz"
+
+# Offline regional packs (/data/packs)
+docker compose -f docker-compose.ghcr.yml exec -T api \
+  tar -czf - -C /data packs > "backups/trailforge-packs-$(date +%Y%m%d-%H%M%S).tar.gz"
+```
+
+To restore either archive:
+
+```bash
+docker compose -f docker-compose.ghcr.yml exec -T api \
+  tar -xzf - -C /data < backups/trailforge-uploads-YYYYMMDD-HHMMSS.tar.gz
+```
+
+---
+
+## Low-Downtime Upgrades & Rollbacks
+
+1. **Back up PostGIS** (command above) before jumping across minor/major versions.
+2. **Pre-pull the target images** while the current stack keeps serving traffic:
+   ```bash
+   # Update TRAILFORGE_IMAGE_TAG in .env (e.g. v1.0.0) or keep :latest for stable releases
+   docker compose -f docker-compose.ghcr.yml pull
+   ```
+3. **Recreate containers in dependency order** (Alembic migrations run automatically when `api` boots):
+   ```bash
+   docker compose -f docker-compose.ghcr.yml up -d --remove-orphans
+   ```
+4. **Verify post-upgrade health:**
+   ```bash
+   docker compose -f docker-compose.ghcr.yml ps
+   curl -fsS http://127.0.0.1:5173/api/health
+   ```
+5. **Rollback:** restore your pre-upgrade `pg_dump` if a schema downgrade is required, pin the previous `TRAILFORGE_IMAGE_TAG`, and run `docker compose -f docker-compose.ghcr.yml up -d`.
+
+---
+
+## Licensing & Required Attributions
+
+TrailForge is licensed under **`GPL-3.0-or-later`**. Deployed instances must preserve attribution notices for OpenStreetMap (`ODbL`), Geoscience Australia / DEA / CAPAD / NSW Spatial Services / Victoria DEECA (`CC BY 4.0`), and Open-Meteo (`CC BY 4.0`).

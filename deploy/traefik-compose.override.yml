@@ -1,0 +1,57 @@
+# Traefik v3 HTTPS Compose Override for TrailForge
+#
+# Usage:
+#   TRAILFORGE_HOST=trails.example.com \
+#   CORS_ORIGINS=https://trails.example.com \
+#   AUTH_COOKIE_SECURE=true \
+#   docker compose -f docker-compose.ghcr.yml -f deploy/traefik-compose.override.yml up -d
+#
+# Prerequisites:
+#   - An existing Traefik v3 reverse proxy attached to the external `traefik` Docker network
+#   - A certificate resolver named `letsencrypt` (override via TRAEFIK_CERTRESOLVER)
+#   - Strong production secrets in `.env` (`AUTH_SECRET_KEY`, `TRAILFORGE_PRIVACY_SECRET`,
+#     `POSTGRES_PASSWORD`, and matching `DATABASE_URL`)
+#
+# PMTiles HTTP Range / 206 Partial Content safety:
+#   - Do NOT attach Traefik's `compress` middleware to `/api/tiles/*` or `/api/packs/*`
+#     routes: compressing ranged binary responses can break PMTiles HTTP 206 offsets.
+#   - The middleware chain below applies security headers and a 15 MB request body cap
+#     without touching `Range` / `If-Range` headers or buffering streaming responses.
+
+services:
+  api:
+    environment:
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://${TRAILFORGE_HOST:-trails.example.com}}
+      AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-true}
+
+  web:
+    # Remove direct host loopback binding when routing exclusively through Traefik
+    ports: !reset []
+    networks:
+      - default
+      - traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik"
+      - "traefik.http.routers.trailforge.rule=Host(`${TRAILFORGE_HOST:-trails.example.com}`)"
+      - "traefik.http.routers.trailforge.entrypoints=websecure"
+      - "traefik.http.routers.trailforge.tls=true"
+      - "traefik.http.routers.trailforge.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      - "traefik.http.routers.trailforge.middlewares=trailforge-security@docker,trailforge-upload-limit@docker"
+      - "traefik.http.services.trailforge.loadbalancer.server.port=80"
+      - "traefik.http.services.trailforge.loadbalancer.passhostheader=true"
+      - "traefik.http.services.trailforge.loadbalancer.responseforwarding.flushinterval=100ms"
+      # Security headers (preserves Range / 206 Partial Content for PMTiles — no compression middleware)
+      - "traefik.http.middlewares.trailforge-security.headers.stsSeconds=31536000"
+      - "traefik.http.middlewares.trailforge-security.headers.stsIncludeSubdomains=true"
+      - "traefik.http.middlewares.trailforge-security.headers.contentTypeNosniff=true"
+      - "traefik.http.middlewares.trailforge-security.headers.customFrameOptionsValue=SAMEORIGIN"
+      - "traefik.http.middlewares.trailforge-security.headers.referrerPolicy=strict-origin-when-cross-origin"
+      - "traefik.http.middlewares.trailforge-security.headers.customRequestHeaders.X-Forwarded-Proto=https"
+      # Allow up to 15 MB GPX trace & condition report photo uploads (matches web/nginx.conf)
+      - "traefik.http.middlewares.trailforge-upload-limit.buffering.maxRequestBodyBytes=15728640"
+      - "traefik.http.middlewares.trailforge-upload-limit.buffering.memRequestBodyBytes=2097152"
+
+networks:
+  traefik:
+    external: true
