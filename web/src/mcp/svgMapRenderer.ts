@@ -7,6 +7,7 @@ import {
 import { escapeHtml, getGradeColor } from "../presets";
 import {
   COMPARE_FALLBACK_COLORS,
+  sanitizeHexColor,
   type CompactClosureItem,
   type CompactElevationPoint,
   type CompactPoiItem,
@@ -284,9 +285,10 @@ export function buildVectorMapSvg(
     pois.push(...(payload.route.nearby_pois ?? []));
   } else if (payload.view_mode === "compare" && payload.compare) {
     (payload.compare.tracks ?? []).forEach((entry, idx) => {
-      const color =
-        entry.color_hex ||
-        COMPARE_FALLBACK_COLORS[idx % COMPARE_FALLBACK_COLORS.length]!;
+      const color = sanitizeHexColor(
+        entry.color_hex,
+        COMPARE_FALLBACK_COLORS[idx % COMPARE_FALLBACK_COLORS.length]!
+      );
       for (const seg of entry.segments ?? []) {
         if (seg.coords.length >= 2) {
           polylines.push({
@@ -420,7 +422,8 @@ export function buildVectorMapSvg(
           ? ` data-map-track-id="${escapeHtml(line.trackId)}" class="tfm-svg-track-line"`
           : "";
       const titleTag = line.label ? `<title>${escapeHtml(line.label)}</title>` : "";
-      return `<polyline points="${pts}" fill="none" stroke="${line.color}" stroke-width="${line.width.toFixed(1)}" stroke-linecap="round" stroke-linejoin="round"${line.dashed ? ' stroke-dasharray="6 4"' : ""}${clickAttr}>${titleTag}</polyline>`;
+      const safeStroke = sanitizeHexColor(line.color, "#38BDF8");
+      return `<polyline points="${pts}" fill="none" stroke="${safeStroke}" stroke-width="${line.width.toFixed(1)}" stroke-linecap="round" stroke-linejoin="round"${line.dashed ? ' stroke-dasharray="6 4"' : ""}${clickAttr}>${titleTag}</polyline>`;
     })
     .join("");
 

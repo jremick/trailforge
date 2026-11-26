@@ -102,9 +102,11 @@ describe("AI Tokens & Connected Apps helpers", () => {
       client_name: "ChatGPT",
       scope: "trailforge:read trailforge:write",
       active_token_count: 2,
+      granted_at: "2026-11-26T09:30:00Z",
     });
     expect(grant?.client_name).toBe("ChatGPT");
     expect(grant?.scopes).toEqual(["trailforge:read", "trailforge:write"]);
+    expect(grant?.created_at).toBe("2026-11-26T09:30:00Z");
   });
 
   it("escapes untrusted token/app names and renders minted copy-once secret banner", () => {

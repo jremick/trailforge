@@ -40,6 +40,7 @@ import {
   DEFAULT_ATTRIBUTIONS,
   normalizeViewPayload,
   sanitizeExternalHttpUrl,
+  sanitizeHexColor,
   type CompactElevationPoint,
   type HostCapabilityFlags,
   type TrailForgeViewPayload,
@@ -664,9 +665,10 @@ export function renderExplorerApp(
               ${tracks
                 .map((entry, idx) => {
                   const s = entry.summary;
-                  const col =
-                    entry.color_hex ||
-                    COMPARE_FALLBACK_COLORS[idx % COMPARE_FALLBACK_COLORS.length]!;
+                  const col = sanitizeHexColor(
+                    entry.color_hex,
+                    COMPARE_FALLBACK_COLORS[idx % COMPARE_FALLBACK_COLORS.length]!
+                  );
                   const gCol = getGradeColor(s.grade);
                   const nameCell = canCallServer
                     ? `<button type="button" class="tfm-btn tfm-btn-sm" data-inspect-track="${escapeHtml(s.track_id)}"><span class="tfm-pill-dot" style="background:${col}"></span>${escapeHtml(s.name)}</button>`
@@ -1328,6 +1330,9 @@ export class TrailForgeMcpApp {
         });
     }
 
+    // Interactive Pan/Zoom + Lockstep Elevation <-> Map Scrubbing
+    const { syncAtDistance } = this.bindSvgPanZoomAndScrub(rendered);
+
     // Hybrid MapLibre GL mount with automatic silent fallback to SVG
     const payload = this.state.payload;
     if (payload && this.state.rendererMode === "maplibre") {
@@ -1344,10 +1349,31 @@ export class TrailForgeMcpApp {
               void this.inspectTrackById(trackId);
             }
           },
+          onHoverCoord: (lon, lat) => {
+            if (
+              !syncAtDistance ||
+              !rendered.vectorMap ||
+              rendered.vectorMap.vertices.length < 2
+            ) {
+              return;
+            }
+            const projected = rendered.vectorMap.project(lon, lat);
+            const nearest = findNearestPointOnTrackCourse(
+              rendered.vectorMap.vertices,
+              projected.x,
+              projected.y
+            );
+            if (nearest) {
+              syncAtDistance(nearest.distM);
+            }
+          },
           onFallback: (reason) => {
             console.info("TrailForge MCP switching to zero-network SVG map:", reason);
             this.mapLibreCtrl = null;
             this.state = { ...this.state, rendererMode: "svg" };
+            this.root
+              ?.querySelector<HTMLElement>(".tfm-shell")
+              ?.setAttribute("data-renderer", "svg");
             this.root
               ?.querySelector<HTMLElement>("[data-role='maplibre-container']")
               ?.classList.add("hidden");
@@ -1362,13 +1388,14 @@ export class TrailForgeMcpApp {
         });
       }
     }
-
-    // Interactive Pan/Zoom + Lockstep Elevation <-> Map Scrubbing
-    this.bindSvgPanZoomAndScrub(rendered);
   }
 
-  private bindSvgPanZoomAndScrub(rendered: RenderedExplorerView): void {
-    if (!this.root || !rendered.vectorMap) return;
+  private bindSvgPanZoomAndScrub(rendered: RenderedExplorerView): {
+    syncAtDistance: ((distM: number) => void) | null;
+  } {
+    if (!this.root || !rendered.vectorMap) {
+      return { syncAtDistance: null };
+    }
     const vectorMap = rendered.vectorMap;
     const svgEl = this.root.querySelector<SVGSVGElement>(
       "[data-role='vector-map-svg']"
@@ -1522,7 +1549,7 @@ export class TrailForgeMcpApp {
 
     const payload = this.state.payload;
     if (!geom || !elevSvg || !elevHit || !crosshair || !crossLine || !hud || !payload) {
-      return;
+      return { syncAtDistance: null };
     }
 
     const syncAtDistance = (distM: number): void => {
@@ -1545,9 +1572,10 @@ export class TrailForgeMcpApp {
               clamped
             );
             if (!sample) return "";
-            const col =
-              t.color_hex ||
-              COMPARE_FALLBACK_COLORS[idx % COMPARE_FALLBACK_COLORS.length]!;
+            const col = sanitizeHexColor(
+              t.color_hex,
+              COMPARE_FALLBACK_COLORS[idx % COMPARE_FALLBACK_COLORS.length]!
+            );
             return `<span class="mono"><span class="tfm-pill-dot" style="display:inline-block;background:${col};margin-right:4px"></span>${escapeHtml(t.summary.name)}: <strong>${Math.round(sample.elevM)}m</strong></span>`;
           })
           .filter(Boolean)
@@ -1625,5 +1653,7 @@ export class TrailForgeMcpApp {
 
     elevHit.addEventListener("pointermove", (ev) => handleElevPointer(ev.clientX));
     elevHit.addEventListener("pointerdown", (ev) => handleElevPointer(ev.clientX));
+
+    return { syncAtDistance };
   }
 }

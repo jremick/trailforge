@@ -9,6 +9,7 @@ import { escapeHtml } from "../presets";
 import type { ElevationProfilePoint, WaterwayCrossingItem } from "../types";
 import {
   COMPARE_FALLBACK_COLORS,
+  sanitizeHexColor,
   type CompactCrossingItem,
   type CompactElevationPoint,
   type CompareTrackEntry,
@@ -153,9 +154,10 @@ export function buildCompareElevationSvg(
 
   const curvesHtml = validTracks
     .map((entry, idx) => {
-      const color =
-        entry.color_hex ||
-        COMPARE_FALLBACK_COLORS[idx % COMPARE_FALLBACK_COLORS.length]!;
+      const color = sanitizeHexColor(
+        entry.color_hex,
+        COMPARE_FALLBACK_COLORS[idx % COMPARE_FALLBACK_COLORS.length]!
+      );
       const coords = entry.elevation_profile
         .map((p) => `${toX(p.dist_m).toFixed(1)},${toY(p.elev_m).toFixed(1)}`)
         .join(" ");

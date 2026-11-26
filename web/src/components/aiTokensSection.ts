@@ -208,6 +208,7 @@ export function normalizeOAuthGrantItem(raw: unknown): OAuthGrantItem | null {
   const obj = raw as Record<string, unknown>;
   const clientId = String(obj.client_id ?? "").trim();
   if (!clientId) return null;
+  const createdRaw = obj.created_at ?? obj.granted_at;
   return {
     client_id: clientId,
     client_name:
@@ -217,7 +218,7 @@ export function normalizeOAuthGrantItem(raw: unknown): OAuthGrantItem | null {
       typeof obj.active_token_count === "number"
         ? obj.active_token_count
         : undefined,
-    created_at: typeof obj.created_at === "string" ? obj.created_at : null,
+    created_at: typeof createdRaw === "string" ? createdRaw : null,
     last_used_at: typeof obj.last_used_at === "string" ? obj.last_used_at : null,
     expires_at: typeof obj.expires_at === "string" ? obj.expires_at : null,
   };

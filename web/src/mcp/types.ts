@@ -248,6 +248,25 @@ export const COMPARE_FALLBACK_COLORS: readonly string[] = [
   "#A855F7",
 ];
 
+const STRICT_HEX_COLOR_PATTERN =
+  /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
+
+/**
+ * Validate a hex color string before interpolating into SVG/CSS attributes,
+ * rejecting any injection payload and returning a safe hex fallback.
+ */
+export function sanitizeHexColor(
+  raw: string | null | undefined,
+  fallback = "#38BDF8"
+): string {
+  const safeFallback = STRICT_HEX_COLOR_PATTERN.test(fallback)
+    ? fallback
+    : "#38BDF8";
+  if (typeof raw !== "string") return safeFallback;
+  const trimmed = raw.trim();
+  return STRICT_HEX_COLOR_PATTERN.test(trimmed) ? trimmed : safeFallback;
+}
+
 /**
  * Validate an external URL for safe `openLink` / anchor usage (`http:` / `https:` only).
  */

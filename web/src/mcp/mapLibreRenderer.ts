@@ -10,6 +10,7 @@ import { getGradeColor } from "../presets";
 import {
   COMPARE_FALLBACK_COLORS,
   sanitizeExternalHttpUrl,
+  sanitizeHexColor,
   type TrailForgeViewPayload,
 } from "./types";
 
@@ -153,9 +154,10 @@ function buildOverlayGeoJson(payload: TrailForgeViewPayload): {
     }
   } else if (payload.view_mode === "compare" && payload.compare) {
     (payload.compare.tracks ?? []).forEach((entry, idx) => {
-      const color =
-        entry.color_hex ||
-        COMPARE_FALLBACK_COLORS[idx % COMPARE_FALLBACK_COLORS.length]!;
+      const color = sanitizeHexColor(
+        entry.color_hex,
+        COMPARE_FALLBACK_COLORS[idx % COMPARE_FALLBACK_COLORS.length]!
+      );
       for (const seg of entry.segments ?? []) {
         if (seg.coords.length >= 2) {
           seg.coords.forEach(([lon, lat]) => include(lon, lat));

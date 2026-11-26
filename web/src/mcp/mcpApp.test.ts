@@ -16,9 +16,11 @@ import {
 } from "./mcpApp";
 import { buildVectorMapSvg } from "./svgMapRenderer";
 import {
+  COMPARE_FALLBACK_COLORS,
   DEFAULT_ATTRIBUTIONS,
   normalizeViewPayload,
   sanitizeExternalHttpUrl,
+  sanitizeHexColor,
 } from "./types";
 
 interface FakeBridgeOptions {
@@ -78,6 +80,42 @@ describe("SC-4: TrailForge MCP App payload normalization & URL hygiene", () => {
     expect(sanitizeExternalHttpUrl("javascript:alert(1)")).toBeNull();
     expect(sanitizeExternalHttpUrl("data:text/html,<svg onload=alert(1)>")).toBeNull();
     expect(sanitizeExternalHttpUrl("file:///etc/passwd")).toBeNull();
+  });
+
+  it("rejects malicious color_hex values in compare mode across HTML, SVG map, and elevation chart", () => {
+    expect(sanitizeHexColor("#22C55E")).toBe("#22C55E");
+    expect(sanitizeHexColor("#abc")).toBe("#abc");
+    expect(sanitizeHexColor('" onload="alert(1)', "#38BDF8")).toBe("#38BDF8");
+    expect(
+      sanitizeHexColor("red;background:url(javascript:alert(1))", "#F59E0B")
+    ).toBe("#F59E0B");
+
+    const poisonedCompare = structuredClone(DEMO_PAYLOADS.compare);
+    poisonedCompare.compare!.tracks[0]!.color_hex = '" onload="alert(1)';
+    poisonedCompare.compare!.tracks[1]!.color_hex =
+      "red;background:url(javascript:alert(1))";
+
+    const rendered = renderExplorerApp({
+      status: "ready",
+      statusMessage: null,
+      payload: poisonedCompare,
+      previousExplorePayload: null,
+      theme: "dark",
+      capabilities: {
+        openLinks: true,
+        updateModelContext: true,
+        serverTools: true,
+      },
+      rendererMode: "svg",
+      forceSvgFallback: true,
+      standalonePreview: false,
+      actionToast: null,
+    });
+
+    expect(rendered.html).not.toContain('onload="alert(1)');
+    expect(rendered.html).not.toContain("javascript:alert(1)");
+    expect(rendered.html).toContain(COMPARE_FALLBACK_COLORS[0]!);
+    expect(rendered.html).toContain(COMPARE_FALLBACK_COLORS[1]!);
   });
 });
 
