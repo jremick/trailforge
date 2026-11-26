@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### Phase B — Pillar 1: Pan-Australia 8-State Connectors & 15-Region Pack Catalog
+- Tier A `source_tracks_au_state` ORM model and reversible Alembic migration (`migrations/versions/0003_pan_au_source_tracks.py`, bringing the schema to 28 base tables and 21 GIST indexes) widening state/source/feed CHECK constraints cleanly across all 8 Australian states & territories while preserving strict 3-tier OSM ODbL separation and existing `source_tracks_vic` / `source_tracks_nsw` tables.
+- All 6 remaining Australian state & territory open-data trail/POI connectors (`src/trailforge/ingestion/connectors/au_states.py`): `ACTTrailsConnector` (`ACTmapi/EPSDD`, `CC BY 4.0`), `TASTrailsConnector` (`the LIST/NRE Tas`, `CC BY 3.0 AU`), `QLDTrailsConnector` (`QSpatial/DESI/DNRM`, `CC BY 4.0`), `WATrailsConnector` (`DBCA/Landgate SLIP`, `CC BY 4.0`, strictly excluding any `CC BY-NC` records), `SATrailsConnector` (`DEW/DHUD/Location SA` + GA Topo250K, `CC BY 4.0`), and `NTTrailsConnector` (`NTLIS/DEPWS` + GA Topo250K, `CC BY 4.0`).
+- `AutoAUStateTrailsRouter` automatically detecting all intersecting Australian states for any bounding box, dispatching cross-border connectors, merging results into pan-AU conflation/segmentation/live-bake pipelines, and returning dynamic agency attributions strictly for contributing states.
+- Expanded offline pack catalog (`src/trailforge/packs/catalog.py`, `src/trailforge/api/packs.py`) to **15 Pan-Australia regions** (`7` iconic 4WD regions: `australian-alps`, `blue-mountains`, `tasmania-wilderness`, `far-north-qld`, `flinders-ranges`, `red-centre`, `perth-hills`; plus `8` statewide packs: `vic`, `nsw`, `act`, `tas`, `qld`, `wa`, `sa`, `nt`) exposing `category`, `states`, and dynamic per-state attributions (`tests/test_au_states_connectors.py`).
+
+#### Phase B — Pillar 2: Pan-Australia Official Emergency & Park Closure Feeds
+- 6 new official state/territory closure & emergency adapters (`src/trailforge/feeds/adapters_au.py`) alongside the 5 existing VIC/NSW/OSM feeds (11 adapters total): `ACTESAAlertsAdapter` (`act_esa`), `TasAlertAdapter` (`tas_alert`), `QLDParksAlertsAdapter` (`qld_des_alerts`), `EmergencyWAAdapter` (`wa_emergency`), `SAAlertAdapter` (`sa_cfs_parks`), and `NTFireParksAdapter` (`nt_securent`) with CAPAD park joins, official source URL preservation, and graceful outage `is_stale=True` retention.
+- Lean opt-in state-scoped polling via `TRAILFORGE_ENABLED_STATES` (default `"VIC,NSW"`, `"VIC,NSW,ACT"`, or `"ALL"`), CLI `--states` option (`trailforge.feeds.cli`), and `?state=` single/comma-separated filtering + `available_states` (all 8 AU states) on `/api/closures` and `/api/closures/status` (`tests/test_au_closure_feeds.py`).
+
+#### Phase B — Pillar 3: Pluggable Valhalla `TrackMatcher` Sidecar & High-Rate 50 Hz Mobile IMU
+- Pluggable `ValhallaTrackMatcher` sidecar plugin and pure-Python Polyline6 encoder/decoder (`src/trailforge/matching/valhalla.py`, `src/trailforge/matching/factory.py`) implementing `TrackMatcher` via `POST {valhalla_url}/trace_attributes` (`use_tracks=1.0`, `map_snap`), projecting Valhalla-matched subtraces onto TrailForge's canonical 50–100 m PostGIS `track_segments` (preserving strict ODbL separation), extracting off-network spurs cleanly, and gracefully falling back to `PostGISHMMMatcher` (`postgis_hmm_fallback`) on HTTP error/timeout/connect failures.
+- High-rate mobile IMU signal processor (`src/trailforge/matching/imu.py`) performing gravity baseline removal (`||a|| = sqrt(ax^2+ay^2+az^2)` in g units with sparse low-rate self-cancellation guard), computing `roughness_rms`, `roughness_p95`, debounced `shock_event_count` (`> 0.8g` dynamic / `> 1.8g` total), and `max_pitch_deg` / `max_roll_deg`, time-aligning IMU roughness onto trimmed GPS breadcrumbs and segments, and strictly discarding all IMU samples inside the mandatory `>= 250 m` start/end privacy buffer.
+- Authenticated `POST /api/trips/mobile-sync` endpoint and optional `imu_samples` support on JSON `POST /api/trips/upload` (`src/trailforge/api/trips.py`), plus opt-in `deploy/valhalla-compose.override.yml` and `deploy/valhalla.md` keeping the default Compose stack lean (`tests/test_valhalla_imu.py`).
+
+#### Phase B — Pillar 4: Capacitor 7 Mobile Shell, Live 4WD Clinometer & Pan-Australia Web UI
+- Capacitor 7 mobile container configuration (`web/capacitor.config.ts`), native iOS/Android build guide & permission templates (`mobile/README.md`, `mobile/ios/Info.plist.snippet.xml`, `mobile/android/AndroidManifest.snippet.xml`), and Apple CarPlay (`CPMapTemplate`) / Android Auto (`NavigationTemplate`) architecture guide (`mobile/carplay-android-auto.md`).
+- Zero-crash Capacitor/PWA runtime bridge (`web/src/native/bridge.ts`, `web/src/native/bridge.test.ts`) unifying native background geolocation, high-rate IMU capture, KeepAwake, and browser PWA fallbacks.
+- Upgraded In-Cab Recorder with a live **4WD Clinometer** (`Pitch° / Roll°` with amber `>= 15°` and red `>= 25°` alerts), runtime mode badge, shock counter, simulated High Country clinometer/shock bursts, `POST /api/trips/mobile-sync` sync with offline IndexedDB queue fallback, plus Pan-Australia 15-region presets, `AU · 8 STATES` topbar pill, and **All / Iconic 4WD Regions / Statewide** pack category filters.
+
+### Verification Metrics (Phase B)
+- **Offline CI Tests:** `246+` automated offline tests passing (`148` isolated Docker PostGIS Python tests + `98` Vitest web tests across 13 files + host deploy-manifest parity checks; `0` failures, `0` worker races).
+- **Schema & Lean Resource Footprint:** Alembic `0003_pan_au_source_tracks` roundtrip & `alembic check` clean (**28 base tables, 21 GIST indexes**); default Compose stack idle RAM **`~350 MiB`** (`< 400 MiB` budget) with optional Valhalla sidecar cleanly isolated in `deploy/valhalla-compose.override.yml`.
+
 ---
 
 ## [1.0.0-beta.1] - 2026-11-26
