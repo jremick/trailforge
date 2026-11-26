@@ -255,7 +255,7 @@ describe("fetchHealth (mocked offline)", () => {
     const payload = {
       status: "ok",
       service: "trailforge-api",
-      version: "1.0.0-alpha.1",
+      version: "1.0.0-beta.1",
       db_ok: true,
       postgis_version: "3.4",
       schema_revision: "0001_initial",
@@ -281,7 +281,7 @@ describe("fetchHealth (mocked offline)", () => {
     const degradedPayload = {
       status: "degraded",
       service: "trailforge-api",
-      version: "1.0.0-alpha.1",
+      version: "1.0.0-beta.1",
       db_ok: false,
       postgis_version: null,
       schema_revision: null,

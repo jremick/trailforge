@@ -5,7 +5,13 @@ All notable changes to **TrailForge** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — Phase A (Path to `v1.0.0-beta.1` / `v1.0.0` GA)
+## [Unreleased]
+
+---
+
+## [1.0.0-beta.1] - 2026-11-26
+
+First public beta release of **TrailForge**, building on `v1.0.0-alpha.1` with a real-data streaming OSM PBF & Australian open-data regional bake pipeline, zero-build multi-arch GHCR & HTTPS deployment kit, isolated PostGIS test database, and an interactive multi-track Route Planner with GridForge 300 DPI Strip Atlas handoff.
 
 ### Added
 
@@ -25,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Route planning engine & REST API (`src/trailforge/routes/planner.py`, `src/trailforge/api/routes.py`, `tests/test_route_planner.py`): `POST /api/routes/plan` with 2-state DP automatic leg orientation, `> 100 m` leg gap detection, combined distance/duration/elevation/slope/grade/rig-suitability/closures/gates/wet-risk/crossings/POIs summary, `POST /api/routes/plan/export?format=gpx|geojson` (GDAL-verified GPX 1.1 & RFC 7946 GeoJSON), authenticated saved-routes CRUD (`/api/routes`) with strict owner isolation, and pre-formatted `gridforge_cli` strip-atlas command.
 - Interactive web **Route Planner** drawer, top-bar `Route` pill, `+ Route` Track Inspector button, stitched MapLibre route overlay (`#14b8a6` line + numbered `S` / `2..N` / `F` / `W` pins), combined 4-grade SVG elevation profile, offline pack fallback planner, one-click `Copy CLI` GridForge card, and drawer `overflow: clip` / `visibility` layout hardening (`web/src/components/routePlanner.ts`, `web/src/routeHelpers.ts`, `web/src/routeHelpers.test.ts`).
 
-### Verification Metrics (Phase A)
+### Verification Metrics (`v1.0.0-beta.1`)
 - **Offline CI Tests:** `207+` offline automated tests passing (`121` isolated Docker PostGIS Python tests + `86` Vitest web tests across 12 files + `4` host deploy-manifest parity tests; zero `worker-1` races and live dev corridor intact).
 - **10k+ Segment Scale & GIST Benchmark:** `11,179` canonical segments (`150` tracks), **`13.65 MiB`** peak Python heap (`< 300 MB` budget), **`0.18–0.63 ms`** PostGIS GIST index scans (`0` Seq Scans on `track_segments`).
 - **Live Real-Data AU Verification (`@pytest.mark.live`):** `4/4` passing across all 8 AU upstream agencies + real corridor bakes (Blue Mountains Narrow Neck & Australian Alps Tom Groggin: `592` real segments, `2.3 MiB` vector + `300 KiB` terrain PMTiles).

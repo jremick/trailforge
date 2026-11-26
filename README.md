@@ -5,7 +5,7 @@
 **Open-source, self-hostable 4WD & off-road mapping, live track-grading, multi-track route planning, and trail-intelligence platform — launching first for Victoria & New South Wales (including ACT).**
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-[![Release: v1.0.0-alpha.1](https://img.shields.io/badge/Release-v1.0.0--alpha.1-8b5cf6)](CHANGELOG.md)
+[![Release: v1.0.0-beta.1](https://img.shields.io/badge/Release-v1.0.0--beta.1-8b5cf6)](CHANGELOG.md)
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![PostGIS 3.4 + PMTiles](https://img.shields.io/badge/PostGIS-3.4%20%2B%20PMTiles-336791?logo=postgresql&logoColor=white)](Dockerfile)
 [![MapLibre GL JS 5](https://img.shields.io/badge/MapLibre%20GL%20JS-5-396CB2?logo=maplibre&logoColor=white)](web/package.json)
@@ -271,13 +271,13 @@ See [`docs/PLAN.md`](docs/PLAN.md) for the vertical-slice roadmap, [`docs/SPEC_G
 
 ---
 
-## Release Status & Roadmap (`v1.0.0-alpha.1` → `v1.0.0-beta.1` / `v1.0.0` GA)
+## Release Status & Roadmap (`v1.0.0-beta.1` → `v1.0.0` GA)
 
-- **Shipped in `v1.0.0-alpha.1`:** All **9 vertical slices** from [`docs/PLAN.md`](docs/PLAN.md) verified end-to-end across Checkpoints A, B, and C on the VIC/NSW Australian Alps corridor.
-- **Completed in Phase A (Ready for `v1.0.0-beta.1`):**
+- **Shipped in `v1.0.0-beta.1`:**
   - Streaming OSM PBF + live VIC/NSW open-data tiled regional bake pipeline (`bake_cli`), real-data AU corridor bake verification (Blue Mountains & Tom Groggin), and `11,179`-segment PostGIS GIST scale benchmark (`13.65 MiB` heap, `0.18–0.63 ms` index scans).
   - Multi-arch GHCR release workflow (`.github/workflows/release-images.yml`), zero-build `docker-compose.ghcr.yml`, turnkey HTTPS deploy kit (`deploy/`), and isolated `trailforge_test` PostGIS integration test DB (`make test-integration`).
   - Interactive Multi-Track Route Planner (`planned_routes` migration, DP leg orientation, combined 4-grade elevation profile, saved routes CRUD, GPX/GeoJSON export, and 1-click GridForge 300 DPI Strip Atlas CLI handoff).
+- **Previously shipped in `v1.0.0-alpha.1`:** All **9 vertical slices** from [`docs/PLAN.md`](docs/PLAN.md) verified end-to-end across Checkpoints A, B, and C on the VIC/NSW Australian Alps corridor.
 - **Next Milestones toward `v1.0.0` GA:** Full statewide Victoria (`vic`) & New South Wales (`nsw`) production PBF/DEM pack bakes and multi-week live agency soak testing across VIC/NSW feeds and Open-Meteo.
 - **Planned `v1.1+` Follow-Ons:** Native mobile shell (Capacitor / React Native) for locked-screen iOS & Android background GPS + high-rate IMU roughness capture, Apple CarPlay & Android Auto projection, pan-Australia expansion (`QLD`, `WA`, `SA`, `TAS`, `NT`), and an optional Valhalla map-matching sidecar plugin behind the existing `TrackMatcher` protocol.
 

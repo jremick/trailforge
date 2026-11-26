@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TrailForge End-to-End Demo Walkthrough (v1.0.0-alpha.1)
+# TrailForge End-to-End Demo Walkthrough (v1.0.0-beta.1)
 #
 # Exercises a running, corridor-seeded TrailForge stack without requiring `jq`:
 #   1. Health & PostGIS/Alembic readiness check
