@@ -6,6 +6,14 @@ import {
   getClosureTone,
 } from "../closuresHelpers";
 import {
+  formatConfidenceBadge,
+  formatDurationMinutes,
+  formatHotspotReason,
+  formatLastDriven,
+  formatWetRiskBanner,
+  normalizeVehicleClassSplit,
+} from "../gradingHelpers";
+import {
   buildElevationProfileSvg,
   formatBreakdownFactors,
   formatOverrideLabel,
@@ -52,6 +60,7 @@ export interface TrackInspectorCallbacks {
   onClose: () => void;
   onZoomToTrack: (bbox: BBoxTuple) => void;
   onPoiSelect: (poi: PoiItem) => void;
+  onHotspotSelect?: (lat: number, lon: number, label: string) => void;
   onOpenRigPanel: () => void;
   onRequireSignIn: () => void;
   onToggleFavorite: (trackId: string, currentlyFavorite: boolean) => void;
@@ -486,6 +495,210 @@ export class TrackInspectorDrawer {
             .join("")
         : `<p class="tf-inspector-muted">No recent trail condition reports yet. Been through recently? Share an update above.</p>`;
 
+    // Slice 07 Live Crowdsourced Evidence & 72h Rainfall Context
+    const liveBreakdown = detail.live_breakdown ?? null;
+    const liveGrade = detail.live_grade ?? liveBreakdown?.live_grade ?? null;
+    const liveScore = detail.live_score ?? liveBreakdown?.live_score ?? null;
+    const sampleCount =
+      detail.sample_count ?? liveBreakdown?.sample_count ?? 0;
+    const confidence = formatConfidenceBadge(
+      detail.confidence_level ?? liveBreakdown?.confidence_level,
+      sampleCount
+    );
+    const lastDriven = formatLastDriven(
+      detail.last_driven_at ?? liveBreakdown?.last_driven_at
+    );
+    const avgSpeedKmh =
+      detail.avg_speed_kmh ?? liveBreakdown?.avg_speed_kmh ?? null;
+    const estDurationText = formatDurationMinutes(
+      detail.est_duration_min,
+      liveBreakdown?.avg_duration_s
+    );
+    const vehicleSplit = normalizeVehicleClassSplit(
+      detail.vehicle_class_split ?? liveBreakdown?.vehicle_class_split
+    );
+    const wetRisk = formatWetRiskBanner(detail.rainfall_context);
+    const hotspots = detail.obstacle_hotspots ?? [];
+    const liveReasons = liveBreakdown?.reasons ?? [];
+    const outlierClamped = liveBreakdown?.outlier_clamped_count ?? 0;
+
+    const wetBannerHtml = wetRisk
+      ? `
+        <div class="tf-wet-banner tone-${wetRisk.tone}">
+          <div class="tf-wet-head">
+            <span class="tf-wet-title">🌧 72h Rainfall · ${escapeHtml(wetRisk.label)}</span>
+            <span class="mono tf-wet-totals">${escapeHtml(wetRisk.rain72hText)} (72h) · ${escapeHtml(wetRisk.rain24hText)} (24h)</span>
+          </div>
+          ${
+            wetRisk.warning
+              ? `<p class="tf-wet-warning">${escapeHtml(wetRisk.warning)}</p>`
+              : ""
+          }
+          <div class="tf-wet-meta">
+            ${
+              wetRisk.adjustmentText
+                ? `<span class="tf-mini-tag amber">${escapeHtml(wetRisk.adjustmentText)}</span>`
+                : `<span class="tf-mini-tag">No wet penalty</span>`
+            }
+            ${
+              wetRisk.isStale
+                ? `<span class="tf-stale-badge">CACHED WEATHER</span>`
+                : ""
+            }
+            <span class="tf-wet-attrib">${escapeHtml(wetRisk.attribution)}</span>
+          </div>
+        </div>
+      `
+      : "";
+
+    const vehicleSplitHtml =
+      vehicleSplit.length > 0
+        ? `
+          <div class="tf-split-block">
+            <div class="tf-subhead">Vehicle Capability Traffic Split</div>
+            <div class="tf-split-bar" role="img" aria-label="Traffic split by vehicle capability class">
+              ${vehicleSplit
+                .filter((s) => s.pct > 0)
+                .map(
+                  (s) =>
+                    `<span class="tf-split-seg" style="width:${s.pct}%;background:${s.color}" title="${escapeHtml(s.shortLabel)}: ${s.count} (${s.pct}%)"></span>`
+                )
+                .join("")}
+            </div>
+            <div class="tf-split-legend">
+              ${vehicleSplit
+                .map(
+                  (s) => `
+                    <span class="tf-split-chip ${s.count === 0 ? "dimmed" : ""}">
+                      <span class="tf-diff-swatch" style="background:${s.color}"></span>
+                      <span>${escapeHtml(s.shortLabel)}</span>
+                      <span class="mono">${s.pct}% (${s.count})</span>
+                    </span>
+                  `
+                )
+                .join("")}
+            </div>
+          </div>
+        `
+        : "";
+
+    const hotspotsHtml =
+      hotspots.length > 0
+        ? `
+          <div class="tf-hotspots-block">
+            <div class="tf-subhead">Rough / Slow Obstacle Hotspots (${hotspots.length})</div>
+            <div class="tf-card-stack">
+              ${hotspots
+                .map((h, idx) => {
+                  const kmText =
+                    typeof h.dist_m === "number"
+                      ? `${(h.dist_m / 1000).toFixed(2)} km`
+                      : h.segment_id;
+                  const speedText =
+                    typeof h.avg_speed_kmh === "number"
+                      ? `${h.avg_speed_kmh.toFixed(1)} km/h`
+                      : null;
+                  const roughVal = h.roughness_rms ?? h.median_roughness_rms;
+                  const roughText =
+                    typeof roughVal === "number"
+                      ? `${roughVal.toFixed(2)}g RMS`
+                      : null;
+                  const reasonsList = (h.reasons ?? h.obstacle_reasons ?? [])
+                    .map((r) => formatHotspotReason(r))
+                    .join(" · ");
+                  const clickable =
+                    typeof h.lat === "number" && typeof h.lon === "number";
+                  return `
+                    <button
+                      type="button"
+                      class="tf-hotspot-card"
+                      ${clickable ? `data-hotspot-idx="${idx}"` : "disabled"}
+                    >
+                      <div class="tf-list-card-head">
+                        <span class="tf-list-card-title">⚡ ${escapeHtml(kmText)}</span>
+                        <span class="mono tf-list-card-sub">${escapeHtml([speedText, roughText].filter(Boolean).join(" · ") || "Hotspot")}</span>
+                      </div>
+                      ${
+                        reasonsList
+                          ? `<div class="tf-list-card-sub">${escapeHtml(reasonsList)}</div>`
+                          : ""
+                      }
+                    </button>
+                  `;
+                })
+                .join("")}
+            </div>
+          </div>
+        `
+        : "";
+
+    const liveGradeColor = liveGrade ? getGradeColor(liveGrade) : "#94A3B8";
+    const liveSectionHtml = `
+      <section class="tf-insp-section tf-live-section">
+        <div class="tf-insp-sec-head">
+          <h3>Live Crowdsourced Evidence</h3>
+          <span class="mono tf-insp-meta">${escapeHtml(liveBreakdown?.version ?? "live_v1")}</span>
+        </div>
+
+        ${wetBannerHtml}
+
+        <div class="tf-live-hero">
+          <div class="tf-live-grade-box">
+            <span class="tf-live-kicker">Live Grade</span>
+            <div class="tf-live-grade-val" style="color:${liveGradeColor}">
+              ${escapeHtml(liveGrade ?? "Baseline Only")}
+              ${
+                liveScore !== null
+                  ? `<span class="mono tf-live-score">(${Math.round(liveScore)}/100)</span>`
+                  : ""
+              }
+            </div>
+          </div>
+          <span class="tf-conf-pill tone-${confidence.tone}" title="${escapeHtml(confidence.detail)}">
+            ${escapeHtml(confidence.label)}
+          </span>
+        </div>
+
+        <div class="tf-live-stats-grid">
+          <div class="tf-stat-card">
+            <span class="tf-stat-label">Traversals</span>
+            <span class="mono tf-stat-val">${sampleCount}</span>
+          </div>
+          <div class="tf-stat-card">
+            <span class="tf-stat-label">Last Driven</span>
+            <span class="mono tf-stat-val tf-stat-sm">${escapeHtml(lastDriven)}</span>
+          </div>
+          <div class="tf-stat-card">
+            <span class="tf-stat-label">Avg Speed</span>
+            <span class="mono tf-stat-val">${avgSpeedKmh !== null ? `${avgSpeedKmh.toFixed(1)} km/h` : "—"}</span>
+          </div>
+          <div class="tf-stat-card">
+            <span class="tf-stat-label">Est. Duration</span>
+            <span class="mono tf-stat-val">${escapeHtml(estDurationText)}</span>
+          </div>
+        </div>
+
+        ${
+          outlierClamped > 0
+            ? `<div class="tf-telemetry-note">🛡 Outlier guard: ${outlierClamped} extreme traversal sample${outlierClamped === 1 ? "" : "s"} clamped &amp; blended with baseline terrain prior.</div>`
+            : confidence.level === "low" || confidence.level === "none"
+              ? `<div class="tf-telemetry-note">${escapeHtml(confidence.detail)}.</div>`
+              : ""
+        }
+
+        ${vehicleSplitHtml}
+        ${hotspotsHtml}
+
+        ${
+          liveReasons.length > 0
+            ? `<ul class="tf-reason-list">
+                ${liveReasons.map((r) => `<li>${escapeHtml(r)}</li>`).join("")}
+              </ul>`
+            : ""
+        }
+      </section>
+    `;
+
     const elevRangeText =
       norm.minElevM !== null && norm.maxElevM !== null
         ? `${Math.round(norm.minElevM)}–${Math.round(norm.maxElevM)} m`
@@ -658,7 +871,11 @@ export class TrackInspectorDrawer {
             <span class="tf-grade-swatch" style="background:${gradeColor}"></span>
             <div>
               <div class="tf-grade-name" style="color:${gradeColor}">${escapeHtml(norm.grade)}</div>
-              <div class="tf-grade-sub">Day-1 Deterministic Baseline</div>
+              <div class="tf-grade-sub">${
+                liveGrade && sampleCount > 0
+                  ? `Effective Grade · Baseline + ${sampleCount} Live Traversals`
+                  : "Day-1 Deterministic Terrain Baseline"
+              }</div>
             </div>
           </div>
           <div class="tf-grade-hero-right">
@@ -724,16 +941,15 @@ export class TrackInspectorDrawer {
 
         <section class="tf-insp-section">
           <div class="tf-insp-sec-head">
-            <h3>Explainable Grade Breakdown</h3>
+            <h3>Static Terrain Baseline</h3>
             <span class="mono tf-insp-meta">${escapeHtml(norm.breakdown?.formula_version ?? "baseline_v1")}</span>
           </div>
           <div class="tf-factor-list">${factorsHtml}</div>
           ${overridesHtml}
           ${reasonsHtml}
-          <div class="tf-telemetry-note">
-            Live crowdsourced traversals, vehicle-class split &amp; 72 h Open-Meteo rainfall context arrive in Slice 07.
-          </div>
         </section>
+
+        ${liveSectionHtml}
 
         <section class="tf-insp-section">
           <div class="tf-insp-sec-head">
@@ -891,6 +1107,22 @@ export class TrackInspectorDrawer {
       const bbox = detail.bbox;
       zoomBtn.addEventListener("click", () => this.callbacks.onZoomToTrack(bbox));
     }
+
+    this.root
+      .querySelectorAll<HTMLButtonElement>("[data-hotspot-idx]")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const idx = Number(btn.dataset.hotspotIdx);
+          const h = hotspots[idx];
+          if (h && typeof h.lat === "number" && typeof h.lon === "number") {
+            this.callbacks.onHotspotSelect?.(
+              h.lat,
+              h.lon,
+              `${norm.name} obstacle hotspot`
+            );
+          }
+        });
+      });
 
     this.root
       .querySelectorAll<HTMLButtonElement>("[data-poi-index]")

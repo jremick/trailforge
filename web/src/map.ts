@@ -22,12 +22,15 @@ import {
   userPinsToGeoJson,
 } from "./style";
 import { formatClosureTypeLabel } from "./closuresHelpers";
+import { formatHotspotReason } from "./gradingHelpers";
+import { buildRecordedTrackGeoJson } from "./offline/recorderEngine";
 import { formatReportTypeLabel, isGateWarningType } from "./reportsHelpers";
 import type {
   BasemapId,
   BBoxTuple,
   LayerVisibilityState,
   PoiItem,
+  RecordedBreadcrumbPoint,
   RegionPreset,
   TileManifestResponse,
   UserPinItem,
@@ -134,8 +137,11 @@ export class TrailForgeMap {
   private fallbackTracks: FeatureCollection | null = null;
   private fallbackPois: PoiItem[] | null = null;
   private closuresGeoJson: FeatureCollection | null = null;
+  private hotspotsGeoJson: FeatureCollection | null = null;
   private reportsGeoJson: FeatureCollection | null = null;
   private unmappedGeoJson: FeatureCollection | null = null;
+  private recordedPoints: RecordedBreadcrumbPoint[] = [];
+  private backtrackActive = false;
   private userPins: UserPinItem[] = [];
   private readonly loadedIconIds = new Set<string>();
   private readonly loadingIcons = new Set<string>();
@@ -198,6 +204,8 @@ export class TrailForgeMap {
 
       const hitLayers = [
         "tf-reports-points",
+        "tf-hotspots-points",
+        "tf-hotspots-line",
         "tf-closures-points",
         "tf-closures-line",
         "tf-steep-highlights",
@@ -316,6 +324,30 @@ export class TrailForgeMap {
     this.closuresGeoJson = fc;
     if (this.isLoaded) {
       this.applyClosuresData();
+    }
+  }
+
+  /**
+   * Populate Slice 07 rough/slow obstacle hotspots GeoJSON overlay.
+   */
+  setHotspotsGeoJson(fc: FeatureCollection | null): void {
+    this.hotspotsGeoJson = fc;
+    if (this.isLoaded) {
+      this.applyHotspotsData();
+    }
+  }
+
+  /**
+   * Populate Slice 09 live in-cab recorded breadcrumb trail & optional backtrack route.
+   */
+  setRecordedBreadcrumbs(
+    points: readonly RecordedBreadcrumbPoint[],
+    backtrackActive: boolean
+  ): void {
+    this.recordedPoints = [...points];
+    this.backtrackActive = backtrackActive;
+    if (this.isLoaded) {
+      this.applyRecordedTrackData();
     }
   }
 
@@ -503,8 +535,10 @@ export class TrailForgeMap {
       this.applyFallbackData();
     }
     this.applyClosuresData();
+    this.applyHotspotsData();
     this.applyReportsData();
     this.applyUnmappedData();
+    this.applyRecordedTrackData();
     this.applyUserPinsData();
   }
 
@@ -575,6 +609,8 @@ export class TrailForgeMap {
 
     const queryLayers = [
       "tf-reports-points",
+      "tf-hotspots-points",
+      "tf-hotspots-line",
       "tf-user-pins-dot",
       "tf-closures-points",
       "tf-closures-line",
@@ -624,6 +660,55 @@ export class TrailForgeMap {
              <span>· ✓${confirms}${escapeHtml(stale)}</span>
            </div>
            ${notes ? `<div class="tf-popup-note">${escapeHtml(notes)}</div>` : ""}`
+        )
+        .addTo(this.map);
+      return;
+    }
+
+    if (layerId === "tf-hotspots-line" || layerId === "tf-hotspots-points") {
+      this.map.getCanvas().style.cursor = "pointer";
+      const trackName = String(
+        props.track_name ?? props.name ?? "Obstacle Hotspot"
+      );
+      const avgSpeed =
+        typeof props.avg_speed_kmh === "number"
+          ? `${props.avg_speed_kmh.toFixed(1)} km/h avg`
+          : "";
+      const rough =
+        typeof props.median_roughness_rms === "number"
+          ? `${props.median_roughness_rms.toFixed(2)}g rough`
+          : "";
+      const wet =
+        typeof props.wet_risk_level === "string" && props.wet_risk_level !== "dry"
+          ? `Wet: ${props.wet_risk_level.replace(/_/g, " ")}`
+          : "";
+      let reasonsText = "";
+      if (Array.isArray(props.obstacle_reasons)) {
+        reasonsText = props.obstacle_reasons
+          .map((r) => formatHotspotReason(String(r)))
+          .join(", ");
+      } else if (typeof props.obstacle_reasons === "string") {
+        try {
+          const parsed = JSON.parse(props.obstacle_reasons) as unknown;
+          if (Array.isArray(parsed)) {
+            reasonsText = parsed
+              .map((r) => formatHotspotReason(String(r)))
+              .join(", ");
+          } else {
+            reasonsText = formatHotspotReason(props.obstacle_reasons);
+          }
+        } catch {
+          reasonsText = formatHotspotReason(props.obstacle_reasons);
+        }
+      }
+      this.hoverPopup
+        .setLngLat(e.lngLat)
+        .setHTML(
+          `<div class="tf-popup-title">⚡ Obstacle Hotspot · ${escapeHtml(trackName)}</div>
+           <div class="tf-popup-meta">
+             <span class="tf-popup-warn">${escapeHtml([avgSpeed, rough, wet].filter(Boolean).join(" · ") || "Slow / rough segment")}</span>
+           </div>
+           ${reasonsText ? `<div class="tf-popup-note">${escapeHtml(reasonsText)}</div>` : ""}`
         )
         .addTo(this.map);
       return;
@@ -727,6 +812,16 @@ export class TrailForgeMap {
       props.track_name ?? props.name ?? "4WD Track Segment"
     );
     const grade = String(props.grade ?? props.effective_grade ?? "Easy");
+    const liveGrade =
+      typeof props.live_grade === "string" && props.live_grade
+        ? props.live_grade
+        : null;
+    const wetRisk =
+      typeof props.wet_risk_level === "string" &&
+      props.wet_risk_level &&
+      props.wet_risk_level !== "dry"
+        ? props.wet_risk_level.replace(/_/g, " ")
+        : null;
     const slope =
       typeof props.max_slope_deg === "number"
         ? `${props.max_slope_deg.toFixed(1)}° max`
@@ -739,7 +834,9 @@ export class TrailForgeMap {
          <div class="tf-popup-meta">
            <span class="tf-popup-dot" style="background:${color}"></span>
            <span>${escapeHtml(grade)}</span>
+           ${liveGrade ? `<span>· Live: ${escapeHtml(liveGrade)}</span>` : ""}
            ${slope ? `<span>· ${escapeHtml(slope)}</span>` : ""}
+           ${wetRisk ? `<span class="tf-popup-warn">· ${escapeHtml(wetRisk)}</span>` : ""}
            <span class="tf-popup-hint">Click to inspect</span>
          </div>`
       )
@@ -763,6 +860,9 @@ export class TrailForgeMap {
     this.setLayerVis("tf-tracks-line", this.currentLayers.tracks);
     this.setLayerVis("tf-tracks-access-warn", this.currentLayers.tracks);
     this.setLayerVis("tf-steep-highlights", this.currentLayers.steepHighlights);
+    this.setLayerVis("tf-hotspots-casing", this.currentLayers.hotspots);
+    this.setLayerVis("tf-hotspots-line", this.currentLayers.hotspots);
+    this.setLayerVis("tf-hotspots-points", this.currentLayers.hotspots);
     this.setLayerVis("tf-closures-polygon-fill", this.currentLayers.closures);
     this.setLayerVis("tf-closures-polygon-outline", this.currentLayers.closures);
     this.setLayerVis("tf-closures-line-casing", this.currentLayers.closures);
@@ -844,6 +944,30 @@ export class TrailForgeMap {
       | maplibregl.GeoJSONSource
       | undefined;
     src?.setData(this.closuresGeoJson ?? EMPTY_FEATURE_COLLECTION);
+  }
+
+  private applyHotspotsData(): void {
+    const src = this.map.getSource("tf-hotspots") as
+      | maplibregl.GeoJSONSource
+      | undefined;
+    src?.setData(this.hotspotsGeoJson ?? EMPTY_FEATURE_COLLECTION);
+  }
+
+  private applyRecordedTrackData(): void {
+    const { liveLineFc, backtrackLineFc, headPointFc } =
+      buildRecordedTrackGeoJson(this.recordedPoints, this.backtrackActive);
+    const liveSrc = this.map.getSource("tf-recorded-track") as
+      | maplibregl.GeoJSONSource
+      | undefined;
+    const backSrc = this.map.getSource("tf-backtrack-route") as
+      | maplibregl.GeoJSONSource
+      | undefined;
+    const headSrc = this.map.getSource("tf-recorder-head") as
+      | maplibregl.GeoJSONSource
+      | undefined;
+    liveSrc?.setData(liveLineFc);
+    backSrc?.setData(backtrackLineFc);
+    headSrc?.setData(headPointFc);
   }
 
   private applyReportsData(): void {

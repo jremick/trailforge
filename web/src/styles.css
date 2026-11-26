@@ -2473,3 +2473,513 @@ button {
 .tf-osm-inline:hover {
   text-decoration: underline;
 }
+
+/* ---------- Slice 07 Live Crowdsourced Evidence & 72h Rainfall ---------- */
+
+.tf-live-section {
+  border-color: rgba(56, 189, 248, 0.35);
+}
+
+.tf-wet-banner {
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-strong);
+  border-left-width: 3px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  background: var(--bg-panel);
+}
+
+.tf-wet-banner.tone-dry {
+  border-left-color: var(--accent-emerald);
+  background: rgba(34, 197, 94, 0.06);
+}
+
+.tf-wet-banner.tone-damp {
+  border-left-color: var(--accent-cyan);
+  background: rgba(56, 189, 248, 0.08);
+}
+
+.tf-wet-banner.tone-wet {
+  border-left-color: var(--accent-amber);
+  background: rgba(245, 158, 11, 0.1);
+}
+
+.tf-wet-banner.tone-heavy_rain {
+  border-left-color: var(--accent-red);
+  background: rgba(239, 68, 68, 0.12);
+}
+
+.tf-wet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.tf-wet-title {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.tf-wet-totals {
+  font-size: 10.5px;
+  color: var(--text-secondary);
+}
+
+.tf-wet-warning {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--accent-amber-bright);
+  line-height: 1.38;
+}
+
+.tf-wet-banner.tone-heavy_rain .tf-wet-warning {
+  color: #fca5a5;
+}
+
+.tf-wet-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tf-wet-attrib {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-left: auto;
+}
+
+.tf-live-hero {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+}
+
+.tf-live-kicker {
+  display: block;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.tf-live-grade-val {
+  font-size: 15px;
+  font-weight: 800;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.tf-live-score {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.tf-conf-pill {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  white-space: nowrap;
+}
+
+.tf-conf-pill.tone-high {
+  background: var(--accent-emerald-soft);
+  border-color: rgba(34, 197, 94, 0.5);
+  color: var(--accent-emerald);
+}
+
+.tf-conf-pill.tone-medium {
+  background: rgba(56, 189, 248, 0.14);
+  border-color: rgba(56, 189, 248, 0.5);
+  color: var(--accent-cyan);
+}
+
+.tf-conf-pill.tone-low {
+  background: var(--accent-amber-soft);
+  border-color: rgba(245, 158, 11, 0.5);
+  color: var(--accent-amber-bright);
+}
+
+.tf-conf-pill.tone-none {
+  background: var(--bg-surface);
+  color: var(--text-muted);
+}
+
+.tf-live-stats-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.tf-stat-sm {
+  font-size: 11.5px;
+}
+
+.tf-split-block,
+.tf-hotspots-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tf-split-bar {
+  display: flex;
+  width: 100%;
+  height: 10px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--bg-base);
+  border: 1px solid var(--border-strong);
+}
+
+.tf-split-seg {
+  height: 100%;
+  min-width: 2px;
+}
+
+.tf-split-legend {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 8px;
+}
+
+.tf-split-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  color: var(--text-secondary);
+}
+
+.tf-split-chip.dimmed {
+  opacity: 0.48;
+}
+
+.tf-hotspot-card {
+  width: 100%;
+  text-align: left;
+  padding: 7px 9px;
+  border-radius: var(--radius-md);
+  background: rgba(255, 107, 0, 0.08);
+  border: 1px solid rgba(255, 107, 0, 0.42);
+  color: var(--text-primary);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  transition: background 0.14s ease, border-color 0.14s ease;
+}
+
+.tf-hotspot-card:hover:not(:disabled) {
+  background: rgba(255, 107, 0, 0.16);
+  border-color: #fb923c;
+}
+
+/* ---------- Slice 09 Offline Packs Drawer & In-Cab Breadcrumb Recorder ---------- */
+
+.tf-packs-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tf-shell.packs-open .tf-packs-panel {
+  transform: translateX(0);
+}
+
+.tf-shell.packs-open .tf-map-toolbar,
+.tf-shell.packs-open .tf-offline-banner,
+.tf-shell.packs-open .tf-coord-hud {
+  right: calc(var(--inspector-w) + 12px);
+}
+
+.tf-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tf-offline-pack-active-banner {
+  padding: 9px 10px;
+  border-radius: var(--radius-md);
+  background: rgba(56, 189, 248, 0.12);
+  border: 1px solid rgba(56, 189, 248, 0.45);
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11.5px;
+}
+
+.tf-sync-card {
+  padding: 9px 10px;
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tf-sync-err {
+  font-size: 10.5px;
+  color: #fca5a5;
+  margin-top: 2px;
+}
+
+.tf-pack-card {
+  padding: 10px;
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.tf-pack-card.active {
+  border-color: var(--accent-cyan);
+  background: rgba(56, 189, 248, 0.08);
+}
+
+.tf-pack-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.tf-pack-title {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.tf-pack-id {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+.tf-pack-badges {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.tf-pack-desc {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.35;
+}
+
+.tf-pack-metrics {
+  font-size: 10.5px;
+  color: var(--text-secondary);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.tf-pack-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tf-pack-progress-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10.5px;
+  color: var(--accent-cyan);
+}
+
+.tf-pack-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.tf-pack-actions a.tf-mini-btn {
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+}
+
+.tf-pack-attribs {
+  font-size: 9.5px;
+  color: var(--text-muted);
+  border-top: 1px solid var(--border-subtle);
+  padding-top: 5px;
+  line-height: 1.3;
+}
+
+/* Floating In-Cab Breadcrumb Recorder HUD */
+
+.tf-recorder-hud {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  z-index: 22;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100% - 24px);
+  pointer-events: none;
+}
+
+.tf-recorder-hud > * {
+  pointer-events: auto;
+}
+
+.tf-recorder-pill {
+  height: 34px;
+  padding: 0 14px;
+  border-radius: 999px;
+  background: rgba(14, 21, 27, 0.94);
+  border: 1px solid var(--border-strong);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 700;
+  box-shadow: var(--shadow-panel);
+  backdrop-filter: blur(10px);
+  transition: border-color 0.14s ease, background 0.14s ease;
+}
+
+.tf-recorder-pill:hover {
+  border-color: var(--accent-emerald);
+}
+
+.tf-recorder-pill.recording {
+  border-color: var(--accent-emerald);
+  background: rgba(16, 48, 30, 0.94);
+  color: #6ee7b7;
+}
+
+.tf-recorder-pill.backtrack {
+  border-color: #f472b6;
+  color: #fbcfe8;
+}
+
+.tf-recorder-card {
+  width: 360px;
+  max-width: calc(100vw - 28px);
+  padding: 11px 12px;
+  border-radius: var(--radius-lg);
+  background: rgba(14, 21, 27, 0.97);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-panel);
+  backdrop-filter: blur(14px);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tf-recorder-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.tf-recorder-title {
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent-emerald);
+}
+
+.tf-recorder-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  padding: 7px 8px;
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+}
+
+.tf-recorder-stats > div {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.tf-recorder-stats strong {
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.tf-recorder-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tf-recorder-controls > .tf-btn-primary,
+.tf-recorder-controls > .tf-btn-secondary {
+  flex: 1;
+}
+
+.tf-recorder-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.tf-backtrack-banner {
+  padding: 7px 9px;
+  border-radius: var(--radius-md);
+  background: rgba(244, 114, 182, 0.14);
+  border: 1px solid rgba(244, 114, 182, 0.55);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.tf-backtrack-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  color: #fbcfe8;
+}
+
+.tf-backtrack-meta {
+  font-size: 10.5px;
+  color: var(--text-secondary);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.tf-form-grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+@media (max-width: 768px) {
+  .tf-recorder-hud {
+    bottom: 46px;
+  }
+}

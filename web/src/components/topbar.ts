@@ -17,6 +17,7 @@ export interface TopBarCallbacks {
   onHealthClick: () => void;
   onFeedStatusClick: () => void;
   onRigAccountClick: () => void;
+  onOfflinePacksClick: () => void;
 }
 
 const SEARCH_DEBOUNCE_MS = 180;
@@ -34,6 +35,9 @@ export class TopBar {
   private readonly feedTextEl: HTMLElement;
   private readonly rigBtnEl: HTMLButtonElement;
   private readonly rigLabelEl: HTMLElement;
+  private readonly packsBtnEl: HTMLButtonElement;
+  private readonly packsDotEl: HTMLElement;
+  private readonly packsLabelEl: HTMLElement;
   private readonly healthPillEl: HTMLButtonElement;
   private readonly healthDotEl: HTMLElement;
   private readonly healthTextEl: HTMLElement;
@@ -123,6 +127,16 @@ export class TopBar {
 
         <button
           type="button"
+          class="tf-rig-btn tf-packs-btn"
+          data-role="packs-btn"
+          title="Download VIC/NSW Offline Regional Packs & Manage Sync Queue"
+        >
+          <span class="tf-status-dot online" data-role="packs-dot"></span>
+          <span data-role="packs-label">Offline Packs</span>
+        </button>
+
+        <button
+          type="button"
           class="tf-rig-btn"
           data-role="rig-btn"
           title="Vehicle Profiles, Rig Suitability, Saved Tracks & Account"
@@ -166,6 +180,9 @@ export class TopBar {
     this.feedTextEl = this.q("[data-role='feed-text']");
     this.rigBtnEl = this.q<HTMLButtonElement>("[data-role='rig-btn']");
     this.rigLabelEl = this.q("[data-role='rig-label']");
+    this.packsBtnEl = this.q<HTMLButtonElement>("[data-role='packs-btn']");
+    this.packsDotEl = this.q("[data-role='packs-dot']");
+    this.packsLabelEl = this.q("[data-role='packs-label']");
     this.healthPillEl = this.q<HTMLButtonElement>("[data-role='health-pill']");
     this.healthDotEl = this.q("[data-role='health-dot']");
     this.healthTextEl = this.q("[data-role='health-text']");
@@ -230,6 +247,10 @@ export class TopBar {
       callbacks.onRigAccountClick();
     });
 
+    this.packsBtnEl.addEventListener("click", () => {
+      callbacks.onOfflinePacksClick();
+    });
+
     this.healthPillEl.addEventListener("click", () => {
       callbacks.onHealthClick();
     });
@@ -247,6 +268,44 @@ export class TopBar {
 
   setSelectedPreset(presetId: string): void {
     this.presetSelectEl.value = presetId;
+  }
+
+  updateOfflineSummary(params: {
+    online: boolean;
+    downloadedCount: number;
+    activePackId: string | null;
+    pendingSyncCount: number;
+  }): void {
+    this.packsDotEl.className = "tf-status-dot";
+    if (!params.online) {
+      this.packsDotEl.classList.add("degraded");
+    } else if (params.activePackId) {
+      this.packsDotEl.classList.add("connecting");
+    } else {
+      this.packsDotEl.classList.add("online");
+    }
+
+    const parts: string[] = [];
+    if (!params.online) {
+      parts.push("Offline");
+    } else if (params.activePackId) {
+      parts.push(`Pack: ${params.activePackId}`);
+    } else if (params.downloadedCount > 0) {
+      parts.push(`Packs (${params.downloadedCount})`);
+    } else {
+      parts.push("Offline Packs");
+    }
+
+    if (params.pendingSyncCount > 0) {
+      parts.push(`↑${params.pendingSyncCount}`);
+    }
+
+    this.packsLabelEl.textContent = parts.join(" · ");
+    this.packsBtnEl.classList.toggle(
+      "signed-in",
+      Boolean(params.activePackId || params.downloadedCount > 0)
+    );
+    this.packsBtnEl.title = `${params.online ? "Online" : "Offline"} · ${params.downloadedCount} regional pack(s) cached · ${params.pendingSyncCount} pending sync item(s)`;
   }
 
   updateRigSummary(

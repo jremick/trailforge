@@ -2,6 +2,7 @@ import "./styles.css";
 import {
   activateVehicle,
   addFavorite,
+  buildRegionPack,
   createConditionReport,
   createPin,
   createVehicle,
@@ -14,6 +15,8 @@ import {
   fetchClosuresStatus,
   fetchFavorites,
   fetchHealth,
+  fetchHotspotsGeoJson,
+  fetchPacksCatalog,
   fetchPins,
   fetchPois,
   fetchReportsGeoJson,
@@ -39,6 +42,8 @@ import {
 } from "./components/accountPanel";
 import { renderAttributionFooter } from "./components/footer";
 import { TrackInspectorDrawer } from "./components/inspector";
+import { OfflinePacksPanel } from "./components/packsPanel";
+import { InCabRecorderHud } from "./components/recorder";
 import { Sidebar } from "./components/sidebar";
 import { TopBar } from "./components/topbar";
 import {
@@ -47,6 +52,30 @@ import {
   latLonToMgrs,
 } from "./coords";
 import { TrailForgeMap } from "./map";
+import {
+  buildClientGeoJson,
+  buildClientGpx,
+  slugifyExportFilename,
+  triggerClientFileDownload,
+} from "./offline/exporters";
+import {
+  deleteOfflinePin,
+  downloadRegionalPackToDevice,
+  getActiveOfflinePackId,
+  listDownloadedPacks,
+  listOfflinePins,
+  removeOfflinePack,
+  saveOfflinePin,
+  setActiveOfflinePackId,
+} from "./offline/packStore";
+import {
+  enqueueOfflinePin,
+  enqueueOfflineReport,
+  enqueueOfflineTrip,
+  flushSyncQueue,
+  generateClientUuid,
+  listSyncQueue,
+} from "./offline/syncQueue";
 import {
   BASEMAP_OPTIONS,
   DEFAULT_PRESET_ID,
@@ -60,9 +89,14 @@ import { buildTripExportUrl, getTripId } from "./tripsHelpers";
 import type {
   AuthUser,
   BasemapId,
+  DownloadedPackRecord,
   HealthState,
   LayerVisibilityState,
+  OfflinePackRegionItem,
+  RecordedBreadcrumbPoint,
   RegionPreset,
+  SyncQueueItem,
+  TrackInspectorDetail,
   TripItem,
   UnifiedSearchItem,
   UserFavoriteItem,
@@ -107,6 +141,8 @@ class TrailForgeApp {
   private readonly sidebar: Sidebar;
   private readonly inspector: TrackInspectorDrawer;
   private readonly accountPanel: RigAccountPanel;
+  private readonly packsPanel: OfflinePacksPanel;
+  private readonly recorderHud: InCabRecorderHud;
   private readonly map: TrailForgeMap;
   private readonly collapseBtnEl: HTMLButtonElement;
   private readonly cursorCoordsEl: HTMLElement;
@@ -134,10 +170,21 @@ class TrailForgeApp {
   private coordPickMode: "pin" | "report" | null = null;
   private pendingPinCoords: { lat: number; lon: number } | null = null;
   private pickedReportCoords: { lat: number; lon: number } | null = null;
+  private currentTrackDetail: TrackInspectorDetail | null = null;
+
+  // Slice 09 Offline Packs, Offline Pins & Sync Queue state
+  private isOnline = true;
+  private packRegions: OfflinePackRegionItem[] = [];
+  private downloadedPacks: DownloadedPackRecord[] = [];
+  private activeOfflinePackId: string | null = getActiveOfflinePackId();
+  private syncQueue: SyncQueueItem[] = [];
+  private offlinePins: UserPinItem[] = [];
+  private isSyncingQueue = false;
 
   constructor(root: HTMLElement) {
     const initiallyOnline =
       typeof navigator === "undefined" ? true : navigator.onLine;
+    this.isOnline = initiallyOnline;
     this.activeBasemap = initiallyOnline ? "opentopo" : "offline-topo";
 
     // Start collapsed on narrow mobile screens so the map is immediately prominent
@@ -163,6 +210,9 @@ class TrailForgeApp {
           <aside data-role="sidebar"></aside>
           <aside data-role="inspector"></aside>
           <aside data-role="account-panel"></aside>
+          <aside data-role="packs-panel"></aside>
+
+          <div data-role="recorder-hud"></div>
 
           <div class="tf-map-toolbar">
             <div class="tf-basemap-switcher" role="group" aria-label="Basemap switcher">
@@ -240,6 +290,13 @@ class TrailForgeApp {
             this.openAccountPanel("rig");
           }
         },
+        onOfflinePacksClick: () => {
+          if (this.packsPanel.isPanelOpen()) {
+            this.closePacksPanel();
+          } else {
+            this.openPacksPanel();
+          }
+        },
       }
     );
 
@@ -254,6 +311,9 @@ class TrailForgeApp {
           if (key === "unmapped" && enabled) {
             void this.refreshUnmappedCandidates();
           }
+          if (key === "hotspots" && enabled) {
+            void this.refreshHotspotsGeoJson();
+          }
         },
         onSnowLineElevationChange: (elevationM) => {
           this.layerState = { ...this.layerState, snowLineElevationM: elevationM };
@@ -265,6 +325,9 @@ class TrailForgeApp {
             this.activePreset,
             this.sidebarCollapsed ? 16 : 340
           );
+        },
+        onOpenOfflinePacks: () => {
+          this.openPacksPanel();
         },
       }
     );
@@ -285,6 +348,11 @@ class TrailForgeApp {
           this.updateCursorReadout(poi.lat, poi.lon);
           this.showToast(`Located ${poi.name}`, "info");
         },
+        onHotspotSelect: (lat, lon, label) => {
+          this.map.flyToCoordinate(lat, lon, label, 14.5);
+          this.updateCursorReadout(lat, lon);
+          this.showToast(`Zoomed to ${label}`, "info");
+        },
         onOpenRigPanel: () => {
           this.openAccountPanel("rig");
         },
@@ -303,11 +371,41 @@ class TrailForgeApp {
           this.shellEl.classList.remove("inspector-open");
         },
         onSubmitReport: async (input) => {
-          await createConditionReport(input);
-          this.pickedReportCoords = null;
-          this.showToast("Trail condition report published", "success");
-          await this.refreshReportsGeoJson();
-          this.refreshOpenInspectorForRig();
+          if (!this.isOnline) {
+            const { photo: _omit, ...offlinePayload } = input;
+            await enqueueOfflineReport(offlinePayload);
+            await this.refreshOfflineLocalState();
+            this.pickedReportCoords = null;
+            this.showToast(
+              "Offline: condition report queued & will sync automatically when online",
+              "info"
+            );
+            return;
+          }
+          try {
+            await createConditionReport(input);
+            this.pickedReportCoords = null;
+            this.showToast("Trail condition report published", "success");
+            await this.refreshReportsGeoJson();
+            this.refreshOpenInspectorForRig();
+          } catch (err) {
+            const status =
+              err && typeof err === "object" && "status" in err
+                ? Number((err as { status: unknown }).status)
+                : null;
+            if (status === null || status === 503) {
+              const { photo: _omit, ...offlinePayload } = input;
+              await enqueueOfflineReport(offlinePayload);
+              await this.refreshOfflineLocalState();
+              this.pickedReportCoords = null;
+              this.showToast(
+                "Network unavailable — condition report queued for automatic sync",
+                "info"
+              );
+              return;
+            }
+            throw err;
+          }
         },
         onVoteReport: async (reportId, vote) => {
           try {
@@ -467,16 +565,70 @@ class TrailForgeApp {
           }
         },
         onCreatePin: async (payload) => {
-          const created = await createPin(payload);
-          this.pins = [created, ...this.pins];
-          this.pendingPinCoords = null;
-          this.setCoordPickMode(null);
-          this.map.setUserPins(this.pins);
-          this.syncRigUiState();
-          this.showToast(
-            `Dropped pin "${created.name ?? created.title ?? payload.name}"`,
-            "success"
-          );
+          if (!this.isOnline || !this.user) {
+            const localPin: UserPinItem = {
+              id: `offline-pin-${generateClientUuid()}`,
+              name: payload.name,
+              category: payload.category,
+              notes: payload.notes ?? null,
+              lon: payload.lon,
+              lat: payload.lat,
+              track_id: payload.track_id ?? null,
+              created_at: new Date().toISOString(),
+            };
+            await saveOfflinePin(localPin);
+            if (this.user) {
+              await enqueueOfflinePin(payload, localPin.id);
+            }
+            this.pendingPinCoords = null;
+            this.setCoordPickMode(null);
+            await this.refreshOfflineLocalState();
+            this.showToast(
+              `Saved offline pin "${payload.name}"${this.user ? " (queued to sync)" : ""}`,
+              "success"
+            );
+            return;
+          }
+          try {
+            const created = await createPin(payload);
+            this.pins = [created, ...this.pins];
+            this.pendingPinCoords = null;
+            this.setCoordPickMode(null);
+            this.renderCombinedPinsOnMap();
+            this.syncRigUiState();
+            this.showToast(
+              `Dropped pin "${created.name ?? created.title ?? payload.name}"`,
+              "success"
+            );
+          } catch (err) {
+            const status =
+              err && typeof err === "object" && "status" in err
+                ? Number((err as { status: unknown }).status)
+                : null;
+            if (status === null || status === 503) {
+              const localPin: UserPinItem = {
+                id: `offline-pin-${generateClientUuid()}`,
+                name: payload.name,
+                category: payload.category,
+                notes: payload.notes ?? null,
+                lon: payload.lon,
+                lat: payload.lat,
+                track_id: payload.track_id ?? null,
+                created_at: new Date().toISOString(),
+              };
+              await saveOfflinePin(localPin);
+              await enqueueOfflinePin(payload, localPin.id);
+              this.pendingPinCoords = null;
+              this.setCoordPickMode(null);
+              await this.refreshOfflineLocalState();
+              this.showToast(
+                `Network unreachable — saved pin "${payload.name}" offline & queued to sync`,
+                "info"
+              );
+              return;
+            }
+            throw err;
+          }
         },
         onSelectPin: (pin) => {
           this.map.flyToCoordinate(
@@ -488,9 +640,15 @@ class TrailForgeApp {
           this.updateCursorReadout(pin.lat, pin.lon);
         },
         onDeletePin: async (id) => {
+          if (id.startsWith("offline-pin-")) {
+            await deleteOfflinePin(id);
+            await this.refreshOfflineLocalState();
+            this.showToast("Offline pin deleted", "info");
+            return;
+          }
           await deletePin(id);
           this.pins = this.pins.filter((p) => p.id !== id);
-          this.map.setUserPins(this.pins);
+          this.renderCombinedPinsOnMap();
           this.syncRigUiState();
           this.showToast("Personal pin deleted", "info");
         },
@@ -505,6 +663,165 @@ class TrailForgeApp {
             "success"
           );
         },
+      }
+    );
+
+    this.packsPanel = new OfflinePacksPanel(
+      this.q(root, "[data-role='packs-panel']"),
+      {
+        online: initiallyOnline,
+        loading: false,
+        regions: [],
+        downloaded: [],
+        activeOfflinePackId: this.activeOfflinePackId,
+        syncQueue: [],
+        syncing: false,
+        buildingRegionId: null,
+        downloadingRegionId: null,
+        downloadProgress: null,
+        error: null,
+      },
+      {
+        onClose: () => this.closePacksPanel(),
+        onRefresh: () => this.refreshPacksCatalog(),
+        onBuildPack: async (regionId) => {
+          this.packsPanel.updateState({
+            buildingRegionId: regionId,
+            error: null,
+          });
+          try {
+            await buildRegionPack(regionId);
+            await this.refreshPacksCatalog();
+            this.showToast(`Built offline regional pack: ${regionId}`, "success");
+          } catch (err) {
+            const msg =
+              err instanceof Error ? err.message : "Failed to build pack";
+            this.packsPanel.updateState({ error: msg });
+            this.showToast(msg, "error");
+          } finally {
+            this.packsPanel.updateState({ buildingRegionId: null });
+          }
+        },
+        onDownloadPack: async (region) => {
+          this.packsPanel.updateState({
+            downloadingRegionId: region.region_id,
+            downloadProgress: { stage: "Starting download…", pct: 5 },
+            error: null,
+          });
+          try {
+            const record = await downloadRegionalPackToDevice(region, (prog) => {
+              this.packsPanel.updateState({ downloadProgress: prog });
+            });
+            await this.refreshOfflineLocalState();
+            this.showToast(
+              `Downloaded ${record.name} for offline use (${record.track_count} tracks)`,
+              "success"
+            );
+          } catch (err) {
+            const msg =
+              err instanceof Error ? err.message : "Pack download failed";
+            this.packsPanel.updateState({ error: msg });
+            this.showToast(msg, "error");
+          } finally {
+            this.packsPanel.updateState({
+              downloadingRegionId: null,
+              downloadProgress: null,
+            });
+          }
+        },
+        onUseOfflinePack: async (regionId) => {
+          this.activeOfflinePackId = regionId;
+          setActiveOfflinePackId(regionId);
+          this.syncOfflinePanelState();
+          await this.loadVectorAndTerrainLayers();
+          await Promise.all([
+            this.refreshClosures(false),
+            this.refreshReportsGeoJson(),
+            this.refreshHotspotsGeoJson(),
+          ]);
+          if (regionId) {
+            this.setActiveBasemap("offline-topo");
+            const preset = getPresetById(regionId);
+            if (preset) {
+              this.map.flyToPreset(preset, this.sidebarCollapsed ? 16 : 340);
+            }
+            this.showToast(
+              `Switched to offline pack "${regionId}" (zero network tiles)`,
+              "success"
+            );
+          } else {
+            this.showToast("Returned to live TrailForge API tiles", "info");
+          }
+        },
+        onRemovePack: async (regionId) => {
+          await removeOfflinePack(regionId);
+          this.activeOfflinePackId = getActiveOfflinePackId();
+          await this.refreshOfflineLocalState();
+          this.showToast(`Removed cached pack ${regionId}`, "info");
+        },
+        onSyncNow: () => this.handleFlushSyncQueue(true),
+      }
+    );
+
+    this.recorderHud = new InCabRecorderHud(
+      this.q(root, "[data-role='recorder-hud']"),
+      {
+        onPointsChanged: (pts, backtrack) => {
+          this.map.setRecordedBreadcrumbs(pts, backtrack);
+        },
+        onCenterOnPoint: (lat, lon) => {
+          this.updateCursorReadout(lat, lon);
+        },
+        onSaveRecordedTrip: async (params) => {
+          const payload = {
+            name: params.name,
+            points: params.points.map((p) => ({
+              lon: p.lon,
+              lat: p.lat,
+              elev_m: p.elev_m ?? null,
+              timestamp: p.timestamp,
+              speed_mps: p.speed_mps ?? null,
+              roughness_rms: p.roughness_rms ?? null,
+            })),
+            vehicle_profile_id: params.vehicle_profile_id,
+            visibility: params.visibility,
+            privacy_trim_m: params.privacy_trim_m,
+            client_uuid: generateClientUuid(),
+          };
+
+          if (this.isOnline && this.user) {
+            try {
+              const uploaded = await uploadTripJson(payload);
+              this.latestUploadedTrip = uploaded;
+              await this.reloadTrips();
+              void this.refreshUnmappedCandidates();
+              void this.refreshHotspotsGeoJson();
+              this.showToast(
+                `Trip uploaded & matched (${uploaded.matched_segment_count ?? 0} segments)`,
+                "success"
+              );
+              return;
+            } catch (err) {
+              const status =
+                err && typeof err === "object" && "status" in err
+                  ? Number((err as { status: unknown }).status)
+                  : null;
+              if (status !== null && status !== 503 && status !== 0) {
+                throw err;
+              }
+            }
+          }
+
+          await enqueueOfflineTrip(payload);
+          await this.refreshOfflineLocalState();
+          this.showToast(
+            this.user
+              ? "Offline: recorded trip queued & will sync automatically when back online"
+              : "Trip queued locally — sign in & sync when online (or export GPX anytime)",
+            "info"
+          );
+        },
+        onToast: (msg, kind) => this.showToast(msg, kind),
       }
     );
 
@@ -583,10 +900,128 @@ class TrailForgeApp {
       trips: this.trips,
       latestUploadedTrip: this.latestUploadedTrip,
       favorites: this.favorites,
-      pins: this.pins,
+      pins: [...this.offlinePins, ...this.pins],
       pinDropActive: this.coordPickMode === "pin",
       pendingPinCoords: this.pendingPinCoords,
     };
+  }
+
+  private renderCombinedPinsOnMap(): void {
+    this.map.setUserPins([...this.offlinePins, ...this.pins]);
+  }
+
+  private syncOfflinePanelState(): void {
+    this.packsPanel.updateState({
+      online: this.isOnline,
+      regions: this.packRegions,
+      downloaded: this.downloadedPacks,
+      activeOfflinePackId: this.activeOfflinePackId,
+      syncQueue: this.syncQueue,
+      syncing: this.isSyncingQueue,
+    });
+    this.topbar.updateOfflineSummary({
+      online: this.isOnline,
+      downloadedCount: this.downloadedPacks.length,
+      activePackId: this.activeOfflinePackId,
+      pendingSyncCount: this.syncQueue.length,
+    });
+    this.recorderHud.updateContext({
+      vehicles: this.vehicles,
+      isOnline: this.isOnline,
+      isAuthenticated: Boolean(this.user),
+    });
+  }
+
+  private async refreshOfflineLocalState(): Promise<void> {
+    const [downloaded, queue, offPins] = await Promise.all([
+      listDownloadedPacks().catch(() => []),
+      listSyncQueue().catch(() => []),
+      listOfflinePins().catch(() => []),
+    ]);
+    this.downloadedPacks = downloaded;
+    this.syncQueue = queue;
+    this.offlinePins = offPins;
+    this.renderCombinedPinsOnMap();
+    this.syncOfflinePanelState();
+    this.syncRigUiState();
+  }
+
+  private async refreshPacksCatalog(): Promise<void> {
+    this.packsPanel.updateState({ loading: true, error: null });
+    try {
+      const catalog = await fetchPacksCatalog();
+      this.packRegions = catalog.regions ?? [];
+    } catch {
+      // Keep cached fallback regions cleanly when offline
+    } finally {
+      this.packsPanel.updateState({ loading: false });
+      await this.refreshOfflineLocalState();
+    }
+  }
+
+  private async handleFlushSyncQueue(announce: boolean): Promise<void> {
+    if (this.isSyncingQueue || !this.isOnline) return;
+    if (this.syncQueue.length === 0) return;
+
+    this.isSyncingQueue = true;
+    this.syncOfflinePanelState();
+    try {
+      const result = await flushSyncQueue({
+        syncTrip: async (payload) => {
+          await uploadTripJson(payload);
+        },
+        syncReport: async (payload) => {
+          await createConditionReport(payload);
+        },
+        syncPin: async (payload, localPinId) => {
+          const created = await createPin(payload);
+          this.pins = [created, ...this.pins];
+          if (localPinId) {
+            await deleteOfflinePin(localPinId);
+          }
+        },
+      });
+      await this.refreshOfflineLocalState();
+      if (result.synced > 0) {
+        void this.reloadTrips().catch(() => undefined);
+        void this.refreshReportsGeoJson();
+        void this.refreshHotspotsGeoJson();
+        this.showToast(
+          `Synced ${result.synced} queued offline item${result.synced === 1 ? "" : "s"}`,
+          "success"
+        );
+      } else if (result.authRequired && announce) {
+        this.showToast(
+          "Sign in to complete syncing queued trips/reports",
+          "info"
+        );
+        this.openAccountPanel("account");
+      } else if (result.failed > 0 && announce) {
+        this.showToast(
+          `${result.failed} queued item(s) could not sync yet`,
+          "error"
+        );
+      }
+    } finally {
+      this.isSyncingQueue = false;
+      this.syncOfflinePanelState();
+    }
+  }
+
+  private openPacksPanel(): void {
+    if (this.inspector.openState()) {
+      this.inspector.close();
+      this.shellEl.classList.remove("inspector-open");
+    }
+    this.closeAccountPanel();
+    this.packsPanel.open();
+    this.shellEl.classList.add("packs-open");
+    void this.refreshPacksCatalog();
+  }
+
+  private closePacksPanel(): void {
+    this.packsPanel.close();
+    this.shellEl.classList.remove("packs-open");
   }
 
   private syncRigUiState(): void {
@@ -595,9 +1030,14 @@ class TrailForgeApp {
       rig.vehicleClass,
       rig.vehicleName,
       this.user?.display_name ?? null,
-      this.favorites.length + this.pins.length
+      this.favorites.length + this.pins.length + this.offlinePins.length
     );
     this.accountPanel.updateState(this.buildAccountPanelState());
+    this.recorderHud.updateContext({
+      vehicles: this.vehicles,
+      isOnline: this.isOnline,
+      isAuthenticated: Boolean(this.user),
+    });
 
     const openTrackId = this.inspector.getCurrentTrackId();
     this.inspector.updateContext({
@@ -617,6 +1057,7 @@ class TrailForgeApp {
       this.inspector.close();
       this.shellEl.classList.remove("inspector-open");
     }
+    this.closePacksPanel();
     this.accountPanel.updateState(this.buildAccountPanelState());
     this.accountPanel.open(tab);
     this.shellEl.classList.add("account-open");
@@ -695,6 +1136,8 @@ class TrailForgeApp {
           if (this.inspector.openState()) {
             this.shellEl.classList.add("inspector-open");
           }
+        } else if (this.packsPanel.isPanelOpen()) {
+          this.closePacksPanel();
         } else if (this.accountPanel.isPanelOpen()) {
           this.closeAccountPanel();
         } else if (this.inspector.openState()) {
@@ -706,17 +1149,23 @@ class TrailForgeApp {
     });
 
     subscribeNetworkStatus((online) => {
+      this.isOnline = online;
       this.sidebar.updateNetworkStatus(online);
+      this.syncOfflinePanelState();
       if (!online) {
         this.setActiveBasemap("offline-topo");
         this.offlineBannerEl.textContent =
-          "Offline mode — displaying corridor PMTiles & built-in topo grid";
+          this.downloadedPacks.length > 0
+            ? "Offline mode — serving downloaded regional pack PMTiles & snapshots"
+            : "Offline mode — displaying corridor PMTiles & built-in topo grid";
         this.offlineBannerEl.classList.remove("hidden");
       } else {
         this.offlineBannerEl.classList.add("hidden");
         void this.refreshHealth(false);
         void this.refreshClosures(false);
         void this.refreshReportsGeoJson();
+        void this.refreshHotspotsGeoJson();
+        void this.handleFlushSyncQueue(false);
       }
     });
   }
@@ -731,11 +1180,14 @@ class TrailForgeApp {
     this.topbar.updateHealth(initialHealth);
     this.sidebar.updateHealth(initialHealth);
 
+    void this.refreshOfflineLocalState();
     void this.refreshHealth(false);
     void this.loadVectorAndTerrainLayers();
     void this.refreshClosures(false);
+    void this.refreshHotspotsGeoJson();
     void this.refreshReportsGeoJson();
     void this.refreshUnmappedCandidates();
+    void this.refreshPacksCatalog();
     void this.hydrateAuthSession();
 
     window.setInterval(
@@ -779,9 +1231,12 @@ class TrailForgeApp {
       this.trips = trips;
       this.favorites = favorites;
       this.pins = pins;
-      this.map.setUserPins(pins);
+      this.renderCombinedPinsOnMap();
     } finally {
       this.syncRigUiState();
+      if (this.isOnline && this.syncQueue.length > 0) {
+        void this.handleFlushSyncQueue(false);
+      }
     }
   }
 
@@ -793,6 +1248,15 @@ class TrailForgeApp {
   private async reloadTrips(): Promise<void> {
     this.trips = await fetchTrips();
     this.syncRigUiState();
+  }
+
+  private async refreshHotspotsGeoJson(): Promise<void> {
+    try {
+      const fc = await fetchHotspotsGeoJson();
+      this.map.setHotspotsGeoJson(fc);
+    } catch {
+      // Obstacle hotspots layer stays empty gracefully offline
+    }
   }
 
   private async refreshReportsGeoJson(): Promise<void> {
@@ -901,6 +1365,7 @@ class TrailForgeApp {
     this.inspectorAbort = controller;
 
     this.closeAccountPanel();
+    this.closePacksPanel();
     this.shellEl.classList.add("inspector-open");
     this.map.setSelectedTrackId(trackId);
     this.inspector.showLoading(trackLabel);
@@ -915,6 +1380,7 @@ class TrailForgeApp {
       });
       if (controller.signal.aborted) return;
 
+      this.currentTrackDetail = detail;
       this.inspector.showTrack(detail, {
         snowLineElevationM: this.layerState.snowLineElevationM,
         activeVehicleClass: rig.vehicleClass,
@@ -963,17 +1429,71 @@ class TrailForgeApp {
     trackId: string,
     format: "gpx" | "geojson"
   ): Promise<void> {
-    try {
-      const url = buildTrackExportUrl(trackId, format);
-      await downloadAuthenticatedExport(
-        url,
-        `${trackId}.${format === "gpx" ? "gpx" : "geojson"}`
-      );
-      this.showToast(`Downloaded track ${format.toUpperCase()}`, "success");
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "Export failed";
-      this.showToast(msg, "error");
+    if (this.isOnline) {
+      try {
+        const url = buildTrackExportUrl(trackId, format);
+        await downloadAuthenticatedExport(
+          url,
+          `${trackId}.${format === "gpx" ? "gpx" : "geojson"}`
+        );
+        this.showToast(`Downloaded track ${format.toUpperCase()}`, "success");
+        return;
+      } catch {
+        // Fall through to 100% client-side offline export if track detail is loaded
+      }
     }
+
+    const detail = this.currentTrackDetail;
+    if (detail && detail.track_id === trackId && detail.segments?.length) {
+      const pts: RecordedBreadcrumbPoint[] = [];
+      for (const seg of detail.segments) {
+        const geom = (
+          seg as unknown as {
+            geometry?: { type?: string; coordinates?: number[][] };
+          }
+        ).geometry;
+        if (geom?.type === "LineString" && Array.isArray(geom.coordinates)) {
+          for (const c of geom.coordinates) {
+            if (typeof c[0] === "number" && typeof c[1] === "number") {
+              pts.push({
+                lon: c[0],
+                lat: c[1],
+                elev_m: typeof c[2] === "number" ? c[2] : (seg.elev_min_m ?? null),
+                timestamp: new Date().toISOString(),
+              });
+            }
+          }
+        }
+      }
+      if (pts.length >= 2) {
+        if (format === "gpx") {
+          const xml = buildClientGpx(detail.name, pts, {
+            description: `TrailForge offline track export (${detail.state})`,
+          });
+          triggerClientFileDownload(
+            xml,
+            slugifyExportFilename(detail.name, "gpx"),
+            "application/gpx+xml"
+          );
+        } else {
+          const fc = buildClientGeoJson(detail.name, pts, {
+            description: `TrailForge offline track export (${detail.state})`,
+          });
+          triggerClientFileDownload(
+            JSON.stringify(fc, null, 2),
+            slugifyExportFilename(detail.name, "geojson"),
+            "application/geo+json"
+          );
+        }
+        this.showToast(
+          `Exported offline ${format.toUpperCase()} (GridForge-compatible)`,
+          "success"
+        );
+        return;
+      }
+    }
+
+    this.showToast("Export failed — track geometry unavailable offline", "error");
   }
 
   private handleSearchSelect(item: UnifiedSearchItem): void {

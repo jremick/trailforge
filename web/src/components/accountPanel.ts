@@ -545,57 +545,17 @@ export class RigAccountPanel {
     const { user, favorites, pins, pinDropActive, pendingPinCoords } =
       this.state;
 
-    if (!user) {
-      return `
-        <section class="tf-insp-section">
-          <div class="tf-insp-sec-head">
-            <h3>My Favorites &amp; Personal Pins</h3>
-            <span class="mono tf-insp-meta">Sign In Required</span>
-          </div>
-          <p class="tf-inspector-muted">Sign in to save favorite VIC/NSW tracks, drop personal camp/hazard/recovery pins on the map, and export your full trip pack as GPX or GeoJSON.</p>
-          <p class="tf-inspector-muted">Note: Individual track GPX/GeoJSON exports work directly in the Track Inspector without an account.</p>
-          <button type="button" class="tf-btn-primary" data-jump-tab="account">Sign In / Create Account</button>
-        </section>
-      `;
-    }
-
-    const favsHtml =
-      favorites.length > 0
-        ? favorites
-            .map((fav) => {
-              const title = fav.track_name ?? fav.name ?? fav.track_id;
-              const grade = fav.grade ?? "";
-              const dist =
-                typeof fav.total_length_m === "number"
-                  ? `${(fav.total_length_m / 1000).toFixed(1)} km`
-                  : "";
-              return `
-                <div class="tf-saved-row">
-                  <button type="button" class="tf-saved-main" data-open-fav="${escapeHtml(fav.track_id)}">
-                    <span class="tf-saved-title">${escapeHtml(title)}</span>
-                    <span class="tf-saved-sub">
-                      ${grade ? `<span style="color:${getGradeColor(grade)}">${escapeHtml(grade)}</span>` : ""}
-                      ${fav.state ? ` · ${escapeHtml(fav.state)}` : ""}
-                      ${dist ? ` · ${escapeHtml(dist)}` : ""}
-                    </span>
-                  </button>
-                  <button type="button" class="tf-mini-btn danger" data-remove-fav="${escapeHtml(fav.track_id)}" title="Remove favorite">×</button>
-                </div>
-              `;
-            })
-            .join("")
-        : `<p class="tf-inspector-muted">No favorite tracks saved yet. Click ☆ Save inside any Track Inspector.</p>`;
-
     const pinsHtml =
       pins.length > 0
         ? pins
             .map((pin, idx) => {
               const name = pin.name ?? pin.title ?? "Pin";
               const color = getPinCategoryColor(pin.category);
+              const isLocal = pin.id.startsWith("offline-pin-");
               return `
                 <div class="tf-saved-row">
                   <button type="button" class="tf-saved-main" data-goto-pin="${idx}">
-                    <span class="tf-saved-title"><span class="tf-rig-dot" style="background:${color}"></span> ${escapeHtml(name)}</span>
+                    <span class="tf-saved-title"><span class="tf-rig-dot" style="background:${color}"></span> ${escapeHtml(name)}${isLocal ? ` <span class="tf-mini-tag amber">LOCAL</span>` : ""}</span>
                     <span class="tf-saved-sub mono">${escapeHtml(pin.category)} · ${pin.lat.toFixed(4)}, ${pin.lon.toFixed(4)}</span>
                     ${pin.notes ? `<span class="tf-saved-note">${escapeHtml(pin.notes)}</span>` : ""}
                   </button>
@@ -606,22 +566,11 @@ export class RigAccountPanel {
             .join("")
         : `<p class="tf-inspector-muted">No personal pins dropped yet.</p>`;
 
-    return `
-      <section class="tf-insp-section">
-        <div class="tf-insp-sec-head">
-          <h3>Export Saved Pack</h3>
-          <span class="mono tf-insp-meta">GridForge Ready</span>
-        </div>
-        <div class="tf-btn-row">
-          <button type="button" class="tf-btn-secondary" data-export-user="gpx">⬇ Export All GPX</button>
-          <button type="button" class="tf-btn-secondary" data-export-user="geojson">⬇ Export All GeoJSON</button>
-        </div>
-      </section>
-
+    const pinsSectionHtml = `
       <section class="tf-insp-section">
         <div class="tf-insp-sec-head">
           <h3>Personal Map Pins</h3>
-          <span class="mono tf-insp-meta">${pins.length}</span>
+          <span class="mono tf-insp-meta">${pins.length}${user ? "" : " (Offline Local)"}</span>
         </div>
 
         <button type="button" class="tf-btn-secondary ${pinDropActive ? "active-drop" : ""}" data-role="toggle-pin-drop">
@@ -661,6 +610,64 @@ export class RigAccountPanel {
 
         <div class="tf-card-stack">${pinsHtml}</div>
       </section>
+    `;
+
+    if (!user) {
+      return `
+        ${pinsSectionHtml}
+
+        <section class="tf-insp-section">
+          <div class="tf-insp-sec-head">
+            <h3>Favorites &amp; Cloud Sync</h3>
+            <span class="mono tf-insp-meta">Optional Account</span>
+          </div>
+          <p class="tf-inspector-muted">Personal pins above work 100% offline in browser storage. Sign in to save favorite VIC/NSW tracks and sync pins across devices.</p>
+          <p class="tf-inspector-muted">Individual track GPX/GeoJSON exports work directly in the Track Inspector and In-Cab Recorder without an account.</p>
+          <button type="button" class="tf-btn-primary" data-jump-tab="account">Sign In / Create Account</button>
+        </section>
+      `;
+    }
+
+    const favsHtml =
+      favorites.length > 0
+        ? favorites
+            .map((fav) => {
+              const title = fav.track_name ?? fav.name ?? fav.track_id;
+              const grade = fav.grade ?? "";
+              const dist =
+                typeof fav.total_length_m === "number"
+                  ? `${(fav.total_length_m / 1000).toFixed(1)} km`
+                  : "";
+              return `
+                <div class="tf-saved-row">
+                  <button type="button" class="tf-saved-main" data-open-fav="${escapeHtml(fav.track_id)}">
+                    <span class="tf-saved-title">${escapeHtml(title)}</span>
+                    <span class="tf-saved-sub">
+                      ${grade ? `<span style="color:${getGradeColor(grade)}">${escapeHtml(grade)}</span>` : ""}
+                      ${fav.state ? ` · ${escapeHtml(fav.state)}` : ""}
+                      ${dist ? ` · ${escapeHtml(dist)}` : ""}
+                    </span>
+                  </button>
+                  <button type="button" class="tf-mini-btn danger" data-remove-fav="${escapeHtml(fav.track_id)}" title="Remove favorite">×</button>
+                </div>
+              `;
+            })
+            .join("")
+        : `<p class="tf-inspector-muted">No favorite tracks saved yet. Click ☆ Save inside any Track Inspector.</p>`;
+
+    return `
+      <section class="tf-insp-section">
+        <div class="tf-insp-sec-head">
+          <h3>Export Saved Pack</h3>
+          <span class="mono tf-insp-meta">GridForge Ready</span>
+        </div>
+        <div class="tf-btn-row">
+          <button type="button" class="tf-btn-secondary" data-export-user="gpx">⬇ Export All GPX</button>
+          <button type="button" class="tf-btn-secondary" data-export-user="geojson">⬇ Export All GeoJSON</button>
+        </div>
+      </section>
+
+      ${pinsSectionHtml}
 
       <section class="tf-insp-section">
         <div class="tf-insp-sec-head">

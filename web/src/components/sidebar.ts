@@ -23,6 +23,7 @@ export interface SidebarCallbacks {
   onLayerToggle: (key: LayerKey, enabled: boolean) => void;
   onSnowLineElevationChange: (elevationM: number) => void;
   onResetRegion: () => void;
+  onOpenOfflinePacks?: () => void;
 }
 
 interface LayerToggleDef {
@@ -41,6 +42,11 @@ const LAYER_TOGGLES: readonly LayerToggleDef[] = [
     key: "steepHighlights",
     label: "Steep Climbs (≥14°)",
     hint: "Highlighted sustained & max gradient hazard pitches",
+  },
+  {
+    key: "hotspots",
+    label: "Obstacle Hotspots",
+    hint: "Crowdsourced slow-crawl & high-roughness terrain pinch points",
   },
   {
     key: "closures",
@@ -235,9 +241,14 @@ export class Sidebar {
               <span class="tf-kv-key">Offline Pack</span>
               <span class="tf-kv-val mono" data-role="region-pack"></span>
             </div>
-            <button type="button" class="tf-btn-secondary" data-role="reset-region">
-              ⌖ Recenter on Corridor
-            </button>
+            <div class="tf-btn-row">
+              <button type="button" class="tf-btn-secondary" data-role="reset-region">
+                ⌖ Recenter
+              </button>
+              <button type="button" class="tf-btn-secondary" data-role="open-packs">
+                ⬇ Offline Packs
+              </button>
+            </div>
           </div>
         </details>
 
@@ -315,6 +326,12 @@ export class Sidebar {
     this.q("[data-role='reset-region']").addEventListener("click", () => {
       callbacks.onResetRegion();
     });
+
+    this.root
+      .querySelector("[data-role='open-packs']")
+      ?.addEventListener("click", () => {
+        callbacks.onOpenOfflinePacks?.();
+      });
   }
 
   openFeedsSection(): void {
@@ -403,7 +420,7 @@ export class Sidebar {
     this.regionDescEl.textContent = preset.description;
     this.regionBboxEl.textContent = `${w.toFixed(2)}E..${e.toFixed(2)}E, ${s.toFixed(2)}..${n.toFixed(2)}`;
     this.regionPackEl.textContent = preset.estimatedPackHint
-      ? `${preset.estimatedPackHint} (Slice 09)`
+      ? `${preset.estimatedPackHint} (Offline Pack)`
       : "Corridor view";
   }
 

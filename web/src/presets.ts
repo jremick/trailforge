@@ -237,6 +237,7 @@ export function createInitialLayerState(): LayerVisibilityState {
   return {
     tracks: true,
     steepHighlights: true,
+    hotspots: true,
     closures: true,
     reports: true,
     unmapped: false,

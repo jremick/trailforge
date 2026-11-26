@@ -9,6 +9,7 @@ export type CanonicalGrade = "Easy" | "Medium" | "Hard" | "Extreme";
 export type LayerKey =
   | "tracks"
   | "steepHighlights"
+  | "hotspots"
   | "closures"
   | "reports"
   | "unmapped"
@@ -20,6 +21,7 @@ export type LayerKey =
 export interface LayerVisibilityState {
   tracks: boolean;
   steepHighlights: boolean;
+  hotspots: boolean;
   closures: boolean;
   reports: boolean;
   unmapped: boolean;
@@ -324,6 +326,7 @@ export interface TripUploadJsonPayload {
   vehicle_profile_id?: string | null;
   visibility: TripVisibility;
   privacy_trim_m?: number;
+  client_uuid?: string | null;
 }
 
 export interface TripMatchedSegment {
@@ -407,8 +410,206 @@ export interface ConditionReportCreateInput {
   track_id?: string | null;
   segment_id?: string | null;
   vehicle_class?: string | null;
+  client_uuid?: string | null;
   photo?: File | null;
 }
+
+/* ---------- Slice 07 Explainable Crowdsourced Grading & Rainfall ---------- */
+
+export type ConfidenceLevel = "none" | "low" | "medium" | "high";
+
+export type WetRiskLevel = "dry" | "damp" | "wet" | "heavy_rain";
+
+export interface VehicleClassSplitEntry {
+  count: number;
+  pct: number;
+}
+
+export type VehicleClassSplit = Partial<
+  Record<VehicleCapabilityClass | string, VehicleClassSplitEntry | number>
+>;
+
+export interface LiveGradeBreakdown {
+  version?: string;
+  sample_count?: number;
+  effective_sample_weight?: number;
+  confidence_level?: ConfidenceLevel | string;
+  last_driven_at?: string | null;
+  avg_speed_kmh?: number | null;
+  median_speed_kmh?: number | null;
+  avg_duration_s?: number | null;
+  median_roughness_rms?: number | null;
+  vehicle_class_split?: VehicleClassSplit | null;
+  vehicle_normalized_delta?: number | null;
+  outlier_clamped_count?: number;
+  is_obstacle_hotspot?: boolean;
+  obstacle_reasons?: string[];
+  live_score?: number | null;
+  live_grade?: string | null;
+  reasons?: string[];
+}
+
+export interface RainfallContext {
+  source?: string;
+  attribution?: string;
+  fetched_at?: string | null;
+  rain_24h_mm?: number | null;
+  rain_72h_mm?: number | null;
+  wet_risk_level: WetRiskLevel | string;
+  wet_score_adjustment?: number | null;
+  warning?: string | null;
+  is_stale?: boolean;
+}
+
+export interface ObstacleHotspotItem {
+  segment_id: string;
+  dist_m?: number | null;
+  lon?: number | null;
+  lat?: number | null;
+  avg_speed_kmh?: number | null;
+  roughness_rms?: number | null;
+  median_roughness_rms?: number | null;
+  reasons?: string[];
+  obstacle_reasons?: string[];
+}
+
+export interface RainfallSummaryResponse {
+  source?: string;
+  attribution?: string;
+  snapshots?: Array<{
+    spatial_cell_key?: string;
+    rain_24h_mm?: number;
+    rain_72h_mm?: number;
+    wet_risk_level?: string;
+    fetched_at?: string;
+    is_stale?: boolean;
+  }>;
+  latest?: RainfallContext | null;
+}
+
+/* ---------- Slice 09 Offline Regional Packs, Sync Queue & In-Cab Recorder ---------- */
+
+export type PackBuildStatus = "ready" | "not_built" | "building" | "failed" | string;
+
+export interface OfflinePackRegionItem {
+  region_id: string;
+  name: string;
+  description: string;
+  bbox: BBoxTuple;
+  status: PackBuildStatus;
+  version?: string | null;
+  generated_at?: string | null;
+  total_size_bytes?: number;
+  track_count?: number;
+  segment_count?: number;
+  poi_count?: number;
+  manifest_url?: string | null;
+  snapshot_url?: string | null;
+  bundle_url?: string | null;
+  vector_pmtiles_url?: string | null;
+  terrain_pmtiles_url?: string | null;
+  attributions?: string[];
+}
+
+export interface OfflinePacksCatalogResponse {
+  regions: OfflinePackRegionItem[];
+}
+
+export interface OfflinePackFileEntry {
+  filename?: string;
+  path?: string;
+  url?: string;
+  size_bytes?: number;
+  sha256?: string;
+}
+
+export interface OfflinePackManifest {
+  region_id: string;
+  name?: string;
+  version?: string;
+  generated_at?: string;
+  bbox?: BBoxTuple;
+  bounds?: BBoxTuple;
+  total_size_bytes?: number;
+  counts?: Record<string, number>;
+  attributions?: string[];
+  files?: Record<string, OfflinePackFileEntry> | OfflinePackFileEntry[];
+  vector_pmtiles_url?: string | null;
+  terrain_pmtiles_url?: string | null;
+  snapshot_url?: string | null;
+  bundle_url?: string | null;
+  snowline_bands_m?: number[];
+}
+
+export interface OfflinePackSnapshot {
+  region_id: string;
+  version?: string;
+  generated_at?: string;
+  bounds?: BBoxTuple;
+  attributions?: string[];
+  tracks?: TrackInspectorDetail[];
+  pois?: PoiItem[];
+  capad_parks?: ParkTenureItem[];
+  closures?: unknown;
+  reports?: unknown;
+  hotspots?: unknown;
+}
+
+export interface DownloadedPackRecord {
+  region_id: string;
+  name: string;
+  version: string;
+  downloaded_at: string;
+  total_size_bytes: number;
+  track_count: number;
+  segment_count: number;
+  poi_count: number;
+  bbox: BBoxTuple;
+  vector_pmtiles_url: string | null;
+  terrain_pmtiles_url: string | null;
+  has_vector_pmtiles: boolean;
+  has_terrain_pmtiles: boolean;
+  snowline_bands_m: number[];
+  attributions: string[];
+  sha256_verified: boolean;
+}
+
+export interface RecordedBreadcrumbPoint {
+  lon: number;
+  lat: number;
+  elev_m?: number | null;
+  timestamp: string;
+  accuracy_m?: number | null;
+  speed_mps?: number | null;
+  roughness_rms?: number | null;
+}
+
+export type SyncQueueItem =
+  | {
+      id: string;
+      kind: "trip";
+      created_at: string;
+      label: string;
+      payload: TripUploadJsonPayload;
+      last_error?: string | null;
+    }
+  | {
+      id: string;
+      kind: "report";
+      created_at: string;
+      label: string;
+      payload: Omit<ConditionReportCreateInput, "photo">;
+      last_error?: string | null;
+    }
+  | {
+      id: string;
+      kind: "pin";
+      created_at: string;
+      label: string;
+      payload: UserPinInput;
+      local_pin_id?: string | null;
+      last_error?: string | null;
+    };
 
 /* ---------- Slice 03 Track Inspector & Search Types ---------- */
 
@@ -567,6 +768,17 @@ export interface TrackInspectorDetail {
   suitability?: TrackSuitability | null;
   bbox?: BBoxTuple | null;
   baseline_breakdown?: BaselineBreakdown | null;
+  live_grade?: string | null;
+  live_score?: number | null;
+  confidence_level?: ConfidenceLevel | string | null;
+  sample_count?: number;
+  last_driven_at?: string | null;
+  avg_speed_kmh?: number | null;
+  est_duration_min?: number | null;
+  vehicle_class_split?: VehicleClassSplit | null;
+  live_breakdown?: LiveGradeBreakdown | null;
+  rainfall_context?: RainfallContext | null;
+  obstacle_hotspots?: ObstacleHotspotItem[];
   elevation_profile?: ElevationProfilePoint[];
   waterway_crossings?: WaterwayCrossingItem[];
   nearby_pois?: PoiItem[];

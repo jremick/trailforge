@@ -147,6 +147,21 @@ describe("MapLibre 5 PMTiles & offline fallback style builder", () => {
     expect(byId.get("tf-user-pins-dot")).toMatchObject({
       source: "tf-user-pins",
     });
+    // Slice 07 obstacle hotspots & Slice 09 in-cab recorder + backtrack layers
+    expect(byId.get("tf-hotspots-points")).toMatchObject({
+      source: "tf-hotspots",
+      layout: { visibility: "visible" },
+    });
+    expect(byId.get("tf-hotspots-line")).toMatchObject({
+      source: "tf-hotspots",
+      layout: { visibility: "visible" },
+    });
+    expect(byId.get("tf-recorded-track-line")).toMatchObject({
+      source: "tf-recorded-track",
+    });
+    expect(byId.get("tf-backtrack-route-line")).toMatchObject({
+      source: "tf-backtrack-route",
+    });
   });
 
   it("converts Slice 05 personal user pins into category-colored GeoJSON", () => {

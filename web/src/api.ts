@@ -1,4 +1,15 @@
 import type { FeatureCollection } from "geojson";
+import {
+  getActiveOfflinePackId,
+  getOfflineClosuresGeoJson,
+  getOfflineHotspotsGeoJson,
+  getOfflinePois,
+  getOfflineReportsGeoJson,
+  getOfflineTileManifest,
+  getOfflineTrackDetail,
+  getOfflineTracksGeoJson,
+  searchOfflineSnapshots,
+} from "./offline/packStore";
 import type {
   ApiHealthResponse,
   ApiSearchResponse,
@@ -8,8 +19,13 @@ import type {
   ClosuresStatusResponse,
   ConditionReportCreateInput,
   ConditionReportItem,
+  OfflinePackManifest,
+  OfflinePackRegionItem,
+  OfflinePackSnapshot,
+  OfflinePacksCatalogResponse,
   ParkTenureItem,
   PoiItem,
+  RainfallSummaryResponse,
   ReportVoteKind,
   TileManifestResponse,
   TrackInspectorDetail,
@@ -176,58 +192,123 @@ export async function fetchHealth(
   throw new ApiError(detail, res.status);
 }
 
-export function fetchTileManifest(
+function shouldPreferOfflinePack(): boolean {
+  if (typeof navigator !== "undefined" && navigator.onLine === false) {
+    return true;
+  }
+  return Boolean(getActiveOfflinePackId());
+}
+
+export async function fetchTileManifest(
   signal?: AbortSignal
 ): Promise<TileManifestResponse> {
-  return requestJson<TileManifestResponse>("/api/tiles/manifest.json", {
-    signal,
-  });
+  if (shouldPreferOfflinePack()) {
+    const offline = await getOfflineTileManifest();
+    if (offline) return offline;
+  }
+  try {
+    return await requestJson<TileManifestResponse>("/api/tiles/manifest.json", {
+      signal,
+    });
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    const offline = await getOfflineTileManifest();
+    if (offline) return offline;
+    throw err;
+  }
 }
 
-export function fetchTracksGeoJson(
+export async function fetchTracksGeoJson(
   signal?: AbortSignal
 ): Promise<FeatureCollection> {
-  return requestJson<FeatureCollection>("/api/tracks/geojson?limit=2500", {
-    signal,
-  });
+  if (shouldPreferOfflinePack()) {
+    const offline = await getOfflineTracksGeoJson();
+    if (offline) return offline;
+  }
+  try {
+    return await requestJson<FeatureCollection>("/api/tracks/geojson?limit=2500", {
+      signal,
+    });
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    const offline = await getOfflineTracksGeoJson();
+    if (offline) return offline;
+    throw err;
+  }
 }
 
-export function fetchPois(signal?: AbortSignal): Promise<PoiItem[]> {
-  return requestJson<PoiItem[]>("/api/pois?limit=500", { signal });
+export async function fetchPois(signal?: AbortSignal): Promise<PoiItem[]> {
+  if (shouldPreferOfflinePack()) {
+    const offline = await getOfflinePois();
+    if (offline) return offline;
+  }
+  try {
+    return await requestJson<PoiItem[]>("/api/pois?limit=500", { signal });
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    const offline = await getOfflinePois();
+    if (offline) return offline;
+    throw err;
+  }
 }
 
 export function fetchParks(signal?: AbortSignal): Promise<ParkTenureItem[]> {
   return requestJson<ParkTenureItem[]>("/api/parks?limit=200", { signal });
 }
 
-export function fetchTrackDetail(
+export async function fetchTrackDetail(
   trackId: string,
   options?: {
     vehicleClass?: VehicleCapabilityClass | null;
     signal?: AbortSignal;
   }
 ): Promise<TrackInspectorDetail> {
+  if (shouldPreferOfflinePack()) {
+    const offline = await getOfflineTrackDetail(trackId);
+    if (offline) return offline;
+  }
   const params = new URLSearchParams();
   if (options?.vehicleClass) {
     params.set("vehicle_class", options.vehicleClass);
   }
   const qs = params.toString();
   const url = `/api/tracks/${encodeURIComponent(trackId)}${qs ? `?${qs}` : ""}`;
-  return requestJson<TrackInspectorDetail>(url, { signal: options?.signal });
+  try {
+    return await requestJson<TrackInspectorDetail>(url, {
+      signal: options?.signal,
+    });
+  } catch (err) {
+    if (options?.signal?.aborted) throw err;
+    const offline = await getOfflineTrackDetail(trackId);
+    if (offline) return offline;
+    throw err;
+  }
 }
 
-export function fetchSearch(
+export async function fetchSearch(
   query: string,
   limit = 12,
   signal?: AbortSignal
 ): Promise<ApiSearchResponse> {
+  if (shouldPreferOfflinePack()) {
+    const offline = await searchOfflineSnapshots(query, limit);
+    if (offline) return offline;
+  }
   const params = new URLSearchParams({
     q: query,
     limit: String(limit),
   });
-  return requestJson<ApiSearchResponse>(`/api/search?${params.toString()}`, {
-    signal,
-  });
+  try {
+    return await requestJson<ApiSearchResponse>(
+      `/api/search?${params.toString()}`,
+      { signal }
+    );
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    const offline = await searchOfflineSnapshots(query, limit);
+    if (offline) return offline;
+    throw err;
+  }
 }
 
 /* ---------- Slice 04 Closures & Official Feeds ---------- */
@@ -238,10 +319,23 @@ export function fetchClosuresStatus(
   return requestJson<ClosuresStatusResponse>("/api/closures/status", { signal });
 }
 
-export function fetchClosuresGeoJson(
+export async function fetchClosuresGeoJson(
   signal?: AbortSignal
 ): Promise<FeatureCollection> {
-  return requestJson<FeatureCollection>("/api/closures/geojson", { signal });
+  if (shouldPreferOfflinePack()) {
+    const offline = await getOfflineClosuresGeoJson();
+    if (offline) return offline;
+  }
+  try {
+    return await requestJson<FeatureCollection>("/api/closures/geojson", {
+      signal,
+    });
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    const offline = await getOfflineClosuresGeoJson();
+    if (offline) return offline;
+    throw err;
+  }
 }
 
 export function fetchClosuresList(
@@ -454,15 +548,56 @@ export function fetchUnmappedCandidatesGeoJson(
   return requestJson<FeatureCollection>("/api/telemetry/unmapped", { signal });
 }
 
-/* ---------- Slice 08 Community Condition Reports & Gate Warnings ---------- */
+/* ---------- Slice 07 Live Crowdsourced Grading, Hotspots & Rainfall ---------- */
 
-export function fetchReportsGeoJson(
+export async function fetchHotspotsGeoJson(
   signal?: AbortSignal
 ): Promise<FeatureCollection> {
-  return requestJson<FeatureCollection>(
-    "/api/reports/geojson?include_resolved=false",
-    { signal }
-  );
+  if (shouldPreferOfflinePack()) {
+    const offline = await getOfflineHotspotsGeoJson();
+    if (offline) return offline;
+  }
+  try {
+    return await requestJson<FeatureCollection>(
+      "/api/grading/hotspots/geojson",
+      { signal }
+    );
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    const offline = await getOfflineHotspotsGeoJson();
+    if (offline) return offline;
+    throw err;
+  }
+}
+
+export function fetchRainfallSummary(
+  signal?: AbortSignal
+): Promise<RainfallSummaryResponse> {
+  return requestJson<RainfallSummaryResponse>("/api/grading/rainfall", {
+    signal,
+  });
+}
+
+/* ---------- Slice 08 Community Condition Reports & Gate Warnings ---------- */
+
+export async function fetchReportsGeoJson(
+  signal?: AbortSignal
+): Promise<FeatureCollection> {
+  if (shouldPreferOfflinePack()) {
+    const offline = await getOfflineReportsGeoJson();
+    if (offline) return offline;
+  }
+  try {
+    return await requestJson<FeatureCollection>(
+      "/api/reports/geojson?include_resolved=false",
+      { signal }
+    );
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    const offline = await getOfflineReportsGeoJson();
+    if (offline) return offline;
+    throw err;
+  }
 }
 
 export async function createConditionReport(
@@ -479,6 +614,7 @@ export async function createConditionReport(
     if (input.track_id) form.append("track_id", input.track_id);
     if (input.segment_id) form.append("segment_id", input.segment_id);
     if (input.vehicle_class) form.append("vehicle_class", input.vehicle_class);
+    if (input.client_uuid) form.append("client_uuid", input.client_uuid);
     form.append("photo", input.photo, input.photo.name);
 
     const res = await fetch("/api/reports", {
@@ -506,8 +642,46 @@ export async function createConditionReport(
       track_id: input.track_id ?? null,
       segment_id: input.segment_id ?? null,
       vehicle_class: input.vehicle_class ?? null,
+      client_uuid: input.client_uuid ?? null,
     },
   });
+}
+
+/* ---------- Slice 09 Offline Regional Packs ---------- */
+
+export function fetchPacksCatalog(
+  signal?: AbortSignal
+): Promise<OfflinePacksCatalogResponse> {
+  return requestJson<OfflinePacksCatalogResponse>("/api/packs", { signal });
+}
+
+export function buildRegionPack(
+  regionId: string
+): Promise<OfflinePackRegionItem> {
+  return requestJson<OfflinePackRegionItem>(
+    `/api/packs/${encodeURIComponent(regionId)}/build`,
+    { method: "POST" }
+  );
+}
+
+export function fetchPackManifest(
+  regionId: string,
+  signal?: AbortSignal
+): Promise<OfflinePackManifest> {
+  return requestJson<OfflinePackManifest>(
+    `/api/packs/${encodeURIComponent(regionId)}/manifest.json`,
+    { signal }
+  );
+}
+
+export function fetchPackSnapshot(
+  regionId: string,
+  signal?: AbortSignal
+): Promise<OfflinePackSnapshot> {
+  return requestJson<OfflinePackSnapshot>(
+    `/api/packs/${encodeURIComponent(regionId)}/snapshot.json`,
+    { signal }
+  );
 }
 
 export function voteConditionReport(

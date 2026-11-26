@@ -440,11 +440,27 @@ export function buildTrailForgeStyle(
       type: "geojson",
       data: EMPTY_FEATURE_COLLECTION,
     },
+    "tf-hotspots": {
+      type: "geojson",
+      data: EMPTY_FEATURE_COLLECTION,
+    },
     "tf-unmapped": {
       type: "geojson",
       data: EMPTY_FEATURE_COLLECTION,
     },
     "tf-reports": {
+      type: "geojson",
+      data: EMPTY_FEATURE_COLLECTION,
+    },
+    "tf-recorded-track": {
+      type: "geojson",
+      data: EMPTY_FEATURE_COLLECTION,
+    },
+    "tf-backtrack-route": {
+      type: "geojson",
+      data: EMPTY_FEATURE_COLLECTION,
+    },
+    "tf-recorder-head": {
       type: "geojson",
       data: EMPTY_FEATURE_COLLECTION,
     },
@@ -1071,6 +1087,56 @@ export function buildTrailForgeStyle(
     }
   );
 
+  // Slice 07 Rough / Slow Obstacle Hotspots overlay
+  styleLayers.push(
+    {
+      id: "tf-hotspots-casing",
+      type: "line",
+      source: "tf-hotspots",
+      filter: ["in", ["geometry-type"], ["literal", ["LineString", "MultiLineString"]]],
+      layout: {
+        visibility: vis(layers.hotspots),
+        "line-cap": "round",
+        "line-join": "round",
+      },
+      paint: {
+        "line-color": "#090F14",
+        "line-width": ["interpolate", ["linear"], ["zoom"], 9, 7.6, 14, 11.2],
+        "line-opacity": 0.78,
+      },
+    },
+    {
+      id: "tf-hotspots-line",
+      type: "line",
+      source: "tf-hotspots",
+      filter: ["in", ["geometry-type"], ["literal", ["LineString", "MultiLineString"]]],
+      layout: {
+        visibility: vis(layers.hotspots),
+        "line-cap": "round",
+        "line-join": "round",
+      },
+      paint: {
+        "line-color": "#FF6B00",
+        "line-width": ["interpolate", ["linear"], ["zoom"], 9, 4.2, 14, 6.8],
+        "line-dasharray": [1.8, 1.4],
+        "line-opacity": 0.96,
+      },
+    },
+    {
+      id: "tf-hotspots-points",
+      type: "circle",
+      source: "tf-hotspots",
+      filter: ["==", ["geometry-type"], "Point"],
+      layout: { visibility: vis(layers.hotspots) },
+      paint: {
+        "circle-radius": 7.4,
+        "circle-color": "#FF6B00",
+        "circle-stroke-color": "#FEF08A",
+        "circle-stroke-width": 2.2,
+      },
+    }
+  );
+
   // Slice 06 Anonymized Unmapped Track Candidates (subtle violet dashed spurs)
   styleLayers.push(
     {
@@ -1142,6 +1208,87 @@ export function buildTrailForgeStyle(
         "circle-color": reportColor,
         "circle-stroke-color": "#F8FAFC",
         "circle-stroke-width": 2.0,
+      },
+    }
+  );
+
+  // Slice 09 In-Cab PWA Breadcrumb Recorder & One-Tap Backtrack Route
+  styleLayers.push(
+    {
+      id: "tf-recorded-track-casing",
+      type: "line",
+      source: "tf-recorded-track",
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: {
+        "line-color": "#052E16",
+        "line-width": 7.5,
+        "line-opacity": 0.85,
+      },
+    },
+    {
+      id: "tf-recorded-track-line",
+      type: "line",
+      source: "tf-recorded-track",
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: {
+        "line-color": "#34D399",
+        "line-width": 4.2,
+        "line-opacity": 0.98,
+      },
+    },
+    {
+      id: "tf-backtrack-route-casing",
+      type: "line",
+      source: "tf-backtrack-route",
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: {
+        "line-color": "#0B1117",
+        "line-width": 8.4,
+        "line-opacity": 0.88,
+      },
+    },
+    {
+      id: "tf-backtrack-route-line",
+      type: "line",
+      source: "tf-backtrack-route",
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: {
+        "line-color": "#F472B6",
+        "line-width": 4.8,
+        "line-dasharray": [2.4, 1.8],
+        "line-opacity": 0.98,
+      },
+    },
+    {
+      id: "tf-recorder-head-halo",
+      type: "circle",
+      source: "tf-recorder-head",
+      paint: {
+        "circle-radius": 14,
+        "circle-color": [
+          "case",
+          ["==", ["get", "backtrack"], true],
+          "rgba(244, 114, 182, 0.28)",
+          "rgba(52, 211, 153, 0.28)",
+        ],
+        "circle-stroke-color": [
+          "case",
+          ["==", ["get", "backtrack"], true],
+          "#F472B6",
+          "#34D399",
+        ],
+        "circle-stroke-width": 2,
+      },
+    },
+    {
+      id: "tf-recorder-head-dot",
+      type: "circle",
+      source: "tf-recorder-head",
+      paint: {
+        "circle-radius": 5.5,
+        "circle-color": "#FFFFFF",
+        "circle-stroke-color": "#0B1117",
+        "circle-stroke-width": 2,
       },
     }
   );
