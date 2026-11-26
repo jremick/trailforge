@@ -1,22 +1,26 @@
 /**
- * TrailForge Cloudflare Pages Function — Same-Origin `/api/*` Reverse Proxy.
+ * TrailForge Cloudflare Pages Function — Same-Origin `/api/*`, `/mcp*`, & OAuth Discovery Proxy.
  *
- * Mount at `web/functions/api/[[path]].js` in Cloudflare Pages (or adapt into a
- * standalone Cloudflare Worker route for `https://trails.example.com/api/*`).
+ * Mount via `deploy/cloudflare/pages-middleware.js` as `web/functions/_middleware.js`
+ * (alongside this file as `web/functions/pages-proxy-worker.js`), or mount at
+ * `web/functions/api/[[path]].js` for `/api/*`-only deployments.
  *
  * Required Pages / Worker environment variables:
  *   RAILWAY_API_ORIGIN    = "https://api.example.com"
  *   ORIGIN_SHARED_SECRET  = "<same-secret-as-TRAILFORGE_ORIGIN_SHARED_SECRET>" (recommended)
  *
  * Behavior:
- *   - Proxies `/api/*` requests to `env.RAILWAY_API_ORIGIN` without buffering
- *     request or response bodies (preserving HTTP 206 Partial Content PMTiles
- *     range streaming and multi-MB GPX/photo/pack streams).
- *   - Forwards `CF-Connecting-IP`, `Range`, `If-Range`, `If-None-Match`,
- *     `Cookie`, and `Authorization` headers to FastAPI, and injects
+ *   - Proxies `/api`, `/api/*`, `/mcp`, `/mcp/*`, and `/.well-known/oauth-*` requests
+ *     to `env.RAILWAY_API_ORIGIN` without buffering request or response bodies
+ *     (preserving HTTP 206 Partial Content PMTiles range streaming, multi-MB GPX/photo/pack
+ *     streams, and MCP Streamable HTTP SSE/JSON-RPC responses).
+ *   - Forwards `CF-Connecting-IP`, `Range`, `If-Range`, `If-None-Match`, `If-Modified-Since`,
+ *     `Cookie`, `Authorization`, `Accept`, `Content-Type`, `Mcp-Session-Id`,
+ *     `MCP-Protocol-Version`, and `Last-Event-ID` headers to FastAPI, and injects
  *     `X-TrailForge-Origin-Secret` when `env.ORIGIN_SHARED_SECRET` is configured.
- *   - Preserves all upstream `Set-Cookie`, `Content-Range`, `Accept-Ranges`,
- *     `ETag`, `X-RateLimit-*`, and `Retry-After` response headers.
+ *   - Preserves all upstream `Set-Cookie`, `Mcp-Session-Id`, `WWW-Authenticate`,
+ *     `Content-Range`, `Accept-Ranges`, `ETag`, `X-RateLimit-*`, `Retry-After`,
+ *     and `Access-Control-*` response headers.
  *   - Rewrites upstream redirect `Location` headers (e.g. FastAPI trailing-slash
  *     `307` redirects) back to the public client origin so internal Railway
  *     hostnames (`*.up.railway.app`) are never leaked.
@@ -60,6 +64,16 @@ const EXPLICIT_FORWARD_HEADERS = [
   "if-modified-since",
   "cookie",
   "authorization",
+  "accept",
+  "content-type",
+  "mcp-session-id",
+  "mcp-protocol-version",
+  "last-event-id",
+];
+
+const EXPLICIT_PRESERVE_RESPONSE_HEADERS = [
+  "mcp-session-id",
+  "www-authenticate",
 ];
 
 const SECURITY_RESPONSE_HEADERS = [
@@ -72,6 +86,19 @@ const SECURITY_RESPONSE_HEADERS = [
 const HSTS_HEADER_VALUE = "max-age=31536000; includeSubDomains";
 
 const SANITIZED_5XX_STATUSES = new Set([500, 502, 503, 504]);
+
+export function isProxiedPath(pathname) {
+  if (typeof pathname !== "string") {
+    return false;
+  }
+  return (
+    pathname === "/api" ||
+    pathname.startsWith("/api/") ||
+    pathname === "/mcp" ||
+    pathname.startsWith("/mcp/") ||
+    pathname.startsWith("/.well-known/oauth-")
+  );
+}
 
 function applySecurityHeaders(headers, incomingUrl) {
   for (const [name, value] of SECURITY_RESPONSE_HEADERS) {
@@ -180,11 +207,19 @@ function buildUpstreamHeaders(request, incomingUrl, env) {
 
 function buildClientResponseHeaders(upstreamHeaders, { upstreamOrigin = null, incomingUrl = null } = {}) {
   // Constructing Headers from upstreamHeaders preserves multiple Set-Cookie entries
-  // as well as Content-Range, Content-Length, Accept-Ranges, ETag, and rate-limit headers.
+  // as well as Mcp-Session-Id, WWW-Authenticate, Content-Range, Content-Length,
+  // Accept-Ranges, ETag, CORS, and rate-limit headers.
   const headers = new Headers(upstreamHeaders);
 
   for (const headerName of HOP_BY_HOP_RESPONSE_HEADERS) {
     headers.delete(headerName);
+  }
+
+  for (const headerName of EXPLICIT_PRESERVE_RESPONSE_HEADERS) {
+    const val = upstreamHeaders.get(headerName);
+    if (val !== null) {
+      headers.set(headerName, val);
+    }
   }
 
   // Ensure multi-value Set-Cookie headers survive runtimes that separate getSetCookie().
@@ -196,6 +231,12 @@ function buildClientResponseHeaders(upstreamHeaders, { upstreamOrigin = null, in
         headers.append("Set-Cookie", cookie);
       }
     }
+  }
+
+  // Prevent edge caching or transform buffering on MCP Streamable HTTP SSE responses.
+  const responseContentType = (headers.get("content-type") || "").toLowerCase();
+  if (responseContentType.includes("text/event-stream") && !headers.has("cache-control")) {
+    headers.set("Cache-Control", "no-cache, no-transform");
   }
 
   // Never leak internal Railway upstream origins in 3xx redirect Location headers.
@@ -216,7 +257,7 @@ export async function onRequest(context) {
   const { request, env } = context;
   const incomingUrl = new URL(request.url);
 
-  if (incomingUrl.pathname !== "/api" && !incomingUrl.pathname.startsWith("/api/")) {
+  if (!isProxiedPath(incomingUrl.pathname)) {
     if (typeof context.next === "function") {
       return context.next();
     }
@@ -258,7 +299,7 @@ export async function onRequest(context) {
     try {
       await upstreamResponse.body?.cancel?.();
     } catch {
-      // Ignore stream cancellation errors.
+      // Ignore stream cancellation errors when discarding sanitized 5xx bodies.
     }
     const safeStatus = upstreamResponse.status >= 500 ? upstreamResponse.status : 502;
     const safeMessage =
@@ -274,7 +315,8 @@ export async function onRequest(context) {
   });
 
   // Stream upstreamResponse.body directly without buffering so HTTP 206 Partial Content
-  // PMTiles range slices and offline pack archives transfer at full edge speed.
+  // PMTiles range slices, offline pack archives, and MCP Streamable HTTP SSE/JSON-RPC
+  // frames flush immediately at full edge speed.
   return new Response(upstreamResponse.body, {
     status: upstreamResponse.status,
     statusText: upstreamResponse.statusText,

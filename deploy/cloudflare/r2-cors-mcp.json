@@ -1,0 +1,28 @@
+[
+  {
+    "AllowedOrigins": [
+      "*"
+    ],
+    "AllowedMethods": [
+      "GET",
+      "HEAD"
+    ],
+    "AllowedHeaders": [
+      "Range",
+      "If-Range",
+      "If-None-Match",
+      "If-Modified-Since",
+      "Accept",
+      "Origin"
+    ],
+    "ExposeHeaders": [
+      "Content-Range",
+      "Content-Length",
+      "Accept-Ranges",
+      "ETag",
+      "Last-Modified",
+      "Cache-Control"
+    ],
+    "MaxAgeSeconds": 86400
+  }
+]

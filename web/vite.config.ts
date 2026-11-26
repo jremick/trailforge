@@ -10,6 +10,16 @@ export default defineConfig({
         target: "http://localhost:8000",
         changeOrigin: true,
       },
+      "/mcp": {
+        target: "http://localhost:8000",
+        changeOrigin: true,
+        xfwd: true,
+      },
+      "/.well-known": {
+        target: "http://localhost:8000",
+        changeOrigin: true,
+        xfwd: true,
+      },
     },
   },
   build: {
