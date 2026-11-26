@@ -38,21 +38,27 @@ from trailforge.matching import (
     MAX_PRIVACY_TRIM_M,
     MIN_PRIVACY_TRIM_M,
     GpsPoint,
+    ImuSample,
+    ImuSummary,
     MatchResult,
-    PostGISHMMMatcher,
     TrackMatcher,
+    align_imu_to_trimmed_points,
     compute_contribution_hash,
+    enrich_match_result_with_imu,
     parse_gpx,
     parse_telemetry_json,
     points_to_linestring,
     trim_privacy_buffer,
 )
+from trailforge.matching import get_track_matcher as build_track_matcher
 from trailforge.vehicles.classifier import CapabilityClassLiteral, normalize_capability_class
 
 router = APIRouter(prefix="/api", tags=["trips"])
 
 TripVisibilityLiteral = Literal["private", "community_anonymous"]
 ExportFormatLiteral = Literal["gpx", "geojson"]
+RecordingSourceInputLiteral = Literal["pwa", "pwa_browser", "capacitor_ios", "capacitor_android"]
+RecordingSourceLiteral = Literal["pwa", "capacitor_ios", "capacitor_android"]
 
 _MAX_UPLOAD_BYTES = 15 * 1024 * 1024  # 15 MiB max GPX/JSON trace upload
 _MAX_SPEED_KMH = 160.0
@@ -66,7 +72,42 @@ _NonEmptyTripName = Annotated[
 
 def get_track_matcher(db: Session = Depends(get_db)) -> TrackMatcher:
     """FastAPI dependency returning the active pluggable `TrackMatcher` (Valhalla-swappable)."""
-    return PostGISHMMMatcher(db)
+    return build_track_matcher(get_settings(), session=db)
+
+
+def _resolve_matcher_backend(matcher_name: str | None) -> str:
+    """Normalize a `MatchResult.matcher_name` into a diagnostic `matcher_backend` identifier."""
+    if not matcher_name:
+        return get_settings().matcher_backend
+    lowered = matcher_name.strip().lower()
+    if lowered == "postgis_hmm_fallback":
+        return "postgis_hmm_fallback"
+    if lowered == "valhalla" or lowered.startswith("valhalla"):
+        return "valhalla"
+    if lowered.startswith("postgis_hmm"):
+        return "postgis_hmm"
+    return matcher_name
+
+
+def _normalize_recording_source(source: RecordingSourceInputLiteral) -> RecordingSourceLiteral:
+    if source == "pwa_browser":
+        return "pwa"
+    return source
+
+
+def _resolve_mobile_client_uuid(
+    client_uuid: uuid.UUID | None,
+    client_session_id: str | None,
+) -> uuid.UUID | None:
+    if client_uuid is not None:
+        return client_uuid
+    if client_session_id is not None and client_session_id.strip():
+        cleaned = client_session_id.strip()
+        try:
+            return uuid.UUID(cleaned)
+        except ValueError:
+            return uuid.uuid5(uuid.NAMESPACE_URL, f"trailforge:mobile-sync:{cleaned}")
+    return None
 
 
 class TripPointJsonInput(BaseModel):
@@ -85,11 +126,29 @@ class TripUploadJsonRequest(BaseModel):
         validation_alias=AliasChoices("name", "title"),
     )
     points: list[TripPointJsonInput] = Field(..., min_length=2)
+    imu_samples: list[ImuSample] | None = None
     vehicle_profile_id: str | None = None
     vehicle_class: str | None = None
     visibility: TripVisibilityLiteral = "private"
     privacy_trim_m: float = Field(default=MIN_PRIVACY_TRIM_M)
+    client_session_id: str | None = Field(default=None, max_length=128)
     client_uuid: uuid.UUID | None = None
+
+
+class MobileSyncRequest(BaseModel):
+    name: _NonEmptyTripName | None = Field(
+        default=None,
+        validation_alias=AliasChoices("name", "title"),
+    )
+    points: list[TripPointJsonInput] = Field(..., min_length=2)
+    imu_samples: list[ImuSample] | None = None
+    vehicle_profile_id: str | None = None
+    vehicle_class: str | None = None
+    visibility: TripVisibilityLiteral = "private"
+    privacy_trim_m: float = Field(default=MIN_PRIVACY_TRIM_M)
+    client_session_id: str | None = Field(default=None, max_length=128)
+    client_uuid: uuid.UUID | None = None
+    recording_source: RecordingSourceInputLiteral = "pwa"
 
 
 class TripUpdateRequest(BaseModel):
@@ -109,6 +168,7 @@ class TripMatchedSegmentResponse(BaseModel):
     avg_speed_kmh: float
     min_speed_kmh: float | None = None
     roughness_rms: float | None = None
+    roughness_p95: float | None = None
     matched_point_count: int = 1
 
 
@@ -137,13 +197,23 @@ class TripItemResponse(BaseModel):
     ended_at: datetime | None = None
     match_status: str
     matcher_name: str | None = None
+    matcher_backend: str | None = None
     matched_segment_count: int = 0
     avg_match_confidence: float | None = None
     observations_published: int = 0
     unmapped_candidate_count: int = 0
     matched_segments: list[TripMatchedSegmentResponse] = Field(default_factory=list)
     unmapped_candidates: list[TripUnmappedCandidateResponse] = Field(default_factory=list)
+    imu_summary: ImuSummary | None = None
     created_at: datetime
+
+
+class MobileSyncResponse(TripItemResponse):
+    imu_summary: ImuSummary = Field(default_factory=ImuSummary)
+    matcher_backend: str = "postgis_hmm"
+    recording_source: RecordingSourceLiteral = "pwa"
+    client_session_id: str | None = None
+    imu_samples_discarded_for_privacy: int = 0
 
 
 class TripDetailResponse(TripItemResponse):
@@ -406,6 +476,7 @@ def _build_matched_segments_payload(
             avg_speed_kmh=_clamp_speed(s.avg_speed_kmh),
             min_speed_kmh=_clamp_speed(s.min_speed_kmh) if s.min_speed_kmh is not None else None,
             roughness_rms=round(float(s.roughness_rms), 4) if s.roughness_rms is not None else None,
+            roughness_p95=round(float(s.roughness_p95), 4) if s.roughness_p95 is not None else None,
             matched_point_count=int(s.matched_point_count),
         )
         for s in match_result.matched_segments
@@ -452,6 +523,9 @@ def _load_published_for_trip(
             roughness_rms=(
                 round(float(obs.roughness_rms), 4) if obs.roughness_rms is not None else None
             ),
+            roughness_p95=(
+                round(float(obs.roughness_p95), 4) if obs.roughness_p95 is not None else None
+            ),
             matched_point_count=int(obs.matched_point_count),
         )
         for obs, tid in obs_rows
@@ -488,7 +562,10 @@ def _trip_to_response(
     unmapped_candidates: list[TripUnmappedCandidateResponse],
     observations_published: int,
     unmapped_candidate_count: int,
+    imu_summary: ImuSummary | None = None,
+    matcher_backend: str | None = None,
 ) -> TripItemResponse:
+    resolved_backend = matcher_backend or _resolve_matcher_backend(trip.matcher_name)
     return TripItemResponse(
         id=str(trip.id),
         trip_id=str(trip.id),
@@ -505,6 +582,7 @@ def _trip_to_response(
         ended_at=trip.ended_at,
         match_status=trip.match_status,
         matcher_name=trip.matcher_name,
+        matcher_backend=resolved_backend,
         matched_segment_count=len(matched_segments),
         avg_match_confidence=(
             round(float(trip.avg_match_confidence), 4)
@@ -515,6 +593,7 @@ def _trip_to_response(
         unmapped_candidate_count=unmapped_candidate_count,
         matched_segments=matched_segments,
         unmapped_candidates=unmapped_candidates,
+        imu_summary=imu_summary,
         created_at=trip.created_at,
     )
 
@@ -534,6 +613,155 @@ def _get_owned_trip(db: Session, user: User, trip_id: str) -> Trip:
     return trip
 
 
+async def _ingest_trip_trace(
+    *,
+    db: Session,
+    current_user: User,
+    matcher: TrackMatcher,
+    points: list[GpsPoint],
+    trip_title: str,
+    vehicle_profile_id: str | None,
+    vehicle_class: str | None,
+    visibility: TripVisibilityLiteral,
+    privacy_trim_m: float,
+    client_uuid: uuid.UUID | None,
+    imu_samples: Sequence[ImuSample] | None = None,
+    always_include_imu_summary: bool = False,
+) -> tuple[TripItemResponse, ImuSummary, str, int]:
+    """Shared privacy-trim, IMU alignment, map-match, and persistence pipeline."""
+    trim_m = _validate_trim_meters(privacy_trim_m)
+    resolved_vp_id, resolved_vclass = _resolve_trip_vehicle(
+        db, current_user, vehicle_profile_id, vehicle_class
+    )
+
+    # Idempotent client_uuid lookup for PWA / mobile offline retries
+    if client_uuid is not None:
+        existing = db.execute(
+            select(Trip).where(Trip.user_id == current_user.id, Trip.client_uuid == client_uuid)
+        ).scalar_one_or_none()
+        if existing is not None:
+            m_segs, unm_cands = _load_published_for_trip(db, existing)
+            existing_backend = _resolve_matcher_backend(existing.matcher_name)
+            empty_imu = ImuSummary()
+            resp = _trip_to_response(
+                existing,
+                matched_segments=m_segs,
+                unmapped_candidates=unm_cands,
+                observations_published=len(m_segs),
+                unmapped_candidate_count=len(unm_cands),
+                imu_summary=empty_imu if always_include_imu_summary else None,
+                matcher_backend=existing_backend,
+            )
+            return resp, empty_imu, existing_backend, 0
+
+    try:
+        trim_res = trim_privacy_buffer(points, trim_m=trim_m)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+    raw_line = points_to_linestring(points)
+    started_at = points[0].timestamp
+    ended_at = points[-1].timestamp
+    duration_s = max(0.0, (ended_at - started_at).total_seconds())
+
+    trip_id = uuid.uuid4()
+    nonce = uuid.uuid4()
+    contrib_hash = _compute_trip_hash(trip_id, nonce)
+
+    trimmed_geom = None
+    match_status = "skipped_too_short"
+    matcher_name: str | None = matcher.name
+    matcher_backend: str = _resolve_matcher_backend(matcher.name)
+    avg_conf: float | None = None
+    matched_payload: list[TripMatchedSegmentResponse] = []
+    unmapped_payload: list[TripUnmappedCandidateResponse] = []
+    obs_published = 0
+    unm_published = 0
+    imu_summary = ImuSummary()
+    discarded_imu_count = 0
+    has_imu_input = bool(imu_samples)
+
+    if not trim_res.too_short and len(trim_res.trimmed_points) >= 2:
+        trimmed_geom = from_shape(points_to_linestring(trim_res.trimmed_points), srid=4326)
+        matching_points = trim_res.trimmed_points
+        trimmed_imu_samples: list[ImuSample] = []
+
+        if imu_samples:
+            aligned = align_imu_to_trimmed_points(
+                trim_res.trimmed_points,
+                imu_samples,
+                raw_points=points,
+            )
+            matching_points = aligned.points
+            trimmed_imu_samples = aligned.trimmed_samples
+            imu_summary = aligned.summary
+            discarded_imu_count = aligned.discarded_sample_count
+
+        match_result = await matcher.match_trace(matching_points)
+        if trimmed_imu_samples:
+            match_result = enrich_match_result_with_imu(match_result, trimmed_imu_samples)
+
+        matcher_name = match_result.matcher_name
+        matcher_backend = _resolve_matcher_backend(match_result.matcher_name)
+        avg_conf = float(match_result.overall_confidence)
+        matched_payload = _build_matched_segments_payload(db, match_result)
+        unmapped_payload = _build_unmapped_payload(match_result)
+
+        if visibility == "community_anonymous":
+            match_status = _derive_match_status(match_result)
+            obs_published, unm_published = _persist_community_contributions(
+                db,
+                contrib_hash=contrib_hash,
+                vehicle_class=resolved_vclass,
+                match_result=match_result,
+            )
+        else:
+            # Private logbook ONLY: zero rows written to telemetry_observations or unmapped table
+            match_status = "skipped_private"
+    elif imu_samples:
+        # Privacy guardrail: trace <= 2 * trim_m discards 100% of IMU samples
+        discarded_imu_count = len(imu_samples)
+
+    trip = Trip(
+        id=trip_id,
+        user_id=current_user.id,
+        client_uuid=client_uuid,
+        vehicle_profile_id=resolved_vp_id,
+        vehicle_capability_class=resolved_vclass,
+        title=trip_title,
+        visibility=visibility,
+        privacy_trim_m=trim_m,
+        contribution_nonce=nonce,
+        raw_geom=from_shape(raw_line, srid=4326),
+        trimmed_geom=trimmed_geom,
+        raw_distance_m=trim_res.raw_length_m,
+        trimmed_distance_m=trim_res.trimmed_length_m,
+        duration_s=round(duration_s, 2),
+        started_at=started_at,
+        ended_at=ended_at,
+        match_status=match_status,
+        matcher_name=matcher_name,
+        avg_match_confidence=avg_conf,
+    )
+    db.add(trip)
+    db.commit()
+    db.refresh(trip)
+
+    resp = _trip_to_response(
+        trip,
+        matched_segments=matched_payload,
+        unmapped_candidates=unmapped_payload,
+        observations_published=obs_published,
+        unmapped_candidate_count=unm_published,
+        imu_summary=imu_summary if (always_include_imu_summary or has_imu_input) else None,
+        matcher_backend=matcher_backend,
+    )
+    return resp, imu_summary, matcher_backend, discarded_imu_count
+
+
 @router.post("/trips/upload", response_model=TripItemResponse, status_code=status.HTTP_201_CREATED)
 async def upload_trip(
     request: Request,
@@ -551,6 +779,7 @@ async def upload_trip(
     privacy_trim_m: float = MIN_PRIVACY_TRIM_M
     client_uuid: uuid.UUID | None = None
     parsed_name: str | None = None
+    imu_samples: list[ImuSample] | None = None
     points: list[GpsPoint]
 
     if "multipart/form-data" in content_type:
@@ -660,7 +889,8 @@ async def upload_trip(
         vehicle_class = req.vehicle_class
         visibility = req.visibility
         privacy_trim_m = req.privacy_trim_m
-        client_uuid = req.client_uuid
+        client_uuid = _resolve_mobile_client_uuid(req.client_uuid, req.client_session_id)
+        imu_samples = req.imu_samples
 
         try:
             parsed = parse_telemetry_json(
@@ -677,104 +907,77 @@ async def upload_trip(
         parsed_name = parsed.name
         points = parsed.points
 
-    trim_m = _validate_trim_meters(privacy_trim_m)
-    resolved_vp_id, resolved_vclass = _resolve_trip_vehicle(
-        db, current_user, vehicle_profile_id, vehicle_class
-    )
     trip_title = (explicit_name or parsed_name or "Recorded Trip").strip()[:140]
+    resp, _imu_summary, _backend, _discarded = await _ingest_trip_trace(
+        db=db,
+        current_user=current_user,
+        matcher=matcher,
+        points=points,
+        trip_title=trip_title,
+        vehicle_profile_id=vehicle_profile_id,
+        vehicle_class=vehicle_class,
+        visibility=visibility,
+        privacy_trim_m=privacy_trim_m,
+        client_uuid=client_uuid,
+        imu_samples=imu_samples,
+        always_include_imu_summary=False,
+    )
+    return resp
 
-    # Idempotent client_uuid lookup for PWA offline retries
-    if client_uuid is not None:
-        existing = db.execute(
-            select(Trip).where(Trip.user_id == current_user.id, Trip.client_uuid == client_uuid)
-        ).scalar_one_or_none()
-        if existing is not None:
-            m_segs, unm_cands = _load_published_for_trip(db, existing)
-            return _trip_to_response(
-                existing,
-                matched_segments=m_segs,
-                unmapped_candidates=unm_cands,
-                observations_published=len(m_segs),
-                unmapped_candidate_count=len(unm_cands),
-            )
 
+@router.post(
+    "/trips/mobile-sync",
+    response_model=MobileSyncResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def mobile_sync_trip(
+    payload: MobileSyncRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    matcher: TrackMatcher = Depends(get_track_matcher),
+) -> MobileSyncResponse:
+    """Sync a mobile/Capacitor background GPS + high-rate IMU recording session."""
     try:
-        trim_res = trim_privacy_buffer(points, trim_m=trim_m)
+        parsed = parse_telemetry_json(
+            {
+                "name": payload.name,
+                "points": [p.model_dump() for p in payload.points],
+            }
+        )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
         ) from exc
 
-    raw_line = points_to_linestring(points)
-    started_at = points[0].timestamp
-    ended_at = points[-1].timestamp
-    duration_s = max(0.0, (ended_at - started_at).total_seconds())
-
-    trip_id = uuid.uuid4()
-    nonce = uuid.uuid4()
-    contrib_hash = _compute_trip_hash(trip_id, nonce)
-
-    trimmed_geom = None
-    match_status = "skipped_too_short"
-    matcher_name: str | None = matcher.name
-    avg_conf: float | None = None
-    matched_payload: list[TripMatchedSegmentResponse] = []
-    unmapped_payload: list[TripUnmappedCandidateResponse] = []
-    obs_published = 0
-    unm_published = 0
-
-    if not trim_res.too_short and len(trim_res.trimmed_points) >= 2:
-        trimmed_geom = from_shape(points_to_linestring(trim_res.trimmed_points), srid=4326)
-        match_result = await matcher.match_trace(trim_res.trimmed_points)
-        matcher_name = match_result.matcher_name
-        avg_conf = float(match_result.overall_confidence)
-        matched_payload = _build_matched_segments_payload(db, match_result)
-        unmapped_payload = _build_unmapped_payload(match_result)
-
-        if visibility == "community_anonymous":
-            match_status = _derive_match_status(match_result)
-            obs_published, unm_published = _persist_community_contributions(
-                db,
-                contrib_hash=contrib_hash,
-                vehicle_class=resolved_vclass,
-                match_result=match_result,
-            )
-        else:
-            # Private logbook ONLY: zero rows written to telemetry_observations or unmapped table
-            match_status = "skipped_private"
-
-    trip = Trip(
-        id=trip_id,
-        user_id=current_user.id,
-        client_uuid=client_uuid,
-        vehicle_profile_id=resolved_vp_id,
-        vehicle_capability_class=resolved_vclass,
-        title=trip_title,
-        visibility=visibility,
-        privacy_trim_m=trim_m,
-        contribution_nonce=nonce,
-        raw_geom=from_shape(raw_line, srid=4326),
-        trimmed_geom=trimmed_geom,
-        raw_distance_m=trim_res.raw_length_m,
-        trimmed_distance_m=trim_res.trimmed_length_m,
-        duration_s=round(duration_s, 2),
-        started_at=started_at,
-        ended_at=ended_at,
-        match_status=match_status,
-        matcher_name=matcher_name,
-        avg_match_confidence=avg_conf,
+    resolved_client_uuid = _resolve_mobile_client_uuid(
+        payload.client_uuid, payload.client_session_id
     )
-    db.add(trip)
-    db.commit()
-    db.refresh(trip)
+    trip_title = (payload.name or parsed.name or "Mobile Recorded Trip").strip()[:140]
+    normalized_source = _normalize_recording_source(payload.recording_source)
 
-    return _trip_to_response(
-        trip,
-        matched_segments=matched_payload,
-        unmapped_candidates=unmapped_payload,
-        observations_published=obs_published,
-        unmapped_candidate_count=unm_published,
+    resp, imu_summary, matcher_backend, discarded_imu = await _ingest_trip_trace(
+        db=db,
+        current_user=current_user,
+        matcher=matcher,
+        points=parsed.points,
+        trip_title=trip_title,
+        vehicle_profile_id=payload.vehicle_profile_id,
+        vehicle_class=payload.vehicle_class,
+        visibility=payload.visibility,
+        privacy_trim_m=payload.privacy_trim_m,
+        client_uuid=resolved_client_uuid,
+        imu_samples=payload.imu_samples,
+        always_include_imu_summary=True,
+    )
+    base_data = resp.model_dump()
+    base_data["imu_summary"] = imu_summary
+    base_data["matcher_backend"] = matcher_backend
+    return MobileSyncResponse(
+        **base_data,
+        recording_source=normalized_source,
+        client_session_id=payload.client_session_id,
+        imu_samples_discarded_for_privacy=discarded_imu,
     )
 
 

@@ -1,0 +1,58 @@
+# Optional Valhalla Map-Matching Sidecar Compose Override for TrailForge
+#
+# Keeps the default `docker-compose.yml` / `docker-compose.ghcr.yml` stack lean
+# (~270-350 MiB idle RAM on 16 GB laptops / Raspberry Pi 5 using PostGISHMMMatcher).
+# Layer this override ONLY when you want Valhalla `/trace_attributes` sidecar matching.
+#
+# Usage (local dev build):
+#   docker compose -f docker-compose.yml -f deploy/valhalla-compose.override.yml up -d
+#
+# Usage (prebuilt GHCR homelab stack):
+#   docker compose -f docker-compose.ghcr.yml -f deploy/valhalla-compose.override.yml up -d
+#
+# See deploy/valhalla.md for OSM PBF seeding, memory sizing, and fallback behavior.
+
+services:
+  valhalla:
+    image: ${VALHALLA_IMAGE:-ghcr.io/gis-ops/docker-valhalla/valhalla:latest}
+    environment:
+      # Optional: set VALHALLA_TILE_URLS to auto-download an Australian PBF on first boot
+      # (e.g. https://download.geofabrik.de/australia-oceania/australia-latest.osm.pbf),
+      # or place a pre-extracted regional .osm.pbf in the `trailforge_valhalla_tiles` volume.
+      tile_urls: ${VALHALLA_TILE_URLS:-}
+      serve_tiles: "True"
+      use_tiles_ignore_pbf: "True"
+      build_elevation: "False"
+      build_admins: "False"
+      build_time_zones: "False"
+      build_tar: "True"
+      force_rebuild: "False"
+    volumes:
+      - trailforge_valhalla_tiles:/custom_files
+    # Kept internal to the Docker network by default.
+    # Uncomment for local host inspection of Valhalla /status or /trace_attributes:
+    # ports:
+    #   - "127.0.0.1:${VALHALLA_PORT:-8002}:8002"
+    mem_limit: ${VALHALLA_MEM_LIMIT:-2g}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8002/status >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+
+  api:
+    environment:
+      TRAILFORGE_MATCHER_BACKEND: ${TRAILFORGE_MATCHER_BACKEND:-valhalla}
+      VALHALLA_URL: ${VALHALLA_URL:-http://valhalla:8002}
+      VALHALLA_TIMEOUT_S: ${VALHALLA_TIMEOUT_S:-10.0}
+      VALHALLA_FALLBACK_TO_HMM: ${VALHALLA_FALLBACK_TO_HMM:-true}
+    depends_on:
+      valhalla:
+        # `service_started` (not `service_healthy`) lets API boot immediately and serve
+        # trips via `postgis_hmm_fallback` while Valhalla builds routing tiles on first run.
+        condition: service_started
+
+volumes:
+  trailforge_valhalla_tiles:

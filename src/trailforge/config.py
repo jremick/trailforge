@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -33,6 +34,56 @@ class Settings(BaseSettings):
     worker_poll_seconds: int = Field(default=30, ge=1)
     privacy_trim_meters: int = Field(default=250, ge=250, le=5000)
     snow_line_default_m: int = Field(default=1000, ge=0)
+
+    # Pluggable map-matcher backend & optional Valhalla sidecar (Phase B v1.1.0)
+    matcher_backend: Literal["postgis_hmm", "valhalla"] = Field(
+        default="postgis_hmm",
+        validation_alias=AliasChoices(
+            "TRAILFORGE_MATCHER_BACKEND",
+            "MATCHER_BACKEND",
+            "matcher_backend",
+        ),
+        description="Active TrackMatcher backend ('postgis_hmm' default or optional 'valhalla').",
+    )
+    valhalla_url: str = Field(
+        default="http://valhalla:8002",
+        validation_alias=AliasChoices("VALHALLA_URL", "TRAILFORGE_VALHALLA_URL", "valhalla_url"),
+        description="Base URL of optional Valhalla map-matching sidecar.",
+    )
+    valhalla_timeout_s: float = Field(
+        default=10.0,
+        gt=0.0,
+        le=120.0,
+        validation_alias=AliasChoices(
+            "VALHALLA_TIMEOUT_S",
+            "TRAILFORGE_VALHALLA_TIMEOUT_S",
+            "valhalla_timeout_s",
+        ),
+        description="HTTP timeout in seconds for Valhalla /trace_attributes requests.",
+    )
+    valhalla_fallback_to_hmm: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "VALHALLA_FALLBACK_TO_HMM",
+            "TRAILFORGE_VALHALLA_FALLBACK_TO_HMM",
+            "valhalla_fallback_to_hmm",
+        ),
+        description="Gracefully fall back to PostGISHMMMatcher when Valhalla is unreachable.",
+    )
+
+    # Pan-Australia state scoping for live closure feeds & polling (Phase B v1.1.0)
+    enabled_states: str = Field(
+        default="VIC,NSW",
+        validation_alias=AliasChoices(
+            "TRAILFORGE_ENABLED_STATES",
+            "ENABLED_STATES",
+            "enabled_states",
+        ),
+        description=(
+            "Comma-separated Australian state codes enabled for default feed polling "
+            "('VIC,NSW' default; set 'VIC,NSW,ACT' or 'ALL' for pan-Australia)."
+        ),
+    )
 
     # Auth & privacy secrets (self-hosted, zero external IdP)
     auth_secret_key: str = Field(
@@ -79,6 +130,10 @@ class Settings(BaseSettings):
     @property
     def cors_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def enabled_states_list(self) -> list[str]:
+        return [state.strip().upper() for state in self.enabled_states.split(",") if state.strip()]
 
 
 @lru_cache(maxsize=1)
