@@ -172,7 +172,7 @@ export class AdminConsolePanel {
 
     const t24 = normalizeTrafficWindow(stats?.traffic_24h);
     const t7d = normalizeTrafficWindow(stats?.traffic_7d);
-    const routes = normalizeRouteBreakdown(stats?.route_breakdown).slice(0, 8);
+    const routes = normalizeRouteBreakdown(stats?.route_breakdown).slice(0, 13);
 
     const storage = stats?.storage;
     const quota = computeStorageQuotaSummary(

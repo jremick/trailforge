@@ -11,7 +11,10 @@ __pycache__
 .env
 .env.*
 !.env.example
-web/
+web/node_modules/
+web/dist/
+web/dist-mcp/
+web/.vite/
 data/
 out/
 output/

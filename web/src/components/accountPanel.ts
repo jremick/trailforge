@@ -3,6 +3,7 @@ import {
   getRegistrationUiState,
   isAdminUser,
 } from "../adminHelpers";
+import { AiTokensSection } from "./aiTokensSection";
 import { escapeHtml, getGradeColor } from "../presets";
 import {
   MIN_PRIVACY_TRIM_M,
@@ -117,6 +118,7 @@ function defaultVehicleDraft(): VehicleProfileInput {
 export class RigAccountPanel {
   private readonly root: HTMLElement;
   private readonly callbacks: AccountPanelCallbacks;
+  private readonly aiTokens = new AiTokensSection();
   private isOpen = false;
   private activeTab: AccountPanelTab = "rig";
   private authMode: "login" | "register" = "login";
@@ -164,7 +166,11 @@ export class RigAccountPanel {
   }
 
   updateState(next: AccountPanelState): void {
+    const signedOut = this.state.user !== null && next.user === null;
     this.state = next;
+    if (signedOut) {
+      this.aiTokens.reset();
+    }
     this.render();
   }
 
@@ -733,6 +739,7 @@ export class RigAccountPanel {
           }
           <button type="button" class="tf-btn-secondary danger-outline" data-role="logout-btn" ${this.busy ? "disabled" : ""}>Sign Out</button>
         </section>
+        <div data-role="ai-tokens-mount"></div>
       `;
     }
 
@@ -918,10 +925,18 @@ export class RigAccountPanel {
       ?.addEventListener("click", () => {
         void this.runAsync(async () => {
           await this.callbacks.onLogout();
+          this.aiTokens.reset();
           this.showVehicleForm = false;
           this.editingVehicleId = null;
         });
       });
+
+    const aiMount = this.root.querySelector<HTMLElement>(
+      "[data-role='ai-tokens-mount']"
+    );
+    if (aiMount && this.state.user) {
+      this.aiTokens.mount(aiMount);
+    }
 
     // Slice 06 Trip Upload & Logbook handlers
     this.root

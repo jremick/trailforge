@@ -30,7 +30,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from tests.conftest import _ensure_postgis_and_schema, resolve_test_database_url
 from trailforge.auth.security import create_access_token, hash_password
-from trailforge.config import Settings
+from trailforge.config import Settings, get_settings
 from trailforge.db.models import (
     ConditionReport,
     PlannedRoute,
@@ -171,6 +171,7 @@ def test_resources_sep1865_mime_csp_and_html_override(
         "TRAILFORGE_MCP_CSP_TILE_DOMAINS",
         "https://tiles.example.com/pmtiles/vector.pmtiles, https://cdn.example.org:8443/path",
     )
+    get_settings.cache_clear()
     resources = list_mcp_resources()
     uris = {str(r.uri) for r in resources}
     assert uris == {
@@ -210,8 +211,11 @@ def test_resources_sep1865_mime_csp_and_html_override(
         "<!doctype html><html><body>Custom MCP App</body></html>", encoding="utf-8"
     )
     monkeypatch.setenv("TRAILFORGE_MCP_APP_HTML", str(override_file))
+    get_settings.cache_clear()
     overridden = read_mcp_resource(MCP_APP_URI)
     assert "Custom MCP App" in str(overridden[0].content)
+    monkeypatch.delenv("TRAILFORGE_MCP_APP_HTML", raising=False)
+    get_settings.cache_clear()
 
     # Static reference resources
     grading_md = str(read_mcp_resource(GRADING_METHODOLOGY_URI)[0].content)
@@ -253,6 +257,7 @@ def test_mcp_protocol_endpoints_auth_modes_kill_switch_and_cors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("TRAILFORGE_PUBLIC_BASE_URL", "https://trails.example.com")
+    get_settings.cache_clear()
     app = _build_test_mcp_app()
 
     with TestClient(app) as client:
@@ -276,6 +281,7 @@ def test_mcp_protocol_endpoints_auth_modes_kill_switch_and_cors(
 
         # Spoofed Host / X-Forwarded-Host must never inject quotes or paths into WWW-Authenticate
         monkeypatch.delenv("TRAILFORGE_PUBLIC_BASE_URL", raising=False)
+        get_settings.cache_clear()
         spoof_401 = _mcp_rpc(
             client,
             "tools/list",
@@ -295,6 +301,7 @@ def test_mcp_protocol_endpoints_auth_modes_kill_switch_and_cors(
         )
         assert expected_meta in spoof_www
         monkeypatch.setenv("TRAILFORGE_PUBLIC_BASE_URL", "https://trails.example.com")
+        get_settings.cache_clear()
 
         # 2. Stateless initialize -> tools/list -> resources/list -> resources/read -> prompts/list
         init_resp = _mcp_rpc(
@@ -384,12 +391,14 @@ def test_mcp_protocol_endpoints_auth_modes_kill_switch_and_cors(
 
         # SC-1: TRAILFORGE_ENABLE_MCP=false returns 404
         monkeypatch.setenv("TRAILFORGE_ENABLE_MCP", "false")
+        get_settings.cache_clear()
         assert _mcp_rpc(client, "tools/list", req_id=6).status_code == 404
         assert _mcp_rpc(client, "tools/list", path="/mcp/auth", req_id=7).status_code == 404
 
         # Auth mode: anonymous_only hides personal/write tools, blocks direct calls & 404s /mcp/auth
         monkeypatch.setenv("TRAILFORGE_ENABLE_MCP", "true")
         monkeypatch.setenv("TRAILFORGE_MCP_AUTH_MODE", "anonymous_only")
+        get_settings.cache_clear()
         anon_tools = _mcp_rpc(client, "tools/list", req_id=8).json()["result"]["tools"]
         anon_names = {t["name"] for t in anon_tools}
         assert anon_names == PUBLIC_TOOL_NAMES | APP_ONLY_TOOL_NAMES
@@ -401,9 +410,11 @@ def test_mcp_protocol_endpoints_auth_modes_kill_switch_and_cors(
 
         # Auth mode: oauth_required challenges /mcp with 401
         monkeypatch.setenv("TRAILFORGE_MCP_AUTH_MODE", "oauth_required")
+        get_settings.cache_clear()
         req_401 = _mcp_rpc(client, "tools/list", req_id=10)
         assert req_401.status_code == 401
         assert "/.well-known/oauth-protected-resource/mcp" in req_401.headers["www-authenticate"]
+        get_settings.cache_clear()
 
 
 def test_stdio_proxy_forwarding_and_cli_parsing() -> None:
@@ -514,6 +525,7 @@ def seeded_mcp_env(
     monkeypatch.setenv("TRAILFORGE_PUBLIC_BASE_URL", "https://trails.example.com")
     monkeypatch.setenv("TRAILFORGE_ENABLE_MCP", "true")
     monkeypatch.setenv("TRAILFORGE_MCP_AUTH_MODE", "hybrid")
+    get_settings.cache_clear()
 
     _truncate_mcp_test_tables(mcp_postgis_engine)
     SessionLocal = sessionmaker(bind=mcp_postgis_engine, autoflush=False, expire_on_commit=False)

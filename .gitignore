@@ -17,6 +17,7 @@ htmlcov/
 # Node / Web PWA
 web/node_modules/
 web/dist/
+web/dist-mcp/
 web/.vite/
 
 # OS / Editor / Environment

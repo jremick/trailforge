@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 from typing import Any, Final
 
 from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -31,6 +32,7 @@ from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from trailforge.config import Settings, get_settings
+from trailforge.mcp.context import extract_bare_origin
 
 logger = logging.getLogger(__name__)
 
@@ -55,11 +57,22 @@ AUTH_RATE_LIMIT_PATHS: Final[frozenset[str]] = frozenset(
     {
         "/api/auth/login",
         "/api/auth/register",
+        "/api/oauth/authorize",
+        "/api/oauth/token",
+        "/api/oauth/revoke",
     }
 )
+OAUTH_DCR_PATH: Final[str] = "/api/oauth/register"
 MAX_BODY_TRIPS_BYTES: Final[int] = 16 * 1024 * 1024  # 16 MiB on /api/trips/*
 MAX_BODY_REPORTS_BYTES: Final[int] = 6 * 1024 * 1024  # 6 MiB on /api/reports*
-MAX_BODY_API_DEFAULT_BYTES: Final[int] = 1 * 1024 * 1024  # 1 MiB on all other /api/*
+MAX_BODY_API_DEFAULT_BYTES: Final[int] = 1 * 1024 * 1024  # 1 MiB on /api/*, /mcp*, /api/oauth/*
+
+MCP_CORS_ALLOWED_HEADERS: Final[str] = (
+    "Authorization, Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version, Last-Event-ID"
+)
+MCP_CORS_EXPOSED_HEADERS: Final[str] = (
+    "Mcp-Session-Id, WWW-Authenticate, X-RateLimit-Limit, X-RateLimit-Remaining"
+)
 
 MUTATING_HTTP_METHODS: Final[frozenset[str]] = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 ALLOWED_SEC_FETCH_SITES: Final[frozenset[str]] = frozenset({"same-origin", "none"})
@@ -81,6 +94,7 @@ ROUTE_GROUPS: Final[tuple[str, ...]] = (
     "closures",
     "grading",
     "auth",
+    "mcp",
     "search",
     "admin",
     "other",
@@ -93,9 +107,26 @@ _DEFAULT_FLUSH_INTERVAL_S: Final[float] = 30.0
 _DEFAULT_FLUSH_BATCH_THRESHOLD: Final[int] = 50
 
 
+def is_mcp_path(path: str) -> bool:
+    """Return True if ``path`` targets ``/mcp`` or ``/mcp/*``."""
+    normalized = path.strip().rstrip("/") or "/"
+    return normalized == "/mcp" or normalized.startswith("/mcp/")
+
+
+def is_oauth_well_known_path(path: str) -> bool:
+    """Return True if ``path`` targets an RFC 9728 / RFC 8414 ``/.well-known/oauth-*`` endpoint."""
+    normalized = path.strip().rstrip("/") or "/"
+    return normalized.startswith("/.well-known/oauth-")
+
+
 def classify_route_group(path: str) -> str:
     """Map an HTTP path to its canonical hourly telemetry ``route_group``."""
     clean = path.strip()
+    normalized = clean.rstrip("/") or "/"
+    if normalized == "/mcp" or normalized.startswith("/mcp/"):
+        return "mcp"
+    if normalized.startswith("/.well-known/oauth-"):
+        return "auth"
     if not clean.startswith("/api/"):
         return "other"
     remainder = clean[5:]
@@ -116,7 +147,7 @@ def classify_route_group(path: str) -> str:
         return "closures"
     if head == "grading":
         return "grading"
-    if head == "auth":
+    if head in ("auth", "oauth"):
         return "auth"
     if head == "search":
         return "search"
@@ -615,6 +646,8 @@ def resolve_body_size_limit(
 ) -> int | None:
     """Return the maximum permitted request body size in bytes for ``path``."""
     normalized = path.rstrip("/") or "/"
+    if is_mcp_path(normalized):
+        return default_api_max_bytes
     if normalized != "/api" and not normalized.startswith("/api/"):
         return None
     if normalized == "/api/trips" or normalized.startswith("/api/trips/"):
@@ -808,6 +841,14 @@ class CookieCSRFMiddleware:
             await self.app(scope, receive, send)
             return
 
+        # /mcp and /mcp/* are strictly Bearer-only (never read cookies), so cross-origin MCP
+        # clients are never blocked by cookie CSRF checks while /api/* (incl. /api/oauth/authorize)
+        # retains full cookie CSRF enforcement.
+        path = str(scope.get("path", "/"))
+        if is_mcp_path(path):
+            await self.app(scope, receive, send)
+            return
+
         headers = Headers(scope=scope)
         if _has_bearer_authorization(headers):
             await self.app(scope, receive, send)
@@ -839,6 +880,76 @@ class CookieCSRFMiddleware:
                 return
 
         await self.app(scope, receive, send)
+
+
+class PathAwareCORSMiddleware:
+    """Path-aware ASGI CORS middleware preserving strict cookie CORS on ``/api/*``.
+
+    - On Bearer-only / public discovery paths (``/mcp``, ``/mcp/*``, ``/.well-known/oauth-*``):
+      bypasses credentialed Starlette ``CORSMiddleware`` so cross-origin MCP clients receive
+      clean non-credentialed CORS headers (reflected sanitized bare origin or ``*``) and
+      ``Access-Control-Expose-Headers`` across ``200``, ``204``, ``401``, ``403``, ``413``,
+      and ``429`` responses without duplicate ``Access-Control-Allow-Origin`` headers.
+    - On all other paths (including ``/api/*``): delegates unchanged to Starlette's
+      ``CORSMiddleware`` with ``allow_credentials=True`` and configured ``allow_origins``.
+    """
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        allow_origins: list[str],
+    ) -> None:
+        self.app = app
+        self._api_cors = CORSMiddleware(
+            app,
+            allow_origins=allow_origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = str(scope.get("path", "/"))
+        mcp_route = is_mcp_path(path)
+        discovery_route = is_oauth_well_known_path(path)
+        if not (mcp_route or discovery_route):
+            await self._api_cors(scope, receive, send)
+            return
+
+        req_headers = Headers(scope=scope)
+        raw_origin = (req_headers.get("origin") or "").strip()
+        bare_origin = extract_bare_origin(raw_origin) if raw_origin else None
+        allow_origin = (
+            bare_origin
+            if (bare_origin is not None and bare_origin == raw_origin.lower())
+            else "*"
+        )
+        allow_methods = "GET, POST, DELETE, OPTIONS" if mcp_route else "GET, OPTIONS"
+
+        async def send_with_mcp_cors(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                resp_headers = MutableHeaders(scope=message)
+                # Never advertise cookie credentials on Bearer-only / discovery routes
+                if "access-control-allow-credentials" in resp_headers:
+                    del resp_headers["access-control-allow-credentials"]
+                if "access-control-allow-origin" not in resp_headers:
+                    resp_headers["Access-Control-Allow-Origin"] = allow_origin
+                if "access-control-allow-methods" not in resp_headers:
+                    resp_headers["Access-Control-Allow-Methods"] = allow_methods
+                if "access-control-allow-headers" not in resp_headers:
+                    resp_headers["Access-Control-Allow-Headers"] = MCP_CORS_ALLOWED_HEADERS
+                if "access-control-expose-headers" not in resp_headers:
+                    resp_headers["Access-Control-Expose-Headers"] = MCP_CORS_EXPOSED_HEADERS
+                if "vary" not in resp_headers:
+                    resp_headers["Vary"] = "Origin"
+            await send(message)
+
+        await self.app(scope, receive, send_with_mcp_cors)
 
 
 class SecurityHeadersMiddleware:
@@ -916,6 +1027,9 @@ class UsageAndRateLimitMiddleware:
         path = str(scope.get("path", "/"))
         normalized_path = path.rstrip("/") or "/"
         is_api_route = normalized_path == "/api" or normalized_path.startswith("/api/")
+        is_mcp_route = is_mcp_path(normalized_path)
+        is_well_known_oauth = is_oauth_well_known_path(normalized_path)
+        is_tracked_route = is_api_route or is_mcp_route or is_well_known_oauth
         is_options = method == "OPTIONS"
         route_group = classify_route_group(normalized_path)
 
@@ -934,7 +1048,7 @@ class UsageAndRateLimitMiddleware:
                     status_code=status.HTTP_403_FORBIDDEN,
                     content={"detail": "Direct origin access forbidden"},
                 )
-                if is_api_route and not is_options:
+                if is_tracked_route and not is_options:
                     self.usage_store.record(
                         route_group=route_group,
                         status_code=status.HTTP_403_FORBIDDEN,
@@ -945,7 +1059,11 @@ class UsageAndRateLimitMiddleware:
                 await forbidden(scope, receive, send)
                 return
 
-        is_bypass = is_options or (not is_api_route) or (normalized_path in RATE_LIMIT_BYPASS_PATHS)
+        is_bypass = (
+            is_options
+            or (not is_tracked_route)
+            or (normalized_path in RATE_LIMIT_BYPASS_PATHS)
+        )
         rl_headers: dict[str, str] = {}
 
         if cfg.rate_limit_enabled and not is_bypass:
@@ -960,7 +1078,15 @@ class UsageAndRateLimitMiddleware:
                 trust_proxy_headers=cfg.trust_proxy_headers,
             )
 
-            if method == "POST" and normalized_path in AUTH_RATE_LIMIT_PATHS:
+            window_s = _MINUTE_WINDOW_S
+            if is_mcp_route:
+                bucket_name = "mcp"
+                limit = cfg.rate_limit_mcp_per_min
+            elif method == "POST" and normalized_path == OAUTH_DCR_PATH:
+                bucket_name = "oauth_dcr"
+                limit = cfg.oauth_dcr_max_per_ip_per_day
+                window_s = _DAY_WINDOW_S
+            elif method == "POST" and normalized_path in AUTH_RATE_LIMIT_PATHS:
                 bucket_name = "auth"
                 limit = cfg.rate_limit_auth_per_min
             else:
@@ -985,7 +1111,7 @@ class UsageAndRateLimitMiddleware:
                 result = limiter.check(
                     f"{bucket_name}:{client_ip}",
                     limit=limit,
-                    window_s=_MINUTE_WINDOW_S,
+                    window_s=window_s,
                 )
                 if not result.allowed:
                     response = JSONResponse(
@@ -1037,7 +1163,7 @@ class UsageAndRateLimitMiddleware:
             status_code = 500
             raise
         finally:
-            if is_api_route and not is_options:
+            if is_tracked_route and not is_options:
                 self.usage_store.record(
                     route_group=route_group,
                     status_code=status_code,

@@ -1,4 +1,4 @@
-.PHONY: help up down logs ps stats lint test test-unit test-integration migrate seed-corridor bake-alps bake-blue-mountains web-check fixtures
+.PHONY: help up down logs ps stats lint test test-unit test-integration migrate seed-corridor bake-alps bake-blue-mountains web-check build-mcp-app fixtures
 
 TEST_DB ?= trailforge_test
 BAKE_ARGS ?=
@@ -17,7 +17,8 @@ help:
 	@echo "  make seed-corridor       - Ingest Alps corridor, closures, telemetry, live grades, tiles & offline pack"
 	@echo "  make bake-alps           - Bake real Australian Alps corridor (pass BAKE_ARGS='--pbf ...')"
 	@echo "  make bake-blue-mountains - Bake real Blue Mountains corridor (pass BAKE_ARGS='--pbf ...')"
-	@echo "  make web-check           - Run web typecheck, build, and Vitest suite"
+	@echo "  make web-check           - Run web typecheck, production + MCP builds, and Vitest suite"
+	@echo "  make build-mcp-app       - Build SEP-1865 MCP App and install into backend static assets"
 	@echo "  make fixtures            - Regenerate deterministic synthetic VIC/NSW fixtures"
 
 up:
@@ -78,7 +79,12 @@ bake-blue-mountains:
 		--region blue-mountains --cache-dir /data/cache --build-tiles --build-pack $(BAKE_ARGS)
 
 web-check:
-	cd web && npm run typecheck && npm run build && npm test
+	cd web && npm run typecheck && npm run build && npm run build:mcp && npm test
+
+build-mcp-app:
+	npm --prefix web run build:mcp
+	mkdir -p src/trailforge/mcp/static
+	cp web/dist-mcp/explorer.html src/trailforge/mcp/static/explorer.html
 
 fixtures:
 	uv run python tests/fixtures/generate_fixtures.py

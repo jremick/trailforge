@@ -1,9 +1,9 @@
-"""SQLAlchemy 2 + GeoAlchemy2 spatial models for TrailForge (Slices 01-09 + v1.1.0).
+"""SQLAlchemy 2 + GeoAlchemy2 spatial models for TrailForge (Slices 01-09 + v1.2).
 
-Implements all 30 PostGIS tables across three strict OSM ODbL separation tiers:
+Implements all 34 PostGIS tables across three strict OSM ODbL separation tiers:
   - Tier A (7 tables): Dedicated upstream source staging tables (incl. Pan-AU state tracks)
   - Tier B (5 tables): Canonical conflated network & reference tables
-  - Tier C (18 tables): Independent TrailForge grading, feeds, telemetry & access-control tables
+  - Tier C (22 tables): Independent TrailForge grading, feeds, telemetry, access & AI auth tables
 """
 
 from __future__ import annotations
@@ -33,6 +33,12 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from trailforge.db.base import Base
+from trailforge.db.models_ai_auth import (
+    OAuthAuthorizationCode,
+    OAuthClient,
+    OAuthToken,
+    PersonalAccessToken,
+)
 
 # =============================================================================
 # Tier A — Upstream Source Tables (6 Tables, Strict ODbL Isolation)
@@ -1398,8 +1404,12 @@ __all__ = [
     "ConditionReportVote",
     "FeedSyncStatus",
     "InviteCode",
+    "OAuthAuthorizationCode",
+    "OAuthClient",
+    "OAuthToken",
     "OfflinePack",
     "POI",
+    "PersonalAccessToken",
     "PlannedRoute",
     "RainfallSnapshot",
     "SegmentClosureLink",

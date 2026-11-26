@@ -173,7 +173,7 @@ import {
 import {
   buildAppUrlSearch,
   parseAppUrlState,
-  type AppUrlState,
+  type ParsedAppUrlState,
 } from "./urlState";
 
 const HEALTH_POLL_INTERVAL_MS = 15000;
@@ -250,10 +250,12 @@ class TrailForgeApp {
   private inspectorAbort: AbortController | null = null;
 
   // Bookmarkable / shareable URL state
-  private readonly initialUrlState: AppUrlState;
+  private readonly initialUrlState: ParsedAppUrlState;
   private urlTrackId: string | null = null;
   private urlRegionId: string | null = null;
   private urlProfileOpen = false;
+  private urlRouteTrackIds: string[] = [];
+  private urlRigClass: VehicleCapabilityClass | null = null;
   private urlView: { lat: number; lon: number; zoom: number } | null = null;
   private suppressUrlSync = false;
 
@@ -317,6 +319,8 @@ class TrailForgeApp {
             lon: null,
             zoom: null,
             profileOpen: false,
+            routeTrackIds: [],
+            rigClass: null,
           };
 
     if (this.initialUrlState.regionId) {
@@ -324,6 +328,15 @@ class TrailForgeApp {
       if (parsedPreset) {
         this.activePreset = parsedPreset;
       }
+    }
+
+    if (this.initialUrlState.rigClass) {
+      this.anonymousRigClass = this.initialUrlState.rigClass;
+      this.urlRigClass = this.initialUrlState.rigClass;
+    }
+    if (this.initialUrlState.routeTrackIds.length > 0) {
+      this.routeTrackIds = [...this.initialUrlState.routeTrackIds];
+      this.urlRouteTrackIds = [...this.initialUrlState.routeTrackIds];
     }
 
     this.urlTrackId = this.initialUrlState.trackId;
@@ -689,6 +702,7 @@ class TrailForgeApp {
         onSelectAnonymousRig: (cls) => {
           this.anonymousRigClass = cls;
           saveStoredAnonRig(cls);
+          this.syncUrlState({ rigClass: cls }, "replace");
           this.syncRigUiState();
           this.showToast(`Rig suitability preview set to ${cls}`, "info");
           this.refreshOpenInspectorForRig();
@@ -1183,14 +1197,17 @@ class TrailForgeApp {
         },
         onMoveLegUp: (idx) => {
           this.routeTrackIds = moveRouteTrackUp(this.routeTrackIds, idx);
+          this.syncUrlState({ routeTrackIds: [...this.routeTrackIds] }, "replace");
           void this.recomputePlannedRoute(false);
         },
         onMoveLegDown: (idx) => {
           this.routeTrackIds = moveRouteTrackDown(this.routeTrackIds, idx);
+          this.syncUrlState({ routeTrackIds: [...this.routeTrackIds] }, "replace");
           void this.recomputePlannedRoute(false);
         },
         onRemoveLeg: (idx) => {
           this.routeTrackIds = removeRouteTrackAt(this.routeTrackIds, idx);
+          this.syncUrlState({ routeTrackIds: [...this.routeTrackIds] }, "replace");
           void this.recomputePlannedRoute(false);
         },
         onClearRoute: () => {
@@ -1204,6 +1221,7 @@ class TrailForgeApp {
           this.routeError = null;
           this.setRoutePlanMode(false);
           this.map.setPlannedRoute(null, null);
+          this.syncUrlState({ routeTrackIds: [] }, "replace");
           this.syncRoutePlannerUiState();
           this.syncRigUiState();
           this.showToast("Cleared active route", "info");
@@ -1612,6 +1630,7 @@ class TrailForgeApp {
 
     this.routeTrackIds = res.trackIds;
     this.routeError = null;
+    this.syncUrlState({ routeTrackIds: [...this.routeTrackIds] }, "replace");
     this.syncRoutePlannerUiState();
     this.syncRigUiState();
     this.showToast(
@@ -1803,6 +1822,7 @@ class TrailForgeApp {
       this.routeNotes = loaded.notes ?? "";
       this.routeTrackIds = [...(loaded.track_ids ?? [])];
       this.routeWaypoints = getSavedRouteWaypoints(loaded);
+      this.syncUrlState({ routeTrackIds: [...this.routeTrackIds] }, "replace");
 
       if (loaded.analysis) {
         this.routeAnalysis = loaded.analysis;
@@ -2173,7 +2193,10 @@ class TrailForgeApp {
     void this.refreshPacksCatalog();
     void this.hydrateAuthSession();
 
-    if (this.initialUrlState.trackId) {
+    if (this.initialUrlState.routeTrackIds.length > 0) {
+      this.openRoutePlanner();
+      void this.recomputePlannedRoute(this.initialUrlState.lat === null);
+    } else if (this.initialUrlState.trackId) {
       void this.openTrackInspector(this.initialUrlState.trackId, undefined, {
         autoZoomIfNoCoords: this.initialUrlState.lat === null,
         autoOpenProfile: this.initialUrlState.profileOpen,
@@ -2625,6 +2648,8 @@ class TrailForgeApp {
       trackId: string | null;
       regionId: string | null;
       profileOpen: boolean;
+      routeTrackIds: string[];
+      rigClass: VehicleCapabilityClass | null;
       lat: number | null;
       lon: number | null;
       zoom: number | null;
@@ -2644,6 +2669,14 @@ class TrailForgeApp {
     }
     if ("profileOpen" in patch) {
       this.urlProfileOpen = Boolean(this.urlTrackId && patch.profileOpen);
+    }
+    if ("routeTrackIds" in patch) {
+      this.urlRouteTrackIds = Array.isArray(patch.routeTrackIds)
+        ? [...patch.routeTrackIds]
+        : [];
+    }
+    if ("rigClass" in patch) {
+      this.urlRigClass = patch.rigClass ?? null;
     }
     if ("lat" in patch && "lon" in patch) {
       if (
@@ -2672,6 +2705,8 @@ class TrailForgeApp {
         trackId: this.urlTrackId,
         regionId: this.urlRegionId,
         profileOpen: this.urlProfileOpen,
+        routeTrackIds: this.urlRouteTrackIds,
+        rigClass: this.urlRigClass,
         lat: this.urlView?.lat ?? null,
         lon: this.urlView?.lon ?? null,
         zoom: this.urlView?.zoom ?? null,
@@ -2702,6 +2737,12 @@ class TrailForgeApp {
       this.urlTrackId = state.trackId;
       this.urlRegionId = state.regionId;
       this.urlProfileOpen = state.profileOpen;
+      this.urlRouteTrackIds = [...state.routeTrackIds];
+      this.urlRigClass = state.rigClass;
+      if (state.rigClass && state.rigClass !== this.anonymousRigClass) {
+        this.anonymousRigClass = state.rigClass;
+        this.syncRigUiState();
+      }
       this.urlView =
         state.lat !== null && state.lon !== null
           ? {
@@ -2733,7 +2774,11 @@ class TrailForgeApp {
         }
       }
 
-      if (state.trackId) {
+      if (state.routeTrackIds.length > 0) {
+        this.routeTrackIds = [...state.routeTrackIds];
+        this.openRoutePlanner();
+        void this.recomputePlannedRoute(state.lat === null);
+      } else if (state.trackId) {
         if (
           this.inspector.getCurrentTrackId() === state.trackId &&
           this.inspector.openState()
@@ -2794,6 +2839,10 @@ class TrailForgeApp {
       {
         trackId: activeTrackId,
         profileOpen: activeTrackId ? this.inspector.isElevationModalOpen() : false,
+        routeTrackIds: [...this.routeTrackIds],
+        rigClass:
+          this.urlRigClass ??
+          (this.routeTrackIds.length > 0 ? this.getActiveRigInfo().vehicleClass : null),
         lat: view.lat,
         lon: view.lon,
         zoom: view.zoom,

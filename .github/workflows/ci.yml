@@ -84,5 +84,8 @@ jobs:
       - name: Build production bundle
         run: npm run build
 
+      - name: Build SEP-1865 MCP App bundle
+        run: npm run build:mcp
+
       - name: Run Vitest offline unit tests
         run: npm test

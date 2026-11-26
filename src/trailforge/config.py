@@ -331,6 +331,102 @@ class Settings(BaseSettings):
         description="Cloudflare R2 S3 API secret access key.",
     )
 
+    # AI & Model Context Protocol (MCP) + Self-Hosted OAuth 2.1 (v1.2, SPEC_AI_MCP Sec 9.1)
+    enable_mcp: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRAILFORGE_ENABLE_MCP",
+            "ENABLE_MCP",
+            "enable_mcp",
+        ),
+        description="Master toggle for /mcp, /mcp/auth, and /.well-known/oauth-* endpoints.",
+    )
+    mcp_auth_mode: Literal["hybrid", "oauth_required", "anonymous_only"] = Field(
+        default="hybrid",
+        validation_alias=AliasChoices(
+            "TRAILFORGE_MCP_AUTH_MODE",
+            "MCP_AUTH_MODE",
+            "mcp_auth_mode",
+        ),
+        description="MCP auth policy ('hybrid', 'oauth_required', or 'anonymous_only').",
+    )
+    public_base_url: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "TRAILFORGE_PUBLIC_BASE_URL",
+            "PUBLIC_BASE_URL",
+            "public_base_url",
+        ),
+        description=(
+            "Canonical public HTTPS origin (e.g. https://trails.example.com) for deep links "
+            "and OAuth 2.1 discovery metadata."
+        ),
+    )
+    rate_limit_mcp_per_min: int = Field(
+        default=60,
+        ge=1,
+        validation_alias=AliasChoices(
+            "TRAILFORGE_RATE_LIMIT_MCP_PER_MIN",
+            "RATE_LIMIT_MCP_PER_MIN",
+            "rate_limit_mcp_per_min",
+        ),
+        description="Per-IP sliding-window request cap per minute on /mcp and /mcp/*.",
+    )
+    mcp_app_html: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "TRAILFORGE_MCP_APP_HTML",
+            "MCP_APP_HTML",
+            "mcp_app_html",
+        ),
+        description="Optional local file path override for ui://trailforge/explorer.html.",
+    )
+    mcp_csp_tile_domains: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "TRAILFORGE_MCP_CSP_TILE_DOMAINS",
+            "MCP_CSP_TILE_DOMAINS",
+            "mcp_csp_tile_domains",
+        ),
+        description=(
+            "Comma-separated bare origins allowed in MCP App _meta.ui.csp "
+            "(auto-includes TILES_PUBLIC_BASE_URL origin when configured)."
+        ),
+    )
+    oauth_access_token_ttl_s: int = Field(
+        default=3600,
+        ge=60,
+        le=86400,
+        validation_alias=AliasChoices(
+            "TRAILFORGE_OAUTH_ACCESS_TOKEN_TTL_S",
+            "OAUTH_ACCESS_TOKEN_TTL_S",
+            "oauth_access_token_ttl_s",
+        ),
+        description="OAuth 2.1 access token lifetime in seconds.",
+    )
+    oauth_refresh_token_ttl_s: int = Field(
+        default=2_592_000,
+        ge=300,
+        le=31_536_000,
+        validation_alias=AliasChoices(
+            "TRAILFORGE_OAUTH_REFRESH_TOKEN_TTL_S",
+            "OAUTH_REFRESH_TOKEN_TTL_S",
+            "oauth_refresh_token_ttl_s",
+        ),
+        description="OAuth 2.1 refresh token lifetime in seconds (default 30 days).",
+    )
+    oauth_dcr_max_per_ip_per_day: int = Field(
+        default=20,
+        ge=1,
+        le=10_000,
+        validation_alias=AliasChoices(
+            "TRAILFORGE_OAUTH_DCR_MAX_PER_IP_PER_DAY",
+            "OAUTH_DCR_MAX_PER_IP_PER_DAY",
+            "oauth_dcr_max_per_ip_per_day",
+        ),
+        description="Daily per-IP cap on RFC 7591 OAuth Dynamic Client Registration.",
+    )
+
     @property
     def uploads_max_total_bytes(self) -> int:
         """Global photo uploads quota expressed in bytes."""

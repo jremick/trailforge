@@ -55,6 +55,17 @@ RUN set -eux; \
     rm -f /tmp/pmtiles.tar.gz
 
 # ---------------------------------------------------------------------------
+# Stage 2b: Build single-file SEP-1865 MCP App HTML (`explorer.html`)
+# ---------------------------------------------------------------------------
+FROM node:22-slim AS mcp-app-builder
+
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build:mcp
+
+# ---------------------------------------------------------------------------
 # Stage 3: Lean Python 3.12 + GDAL + osmium + tippecanoe + rio-rgbify + pmtiles runtime
 # ---------------------------------------------------------------------------
 FROM python:3.12-slim-bookworm AS runtime
@@ -86,9 +97,10 @@ ENV PATH="/opt/venv/bin:${PATH}"
 
 WORKDIR /app
 
-# Install Python dependencies first for layer caching
+# Install Python dependencies first for layer caching (incl. built SEP-1865 MCP App asset)
 COPY pyproject.toml README.md LICENSE ./
 COPY src/ ./src/
+COPY --from=mcp-app-builder /web/dist-mcp/explorer.html ./src/trailforge/mcp/static/explorer.html
 RUN pip install --no-cache-dir --upgrade pip \
     && if [ "${INSTALL_DEV}" = "true" ]; then \
         pip install --no-cache-dir ".[gis,dev]"; \

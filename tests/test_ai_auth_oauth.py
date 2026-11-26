@@ -695,6 +695,7 @@ def test_oauth_discovery_cors_and_feature_toggles(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("TRAILFORGE_PUBLIC_BASE_URL", "https://trails.example.com")
+    get_settings.cache_clear()
     app = _build_test_app(sqlite_db)
 
     with TestClient(app) as client:
@@ -732,6 +733,7 @@ def test_oauth_discovery_cors_and_feature_toggles(
 
     # anonymous_only hides /mcp/auth discovery and OAuth endpoints
     monkeypatch.setenv("TRAILFORGE_MCP_AUTH_MODE", "anonymous_only")
+    get_settings.cache_clear()
     with TestClient(app) as client:
         assert client.get("/.well-known/oauth-protected-resource").status_code == 200
         assert client.get("/.well-known/oauth-protected-resource/mcp/auth").status_code == 404
@@ -747,9 +749,11 @@ def test_oauth_discovery_cors_and_feature_toggles(
     # TRAILFORGE_ENABLE_MCP=false disables all discovery & OAuth routes (404)
     monkeypatch.setenv("TRAILFORGE_MCP_AUTH_MODE", "hybrid")
     monkeypatch.setenv("TRAILFORGE_ENABLE_MCP", "false")
+    get_settings.cache_clear()
     with TestClient(app) as client:
         assert client.get("/.well-known/oauth-protected-resource").status_code == 404
         assert client.get("/.well-known/oauth-authorization-server").status_code == 404
+    get_settings.cache_clear()
 
 
 def test_full_oauth21_pkce_dcr_rotation_reuse_revoke_and_grants(
@@ -1199,6 +1203,7 @@ def test_confidential_client_expired_code_and_dcr_bounds(
     user = _create_user(sqlite_db, email="conf@example.com", display_name="Conf User")
     monkeypatch.setenv("TRAILFORGE_OAUTH_DCR_MAX_PER_IP_PER_DAY", "2")
     monkeypatch.setenv("TRAILFORGE_OAUTH_MAX_CLIENTS", "3")
+    get_settings.cache_clear()
 
     now = datetime.now(UTC)
 
@@ -1336,6 +1341,7 @@ def test_confidential_client_expired_code_and_dcr_bounds(
 def test_public_origin_proxy_header_trust(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TRAILFORGE_PUBLIC_BASE_URL", raising=False)
     monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+    get_settings.cache_clear()
 
     app = FastAPI()
     app.include_router(well_known_router)
@@ -1353,6 +1359,7 @@ def test_public_origin_proxy_header_trust(monkeypatch: pytest.MonkeyPatch) -> No
 
     # When trust_proxy_headers=False, ignore spoofed forwarded host
     monkeypatch.setenv("TRAILFORGE_TRUST_PROXY_HEADERS", "false")
+    get_settings.cache_clear()
     get_settings.cache_clear()
     try:
         with TestClient(app) as client:

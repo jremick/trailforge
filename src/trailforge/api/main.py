@@ -8,8 +8,8 @@ from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI, Request, status
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
 
 from trailforge import SERVICE_NAME, __version__
 from trailforge.api.admin import router as admin_router
@@ -20,11 +20,13 @@ from trailforge.api.health import router as health_router
 from trailforge.api.middleware import (
     BodySizeLimitMiddleware,
     CookieCSRFMiddleware,
+    PathAwareCORSMiddleware,
     SecurityHeadersMiddleware,
     SlidingWindowRateLimiter,
     UsageAndRateLimitMiddleware,
     flush_usage_metrics,
 )
+from trailforge.api.oauth import oauth_router, tokens_router, well_known_router
 from trailforge.api.packs import router as packs_router
 from trailforge.api.reports import router as reports_router
 from trailforge.api.routes import router as routes_router
@@ -34,6 +36,7 @@ from trailforge.api.trips import router as trips_router
 from trailforge.api.user_data import router as user_data_router
 from trailforge.api.vehicles import router as vehicles_router
 from trailforge.auth import security as auth_security
+from trailforge.auth.tokens import resolve_bearer_token
 from trailforge.config import (
     DEV_DEFAULT_AUTH_SECRET_KEY,
     DEV_DEFAULT_PRIVACY_SECRET_KEY,
@@ -41,6 +44,8 @@ from trailforge.config import (
     get_settings,
 )
 from trailforge.db.session import reset_engine
+from trailforge.mcp.context import ANONYMOUS_CONTEXT, McpAuthContext, parse_bearer_token
+from trailforge.mcp.server import create_mcp_asgi_apps, mcp_lifespan
 from trailforge.reports.photos import PhotoStorageQuotaError
 
 logger = logging.getLogger(__name__)
@@ -90,6 +95,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     _validate_startup_secrets(cfg)
     docs_enabled = cfg.docs_enabled
 
+    def _resolve_mcp_bearer(authorization_header: str | None, db: Session) -> McpAuthContext:
+        token = parse_bearer_token(authorization_header)
+        if not token:
+            return ANONYMOUS_CONTEXT
+        active_cfg = settings or get_settings()
+        resolved = resolve_bearer_token(token, db, settings=active_cfg)
+        if resolved is None:
+            return ANONYMOUS_CONTEXT
+        return McpAuthContext(
+            user=resolved.user,
+            auth_method=resolved.auth_method,
+            scopes=resolved.scopes,
+            token_id=resolved.token_id,
+            client_id=resolved.client_id,
+        )
+
+    mcp_apps = create_mcp_asgi_apps(
+        auth_resolver=_resolve_mcp_bearer,
+        settings=settings,
+    )
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         logging.basicConfig(
@@ -98,7 +124,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         logger.info("Starting %s v%s", SERVICE_NAME, __version__)
         try:
-            yield
+            async with mcp_lifespan(mcp_apps):
+                yield
         finally:
             flush_usage_metrics()
             reset_engine()
@@ -121,6 +148,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     rate_limiter = SlidingWindowRateLimiter()
     application.state.rate_limiter = rate_limiter
     application.state.settings = cfg
+    application.state.mcp_apps = mcp_apps
     if settings is not None:
         application.state.custom_settings = settings
 
@@ -135,8 +163,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     # Middleware execution order (outermost -> innermost):
-    # SecurityHeaders -> CORS -> UsageAndRateLimit (incl. Origin Secret)
-    #   -> CookieCSRF -> BodySizeLimit -> FastAPI route handlers.
+    # SecurityHeaders -> PathAwareCORS -> UsageAndRateLimit (incl. Origin Secret)
+    #   -> CookieCSRF -> BodySizeLimit -> FastAPI route handlers & MCP ASGI apps.
     # Registering inner middlewares first keeps CORS & security headers on 403/413/429/507.
     application.add_middleware(BodySizeLimitMiddleware)
     application.add_middleware(CookieCSRFMiddleware, settings=settings)
@@ -146,11 +174,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         rate_limiter=rate_limiter,
     )
     application.add_middleware(
-        CORSMiddleware,
+        PathAwareCORSMiddleware,
         allow_origins=cfg.cors_origins_list,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
     )
     application.add_middleware(SecurityHeadersMiddleware, settings=settings)
 
@@ -163,10 +188,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(reports_router)
     application.include_router(trips_router)
     application.include_router(auth_router)
+    application.include_router(well_known_router)
+    application.include_router(oauth_router)
+    application.include_router(tokens_router)
     application.include_router(vehicles_router)
     application.include_router(user_data_router)
     application.include_router(routes_router)
     application.include_router(admin_router)
+    mcp_apps.register(application)
 
     @application.get("/", tags=["meta"])
     def root() -> dict[str, str]:
