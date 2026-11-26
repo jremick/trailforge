@@ -9,6 +9,12 @@ import {
   escapeHtml,
   snapSnowlineBand,
 } from "../presets";
+import {
+  SIDEBAR_DEFAULT_WIDTH_PX,
+  SIDEBAR_KEYBOARD_STEP_PX,
+  SIDEBAR_MAX_WIDTH_PX,
+  SIDEBAR_MIN_WIDTH_PX,
+} from "../sidebarHelpers";
 import type { SwStatus } from "../pwa";
 import type {
   ClosuresStatusResponse,
@@ -24,6 +30,11 @@ export interface SidebarCallbacks {
   onSnowLineElevationChange: (elevationM: number) => void;
   onResetRegion: () => void;
   onOpenOfflinePacks?: () => void;
+  onCollapse?: () => void;
+  onResizePreview?: (widthPx: number) => void;
+  onResizeCommit?: (widthPx: number) => void;
+  onResizeStateChange?: (resizing: boolean) => void;
+  onResetWidth?: () => void;
 }
 
 interface LayerToggleDef {
@@ -107,8 +118,12 @@ export class Sidebar {
   private readonly sysSchemaEl: HTMLElement;
   private readonly sysNetworkEl: HTMLElement;
   private readonly sysSwEl: HTMLElement;
+  private readonly collapseBtnEl: HTMLButtonElement;
+  private readonly resizerEl: HTMLElement;
 
   private snowBands: number[] = [...DEFAULT_SNOWLINE_BANDS_M];
+  private currentWidthPx: number = SIDEBAR_DEFAULT_WIDTH_PX;
+  private maxWidthPx: number = SIDEBAR_MAX_WIDTH_PX;
 
   constructor(
     container: HTMLElement,
@@ -129,6 +144,29 @@ export class Sidebar {
     const initIdx = Math.max(0, this.snowBands.indexOf(snappedInit));
 
     this.root.innerHTML = `
+      <div class="tf-sidebar-head">
+        <div class="tf-sidebar-head-title">
+          <svg class="tf-sidebar-head-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
+            <polyline points="2 12 12 17 22 12"></polyline>
+            <polyline points="2 17 12 22 22 17"></polyline>
+          </svg>
+          <span>Layers &amp; Controls</span>
+        </div>
+        <button
+          type="button"
+          class="tf-sidebar-collapse-btn"
+          data-role="sidebar-collapse-btn"
+          title="Hide sidebar (shortcut: [)"
+          aria-label="Hide layers sidebar"
+          aria-expanded="true"
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="15 18 9 12 15 6"></polyline>
+          </svg>
+          <span>Hide</span>
+        </button>
+      </div>
       <div class="tf-sidebar-scroll">
         <details class="tf-section" open>
           <summary class="tf-section-summary">
@@ -279,6 +317,20 @@ export class Sidebar {
           </div>
         </details>
       </div>
+      <div
+        class="tf-sidebar-resizer"
+        data-role="sidebar-resizer"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize layers sidebar (drag or use Left/Right arrows, double-click to reset)"
+        aria-valuemin="${SIDEBAR_MIN_WIDTH_PX}"
+        aria-valuemax="${SIDEBAR_MAX_WIDTH_PX}"
+        aria-valuenow="${SIDEBAR_DEFAULT_WIDTH_PX}"
+        tabindex="0"
+        title="Drag to resize sidebar · Double-click to reset width"
+      >
+        <span class="tf-sidebar-resizer-bar" aria-hidden="true"></span>
+      </div>
     `;
 
     this.snowSliderRowEl = this.q("[data-role='snow-control']");
@@ -300,9 +352,17 @@ export class Sidebar {
     this.sysSchemaEl = this.q("[data-role='sys-schema']");
     this.sysNetworkEl = this.q("[data-role='sys-network']");
     this.sysSwEl = this.q("[data-role='sys-sw']");
+    this.collapseBtnEl = this.q<HTMLButtonElement>("[data-role='sidebar-collapse-btn']");
+    this.resizerEl = this.q("[data-role='sidebar-resizer']");
 
     this.renderSnowTicks();
     this.updatePreset(initialPreset);
+
+    this.collapseBtnEl.addEventListener("click", () => {
+      callbacks.onCollapse?.();
+    });
+
+    this.bindResizerEvents();
 
     this.root
       .querySelectorAll<HTMLInputElement>("[data-layer-key]")
@@ -337,6 +397,101 @@ export class Sidebar {
   openFeedsSection(): void {
     this.feedsSectionEl.open = true;
     this.feedsSectionEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+
+  updateWidthMeta(widthPx: number, maxWidthPx: number): void {
+    this.currentWidthPx = widthPx;
+    this.maxWidthPx = maxWidthPx;
+    this.resizerEl.setAttribute("aria-valuenow", String(Math.round(widthPx)));
+    this.resizerEl.setAttribute("aria-valuemax", String(Math.round(maxWidthPx)));
+  }
+
+  updateCollapsedState(collapsed: boolean): void {
+    this.root.setAttribute("aria-hidden", String(collapsed));
+    this.collapseBtnEl.setAttribute("aria-expanded", String(!collapsed));
+  }
+
+  private bindResizerEvents(): void {
+    let activePointerId: number | null = null;
+    let startX = 0;
+    let startWidth = this.currentWidthPx;
+    let latestWidth = this.currentWidthPx;
+
+    const finishDrag = (commit: boolean): void => {
+      if (activePointerId === null) return;
+      const pid = activePointerId;
+      activePointerId = null;
+      this.resizerEl.classList.remove("dragging");
+      try {
+        if (this.resizerEl.hasPointerCapture?.(pid)) {
+          this.resizerEl.releasePointerCapture(pid);
+        }
+      } catch {
+        // Ignore release errors when pointer already ended
+      }
+      this.callbacks.onResizeStateChange?.(false);
+      if (commit) {
+        this.callbacks.onResizeCommit?.(latestWidth);
+      }
+    };
+
+    this.resizerEl.addEventListener("pointerdown", (e: PointerEvent) => {
+      if (e.button !== 0 && e.pointerType === "mouse") return;
+      e.preventDefault();
+      activePointerId = e.pointerId;
+      startX = e.clientX;
+      startWidth = this.root.getBoundingClientRect().width || this.currentWidthPx;
+      latestWidth = startWidth;
+      this.resizerEl.classList.add("dragging");
+      try {
+        this.resizerEl.setPointerCapture?.(e.pointerId);
+      } catch {
+        // Fallback to window listeners below
+      }
+      this.callbacks.onResizeStateChange?.(true);
+    });
+
+    window.addEventListener("pointermove", (e: PointerEvent) => {
+      if (activePointerId === null || e.pointerId !== activePointerId) return;
+      const nextWidth = startWidth + (e.clientX - startX);
+      latestWidth = nextWidth;
+      this.callbacks.onResizePreview?.(nextWidth);
+    });
+
+    window.addEventListener("pointerup", (e: PointerEvent) => {
+      if (activePointerId === null || e.pointerId !== activePointerId) return;
+      finishDrag(true);
+    });
+
+    window.addEventListener("pointercancel", (e: PointerEvent) => {
+      if (activePointerId === null || e.pointerId !== activePointerId) return;
+      finishDrag(true);
+    });
+
+    this.resizerEl.addEventListener("dblclick", (e) => {
+      e.preventDefault();
+      this.callbacks.onResetWidth?.();
+    });
+
+    this.resizerEl.addEventListener("keydown", (e: KeyboardEvent) => {
+      if (e.key === "ArrowRight") {
+        e.preventDefault();
+        this.callbacks.onResizeCommit?.(
+          this.currentWidthPx + SIDEBAR_KEYBOARD_STEP_PX
+        );
+      } else if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        this.callbacks.onResizeCommit?.(
+          this.currentWidthPx - SIDEBAR_KEYBOARD_STEP_PX
+        );
+      } else if (e.key === "Home") {
+        e.preventDefault();
+        this.callbacks.onResetWidth?.();
+      } else if (e.key === "End") {
+        e.preventDefault();
+        this.callbacks.onResizeCommit?.(this.maxWidthPx);
+      }
+    });
   }
 
   updateFeedStatus(status: ClosuresStatusResponse | null): void {

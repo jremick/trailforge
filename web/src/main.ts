@@ -128,6 +128,17 @@ import {
   removeRouteTrackAt,
 } from "./routeHelpers";
 import { buildTripExportUrl, getTripId } from "./tripsHelpers";
+import {
+  SIDEBAR_DEFAULT_WIDTH_PX,
+  clampSidebarWidth,
+  getSidebarMapLeftPadding,
+  getSidebarMaxWidth,
+  isSidebarResizeEnabled,
+  loadStoredSidebarCollapsed,
+  loadStoredSidebarWidth,
+  saveStoredSidebarCollapsed,
+  saveStoredSidebarWidth,
+} from "./sidebarHelpers";
 import type {
   AdminInviteItem,
   AdminStatsResponse,
@@ -224,6 +235,8 @@ class TrailForgeApp {
   private readonly basemapButtons: NodeListOf<HTMLButtonElement>;
 
   private sidebarCollapsed = false;
+  private preferredSidebarWidthPx: number = SIDEBAR_DEFAULT_WIDTH_PX;
+  private activeSidebarWidthPx: number = SIDEBAR_DEFAULT_WIDTH_PX;
   private activePreset: RegionPreset = getDefaultPreset();
   private activeBasemap: BasemapId;
   private layerState: LayerVisibilityState = createInitialLayerState();
@@ -280,9 +293,17 @@ class TrailForgeApp {
     this.isOnline = initiallyOnline;
     this.activeBasemap = initiallyOnline ? "opentopo" : "offline-topo";
 
-    // Start collapsed on narrow mobile screens so the map is immediately prominent
-    this.sidebarCollapsed =
-      typeof window !== "undefined" && window.innerWidth <= 768;
+    const initialViewportWidth =
+      typeof window !== "undefined" ? window.innerWidth : undefined;
+    this.sidebarCollapsed = loadStoredSidebarCollapsed(
+      undefined,
+      initialViewportWidth
+    );
+    this.preferredSidebarWidthPx = loadStoredSidebarWidth(undefined);
+    this.activeSidebarWidthPx = clampSidebarWidth(
+      this.preferredSidebarWidthPx,
+      initialViewportWidth
+    );
 
     root.innerHTML = `
       <div class="tf-shell ${this.sidebarCollapsed ? "sidebar-collapsed" : ""}" data-role="shell">
@@ -309,10 +330,12 @@ class TrailForgeApp {
             type="button"
             class="tf-sidebar-toggle"
             data-role="sidebar-toggle"
-            title="Toggle layers sidebar"
-            aria-label="Toggle layers sidebar"
+            title="Show layers sidebar (shortcut: [)"
+            aria-label="Show layers sidebar"
             aria-expanded="${!this.sidebarCollapsed}"
-          >${this.sidebarCollapsed ? "▸" : "◂"}</button>
+            aria-hidden="${!this.sidebarCollapsed}"
+            tabindex="${this.sidebarCollapsed ? "0" : "-1"}"
+          >${this.renderSidebarToggleMarkup(true)}</button>
 
           <aside data-role="sidebar"></aside>
           <aside data-role="inspector"></aside>
@@ -380,6 +403,9 @@ class TrailForgeApp {
       this.q(root, "[data-role='topbar']"),
       DEFAULT_PRESET_ID,
       {
+        onToggleSidebar: () => {
+          this.setSidebarCollapsed(!this.sidebarCollapsed, { persist: true });
+        },
         onSearchSelect: (item) => this.handleSearchSelect(item),
         onSearchNoMatch: (query, remoteError) => {
           this.showToast(
@@ -401,7 +427,7 @@ class TrailForgeApp {
         onHealthClick: () => void this.refreshHealth(true),
         onFeedStatusClick: () => {
           if (this.sidebarCollapsed) {
-            this.collapseBtnEl.click();
+            this.setSidebarCollapsed(false, { persist: true });
           }
           this.sidebar.openFeedsSection();
           void this.refreshClosures(true);
@@ -454,14 +480,35 @@ class TrailForgeApp {
         onResetRegion: () => {
           this.map.flyToPreset(
             this.activePreset,
-            this.sidebarCollapsed ? 16 : 340
+            this.getMapLeftPadding(16)
           );
         },
         onOpenOfflinePacks: () => {
           this.openPacksPanel();
         },
+        onCollapse: () => {
+          this.setSidebarCollapsed(true, { persist: true });
+        },
+        onResizeStateChange: (resizing) => {
+          this.shellEl.classList.toggle("sidebar-resizing", resizing);
+        },
+        onResizePreview: (widthPx) => {
+          this.applySidebarWidth(widthPx, false);
+        },
+        onResizeCommit: (widthPx) => {
+          this.applySidebarWidth(widthPx, true);
+          window.setTimeout(() => this.map.resize(), 60);
+        },
+        onResetWidth: () => {
+          this.applySidebarWidth(SIDEBAR_DEFAULT_WIDTH_PX, true);
+          window.setTimeout(() => this.map.resize(), 60);
+        },
       }
     );
+
+    this.applySidebarWidth(this.preferredSidebarWidthPx, false);
+    this.sidebar.updateCollapsedState(this.sidebarCollapsed);
+    this.topbar.updateSidebarState(this.sidebarCollapsed);
 
     this.inspector = new TrackInspectorDrawer(
       this.q(root, "[data-role='inspector']"),
@@ -472,7 +519,7 @@ class TrailForgeApp {
           this.pickedReportCoords = null;
         },
         onZoomToTrack: (bbox) => {
-          this.map.fitBBox(bbox, this.sidebarCollapsed ? 24 : 360, 420);
+          this.map.fitBBox(bbox, this.getMapLeftPadding(24), 420);
         },
         onPoiSelect: (poi) => {
           this.map.flyToCoordinate(poi.lat, poi.lon, poi.name, 14);
@@ -1033,7 +1080,7 @@ class TrailForgeApp {
             this.setActiveBasemap("offline-topo");
             const preset = getPresetById(regionId);
             if (preset) {
-              this.map.flyToPreset(preset, this.sidebarCollapsed ? 16 : 340);
+              this.map.flyToPreset(preset, this.getMapLeftPadding(16));
             }
             this.showToast(
               `Switched to offline pack "${regionId}" (zero network tiles)`,
@@ -1097,7 +1144,7 @@ class TrailForgeApp {
           void this.openTrackInspector(trackId);
         },
         onZoomToRoute: (bbox) => {
-          this.map.fitBBox(bbox, this.sidebarCollapsed ? 24 : 360, 420);
+          this.map.fitBBox(bbox, this.getMapLeftPadding(24), 420);
         },
         onPoiSelect: (poi) => {
           this.map.flyToCoordinate(poi.lat, poi.lon, poi.name, 14);
@@ -1555,7 +1602,7 @@ class TrailForgeApp {
       if (fitMap) {
         const bbox = extractAnalysisBBox(analysis);
         if (bbox) {
-          this.map.fitBBox(bbox, this.sidebarCollapsed ? 24 : 360, 420);
+          this.map.fitBBox(bbox, this.getMapLeftPadding(24), 420);
         }
       }
     } catch (err) {
@@ -1692,7 +1739,7 @@ class TrailForgeApp {
         this.map.setPlannedRoute(lineFc, pinsFc);
         const bbox = extractAnalysisBBox(loaded.analysis);
         if (bbox) {
-          this.map.fitBBox(bbox, this.sidebarCollapsed ? 24 : 360, 420);
+          this.map.fitBBox(bbox, this.getMapLeftPadding(24), 420);
         }
         this.syncRoutePlannerUiState();
         this.syncRigUiState();
@@ -1933,14 +1980,11 @@ class TrailForgeApp {
       });
 
     this.collapseBtnEl.addEventListener("click", () => {
-      this.sidebarCollapsed = !this.sidebarCollapsed;
-      this.shellEl.classList.toggle("sidebar-collapsed", this.sidebarCollapsed);
-      this.collapseBtnEl.textContent = this.sidebarCollapsed ? "▸" : "◂";
-      this.collapseBtnEl.setAttribute(
-        "aria-expanded",
-        String(!this.sidebarCollapsed)
-      );
-      window.setTimeout(() => this.map.resize(), 220);
+      this.setSidebarCollapsed(!this.sidebarCollapsed, { persist: true });
+    });
+
+    window.addEventListener("resize", () => {
+      this.syncSidebarWidthForViewport();
     });
 
     this.basemapButtons.forEach((btn) => {
@@ -1973,6 +2017,9 @@ class TrailForgeApp {
       if (e.key === "/" && !inInput) {
         e.preventDefault();
         this.topbar.focusSearch();
+      } else if (e.key === "[" && !inInput && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        this.setSidebarCollapsed(!this.sidebarCollapsed, { persist: true });
       } else if (e.key === "Escape") {
         if (this.coordPickMode === "pin") {
           this.setCoordPickMode(null);
@@ -2383,7 +2430,7 @@ class TrailForgeApp {
 
     if (item.kind === "track") {
       if (item.bbox) {
-        this.map.fitBBox(item.bbox, this.sidebarCollapsed ? 24 : 360, 420);
+        this.map.fitBBox(item.bbox, this.getMapLeftPadding(24), 420);
       } else if (item.lat !== null && item.lon !== null) {
         this.map.flyToCoordinate(item.lat, item.lon, item.title, 13.2);
       }
@@ -2427,8 +2474,78 @@ class TrailForgeApp {
     this.activePreset = preset;
     this.topbar.setSelectedPreset(preset.id);
     this.sidebar.updatePreset(preset);
-    this.map.flyToPreset(preset, this.sidebarCollapsed ? 16 : 340);
+    this.map.flyToPreset(preset, this.getMapLeftPadding(16));
     this.showToast(`Centered on ${preset.shortLabel}`, "info");
+  }
+
+  private renderSidebarToggleMarkup(collapsed: boolean): string {
+    if (collapsed) {
+      return `
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
+          <polyline points="2 12 12 17 22 12"></polyline>
+          <polyline points="2 17 12 22 22 17"></polyline>
+        </svg>
+        <span class="tf-sidebar-toggle-label">Layers</span>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polyline points="9 18 15 12 9 6"></polyline>
+        </svg>
+      `;
+    }
+    return `
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polyline points="15 18 9 12 15 6"></polyline>
+      </svg>
+    `;
+  }
+
+  private setSidebarCollapsed(
+    collapsed: boolean,
+    options?: { persist?: boolean }
+  ): void {
+    this.sidebarCollapsed = collapsed;
+    this.shellEl.classList.toggle("sidebar-collapsed", collapsed);
+    this.collapseBtnEl.setAttribute("aria-expanded", String(!collapsed));
+    this.collapseBtnEl.setAttribute("aria-hidden", String(!collapsed));
+    this.collapseBtnEl.tabIndex = collapsed ? 0 : -1;
+    this.sidebar.updateCollapsedState(collapsed);
+    this.topbar.updateSidebarState(collapsed);
+    if (options?.persist) {
+      saveStoredSidebarCollapsed(collapsed);
+    }
+    window.setTimeout(() => this.map.resize(), 230);
+  }
+
+  private applySidebarWidth(widthPx: number, persist: boolean): void {
+    const viewportWidth =
+      typeof window !== "undefined" ? window.innerWidth : undefined;
+    const clampedForViewport = clampSidebarWidth(widthPx, viewportWidth);
+    const maxForViewport = getSidebarMaxWidth(viewportWidth);
+    this.activeSidebarWidthPx = clampedForViewport;
+
+    if (persist) {
+      this.preferredSidebarWidthPx = saveStoredSidebarWidth(clampedForViewport);
+    }
+
+    if (isSidebarResizeEnabled(viewportWidth)) {
+      this.shellEl.style.setProperty("--sidebar-w", `${clampedForViewport}px`);
+    } else {
+      this.shellEl.style.removeProperty("--sidebar-w");
+    }
+
+    this.sidebar.updateWidthMeta(clampedForViewport, maxForViewport);
+  }
+
+  private syncSidebarWidthForViewport(): void {
+    this.applySidebarWidth(this.preferredSidebarWidthPx, false);
+  }
+
+  private getMapLeftPadding(gutterPx: number): number {
+    return getSidebarMapLeftPadding(
+      this.sidebarCollapsed,
+      this.activeSidebarWidthPx,
+      gutterPx
+    );
   }
 
   private updateCursorReadout(lat: number, lon: number): void {

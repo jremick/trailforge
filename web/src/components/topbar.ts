@@ -10,6 +10,7 @@ import type {
 } from "../types";
 
 export interface TopBarCallbacks {
+  onToggleSidebar?: () => void;
   onSearchSelect: (item: UnifiedSearchItem) => void;
   onSearchNoMatch: (query: string, remoteError: boolean) => void;
   onSearchClear: () => void;
@@ -27,17 +28,26 @@ const SEARCH_DEBOUNCE_MS = 180;
 export class TopBar {
   private readonly root: HTMLElement;
   private readonly callbacks: TopBarCallbacks;
+  private readonly sidebarBtnEl: HTMLButtonElement;
   private readonly searchWrapEl: HTMLElement;
   private readonly searchInputEl: HTMLInputElement;
+  private readonly searchKbdEl: HTMLElement;
   private readonly searchClearBtn: HTMLButtonElement;
   private readonly searchMenuEl: HTMLElement;
   private readonly presetSelectEl: HTMLSelectElement;
   private readonly routeBtnEl: HTMLButtonElement;
   private readonly routeBadgeEl: HTMLElement;
+  private readonly statusWrapEl: HTMLElement;
+  private readonly statusBtnEl: HTMLButtonElement;
+  private readonly statusDotEl: HTMLElement;
+  private readonly statusBadgeEl: HTMLElement;
+  private readonly statusMenuEl: HTMLElement;
   private readonly feedPillEl: HTMLButtonElement;
   private readonly feedDotEl: HTMLElement;
   private readonly feedTextEl: HTMLElement;
+  private readonly feedDetailEl: HTMLElement;
   private readonly rigBtnEl: HTMLButtonElement;
+  private readonly rigDotEl: HTMLElement;
   private readonly rigLabelEl: HTMLElement;
   private readonly adminBtnEl: HTMLButtonElement;
   private readonly packsBtnEl: HTMLButtonElement;
@@ -46,12 +56,19 @@ export class TopBar {
   private readonly healthPillEl: HTMLButtonElement;
   private readonly healthDotEl: HTMLElement;
   private readonly healthTextEl: HTMLElement;
+  private readonly healthDetailEl: HTMLElement;
 
   private searchTimer: number | null = null;
   private searchAbort: AbortController | null = null;
   private results: UnifiedSearchItem[] = [];
   private activeIdx = -1;
   private lastRemoteError = false;
+  private healthSeverity: "online" | "degraded" | "offline" | "connecting" =
+    "connecting";
+  private feedSeverity: "online" | "degraded" | "offline" | "connecting" =
+    "connecting";
+  private healthSummaryTitle = "Checking /api/health…";
+  private feedSummaryTitle = "Checking AU agency closure feeds…";
 
   constructor(
     container: HTMLElement,
@@ -79,35 +96,52 @@ export class TopBar {
         .join("");
 
     this.root.innerHTML = `
-      <div class="tf-brand">
-        <div class="tf-brand-mark" aria-hidden="true">
-          <svg width="26" height="26" viewBox="0 0 64 64" fill="none">
-            <rect width="64" height="64" rx="14" fill="#131D26" stroke="#2C3E4F" stroke-width="2.5"/>
-            <path d="M10 44 L23 22 L33 34 L42 19 L54 44 Z" fill="#182735" stroke="#38BDF8" stroke-width="2.5" stroke-linejoin="round"/>
-            <path d="M12 49 C20 45, 25 41, 31 38 C37 35, 41 29, 52 24" stroke="#F59E0B" stroke-width="4" stroke-linecap="round"/>
-            <circle cx="42" cy="19" r="3.8" fill="#22C55E" stroke="#0B1117" stroke-width="1.6"/>
+      <div class="tf-topbar-left">
+        <button
+          type="button"
+          class="tf-nav-icon-btn"
+          data-role="topbar-sidebar-btn"
+          title="Toggle layers sidebar (shortcut: [)"
+          aria-label="Toggle layers sidebar"
+          aria-expanded="true"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="3" width="18" height="18" rx="3"></rect>
+            <line x1="9" y1="3" x2="9" y2="21"></line>
           </svg>
-        </div>
-        <div class="tf-brand-text">
+        </button>
+
+        <div class="tf-brand">
+          <div class="tf-brand-mark" aria-hidden="true">
+            <svg width="24" height="24" viewBox="0 0 64 64" fill="none">
+              <rect width="64" height="64" rx="14" fill="#131D26" stroke="#2C3E4F" stroke-width="2.5"/>
+              <path d="M10 44 L23 22 L33 34 L42 19 L54 44 Z" fill="#182735" stroke="#38BDF8" stroke-width="2.5" stroke-linejoin="round"/>
+              <path d="M12 49 C20 45, 25 41, 31 38 C37 35, 41 29, 52 24" stroke="#F59E0B" stroke-width="4" stroke-linecap="round"/>
+              <circle cx="42" cy="19" r="3.8" fill="#22C55E" stroke="#0B1117" stroke-width="1.6"/>
+            </svg>
+          </div>
           <span class="tf-brand-name">TrailForge</span>
-          <span class="tf-brand-badge">AU · 8 STATES</span>
         </div>
       </div>
 
       <div class="tf-search-wrap" data-role="search-wrap">
         <form class="tf-search-form" data-role="search-form" role="search">
-          <span class="tf-search-icon" aria-hidden="true">⌕</span>
+          <svg class="tf-search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="11" cy="11" r="8"></circle>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+          </svg>
           <input
             type="text"
-            class="tf-search-input mono"
+            class="tf-search-input"
             data-role="search-input"
-            placeholder="Search tracks, huts, camps, lat,lon or MGRS…"
+            placeholder="Search tracks, huts, camps, coords, or MGRS…"
             aria-label="Search Australian tracks, camps, huts, coordinates, or MGRS"
             aria-autocomplete="list"
             aria-expanded="false"
             autocomplete="off"
             spellcheck="false"
           />
+          <kbd class="tf-search-kbd mono" data-role="search-kbd" aria-hidden="true">/</kbd>
           <button
             type="button"
             class="tf-search-clear hidden"
@@ -115,16 +149,16 @@ export class TopBar {
             title="Clear search"
             aria-label="Clear search"
           >×</button>
-          <button type="submit" class="tf-search-submit" title="Search or jump to coordinate">
-            Go
-          </button>
         </form>
         <div class="tf-search-menu hidden" data-role="search-menu" role="listbox"></div>
       </div>
 
       <div class="tf-topbar-controls">
-        <label class="tf-preset-wrap" aria-label="Select Pan-Australia region preset">
-          <span class="tf-preset-label">Region</span>
+        <label class="tf-preset-wrap" title="Jump to Australian region or corridor" aria-label="Select Pan-Australia region preset">
+          <svg class="tf-preset-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path>
+            <circle cx="12" cy="10" r="3"></circle>
+          </svg>
           <select class="tf-preset-select" data-role="preset-select">
             <optgroup label="Iconic 4WD Regions (${iconicRegions.length})">
               ${renderOptions(iconicRegions)}
@@ -140,81 +174,138 @@ export class TopBar {
 
         <button
           type="button"
-          class="tf-rig-btn tf-route-btn"
+          class="tf-nav-btn tf-route-btn"
           data-role="route-btn"
           title="Interactive Multi-Track Route Planner & GridForge Strip-Route Handoff"
         >
-          <span class="tf-route-icon" aria-hidden="true">⇢</span>
+          <svg class="tf-nav-btn-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="6" cy="19" r="3"></circle>
+            <path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"></path>
+            <circle cx="18" cy="5" r="3"></circle>
+          </svg>
           <span>Route</span>
           <span class="tf-route-badge hidden mono" data-role="route-badge">0</span>
         </button>
 
         <button
           type="button"
-          class="tf-rig-btn tf-packs-btn"
+          class="tf-nav-btn tf-packs-btn"
           data-role="packs-btn"
           title="Download Pan-Australia Offline Regional Packs & Manage Sync Queue"
         >
-          <span class="tf-status-dot online" data-role="packs-dot"></span>
-          <span data-role="packs-label">Offline Packs</span>
+          <svg class="tf-nav-btn-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+            <polyline points="7 10 12 15 17 10"></polyline>
+            <line x1="12" y1="15" x2="12" y2="3"></line>
+          </svg>
+          <span class="tf-status-dot online hidden" data-role="packs-dot"></span>
+          <span data-role="packs-label">Packs</span>
         </button>
+
+        <span class="tf-topbar-divider" aria-hidden="true"></span>
+
+        <div class="tf-status-wrap" data-role="status-wrap">
+          <button
+            type="button"
+            class="tf-status-btn"
+            data-role="status-btn"
+            title="System & AU Agency Feeds status"
+            aria-label="System and AU Agency Feeds status"
+            aria-haspopup="true"
+            aria-expanded="false"
+          >
+            <span class="tf-status-dot connecting" data-role="status-dot"></span>
+            <span class="tf-status-badge hidden" data-role="status-badge">Alert</span>
+          </button>
+
+          <div class="tf-status-menu hidden" data-role="status-menu" role="dialog" aria-label="System and feeds status">
+            <div class="tf-status-menu-title">System &amp; Live Feeds</div>
+
+            <button
+              type="button"
+              class="tf-status-menu-row"
+              data-role="feed-pill"
+              title="Open AU agency closure feeds in sidebar & refresh"
+            >
+              <span class="tf-status-dot connecting" data-role="feed-dot"></span>
+              <span class="tf-status-menu-copy">
+                <span class="tf-status-menu-label" data-role="feed-text">Feeds …</span>
+                <span class="tf-status-menu-sub" data-role="feed-detail">Checking AU agency closure feeds…</span>
+              </span>
+              <span class="tf-status-menu-action">View</span>
+            </button>
+
+            <button
+              type="button"
+              class="tf-status-menu-row"
+              data-role="health-pill"
+              title="Refresh backend /api/health status"
+            >
+              <span class="tf-status-dot connecting" data-role="health-dot"></span>
+              <span class="tf-status-menu-copy">
+                <span class="tf-status-menu-label" data-role="health-text">API …</span>
+                <span class="tf-status-menu-sub" data-role="health-detail">Checking backend health…</span>
+              </span>
+              <span class="tf-status-menu-action">Refresh</span>
+            </button>
+          </div>
+        </div>
+
+        <span class="tf-topbar-divider" aria-hidden="true"></span>
 
         <button
           type="button"
-          class="tf-rig-btn"
+          class="tf-account-btn"
           data-role="rig-btn"
           title="Vehicle Profiles, Rig Suitability, Saved Tracks & Account"
         >
-          <span class="tf-rig-icon" aria-hidden="true">⚙</span>
-          <span data-role="rig-label">Stock 4WD</span>
+          <span class="tf-account-dot hidden" data-role="rig-dot" aria-hidden="true"></span>
+          <svg class="tf-account-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M5 17h14"></path>
+            <path d="M5 17a2 2 0 0 1-2-2v-3l2-5h11l3 4 2 1v3a2 2 0 0 1-2 2"></path>
+            <circle cx="7.5" cy="17.5" r="2"></circle>
+            <circle cx="16.5" cy="17.5" r="2"></circle>
+          </svg>
+          <span class="tf-account-label" data-role="rig-label">Stock 4WD</span>
         </button>
 
         <button
           type="button"
-          class="tf-rig-btn tf-admin-btn hidden"
+          class="tf-nav-btn tf-admin-btn hidden"
           data-role="admin-btn"
           title="Admin Console — Traffic, Storage, Friend Invites & Users"
         >
-          <span aria-hidden="true">🛡</span>
+          <svg class="tf-admin-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+          </svg>
           <span>Admin</span>
-        </button>
-
-        <button
-          type="button"
-          class="tf-health-pill tf-feed-pill"
-          data-role="feed-pill"
-          title="Official Pan-Australia closure & emergency feeds status"
-          aria-live="polite"
-        >
-          <span class="tf-status-dot connecting" data-role="feed-dot"></span>
-          <span class="mono" data-role="feed-text">Feeds …</span>
-        </button>
-
-        <button
-          type="button"
-          class="tf-health-pill"
-          data-role="health-pill"
-          title="Backend /api/health status — click to refresh"
-          aria-live="polite"
-        >
-          <span class="tf-status-dot" data-role="health-dot"></span>
-          <span class="mono" data-role="health-text">API …</span>
         </button>
       </div>
     `;
 
+    this.sidebarBtnEl = this.q<HTMLButtonElement>(
+      "[data-role='topbar-sidebar-btn']"
+    );
     this.searchWrapEl = this.q("[data-role='search-wrap']");
     const searchForm = this.q<HTMLFormElement>("[data-role='search-form']");
     this.searchInputEl = this.q<HTMLInputElement>("[data-role='search-input']");
+    this.searchKbdEl = this.q("[data-role='search-kbd']");
     this.searchClearBtn = this.q<HTMLButtonElement>("[data-role='search-clear']");
     this.searchMenuEl = this.q("[data-role='search-menu']");
     this.presetSelectEl = this.q<HTMLSelectElement>("[data-role='preset-select']");
     this.routeBtnEl = this.q<HTMLButtonElement>("[data-role='route-btn']");
     this.routeBadgeEl = this.q("[data-role='route-badge']");
+    this.statusWrapEl = this.q("[data-role='status-wrap']");
+    this.statusBtnEl = this.q<HTMLButtonElement>("[data-role='status-btn']");
+    this.statusDotEl = this.q("[data-role='status-dot']");
+    this.statusBadgeEl = this.q("[data-role='status-badge']");
+    this.statusMenuEl = this.q("[data-role='status-menu']");
     this.feedPillEl = this.q<HTMLButtonElement>("[data-role='feed-pill']");
     this.feedDotEl = this.q("[data-role='feed-dot']");
     this.feedTextEl = this.q("[data-role='feed-text']");
+    this.feedDetailEl = this.q("[data-role='feed-detail']");
     this.rigBtnEl = this.q<HTMLButtonElement>("[data-role='rig-btn']");
+    this.rigDotEl = this.q("[data-role='rig-dot']");
     this.rigLabelEl = this.q("[data-role='rig-label']");
     this.adminBtnEl = this.q<HTMLButtonElement>("[data-role='admin-btn']");
     this.packsBtnEl = this.q<HTMLButtonElement>("[data-role='packs-btn']");
@@ -223,6 +314,11 @@ export class TopBar {
     this.healthPillEl = this.q<HTMLButtonElement>("[data-role='health-pill']");
     this.healthDotEl = this.q("[data-role='health-dot']");
     this.healthTextEl = this.q("[data-role='health-text']");
+    this.healthDetailEl = this.q("[data-role='health-detail']");
+
+    this.sidebarBtnEl.addEventListener("click", () => {
+      callbacks.onToggleSidebar?.();
+    });
 
     searchForm.addEventListener("submit", (e) => {
       e.preventDefault();
@@ -231,7 +327,7 @@ export class TopBar {
 
     this.searchInputEl.addEventListener("input", () => {
       const q = this.searchInputEl.value.trim();
-      this.searchClearBtn.classList.toggle("hidden", q.length === 0);
+      this.syncSearchAccessoryState(q.length > 0);
       if (!q) {
         this.hideMenu();
         return;
@@ -241,6 +337,14 @@ export class TopBar {
         this.renderMenu(instant, false);
       }
       this.scheduleSearch(q);
+    });
+
+    this.searchInputEl.addEventListener("focus", () => {
+      this.searchKbdEl.classList.add("hidden");
+    });
+
+    this.searchInputEl.addEventListener("blur", () => {
+      this.syncSearchAccessoryState(this.searchInputEl.value.trim().length > 0);
     });
 
     this.searchInputEl.addEventListener("keydown", (e) => {
@@ -258,15 +362,31 @@ export class TopBar {
       }
     });
 
+    this.statusBtnEl.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const willOpen = this.statusMenuEl.classList.contains("hidden");
+      this.setStatusMenuOpen(willOpen);
+    });
+
     document.addEventListener("click", (e) => {
-      if (!this.searchWrapEl.contains(e.target as Node)) {
+      const target = e.target as Node;
+      if (!this.searchWrapEl.contains(target)) {
         this.hideMenu();
+      }
+      if (!this.statusWrapEl.contains(target)) {
+        this.setStatusMenuOpen(false);
+      }
+    });
+
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !this.statusMenuEl.classList.contains("hidden")) {
+        this.setStatusMenuOpen(false);
       }
     });
 
     this.searchClearBtn.addEventListener("click", () => {
       this.searchInputEl.value = "";
-      this.searchClearBtn.classList.add("hidden");
+      this.syncSearchAccessoryState(false);
       this.hideMenu();
       callbacks.onSearchClear();
       this.searchInputEl.focus();
@@ -281,6 +401,7 @@ export class TopBar {
     });
 
     this.feedPillEl.addEventListener("click", () => {
+      this.setStatusMenuOpen(false);
       callbacks.onFeedStatusClick();
     });
 
@@ -301,6 +422,18 @@ export class TopBar {
     });
   }
 
+  updateSidebarState(collapsed: boolean): void {
+    this.sidebarBtnEl.classList.toggle("active", !collapsed);
+    this.sidebarBtnEl.setAttribute("aria-expanded", String(!collapsed));
+    this.sidebarBtnEl.setAttribute(
+      "aria-label",
+      collapsed ? "Show layers sidebar" : "Hide layers sidebar"
+    );
+    this.sidebarBtnEl.title = collapsed
+      ? "Show layers sidebar (shortcut: [)"
+      : "Hide layers sidebar (shortcut: [)";
+  }
+
   focusSearch(): void {
     this.searchInputEl.focus();
     this.searchInputEl.select();
@@ -308,7 +441,7 @@ export class TopBar {
 
   setSearchValue(value: string): void {
     this.searchInputEl.value = value;
-    this.searchClearBtn.classList.toggle("hidden", value.trim().length === 0);
+    this.syncSearchAccessoryState(value.trim().length > 0);
   }
 
   setSelectedPreset(presetId: string): void {
@@ -339,7 +472,12 @@ export class TopBar {
     activePackId: string | null;
     pendingSyncCount: number;
   }): void {
+    const showDot =
+      !params.online ||
+      Boolean(params.activePackId) ||
+      params.pendingSyncCount > 0;
     this.packsDotEl.className = "tf-status-dot";
+    this.packsDotEl.classList.toggle("hidden", !showDot);
     if (!params.online) {
       this.packsDotEl.classList.add("degraded");
     } else if (params.activePackId) {
@@ -356,7 +494,7 @@ export class TopBar {
     } else if (params.downloadedCount > 0) {
       parts.push(`Packs (${params.downloadedCount})`);
     } else {
-      parts.push("Offline Packs");
+      parts.push("Packs");
     }
 
     if (params.pendingSyncCount > 0) {
@@ -365,8 +503,8 @@ export class TopBar {
 
     this.packsLabelEl.textContent = parts.join(" · ");
     this.packsBtnEl.classList.toggle(
-      "signed-in",
-      Boolean(params.activePackId || params.downloadedCount > 0)
+      "active-subtle",
+      !params.online || Boolean(params.activePackId) || params.downloadedCount > 0
     );
     this.packsBtnEl.title = `${params.online ? "Online" : "Offline"} · ${params.downloadedCount} regional pack(s) cached · ${params.pendingSyncCount} pending sync item(s)`;
   }
@@ -386,6 +524,7 @@ export class TopBar {
     const suffix = savedCount > 0 ? ` · ★${savedCount}` : "";
     this.rigLabelEl.textContent = `${rigText}${suffix}`;
     this.rigBtnEl.classList.toggle("signed-in", Boolean(userName));
+    this.rigDotEl.classList.toggle("hidden", !userName);
     this.rigBtnEl.title = userName
       ? `Signed in as ${userName} · Active rig: ${vehicleName ?? vehicleClass}`
       : `Anonymous mode · Rig preview: ${vehicleClass} (click to switch rig or sign in)`;
@@ -396,17 +535,22 @@ export class TopBar {
     this.feedDotEl.className = "tf-status-dot";
     if (summary.kind === "healthy") {
       this.feedDotEl.classList.add("online");
+      this.feedSeverity = "online";
     } else if (summary.kind === "degraded" || summary.kind === "stale") {
       this.feedDotEl.classList.add("degraded");
+      this.feedSeverity = "degraded";
     } else {
       this.feedDotEl.classList.add("offline");
+      this.feedSeverity = "offline";
     }
     this.feedTextEl.textContent = summary.label;
-    this.feedPillEl.title = `${summary.tooltip} (click to refresh)`;
+    this.feedDetailEl.textContent = summary.tooltip;
+    this.feedSummaryTitle = summary.label;
     this.feedPillEl.classList.toggle(
       "warn",
       summary.kind === "degraded" || summary.kind === "stale"
     );
+    this.syncCombinedStatusIndicator();
   }
 
   updateHealth(state: HealthState): void {
@@ -414,8 +558,11 @@ export class TopBar {
 
     if (state.kind === "connecting") {
       this.healthDotEl.classList.add("connecting");
-      this.healthTextEl.textContent = "API …";
-      this.healthPillEl.title = "Checking /api/health…";
+      this.healthTextEl.textContent = "API Connecting…";
+      this.healthDetailEl.textContent = "Checking /api/health…";
+      this.healthSeverity = "connecting";
+      this.healthSummaryTitle = "API connecting…";
+      this.syncCombinedStatusIndicator();
       return;
     }
 
@@ -423,34 +570,81 @@ export class TopBar {
       this.healthDotEl.classList.add("online");
       this.healthTextEl.textContent = "API Online";
       const details = [
-        state.data.version ? `Version: v${state.data.version}` : null,
-        `Status: ${state.data.status}`,
+        state.data.version ? `v${state.data.version}` : null,
         state.data.postgis_version
-          ? `PostGIS: ${state.data.postgis_version}`
+          ? `PostGIS ${state.data.postgis_version}`
           : null,
         state.data.schema_revision
-          ? `Schema: ${state.data.schema_revision}`
+          ? `Rev ${state.data.schema_revision}`
           : null,
       ]
         .filter(Boolean)
         .join(" · ");
-      this.healthPillEl.title = `${details} (click to refresh)`;
+      this.healthDetailEl.textContent = details || "Database healthy";
+      this.healthSeverity = "online";
+      this.healthSummaryTitle = "API Online";
+      this.syncCombinedStatusIndicator();
       return;
     }
 
     if (state.kind === "degraded") {
       this.healthDotEl.classList.add("degraded");
       this.healthTextEl.textContent = "API Degraded";
-      this.healthPillEl.title =
-        state.error ?? "API reachable but database is unavailable (click to retry)";
+      this.healthDetailEl.textContent =
+        state.error ?? "Database health check reported degraded";
+      this.healthSeverity = "degraded";
+      this.healthSummaryTitle = "API Degraded";
+      this.syncCombinedStatusIndicator();
       return;
     }
 
     this.healthDotEl.classList.add("offline");
     this.healthTextEl.textContent = "API Offline";
-    this.healthPillEl.title = state.error
-      ? `Offline: ${state.error} (click to retry)`
-      : "Backend unreachable — operating in offline shell mode";
+    this.healthDetailEl.textContent =
+      state.error ?? "Backend unreachable — operating in offline shell mode";
+    this.healthSeverity = "offline";
+    this.healthSummaryTitle = "API Offline";
+    this.syncCombinedStatusIndicator();
+  }
+
+  private syncCombinedStatusIndicator(): void {
+    const severities = [this.healthSeverity, this.feedSeverity];
+    let overall: "online" | "degraded" | "offline" | "connecting" = "online";
+    if (severities.includes("offline")) {
+      overall = "offline";
+    } else if (severities.includes("degraded")) {
+      overall = "degraded";
+    } else if (severities.includes("connecting")) {
+      overall = "connecting";
+    }
+
+    this.statusDotEl.className = `tf-status-dot ${overall}`;
+    this.statusBtnEl.classList.toggle("warn", overall === "degraded");
+    this.statusBtnEl.classList.toggle("danger", overall === "offline");
+
+    if (overall === "offline") {
+      this.statusBadgeEl.textContent = "Offline";
+      this.statusBadgeEl.classList.remove("hidden");
+    } else if (overall === "degraded") {
+      this.statusBadgeEl.textContent = "Notice";
+      this.statusBadgeEl.classList.remove("hidden");
+    } else {
+      this.statusBadgeEl.classList.add("hidden");
+    }
+
+    this.statusBtnEl.title = `${this.healthSummaryTitle} · ${this.feedSummaryTitle} (click for details)`;
+  }
+
+  private setStatusMenuOpen(open: boolean): void {
+    this.statusMenuEl.classList.toggle("hidden", !open);
+    this.statusBtnEl.setAttribute("aria-expanded", String(open));
+    this.statusBtnEl.classList.toggle("open", open);
+  }
+
+  private syncSearchAccessoryState(hasValue: boolean): void {
+    this.searchClearBtn.classList.toggle("hidden", !hasValue);
+    const focused = document.activeElement === this.searchInputEl;
+    this.searchKbdEl.classList.toggle("hidden", hasValue || focused);
   }
 
   private scheduleSearch(query: string): void {
