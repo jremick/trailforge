@@ -789,6 +789,7 @@ def plan_route_with_geometry(
             TrackSegment.track_id.in_(unique_ids),
             TrackSegment.is_active.is_(True),
             func.lower(SourceWaterway.feature_type) != "connector",
+            func.ST_DWithin(TrackSegment.geom, SourceWaterway.geom, 0.0005),
         )
     ).all()
 
@@ -1192,6 +1193,7 @@ def plan_route_with_geometry(
             ),
         )
         .outerjoin(CAPADPark, POI.capad_park_id == CAPADPark.id)
+        .where(func.ST_DWithin(POI.geom, route_union_sq.c.geom, 0.025))
         .order_by(dist_expr.asc(), POI.name.asc())
         .limit(_MAX_NEARBY_POIS)
     ).all()

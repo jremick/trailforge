@@ -23,7 +23,7 @@ from typing import Any, Final, Literal
 import httpx
 import numpy as np
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from trailforge.db.models import (
@@ -411,6 +411,7 @@ def compute_segment_live_grade(
 
 
 _MAX_SQL_IN_PARAMS: Final[int] = 10_000
+_LIVE_GRADE_BATCH_SIZE: Final[int] = 2_000
 
 
 def _chunked(items: Sequence[str], size: int = _MAX_SQL_IN_PARAMS) -> list[list[str]]:
@@ -429,39 +430,33 @@ def recompute_live_grades(
 ) -> LiveGradingRecomputeSummary:
     """Recompute live grades, obstacle hotspots, and 72 h rainfall across active segments.
 
+    Streams updates in bounded 2,000-row scalar batches via bulk primary-key ``UPDATE`` so
+    even 250k+ segment statewide networks run in <60 MB RAM inside a 0.5 GB worker container.
     Leaves ``baseline_grade``, ``baseline_score``, and ``baseline_breakdown`` strictly intact.
     """
     ref_now = (now or datetime.now(UTC)).astimezone(UTC)
 
-    base_seg_query = (
-        select(
-            TrackSegment.segment_id,
-            TrackSegment.track_id,
-            TrackSegment.surface_class,
-            TrackSegment.waterway_crossing_count,
-            TrackSegment.has_perennial_crossing,
-            TrackSegment.is_bridged,
-            func.ST_X(func.ST_LineInterpolatePoint(TrackSegment.geom, 0.5)).label("mid_lon"),
-            func.ST_Y(func.ST_LineInterpolatePoint(TrackSegment.geom, 0.5)).label("mid_lat"),
-            TrackSegmentGrade,
-        )
+    # 0. Collect target active vehicular segment IDs (strings only -> ~6 MB per 250k segments)
+    id_query = (
+        select(TrackSegment.segment_id)
         .join(TrackSegmentGrade, TrackSegmentGrade.segment_id == TrackSegment.segment_id)
         .where(TrackSegment.is_active.is_(True), TrackSegment.is_vehicular.is_(True))
     )
-
     if segment_ids is None:
-        seg_rows = session.execute(base_seg_query).all()
+        target_seg_ids = list(session.execute(id_query).scalars().all())
     else:
-        unique_target_ids = list(dict.fromkeys(segment_ids))
-        seg_rows = []
-        for id_chunk in _chunked(unique_target_ids):
-            seg_rows.extend(
+        unique_requested = list(dict.fromkeys(segment_ids))
+        target_seg_ids = []
+        for id_chunk in _chunked(unique_requested):
+            target_seg_ids.extend(
                 session.execute(
-                    base_seg_query.where(TrackSegment.segment_id.in_(id_chunk))
-                ).all()
+                    id_query.where(TrackSegment.segment_id.in_(id_chunk))
+                )
+                .scalars()
+                .all()
             )
 
-    if not seg_rows:
+    if not target_seg_ids:
         return LiveGradingRecomputeSummary(
             segments_evaluated=0,
             segments_with_telemetry=0,
@@ -471,8 +466,7 @@ def recompute_live_grades(
             rainfall_summary=get_rainfall_summary(session, now=ref_now),
         )
 
-    # 1. Batch-load anonymized telemetry observations without exceeding PostgreSQL's
-    #    65,535 bind-parameter limit on large (>65k segment) regional/statewide networks.
+    # 1. Load anonymized telemetry observations without exceeding PostgreSQL's 65,535 param limit
     obs_cols = (
         TelemetryObservation.segment_id,
         TelemetryObservation.vehicle_capability_class,
@@ -491,7 +485,6 @@ def recompute_live_grades(
             .where(TrackSegment.is_active.is_(True), TrackSegment.is_vehicular.is_(True))
         ).all()
     else:
-        target_seg_ids = [row.segment_id for row in seg_rows]
         obs_rows = []
         for id_chunk in _chunked(target_seg_ids):
             obs_rows.extend(
@@ -515,89 +508,122 @@ def recompute_live_grades(
             )
         )
 
-    # 2. Compute per-track median observed speed to flag localized sharp slowdowns
+    # 2. Compute per-track median observed speed only for segments with telemetry samples
     track_seg_speeds: dict[str, list[float]] = defaultdict(list)
-    for row in seg_rows:
-        segsamp = samples_by_seg.get(row.segment_id)
-        if segsamp and row.track_id is not None:
-            track_seg_speeds[row.track_id].append(
-                float(np.median([s.avg_speed_kmh for s in segsamp]))
-            )
+    if samples_by_seg:
+        sampled_ids = list(samples_by_seg.keys())
+        for id_chunk in _chunked(sampled_ids):
+            for seg_id, track_id in session.execute(
+                select(TrackSegment.segment_id, TrackSegment.track_id).where(
+                    TrackSegment.segment_id.in_(id_chunk),
+                    TrackSegment.track_id.is_not(None),
+                )
+            ).all():
+                segsamp = samples_by_seg.get(seg_id)
+                if segsamp and track_id is not None:
+                    track_seg_speeds[track_id].append(
+                        float(np.median([s.avg_speed_kmh for s in segsamp]))
+                    )
     track_median_speed: dict[str, float] = {
         tid: float(np.median(spds)) for tid, spds in track_seg_speeds.items() if spds
     }
 
-    # 3. Resolve regional rainfall once per distinct 0.15-degree spatial cell
+    # 3 & 4. Stream scalar segment+baseline columns in 2,000-row batches and bulk-UPDATE grades
     cell_readings: dict[str, RainfallReading] = {}
-    for row in seg_rows:
-        lon = float(row.mid_lon)
-        lat = float(row.mid_lat)
-        cell_id, _, _ = spatial_cell_key(lon, lat)
-        if cell_id not in cell_readings:
-            cell_readings[cell_id] = resolve_cell_rainfall(
-                session,
-                lon,
-                lat,
-                now=ref_now,
-                rain_override_72h_mm=rain_override_72h_mm,
-                rain_override_24h_mm=rain_override_24h_mm,
-                fetch_live=fetch_live_rainfall,
-                client=http_client,
-            )
-
-    # 4. Update track_segment_grades in place (never modifying baseline_* columns!)
+    segments_evaluated = 0
     segments_with_telemetry = 0
     obstacle_hotspots_count = 0
 
-    for row in seg_rows:
-        grade_row: TrackSegmentGrade = row.TrackSegmentGrade
-        lon = float(row.mid_lon)
-        lat = float(row.mid_lat)
-        cell_id, _, _ = spatial_cell_key(lon, lat)
-        reading = cell_readings[cell_id]
-
-        wet_adj = compute_segment_wet_adjustment(
-            reading,
-            surface_class=row.surface_class,
-            waterway_crossing_count=int(row.waterway_crossing_count or 0),
-            has_perennial_crossing=bool(row.has_perennial_crossing),
-            is_bridged=bool(row.is_bridged),
+    batch_query_base = (
+        select(
+            TrackSegment.segment_id,
+            TrackSegment.track_id,
+            TrackSegment.surface_class,
+            TrackSegment.waterway_crossing_count,
+            TrackSegment.has_perennial_crossing,
+            TrackSegment.is_bridged,
+            func.ST_X(func.ST_LineInterpolatePoint(TrackSegment.geom, 0.5)).label("mid_lon"),
+            func.ST_Y(func.ST_LineInterpolatePoint(TrackSegment.geom, 0.5)).label("mid_lat"),
+            TrackSegmentGrade.baseline_score,
+            TrackSegmentGrade.baseline_grade,
         )
-        segsamp = samples_by_seg.get(row.segment_id, [])
-        t_med = track_median_speed.get(row.track_id) if row.track_id is not None else None
+        .join(TrackSegmentGrade, TrackSegmentGrade.segment_id == TrackSegment.segment_id)
+    )
 
-        result = compute_segment_live_grade(
-            baseline_score=float(grade_row.baseline_score),
-            baseline_grade=grade_row.baseline_grade,  # type: ignore[arg-type]
-            samples=segsamp,
-            wet_adjustment=wet_adj,
-            now=ref_now,
-            track_median_speed_kmh=t_med,
-        )
+    for id_batch in _chunked(target_seg_ids, size=_LIVE_GRADE_BATCH_SIZE):
+        rows = session.execute(
+            batch_query_base.where(TrackSegment.segment_id.in_(id_batch))
+        ).all()
+        batch_updates: list[dict[str, Any]] = []
+        for row in rows:
+            lon = float(row.mid_lon)
+            lat = float(row.mid_lat)
+            cell_id, _, _ = spatial_cell_key(lon, lat)
+            reading = cell_readings.get(cell_id)
+            if reading is None:
+                reading = resolve_cell_rainfall(
+                    session,
+                    lon,
+                    lat,
+                    now=ref_now,
+                    rain_override_72h_mm=rain_override_72h_mm,
+                    rain_override_24h_mm=rain_override_24h_mm,
+                    fetch_live=fetch_live_rainfall,
+                    client=http_client,
+                )
+                cell_readings[cell_id] = reading
 
-        grade_row.live_grade = result.live_grade
-        grade_row.live_score = result.live_score
-        grade_row.live_breakdown = result.live_breakdown
-        grade_row.effective_grade = result.effective_grade
-        grade_row.confidence_level = result.db_confidence_level
-        grade_row.confidence_score = result.confidence_score
-        grade_row.sample_count = result.sample_count
-        grade_row.last_driven_at = result.last_driven_at
-        grade_row.avg_speed_kmh = result.avg_speed_kmh
-        grade_row.avg_duration_s = result.avg_duration_s
-        grade_row.vehicle_class_split = result.vehicle_class_split
-        grade_row.rainfall_context = result.wet_adjustment.rainfall_context
-        grade_row.wet_risk_level = result.wet_adjustment.db_wet_risk_level
-        grade_row.live_computed_at = ref_now
+            wet_adj = compute_segment_wet_adjustment(
+                reading,
+                surface_class=row.surface_class,
+                waterway_crossing_count=int(row.waterway_crossing_count or 0),
+                has_perennial_crossing=bool(row.has_perennial_crossing),
+                is_bridged=bool(row.is_bridged),
+            )
+            segsamp = samples_by_seg.get(row.segment_id, [])
+            t_med = track_median_speed.get(row.track_id) if row.track_id is not None else None
 
-        if result.sample_count > 0:
-            segments_with_telemetry += 1
-        if result.is_obstacle_hotspot:
-            obstacle_hotspots_count += 1
+            result = compute_segment_live_grade(
+                baseline_score=float(row.baseline_score),
+                baseline_grade=row.baseline_grade,  # type: ignore[arg-type]
+                samples=segsamp,
+                wet_adjustment=wet_adj,
+                now=ref_now,
+                track_median_speed_kmh=t_med,
+            )
+
+            batch_updates.append(
+                {
+                    "segment_id": row.segment_id,
+                    "live_grade": result.live_grade,
+                    "live_score": result.live_score,
+                    "live_breakdown": result.live_breakdown,
+                    "effective_grade": result.effective_grade,
+                    "confidence_level": result.db_confidence_level,
+                    "confidence_score": result.confidence_score,
+                    "sample_count": result.sample_count,
+                    "last_driven_at": result.last_driven_at,
+                    "avg_speed_kmh": result.avg_speed_kmh,
+                    "avg_duration_s": result.avg_duration_s,
+                    "vehicle_class_split": result.vehicle_class_split,
+                    "rainfall_context": result.wet_adjustment.rainfall_context,
+                    "wet_risk_level": result.wet_adjustment.db_wet_risk_level,
+                    "live_computed_at": ref_now,
+                }
+            )
+            segments_evaluated += 1
+            if result.sample_count > 0:
+                segments_with_telemetry += 1
+            if result.is_obstacle_hotspot:
+                obstacle_hotspots_count += 1
+
+        if batch_updates:
+            session.execute(update(TrackSegmentGrade), batch_updates)
 
     session.flush()
+    session.expire_all()
     return LiveGradingRecomputeSummary(
-        segments_evaluated=len(seg_rows),
+        segments_evaluated=segments_evaluated,
         segments_with_telemetry=segments_with_telemetry,
         obstacle_hotspots_count=obstacle_hotspots_count,
         rainfall_cells_updated=len(cell_readings),

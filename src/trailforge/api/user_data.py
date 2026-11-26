@@ -203,6 +203,7 @@ def _build_export_track_data(
                     _EXPORT_POI_RADIUS_M,
                 ),
             )
+            .where(func.ST_DWithin(POI.geom, track_union_sq.c.geom, 0.025))
             .order_by(POI.name.asc())
             .limit(25)
         ).all()

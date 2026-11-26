@@ -984,6 +984,7 @@ def get_track_detail(
                 TrackSegment.track_id == track_id,
                 TrackSegment.is_active.is_(True),
                 func.lower(SourceWaterway.feature_type) != "connector",
+                func.ST_DWithin(TrackSegment.geom, SourceWaterway.geom, 0.0005),
             )
         ).all()
         seen_crossings: dict[tuple[str, bool], WaterwayCrossingItem] = {}
@@ -1084,6 +1085,7 @@ def get_track_detail(
                 ),
             )
             .outerjoin(CAPADPark, POI.capad_park_id == CAPADPark.id)
+            .where(func.ST_DWithin(POI.geom, track_union_sq.c.geom, 0.025))
             .order_by(dist_expr.asc(), POI.name.asc())
             .limit(25)
         ).all()
