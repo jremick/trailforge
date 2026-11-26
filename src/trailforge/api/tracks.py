@@ -26,6 +26,7 @@ from trailforge.db.models import (
 from trailforge.db.session import get_db
 from trailforge.feeds.queries import get_closures_for_track_ids
 from trailforge.grading.baseline import SegmentGradeInput, compute_baseline_grade
+from trailforge.reports.queries import get_reports_for_track
 from trailforge.vehicles.classifier import (
     CapabilityClassLiteral,
     TrackSuitability,
@@ -239,6 +240,8 @@ class TrackDetailResponse(TrackSummaryResponse):
     capad_parks: list[ParkSummary] = Field(default_factory=list)
     segments: list[SegmentDetailResponse] = Field(default_factory=list)
     nearby_pois: list[PoiResponse] = Field(default_factory=list)
+    condition_reports: list[dict[str, Any]] = Field(default_factory=list)
+    community_gate_warnings: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class SearchResultItem(BaseModel):
@@ -467,6 +470,17 @@ def _load_closures_by_track(
             list(entry.get("active_closures") or []),
         )
     return out
+
+
+def _load_reports_for_track(
+    db: Session, track_id: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Fetch active condition reports and distinct gate/private warnings via Slice 08 helper."""
+    payload = get_reports_for_track(db, track_id, include_resolved=False)
+    return (
+        list(payload.get("condition_reports") or []),
+        list(payload.get("community_gate_warnings") or []),
+    )
 
 
 def _get_favorite_track_ids(db: Session, user: User | None, track_ids: list[str]) -> set[str]:
@@ -1007,6 +1021,7 @@ def get_track_detail(
     c_status, active_closures = _load_closures_by_track(db, [trk.track_id]).get(
         trk.track_id, ("open", [])
     )
+    condition_reports, community_gate_warnings = _load_reports_for_track(db, trk.track_id)
     is_fav = trk.track_id in _get_favorite_track_ids(db, current_user, [trk.track_id])
     suitability = (
         evaluate_track_suitability(
@@ -1068,6 +1083,8 @@ def get_track_detail(
         capad_parks=capad_parks_list,
         segments=segments,
         nearby_pois=nearby_pois,
+        condition_reports=condition_reports,
+        community_gate_warnings=community_gate_warnings,
     )
 
 

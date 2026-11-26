@@ -46,6 +46,7 @@ services:
       PRIVACY_TRIM_METERS: ${PRIVACY_TRIM_METERS:-250}
       SNOW_LINE_DEFAULT_M: ${SNOW_LINE_DEFAULT_M:-1000}
       TILES_DIR: ${TILES_DIR:-/data/tiles}
+      TRAILFORGE_UPLOADS_DIR: ${TRAILFORGE_UPLOADS_DIR:-/data/uploads}
       GDAL_CACHEMAX: ${GDAL_CACHEMAX:-192}
       OMP_THREAD_LIMIT: ${OMP_THREAD_LIMIT:-1}
     ports:
@@ -53,6 +54,7 @@ services:
     volumes:
       - trailforge-data:/data
       - trailforge_tiles:/data/tiles
+      - trailforge_uploads:/data/uploads
     depends_on:
       db:
         condition: service_healthy
@@ -123,3 +125,4 @@ volumes:
   trailforge-pgdata:
   trailforge-data:
   trailforge_tiles:
+  trailforge_uploads:

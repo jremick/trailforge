@@ -34,21 +34,31 @@ class Settings(BaseSettings):
     privacy_trim_meters: int = Field(default=250, ge=250, le=5000)
     snow_line_default_m: int = Field(default=1000, ge=0)
 
-    # Auth / self-hosted session settings (zero external IdP)
+    # Auth & privacy secrets (self-hosted, zero external IdP)
     auth_secret_key: str = Field(
         default="trailforge-dev-secret-change-in-production",
         validation_alias=AliasChoices("AUTH_SECRET_KEY", "TRAILFORGE_AUTH_SECRET_KEY"),
+    )
+    privacy_secret_key: str = Field(
+        default="trailforge-dev-privacy-secret-change-in-production",
+        validation_alias=AliasChoices("TRAILFORGE_PRIVACY_SECRET", "PRIVACY_SECRET_KEY"),
+        description="HMAC secret used to derive revocable telemetry contribution hashes.",
     )
     auth_token_ttl_seconds: int = Field(default=60 * 60 * 24 * 14, ge=300)
     auth_cookie_name: str = Field(default="tf_session")
     auth_cookie_secure: bool = Field(default=False)
 
-    # Local storage directories (streaming pack/tile outputs)
+    # Local storage directories (streaming pack/tile/upload outputs)
     trailforge_data_dir: str = Field(default="/data")
     tiles_dir: str = Field(
         default="/data/tiles",
         validation_alias=AliasChoices("TILES_DIR", "TRAILFORGE_TILES_DIR"),
         description="Directory storing generated vector/terrain PMTiles and manifest.json.",
+    )
+    uploads_dir: str = Field(
+        default="/data/uploads",
+        validation_alias=AliasChoices("TRAILFORGE_UPLOADS_DIR", "UPLOADS_DIR"),
+        description="Directory storing validated community condition report photo attachments.",
     )
     trailforge_packs_dir: str = Field(default="/data/packs")
 
