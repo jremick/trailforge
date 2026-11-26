@@ -150,6 +150,40 @@ class Settings(BaseSettings):
         description="Optional public info banner text displayed in the web UI.",
     )
 
+    # Optional Australian place-name geocoder fallback for /api/search (Nominatim AU)
+    enable_geocoder: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRAILFORGE_ENABLE_GEOCODER",
+            "ENABLE_GEOCODER",
+            "enable_geocoder",
+        ),
+        description=(
+            "Fall back to rate-limited Nominatim AU place search when local "
+            "PostGIS search has few matches."
+        ),
+    )
+    geocoder_url: str = Field(
+        default="https://nominatim.openstreetmap.org/search",
+        validation_alias=AliasChoices(
+            "TRAILFORGE_GEOCODER_URL",
+            "GEOCODER_URL",
+            "geocoder_url",
+        ),
+        description="Nominatim search endpoint URL for Australian place-name fallback.",
+    )
+    geocoder_timeout_s: float = Field(
+        default=3.5,
+        gt=0.2,
+        le=15.0,
+        validation_alias=AliasChoices(
+            "TRAILFORGE_GEOCODER_TIMEOUT_S",
+            "GEOCODER_TIMEOUT_S",
+            "geocoder_timeout_s",
+        ),
+        description="HTTP timeout in seconds for AU place-name geocoder fallback.",
+    )
+
     # Edge rate limiting & storage quotas (zero Redis, bounded in-memory sliding windows)
     rate_limit_enabled: bool = Field(
         default=True,

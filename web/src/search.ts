@@ -73,7 +73,10 @@ export function mapApiSearchResults(
 ): UnifiedSearchItem[] {
   return items.map((item) => {
     const kind =
-      item.kind === "track" || item.kind === "poi" || item.kind === "park"
+      item.kind === "track" ||
+      item.kind === "poi" ||
+      item.kind === "park" ||
+      item.kind === "place"
         ? item.kind
         : "poi";
 

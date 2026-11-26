@@ -2438,6 +2438,19 @@ class TrailForgeApp {
       return;
     }
 
+    if (item.kind === "place") {
+      if (item.bbox) {
+        this.map.fitBBox(item.bbox, this.getMapLeftPadding(24), 48);
+      } else if (item.lat !== null && item.lon !== null) {
+        this.map.flyToCoordinate(item.lat, item.lon, item.title, 13.0);
+      }
+      if (item.lat !== null && item.lon !== null) {
+        this.updateCursorReadout(item.lat, item.lon);
+      }
+      this.showToast(`Located ${item.title}`, "success");
+      return;
+    }
+
     if (item.lat !== null && item.lon !== null) {
       this.map.flyToCoordinate(
         item.lat,

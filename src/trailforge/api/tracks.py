@@ -12,7 +12,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
+from trailforge.api.geocoder import geocode_au_places
 from trailforge.auth.dependencies import get_optional_current_user
+from trailforge.config import get_settings
 from trailforge.db.models import (
     POI,
     CAPADPark,
@@ -1449,6 +1451,28 @@ def search_network(
                 bbox=_bbox_list(xmin, ymin, xmax, ymax),
             )
         )
+
+    if len(items) < min(3, limit) and len(term) >= 3 and get_settings().enable_geocoder:
+        seen_names = {item.name.strip().lower() for item in items}
+        remaining = max(1, min(5, limit - len(items)))
+        for place in geocode_au_places(term, limit=remaining):
+            if place.name.strip().lower() in seen_names:
+                continue
+            seen_names.add(place.name.strip().lower())
+            items.append(
+                SearchResultItem(
+                    kind="place",
+                    id=place.id,
+                    name=place.name,
+                    state=place.state,
+                    subtitle=place.subtitle,
+                    category=place.category,
+                    grade=None,
+                    lon=place.lon,
+                    lat=place.lat,
+                    bbox=place.bbox,
+                )
+            )
 
     trimmed = items[:limit]
     return SearchResponse(query=term, total=len(trimmed), results=trimmed)

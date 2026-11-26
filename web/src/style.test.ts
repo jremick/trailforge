@@ -147,7 +147,7 @@ describe("MapLibre 5 PMTiles & offline fallback style builder", () => {
     expect(byId.get("tf-pois-layer")).toMatchObject({
       type: "circle",
       paint: {
-        "circle-color": "rgba(241, 245, 249, 0.94)",
+        "circle-color": "rgba(241, 245, 249, 0.96)",
       },
     });
     expect(byId.get("tf-tracks-line")).toMatchObject({
@@ -202,6 +202,20 @@ describe("MapLibre 5 PMTiles & offline fallback style builder", () => {
     expect(byId.get("tf-backtrack-route-line")).toMatchObject({
       source: "tf-backtrack-route",
     });
+
+    // Regression: ALL POI icons & point markers must render ABOVE every line layer
+    const maxLineIdx = style.layers.reduce(
+      (max, l, idx) => (l.type === "line" ? Math.max(max, idx) : max),
+      -1
+    );
+    const layerIdx = (id: string) => style.layers.findIndex((l) => l.id === id);
+    expect(layerIdx("tf-pois-layer")).toBeGreaterThan(maxLineIdx);
+    expect(layerIdx("tf-pois-icons")).toBeGreaterThan(layerIdx("tf-pois-layer"));
+    expect(layerIdx("tf-closures-points")).toBeGreaterThan(maxLineIdx);
+    expect(layerIdx("tf-reports-points")).toBeGreaterThan(maxLineIdx);
+    expect(layerIdx("tf-planned-route-pins-badge")).toBeGreaterThan(maxLineIdx);
+    expect(layerIdx("tf-user-pins-dot")).toBeGreaterThan(maxLineIdx);
+    expect(layerIdx("tf-search-pin-dot")).toBeGreaterThan(maxLineIdx);
   });
 
   it("converts Slice 05 personal user pins into category-colored GeoJSON", () => {

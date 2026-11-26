@@ -626,10 +626,17 @@ class BaseHttpFeedAdapter:
                                 f"Upstream feed response exceeds {max_bytes} byte limit"
                             )
                         chunks.append(chunk)
+                    body = b"".join(chunks)
+                    clean_headers = [
+                        (k, v)
+                        for k, v in resp.headers.multi_items()
+                        if k.lower()
+                        not in {"content-encoding", "content-length", "transfer-encoding"}
+                    ]
                     return httpx.Response(
                         status_code=resp.status_code,
-                        headers=resp.headers,
-                        content=b"".join(chunks),
+                        headers=clean_headers,
+                        content=body,
                         request=resp.request,
                     )
 

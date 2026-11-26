@@ -983,7 +983,7 @@ export interface TrackInspectorDetail {
 }
 
 export interface ApiSearchResultItem {
-  kind: "track" | "poi" | "park" | string;
+  kind: "track" | "poi" | "park" | "place" | string;
   id: string;
   name: string;
   state?: string | null;
@@ -1008,6 +1008,7 @@ export type UnifiedSearchItemKind =
   | "track"
   | "poi"
   | "park"
+  | "place"
   | "preset";
 
 export interface UnifiedSearchItem {

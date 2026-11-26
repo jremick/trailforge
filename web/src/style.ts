@@ -861,39 +861,6 @@ export function buildTrailForgeStyle(
         "line-opacity": 0.96,
       },
     });
-
-    // 7. Outdoor POIs with high-contrast backing + adapted SVG symbols
-    styleLayers.push(
-      {
-        id: "tf-pois-layer",
-        type: "circle",
-        source: "tf-vector",
-        "source-layer": "pois",
-        layout: { visibility: vis(layers.pois) },
-        paint: {
-          "circle-radius": 12,
-          "circle-color": "rgba(241, 245, 249, 0.94)",
-          "circle-stroke-color": "#0F172A",
-          "circle-stroke-width": 1.8,
-        },
-      },
-      {
-        id: "tf-pois-icons",
-        type: "symbol",
-        source: "tf-vector",
-        "source-layer": "pois",
-        layout: {
-          visibility: vis(layers.pois),
-          "icon-image": [
-            "concat",
-            "poi-",
-            ["coalesce", ["get", "icon"], ["get", "category"], "trig"],
-          ],
-          "icon-size": 0.72,
-          "icon-allow-overlap": true,
-        },
-      }
-    );
   } else {
     // GeoJSON fallback layers (used automatically when PMTiles are unavailable)
     styleLayers.push(
@@ -990,40 +957,14 @@ export function buildTrailForgeStyle(
           "line-dasharray": [1.5, 2],
           "line-opacity": 0.95,
         },
-      },
-      {
-        id: "tf-pois-layer",
-        type: "circle",
-        source: "tf-pois",
-        layout: { visibility: vis(layers.pois) },
-        paint: {
-          "circle-radius": 11.5,
-          "circle-color": "rgba(241, 245, 249, 0.94)",
-          "circle-stroke-color": "#0F172A",
-          "circle-stroke-width": 1.8,
-        },
-      },
-      {
-        id: "tf-pois-icons",
-        type: "symbol",
-        source: "tf-pois",
-        layout: {
-          visibility: vis(layers.pois),
-          "icon-image": [
-            "concat",
-            "poi-",
-            ["coalesce", ["get", "icon"], ["get", "category"], "trig"],
-          ],
-          "icon-size": 0.72,
-          "icon-allow-overlap": true,
-        },
       }
     );
   }
 
   const closureColor = buildClosureColorExpression();
 
-  // Slice 04 Live Closures, Seasonal Restrictions, Incidents & Gates hazard overlays
+  // Line & polygon overlays (all rendered BELOW point/icon/marker layers)
+  // Slice 04 Live Closures, Seasonal Restrictions, Incidents & Gates hazard lines/polygons
   styleLayers.push(
     {
       id: "tf-closures-polygon-fill",
@@ -1081,23 +1022,10 @@ export function buildTrailForgeStyle(
         "line-dasharray": [2.2, 1.6],
         "line-opacity": 0.98,
       },
-    },
-    {
-      id: "tf-closures-points",
-      type: "circle",
-      source: "tf-closures",
-      filter: ["==", ["geometry-type"], "Point"],
-      layout: { visibility: vis(layers.closures) },
-      paint: {
-        "circle-radius": 7.5,
-        "circle-color": closureColor,
-        "circle-stroke-color": "#F8FAFC",
-        "circle-stroke-width": 2,
-      },
     }
   );
 
-  // Slice 07 Rough / Slow Obstacle Hotspots overlay
+  // Slice 07 Rough / Slow Obstacle Hotspots line overlays
   styleLayers.push(
     {
       id: "tf-hotspots-casing",
@@ -1130,30 +1058,6 @@ export function buildTrailForgeStyle(
         "line-width": ["interpolate", ["linear"], ["zoom"], 9, 4.2, 14, 6.8],
         "line-dasharray": [1.8, 1.4],
         "line-opacity": 0.96,
-      },
-    },
-    {
-      id: "tf-hotspots-points",
-      type: "circle",
-      source: "tf-hotspots",
-      filter: ["==", ["geometry-type"], "Point"],
-      layout: { visibility: vis(layers.hotspots) },
-      paint: {
-        "circle-radius": [
-          "interpolate",
-          ["linear"],
-          ["zoom"],
-          10,
-          3.2,
-          13,
-          4.5,
-          16,
-          6.5,
-        ],
-        "circle-color": "#FF6B00",
-        "circle-opacity": 0.88,
-        "circle-stroke-color": "#FEF08A",
-        "circle-stroke-width": 1.2,
       },
     }
   );
@@ -1193,47 +1097,7 @@ export function buildTrailForgeStyle(
     }
   );
 
-  const reportColor = buildReportColorExpression();
-
-  // Slice 08 Community Condition Reports & Distinct Locked Gate / Private Property Warnings
-  styleLayers.push(
-    {
-      id: "tf-reports-gate-halo",
-      type: "circle",
-      source: "tf-reports",
-      filter: [
-        "any",
-        ["==", ["get", "is_gate_warning"], true],
-        [
-          "in",
-          ["downcase", ["coalesce", ["get", "report_type"], ""]],
-          ["literal", ["locked_gate", "private_property"]],
-        ],
-      ],
-      layout: { visibility: vis(layers.reports) },
-      paint: {
-        "circle-radius": 13.5,
-        "circle-color": reportColor,
-        "circle-opacity": 0.24,
-        "circle-stroke-color": "#FDE047",
-        "circle-stroke-width": 1.8,
-      },
-    },
-    {
-      id: "tf-reports-points",
-      type: "circle",
-      source: "tf-reports",
-      layout: { visibility: vis(layers.reports) },
-      paint: {
-        "circle-radius": 7.2,
-        "circle-color": reportColor,
-        "circle-stroke-color": "#F8FAFC",
-        "circle-stroke-width": 2.0,
-      },
-    }
-  );
-
-  // Slice 09 In-Cab PWA Breadcrumb Recorder & One-Tap Backtrack Route
+  // Slice 09 In-Cab PWA Breadcrumb Recorder & One-Tap Backtrack Route lines
   styleLayers.push(
     {
       id: "tf-recorded-track-casing",
@@ -1279,7 +1143,187 @@ export function buildTrailForgeStyle(
         "line-dasharray": [2.4, 1.8],
         "line-opacity": 0.98,
       },
+    }
+  );
+
+  // Phase A Interactive Multi-Track Planned Route lines (bright cyan/emerald #14b8a6)
+  styleLayers.push(
+    {
+      id: "tf-planned-route-casing",
+      type: "line",
+      source: "tf-planned-route",
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: {
+        "line-color": "#042F2E",
+        "line-width": ["interpolate", ["linear"], ["zoom"], 9, 8.6, 14, 12.6],
+        "line-opacity": 0.9,
+      },
     },
+    {
+      id: "tf-planned-route-line",
+      type: "line",
+      source: "tf-planned-route",
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: {
+        "line-color": "#14b8a6",
+        "line-width": ["interpolate", ["linear"], ["zoom"], 9, 4.6, 14, 7.2],
+        "line-opacity": 0.98,
+      },
+    }
+  );
+
+  // =========================================================================
+  // Point, Icon & Marker Layers — strictly ABOVE all track & overlay lines
+  // =========================================================================
+
+  // Obstacle hotspot point markers
+  styleLayers.push({
+    id: "tf-hotspots-points",
+    type: "circle",
+    source: "tf-hotspots",
+    filter: ["==", ["geometry-type"], "Point"],
+    layout: { visibility: vis(layers.hotspots) },
+    paint: {
+      "circle-radius": [
+        "interpolate",
+        ["linear"],
+        ["zoom"],
+        10,
+        3.2,
+        13,
+        4.5,
+        16,
+        6.5,
+      ],
+      "circle-color": "#FF6B00",
+      "circle-opacity": 0.88,
+      "circle-stroke-color": "#FEF08A",
+      "circle-stroke-width": 1.2,
+    },
+  });
+
+  // Outdoor POIs with high-contrast backing + adapted SVG symbols (on top of all track/closure lines)
+  if (useVectorPmtiles) {
+    styleLayers.push(
+      {
+        id: "tf-pois-layer",
+        type: "circle",
+        source: "tf-vector",
+        "source-layer": "pois",
+        layout: { visibility: vis(layers.pois) },
+        paint: {
+          "circle-radius": 12,
+          "circle-color": "rgba(241, 245, 249, 0.96)",
+          "circle-stroke-color": "#0F172A",
+          "circle-stroke-width": 1.8,
+        },
+      },
+      {
+        id: "tf-pois-icons",
+        type: "symbol",
+        source: "tf-vector",
+        "source-layer": "pois",
+        layout: {
+          visibility: vis(layers.pois),
+          "icon-image": [
+            "concat",
+            "poi-",
+            ["coalesce", ["get", "icon"], ["get", "category"], "trig"],
+          ],
+          "icon-size": 0.72,
+          "icon-allow-overlap": true,
+        },
+      }
+    );
+  } else {
+    styleLayers.push(
+      {
+        id: "tf-pois-layer",
+        type: "circle",
+        source: "tf-pois",
+        layout: { visibility: vis(layers.pois) },
+        paint: {
+          "circle-radius": 11.5,
+          "circle-color": "rgba(241, 245, 249, 0.96)",
+          "circle-stroke-color": "#0F172A",
+          "circle-stroke-width": 1.8,
+        },
+      },
+      {
+        id: "tf-pois-icons",
+        type: "symbol",
+        source: "tf-pois",
+        layout: {
+          visibility: vis(layers.pois),
+          "icon-image": [
+            "concat",
+            "poi-",
+            ["coalesce", ["get", "icon"], ["get", "category"], "trig"],
+          ],
+          "icon-size": 0.72,
+          "icon-allow-overlap": true,
+        },
+      }
+    );
+  }
+
+  // Closure & incident point markers
+  styleLayers.push({
+    id: "tf-closures-points",
+    type: "circle",
+    source: "tf-closures",
+    filter: ["==", ["geometry-type"], "Point"],
+    layout: { visibility: vis(layers.closures) },
+    paint: {
+      "circle-radius": 7.5,
+      "circle-color": closureColor,
+      "circle-stroke-color": "#F8FAFC",
+      "circle-stroke-width": 2,
+    },
+  });
+
+  const reportColor = buildReportColorExpression();
+
+  // Slice 08 Community Condition Reports & Distinct Locked Gate / Private Property Warnings
+  styleLayers.push(
+    {
+      id: "tf-reports-gate-halo",
+      type: "circle",
+      source: "tf-reports",
+      filter: [
+        "any",
+        ["==", ["get", "is_gate_warning"], true],
+        [
+          "in",
+          ["downcase", ["coalesce", ["get", "report_type"], ""]],
+          ["literal", ["locked_gate", "private_property"]],
+        ],
+      ],
+      layout: { visibility: vis(layers.reports) },
+      paint: {
+        "circle-radius": 13.5,
+        "circle-color": reportColor,
+        "circle-opacity": 0.24,
+        "circle-stroke-color": "#FDE047",
+        "circle-stroke-width": 1.8,
+      },
+    },
+    {
+      id: "tf-reports-points",
+      type: "circle",
+      source: "tf-reports",
+      layout: { visibility: vis(layers.reports) },
+      paint: {
+        "circle-radius": 7.2,
+        "circle-color": reportColor,
+        "circle-stroke-color": "#F8FAFC",
+        "circle-stroke-width": 2.0,
+      },
+    }
+  );
+
+  // Recorder live GPS position marker
+  styleLayers.push(
     {
       id: "tf-recorder-head-halo",
       type: "circle",
@@ -1314,30 +1358,8 @@ export function buildTrailForgeStyle(
     }
   );
 
-  // Phase A Interactive Multi-Track Planned Route Overlay (bright cyan/emerald #14b8a6)
+  // Planned route start/leg/waypoint/finish badges
   styleLayers.push(
-    {
-      id: "tf-planned-route-casing",
-      type: "line",
-      source: "tf-planned-route",
-      layout: { "line-cap": "round", "line-join": "round" },
-      paint: {
-        "line-color": "#042F2E",
-        "line-width": ["interpolate", ["linear"], ["zoom"], 9, 8.6, 14, 12.6],
-        "line-opacity": 0.9,
-      },
-    },
-    {
-      id: "tf-planned-route-line",
-      type: "line",
-      source: "tf-planned-route",
-      layout: { "line-cap": "round", "line-join": "round" },
-      paint: {
-        "line-color": "#14b8a6",
-        "line-width": ["interpolate", ["linear"], ["zoom"], 9, 4.6, 14, 7.2],
-        "line-opacity": 0.98,
-      },
-    },
     {
       id: "tf-planned-route-pins-dot",
       type: "circle",

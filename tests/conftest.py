@@ -90,6 +90,8 @@ def block_external_network(request: pytest.FixtureRequest, monkeypatch: pytest.M
         return real_create_connection(address, *args, **kwargs)
 
     monkeypatch.setattr(socket, "create_connection", _guarded_create_connection)
+    monkeypatch.setenv("TRAILFORGE_ENABLE_GEOCODER", "false")
+    get_settings.cache_clear()
 
 
 @pytest.fixture

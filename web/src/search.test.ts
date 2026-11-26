@@ -106,6 +106,26 @@ describe("runUnifiedSearch", () => {
     expect(items.some((i) => i.presetId === "grampians")).toBe(true);
   });
 
+  it("preserves AU geocoder place fallback results with bbox", () => {
+    const mapped = mapApiSearchResults([
+      {
+        kind: "place",
+        id: "nominatim:way:12345",
+        name: "Billy Goat Bluff Track",
+        state: "VIC",
+        subtitle: "Track · Dargo · OSM place",
+        category: "track",
+        lon: 147.131,
+        lat: -37.392,
+        bbox: [147.11, -37.42, 147.16, -37.36],
+      },
+    ]);
+    expect(mapped[0]?.kind).toBe("place");
+    expect(mapped[0]?.iconKey).toBeNull();
+    expect(mapped[0]?.bbox).toEqual([147.11, -37.42, 147.16, -37.36]);
+    expect(mapped[0]?.subtitle).toContain("VIC");
+  });
+
   it("maps unknown POI types safely to fallback icon", () => {
     const mapped = mapApiSearchResults([
       {
