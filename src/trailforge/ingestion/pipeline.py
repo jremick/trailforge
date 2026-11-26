@@ -131,9 +131,43 @@ def _slugify(value: str | None) -> str:
     return slug or "unnamed"
 
 
+_UPSERT_CHUNK_SIZE = 500
+
+
+def _batch_pg_upsert(
+    session: Session,
+    model: type[Any],
+    rows: list[dict[str, Any]],
+    *,
+    key_fn: Any,
+    update_cols: tuple[str, ...],
+    index_elements: list[Any] | None = None,
+    constraint: str | None = None,
+    extra_set: Any = None,
+    chunk_size: int = _UPSERT_CHUNK_SIZE,
+) -> int:
+    """Execute deduplicated multi-row PostgreSQL ON CONFLICT DO UPDATE in chunks."""
+    if not rows:
+        return 0
+    # Deduplicate across all rows preserving last-wins semantics (matches row-by-row loop)
+    deduped = list({key_fn(r): r for r in rows}.values())
+    for start in range(0, len(deduped), chunk_size):
+        chunk = deduped[start : start + chunk_size]
+        stmt = pg_insert(model).values(chunk)
+        set_map: dict[str, Any] = {col: stmt.excluded[col] for col in update_cols}
+        if extra_set is not None:
+            set_map.update(extra_set(stmt))
+        if constraint is not None:
+            stmt = stmt.on_conflict_do_update(constraint=constraint, set_=set_map)
+        else:
+            stmt = stmt.on_conflict_do_update(index_elements=index_elements, set_=set_map)
+        session.execute(stmt)
+    return len(rows)
+
+
 def _upsert_tier_a_osm(session: Session, features: list[RawTrackFeature]) -> int:
     now = datetime.now(UTC)
-    count = 0
+    rows: list[dict[str, Any]] = []
     for feat in features:
         way_id = feat.osm_way_id
         if way_id is None:
@@ -142,57 +176,57 @@ def _upsert_tier_a_osm(session: Session, features: list[RawTrackFeature]) -> int
                 continue
             way_id = int(digits)
         line = _as_linestring(feat.to_shapely())
-        stmt = (
-            pg_insert(SourceTrackOSM)
-            .values(
-                osm_way_id=way_id,
-                osm_version=feat.osm_version,
-                name=feat.name,
-                highway=feat.highway or "track",
-                surface=feat.surface_raw,
-                tracktype=feat.tracktype,
-                smoothness=feat.smoothness,
-                four_wd_only=feat.four_wd_only_raw,
-                access=feat.access_raw,
-                motor_vehicle=feat.motor_vehicle,
-                bridge=feat.bridge_raw,
-                ford=feat.ford_raw,
-                has_gate_barrier=feat.has_gate_barrier,
-                tags=feat.raw_props,
-                geom=from_shape(line, srid=4326),
-                source_snapshot_at=now,
-                ingested_at=now,
-            )
-            .on_conflict_do_update(
-                index_elements=[SourceTrackOSM.osm_way_id],
-                set_={
-                    "osm_version": feat.osm_version,
-                    "name": feat.name,
-                    "highway": feat.highway or "track",
-                    "surface": feat.surface_raw,
-                    "tracktype": feat.tracktype,
-                    "smoothness": feat.smoothness,
-                    "four_wd_only": feat.four_wd_only_raw,
-                    "access": feat.access_raw,
-                    "motor_vehicle": feat.motor_vehicle,
-                    "bridge": feat.bridge_raw,
-                    "ford": feat.ford_raw,
-                    "has_gate_barrier": feat.has_gate_barrier,
-                    "tags": feat.raw_props,
-                    "geom": from_shape(line, srid=4326),
-                    "source_snapshot_at": now,
-                    "ingested_at": now,
-                },
-            )
+        rows.append(
+            {
+                "osm_way_id": way_id,
+                "osm_version": feat.osm_version,
+                "name": feat.name,
+                "highway": feat.highway or "track",
+                "surface": feat.surface_raw,
+                "tracktype": feat.tracktype,
+                "smoothness": feat.smoothness,
+                "four_wd_only": feat.four_wd_only_raw,
+                "access": feat.access_raw,
+                "motor_vehicle": feat.motor_vehicle,
+                "bridge": feat.bridge_raw,
+                "ford": feat.ford_raw,
+                "has_gate_barrier": feat.has_gate_barrier,
+                "tags": feat.raw_props,
+                "geom": from_shape(line, srid=4326),
+                "source_snapshot_at": now,
+                "ingested_at": now,
+            }
         )
-        session.execute(stmt)
-        count += 1
-    return count
+    return _batch_pg_upsert(
+        session,
+        SourceTrackOSM,
+        rows,
+        key_fn=lambda r: r["osm_way_id"],
+        index_elements=[SourceTrackOSM.osm_way_id],
+        update_cols=(
+            "osm_version",
+            "name",
+            "highway",
+            "surface",
+            "tracktype",
+            "smoothness",
+            "four_wd_only",
+            "access",
+            "motor_vehicle",
+            "bridge",
+            "ford",
+            "has_gate_barrier",
+            "tags",
+            "geom",
+            "source_snapshot_at",
+            "ingested_at",
+        ),
+    )
 
 
 def _upsert_tier_a_vic(session: Session, features: list[RawTrackFeature]) -> int:
     now = datetime.now(UTC)
-    count = 0
+    rows: list[dict[str, Any]] = []
     for feat in features:
         mline = _as_multilinestring(feat.to_shapely())
         layer = (
@@ -200,42 +234,42 @@ def _upsert_tier_a_vic(session: Session, features: list[RawTrackFeature]) -> int
             if feat.source_layer in ("tr_road", "recweb_tracks")
             else "tr_road"
         )
-        stmt = (
-            pg_insert(SourceTrackVIC)
-            .values(
-                source_layer=layer,
-                source_feature_id=feat.source_id,
-                name=feat.name,
-                trail_class=feat.trail_class,
-                class_code=feat.class_code,
-                surface=feat.surface_raw,
-                is_vehicular=feat.is_vehicular,
-                raw_props=feat.raw_props,
-                geom=from_shape(mline, srid=4326),
-                ingested_at=now,
-            )
-            .on_conflict_do_update(
-                constraint="uq_source_tracks_vic_feature",
-                set_={
-                    "name": feat.name,
-                    "trail_class": feat.trail_class,
-                    "class_code": feat.class_code,
-                    "surface": feat.surface_raw,
-                    "is_vehicular": feat.is_vehicular,
-                    "raw_props": feat.raw_props,
-                    "geom": from_shape(mline, srid=4326),
-                    "ingested_at": now,
-                },
-            )
+        rows.append(
+            {
+                "source_layer": layer,
+                "source_feature_id": feat.source_id,
+                "name": feat.name,
+                "trail_class": feat.trail_class,
+                "class_code": feat.class_code,
+                "surface": feat.surface_raw,
+                "is_vehicular": feat.is_vehicular,
+                "raw_props": feat.raw_props,
+                "geom": from_shape(mline, srid=4326),
+                "ingested_at": now,
+            }
         )
-        session.execute(stmt)
-        count += 1
-    return count
+    return _batch_pg_upsert(
+        session,
+        SourceTrackVIC,
+        rows,
+        key_fn=lambda r: (r["source_layer"], r["source_feature_id"]),
+        constraint="uq_source_tracks_vic_feature",
+        update_cols=(
+            "name",
+            "trail_class",
+            "class_code",
+            "surface",
+            "is_vehicular",
+            "raw_props",
+            "geom",
+            "ingested_at",
+        ),
+    )
 
 
 def _upsert_tier_a_nsw(session: Session, features: list[RawTrackFeature]) -> int:
     now = datetime.now(UTC)
-    count = 0
+    rows: list[dict[str, Any]] = []
     for feat in features:
         mline = _as_multilinestring(feat.to_shapely())
         layer = (
@@ -243,45 +277,45 @@ def _upsert_tier_a_nsw(session: Session, features: list[RawTrackFeature]) -> int
             if feat.source_layer in ("nsw_fire_trails_l9", "nsw_tracks_l5")
             else "nsw_fire_trails_l9"
         )
-        stmt = (
-            pg_insert(SourceTrackNSW)
-            .values(
-                source_layer=layer,
-                source_feature_id=feat.source_id,
-                name=feat.name,
-                trail_class=feat.trail_class,
-                class_subtype=feat.class_subtype,
-                surface=feat.surface_raw,
-                operational_status=feat.operational_status,
-                is_vehicular=feat.is_vehicular,
-                raw_props=feat.raw_props,
-                geom=from_shape(mline, srid=4326),
-                ingested_at=now,
-            )
-            .on_conflict_do_update(
-                constraint="uq_source_tracks_nsw_feature",
-                set_={
-                    "name": feat.name,
-                    "trail_class": feat.trail_class,
-                    "class_subtype": feat.class_subtype,
-                    "surface": feat.surface_raw,
-                    "operational_status": feat.operational_status,
-                    "is_vehicular": feat.is_vehicular,
-                    "raw_props": feat.raw_props,
-                    "geom": from_shape(mline, srid=4326),
-                    "ingested_at": now,
-                },
-            )
+        rows.append(
+            {
+                "source_layer": layer,
+                "source_feature_id": feat.source_id,
+                "name": feat.name,
+                "trail_class": feat.trail_class,
+                "class_subtype": feat.class_subtype,
+                "surface": feat.surface_raw,
+                "operational_status": feat.operational_status,
+                "is_vehicular": feat.is_vehicular,
+                "raw_props": feat.raw_props,
+                "geom": from_shape(mline, srid=4326),
+                "ingested_at": now,
+            }
         )
-        session.execute(stmt)
-        count += 1
-    return count
+    return _batch_pg_upsert(
+        session,
+        SourceTrackNSW,
+        rows,
+        key_fn=lambda r: (r["source_layer"], r["source_feature_id"]),
+        constraint="uq_source_tracks_nsw_feature",
+        update_cols=(
+            "name",
+            "trail_class",
+            "class_subtype",
+            "surface",
+            "operational_status",
+            "is_vehicular",
+            "raw_props",
+            "geom",
+            "ingested_at",
+        ),
+    )
 
 
 def _upsert_tier_a_au_state(session: Session, features: list[RawTrackFeature]) -> int:
     """Persist ACT/TAS/QLD/WA/SA/NT source tracks into Tier A ``source_tracks_au_state``."""
     now = datetime.now(UTC)
-    count = 0
+    rows: list[dict[str, Any]] = []
     for feat in features:
         state_code = feat.source.upper()
         if state_code not in AU_EXTENDED_STATE_CODES:
@@ -289,110 +323,110 @@ def _upsert_tier_a_au_state(session: Session, features: list[RawTrackFeature]) -
         line = _as_linestring(feat.to_shapely())
         layer = (feat.source_layer or f"{feat.source}_tracks")[:64]
         feat_id = str(feat.source_id)[:128]
-        stmt = (
-            pg_insert(SourceTrackAUState)
-            .values(
-                state_code=state_code,
-                source_layer=layer,
-                source_feature_id=feat_id,
-                name=feat.name,
-                trail_class=feat.trail_class,
-                surface_raw=feat.surface_raw,
-                access_raw=feat.access_raw,
-                properties_json=feat.raw_props,
-                geom=from_shape(line, srid=4326),
-                ingested_at=now,
-            )
-            .on_conflict_do_update(
-                constraint="uq_source_tracks_au_state_feat",
-                set_={
-                    "name": feat.name,
-                    "trail_class": feat.trail_class,
-                    "surface_raw": feat.surface_raw,
-                    "access_raw": feat.access_raw,
-                    "properties_json": feat.raw_props,
-                    "geom": from_shape(line, srid=4326),
-                    "ingested_at": now,
-                },
-            )
+        rows.append(
+            {
+                "state_code": state_code,
+                "source_layer": layer,
+                "source_feature_id": feat_id,
+                "name": feat.name,
+                "trail_class": feat.trail_class,
+                "surface_raw": feat.surface_raw,
+                "access_raw": feat.access_raw,
+                "properties_json": feat.raw_props,
+                "geom": from_shape(line, srid=4326),
+                "ingested_at": now,
+            }
         )
-        session.execute(stmt)
-        count += 1
-    return count
+    return _batch_pg_upsert(
+        session,
+        SourceTrackAUState,
+        rows,
+        key_fn=lambda r: (r["state_code"], r["source_layer"], r["source_feature_id"]),
+        constraint="uq_source_tracks_au_state_feat",
+        update_cols=(
+            "name",
+            "trail_class",
+            "surface_raw",
+            "access_raw",
+            "properties_json",
+            "geom",
+            "ingested_at",
+        ),
+    )
 
 
 def _upsert_tier_a_waterways(session: Session, features: list[RawWaterwayFeature]) -> int:
     now = datetime.now(UTC)
-    count = 0
+    rows: list[dict[str, Any]] = []
     for ww in features:
         geom = ww.to_shapely()
-        stmt = (
-            pg_insert(SourceWaterway)
-            .values(
-                source_provider=ww.source_provider,
-                source_license=ww.source_license,
-                source_feature_id=ww.source_feature_id,
-                name=ww.name,
-                feature_type=ww.feature_type,
-                perenniality=ww.perenniality,
-                hierarchy=ww.hierarchy,
-                geom=from_shape(geom, srid=4326),
-                ingested_at=now,
-            )
-            .on_conflict_do_update(
-                constraint="uq_source_waterways_feat",
-                set_={
-                    "source_license": ww.source_license,
-                    "name": ww.name,
-                    "feature_type": ww.feature_type,
-                    "perenniality": ww.perenniality,
-                    "hierarchy": ww.hierarchy,
-                    "geom": from_shape(geom, srid=4326),
-                    "ingested_at": now,
-                },
-            )
+        rows.append(
+            {
+                "source_provider": ww.source_provider,
+                "source_license": ww.source_license,
+                "source_feature_id": ww.source_feature_id,
+                "name": ww.name,
+                "feature_type": ww.feature_type,
+                "perenniality": ww.perenniality,
+                "hierarchy": ww.hierarchy,
+                "geom": from_shape(geom, srid=4326),
+                "ingested_at": now,
+            }
         )
-        session.execute(stmt)
-        count += 1
-    return count
+    return _batch_pg_upsert(
+        session,
+        SourceWaterway,
+        rows,
+        key_fn=lambda r: (r["source_provider"], r["source_feature_id"]),
+        constraint="uq_source_waterways_feat",
+        update_cols=(
+            "source_license",
+            "name",
+            "feature_type",
+            "perenniality",
+            "hierarchy",
+            "geom",
+            "ingested_at",
+        ),
+    )
 
 
 def _upsert_tier_a_pois(session: Session, features: list[RawPoiFeature]) -> int:
     now = datetime.now(UTC)
-    count = 0
+    rows: list[dict[str, Any]] = []
     for poi in features:
         pt = poi.to_shapely()
-        stmt = (
-            pg_insert(SourcePOI)
-            .values(
-                source_provider=poi.source_provider,
-                source_license=poi.source_license,
-                source_feature_id=poi.source_feature_id,
-                name=poi.name,
-                poi_type=poi.poi_type,
-                state=poi.state,
-                elev_m=poi.elev_m,
-                raw_props=poi.raw_props,
-                geom=from_shape(pt, srid=4326),
-                ingested_at=now,
-            )
-            .on_conflict_do_update(
-                constraint="uq_source_pois_feature",
-                set_={
-                    "source_license": poi.source_license,
-                    "name": poi.name,
-                    "poi_type": poi.poi_type,
-                    "state": poi.state,
-                    "elev_m": poi.elev_m,
-                    "raw_props": poi.raw_props,
-                    "geom": from_shape(pt, srid=4326),
-                    "ingested_at": now,
-                },
-            )
+        rows.append(
+            {
+                "source_provider": poi.source_provider,
+                "source_license": poi.source_license,
+                "source_feature_id": poi.source_feature_id,
+                "name": poi.name,
+                "poi_type": poi.poi_type,
+                "state": poi.state,
+                "elev_m": poi.elev_m,
+                "raw_props": poi.raw_props,
+                "geom": from_shape(pt, srid=4326),
+                "ingested_at": now,
+            }
         )
-        session.execute(stmt)
-        count += 1
-    return count
+    return _batch_pg_upsert(
+        session,
+        SourcePOI,
+        rows,
+        key_fn=lambda r: (r["source_provider"], r["source_feature_id"]),
+        constraint="uq_source_pois_feature",
+        update_cols=(
+            "source_license",
+            "name",
+            "poi_type",
+            "state",
+            "elev_m",
+            "raw_props",
+            "geom",
+            "ingested_at",
+        ),
+    )
 
 
 def _upsert_capad_parks(
@@ -696,6 +730,7 @@ def ingest_corridor_dataset(
         if rec.candidate.track_id:
             segs_by_track.setdefault(rec.candidate.track_id, []).append(rec)
 
+    track_rows: list[dict[str, Any]] = []
     for tid, trk in track_by_id.items():
         t_recs = segs_by_track.get(tid, [])
         elev_mins = [
@@ -725,51 +760,54 @@ def ingest_corridor_dataset(
         primary_park_id = park_votes.most_common(1)[0][0] if park_votes else None
 
         bbox_wkb = from_shape(trk.bbox_geom, srid=4326) if trk.bbox_geom is not None else None
-        session.execute(
-            pg_insert(Track)
-            .values(
-                track_id=trk.track_id,
-                name=trk.name,
-                alt_names=trk.alt_names,
-                state=trk.state,
-                primary_source=trk.primary_source,
-                has_osm_source=trk.has_osm_source,
-                trail_class=trk.trail_class,
-                is_vehicular=trk.is_vehicular,
-                total_length_m=trk.total_length_m,
-                elev_min_m=min(elev_mins) if elev_mins else None,
-                elev_max_m=max(elev_maxs) if elev_maxs else None,
-                elev_gain_m=total_gain,
-                max_slope_deg=max(slopes) if slopes else None,
-                waterway_crossing_count=total_crossings,
-                primary_park_id=primary_park_id,
-                bbox_geom=bbox_wkb,
-                is_active=True,
-                updated_at=now,
-            )
-            .on_conflict_do_update(
-                index_elements=[Track.track_id],
-                set_={
-                    "name": trk.name,
-                    "alt_names": trk.alt_names,
-                    "state": trk.state,
-                    "primary_source": trk.primary_source,
-                    "has_osm_source": trk.has_osm_source,
-                    "trail_class": trk.trail_class,
-                    "is_vehicular": trk.is_vehicular,
-                    "total_length_m": trk.total_length_m,
-                    "elev_min_m": min(elev_mins) if elev_mins else None,
-                    "elev_max_m": max(elev_maxs) if elev_maxs else None,
-                    "elev_gain_m": total_gain,
-                    "max_slope_deg": max(slopes) if slopes else None,
-                    "waterway_crossing_count": total_crossings,
-                    "primary_park_id": primary_park_id,
-                    "bbox_geom": bbox_wkb,
-                    "is_active": True,
-                    "updated_at": now,
-                },
-            )
+        track_rows.append(
+            {
+                "track_id": trk.track_id,
+                "name": trk.name,
+                "alt_names": trk.alt_names,
+                "state": trk.state,
+                "primary_source": trk.primary_source,
+                "has_osm_source": trk.has_osm_source,
+                "trail_class": trk.trail_class,
+                "is_vehicular": trk.is_vehicular,
+                "total_length_m": trk.total_length_m,
+                "elev_min_m": min(elev_mins) if elev_mins else None,
+                "elev_max_m": max(elev_maxs) if elev_maxs else None,
+                "elev_gain_m": total_gain,
+                "max_slope_deg": max(slopes) if slopes else None,
+                "waterway_crossing_count": total_crossings,
+                "primary_park_id": primary_park_id,
+                "bbox_geom": bbox_wkb,
+                "is_active": True,
+                "updated_at": now,
+            }
         )
+    _batch_pg_upsert(
+        session,
+        Track,
+        track_rows,
+        key_fn=lambda r: r["track_id"],
+        index_elements=[Track.track_id],
+        update_cols=(
+            "name",
+            "alt_names",
+            "state",
+            "primary_source",
+            "has_osm_source",
+            "trail_class",
+            "is_vehicular",
+            "total_length_m",
+            "elev_min_m",
+            "elev_max_m",
+            "elev_gain_m",
+            "max_slope_deg",
+            "waterway_crossing_count",
+            "primary_park_id",
+            "bbox_geom",
+            "is_active",
+            "updated_at",
+        ),
+    )
 
     # -------------------------------------------------------------------------
     # 6. Upsert Tier B `track_segments` & Soft-Retire Superseded Segments
@@ -778,6 +816,7 @@ def ingest_corridor_dataset(
     has_dem = dataset.dem_path is not None and Path(dataset.dem_path).is_file()
     dem_tier_val = dataset.dem_tier if has_dem else None
 
+    seg_rows: list[dict[str, Any]] = []
     for rec in plan.reconciled_segments:
         cand = rec.candidate
         terrain, unbridged_cnt, has_perennial, park_id, _grade_res = seg_metrics[
@@ -786,58 +825,61 @@ def ingest_corridor_dataset(
         geom_wkb = from_shape(cand.geom_wgs84, srid=4326)
         active_seg_geoms.append((rec.final_segment_id, cand.geom_3577))
 
-        values = {
-            "segment_id": rec.final_segment_id,
-            "track_id": cand.track_id,
-            "segment_seq": cand.segment_seq,
-            "geom_fingerprint": cand.geom_fingerprint,
-            "geom": geom_wkb,
-            "start_node_key": cand.start_node_key,
-            "end_node_key": cand.end_node_key,
-            "length_m": cand.length_m,
-            "bearing_deg": cand.bearing_deg,
-            "state": cand.state,
-            "name": cand.name,
-            "trail_class": cand.trail_class,
-            "is_vehicular": cand.is_vehicular,
-            "surface_class": cand.surface_class,
-            "tracktype": cand.tracktype,
-            "is_4wd_only": cand.is_4wd_only,
-            "is_4wd_recommended": cand.is_4wd_recommended,
-            "access_status": cand.access_status,
-            "has_gate_barrier": cand.has_gate_barrier,
-            "is_bridged": cand.is_bridged,
-            "elev_min_m": terrain.min_elev_m,
-            "elev_max_m": terrain.max_elev_m,
-            "elev_start_m": terrain.elev_start_m,
-            "elev_end_m": terrain.elev_end_m,
-            "elev_gain_m": terrain.elev_gain_m,
-            "elev_loss_m": terrain.elev_loss_m,
-            "max_slope_deg": terrain.max_slope_deg,
-            "sustained_slope_deg": terrain.sustained_slope_deg,
-            "is_steep_highlight": terrain.is_steep_highlight,
-            "is_above_snowline": terrain.is_above_snowline,
-            "elevation_profile_m": terrain.elevation_profile,
-            "dem_tier": dem_tier_val,
-            "waterway_crossing_count": unbridged_cnt,
-            "has_perennial_crossing": has_perennial,
-            "capad_park_id": park_id,
-            "primary_source": cand.primary_source,
-            "has_osm_source": cand.has_osm_source,
-            "source_refs": cand.source_refs,
-            "is_active": True,
-            "retired_at": None,
-            "superseded_by_segment_id": None,
-            "updated_at": now,
-        }
-        update_cols = {k: v for k, v in values.items() if k != "segment_id"}
-        session.execute(
-            pg_insert(TrackSegment)
-            .values(**values)
-            .on_conflict_do_update(
-                index_elements=[TrackSegment.segment_id],
-                set_=update_cols,
-            )
+        seg_rows.append(
+            {
+                "segment_id": rec.final_segment_id,
+                "track_id": cand.track_id,
+                "segment_seq": cand.segment_seq,
+                "geom_fingerprint": cand.geom_fingerprint,
+                "geom": geom_wkb,
+                "start_node_key": cand.start_node_key,
+                "end_node_key": cand.end_node_key,
+                "length_m": cand.length_m,
+                "bearing_deg": cand.bearing_deg,
+                "state": cand.state,
+                "name": cand.name,
+                "trail_class": cand.trail_class,
+                "is_vehicular": cand.is_vehicular,
+                "surface_class": cand.surface_class,
+                "tracktype": cand.tracktype,
+                "is_4wd_only": cand.is_4wd_only,
+                "is_4wd_recommended": cand.is_4wd_recommended,
+                "access_status": cand.access_status,
+                "has_gate_barrier": cand.has_gate_barrier,
+                "is_bridged": cand.is_bridged,
+                "elev_min_m": terrain.min_elev_m,
+                "elev_max_m": terrain.max_elev_m,
+                "elev_start_m": terrain.elev_start_m,
+                "elev_end_m": terrain.elev_end_m,
+                "elev_gain_m": terrain.elev_gain_m,
+                "elev_loss_m": terrain.elev_loss_m,
+                "max_slope_deg": terrain.max_slope_deg,
+                "sustained_slope_deg": terrain.sustained_slope_deg,
+                "is_steep_highlight": terrain.is_steep_highlight,
+                "is_above_snowline": terrain.is_above_snowline,
+                "elevation_profile_m": terrain.elevation_profile,
+                "dem_tier": dem_tier_val,
+                "waterway_crossing_count": unbridged_cnt,
+                "has_perennial_crossing": has_perennial,
+                "capad_park_id": park_id,
+                "primary_source": cand.primary_source,
+                "has_osm_source": cand.has_osm_source,
+                "source_refs": cand.source_refs,
+                "is_active": True,
+                "retired_at": None,
+                "superseded_by_segment_id": None,
+                "updated_at": now,
+            }
+        )
+    if seg_rows:
+        seg_update_cols = tuple(k for k in seg_rows[0] if k != "segment_id")
+        _batch_pg_upsert(
+            session,
+            TrackSegment,
+            seg_rows,
+            key_fn=lambda r: r["segment_id"],
+            index_elements=[TrackSegment.segment_id],
+            update_cols=seg_update_cols,
         )
 
     # Flush new segments before pointing superseded_by_segment_id FKs to them
@@ -851,48 +893,58 @@ def ingest_corridor_dataset(
             row.superseded_by_segment_id = retired.superseded_by_segment_id
             row.updated_at = now
 
-    for entry in plan.log_entries:
-        session.add(
-            SegmentReconciliationLog(
-                import_run_id=entry.import_run_id,
-                reconcile_action=entry.reconcile_action,
-                old_segment_id=entry.old_segment_id,
-                new_segment_id=entry.new_segment_id,
-                overlap_ratio=entry.overlap_ratio,
-                hausdorff_m=entry.hausdorff_m,
-                heading_diff_deg=entry.heading_diff_deg,
-                created_at=now,
-            )
+    if plan.log_entries:
+        session.add_all(
+            [
+                SegmentReconciliationLog(
+                    import_run_id=entry.import_run_id,
+                    reconcile_action=entry.reconcile_action,
+                    old_segment_id=entry.old_segment_id,
+                    new_segment_id=entry.new_segment_id,
+                    overlap_ratio=entry.overlap_ratio,
+                    hausdorff_m=entry.hausdorff_m,
+                    heading_diff_deg=entry.heading_diff_deg,
+                    created_at=now,
+                )
+                for entry in plan.log_entries
+            ]
         )
 
     # -------------------------------------------------------------------------
     # 7. Upsert Tier C `track_segment_grades` (zero OSM geom/tags, preserves live fields)
     # -------------------------------------------------------------------------
+    grade_rows: list[dict[str, Any]] = []
     for rec in plan.reconciled_segments:
         _, _, _, _, grade_res = seg_metrics[rec.final_segment_id]
-        grade_insert = pg_insert(TrackSegmentGrade).values(
-            segment_id=rec.final_segment_id,
-            baseline_grade=grade_res.grade,
-            baseline_score=grade_res.score,
-            baseline_breakdown=grade_res.baseline_breakdown,
-            effective_grade=grade_res.grade,
-            baseline_computed_at=now,
+        grade_rows.append(
+            {
+                "segment_id": rec.final_segment_id,
+                "baseline_grade": grade_res.grade,
+                "baseline_score": grade_res.score,
+                "baseline_breakdown": grade_res.baseline_breakdown,
+                "effective_grade": grade_res.grade,
+                "baseline_computed_at": now,
+            }
         )
-        session.execute(
-            grade_insert.on_conflict_do_update(
-                index_elements=[TrackSegmentGrade.segment_id],
-                set_={
-                    "baseline_grade": grade_insert.excluded.baseline_grade,
-                    "baseline_score": grade_insert.excluded.baseline_score,
-                    "baseline_breakdown": grade_insert.excluded.baseline_breakdown,
-                    "effective_grade": func.coalesce(
-                        TrackSegmentGrade.live_grade,
-                        grade_insert.excluded.baseline_grade,
-                    ),
-                    "baseline_computed_at": now,
-                },
+    _batch_pg_upsert(
+        session,
+        TrackSegmentGrade,
+        grade_rows,
+        key_fn=lambda r: r["segment_id"],
+        index_elements=[TrackSegmentGrade.segment_id],
+        update_cols=(
+            "baseline_grade",
+            "baseline_score",
+            "baseline_breakdown",
+            "baseline_computed_at",
+        ),
+        extra_set=lambda stmt: {
+            "effective_grade": func.coalesce(
+                TrackSegmentGrade.live_grade,
+                stmt.excluded.baseline_grade,
             )
-        )
+        },
+    )
 
     # -------------------------------------------------------------------------
     # 8. Upsert Deduplicated Canonical `pois`
