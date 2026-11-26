@@ -106,6 +106,56 @@ function renderFallbackPoiBadge(): {
   return { width: size, height: size, data: new Uint8Array(img.data.buffer) };
 }
 
+function renderRoutePinBadgeImage(pinKey: string): {
+  width: number;
+  height: number;
+  data: Uint8Array;
+} | null {
+  const scale = 2;
+  const logicalSize = 24;
+  const size = logicalSize * scale;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+
+  const dashIdx = pinKey.indexOf("-");
+  const kind = dashIdx >= 0 ? pinKey.slice(0, dashIdx) : "leg";
+  const label = (dashIdx >= 0 ? pinKey.slice(dashIdx + 1) : pinKey).slice(0, 3) || "1";
+
+  const fillColor =
+    kind === "start"
+      ? "#10B981"
+      : kind === "finish"
+        ? "#F59E0B"
+        : kind === "wpt" || kind === "waypoint"
+          ? "#38BDF8"
+          : "#14B8A6";
+
+  const cx = size / 2;
+  const cy = size / 2;
+  const r = 10 * scale;
+
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.fillStyle = fillColor;
+  ctx.fill();
+  ctx.strokeStyle = "#042F2E";
+  ctx.lineWidth = 2.2 * scale;
+  ctx.stroke();
+
+  ctx.fillStyle = "#042F2E";
+  const fontSize = label.length >= 3 ? 7.8 * scale : label.length === 2 ? 8.8 * scale : 10 * scale;
+  ctx.font = `800 ${fontSize}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(label, cx, cy + 0.5 * scale);
+
+  const img = ctx.getImageData(0, 0, size, size);
+  return { width: size, height: size, data: new Uint8Array(img.data.buffer) };
+}
+
 export interface TrailForgeMapCallbacks {
   onCursorMove?: (lat: number, lon: number) => void;
   onMapMoveEnd?: (lat: number, lon: number, zoom: number) => void;
@@ -142,6 +192,9 @@ export class TrailForgeMap {
   private unmappedGeoJson: FeatureCollection | null = null;
   private recordedPoints: RecordedBreadcrumbPoint[] = [];
   private backtrackActive = false;
+  private plannedRouteLineFc: FeatureCollection = EMPTY_FEATURE_COLLECTION;
+  private plannedRoutePinsFc: FeatureCollection = EMPTY_FEATURE_COLLECTION;
+  private routePlanMode = false;
   private userPins: UserPinItem[] = [];
   private readonly loadedIconIds = new Set<string>();
   private readonly loadingIcons = new Set<string>();
@@ -208,6 +261,7 @@ export class TrailForgeMap {
         "tf-hotspots-line",
         "tf-closures-points",
         "tf-closures-line",
+        "tf-planned-route-line",
         "tf-steep-highlights",
         "tf-tracks-line",
       ].filter((id) => Boolean(this.map.getLayer(id)));
@@ -247,6 +301,14 @@ export class TrailForgeMap {
       if (id.startsWith("elev-")) {
         const elev = id.slice(5);
         const badge = renderContourBadgeImage(`${elev}m`);
+        if (badge && !this.map.hasImage(id)) {
+          this.map.addImage(id, badge, { pixelRatio: 2 });
+        }
+        return;
+      }
+
+      if (id.startsWith("route-pin-")) {
+        const badge = renderRoutePinBadgeImage(id.slice(10));
         if (badge && !this.map.hasImage(id)) {
           this.map.addImage(id, badge, { pixelRatio: 2 });
         }
@@ -369,6 +431,25 @@ export class TrailForgeMap {
     if (this.isLoaded) {
       this.applyUnmappedData();
     }
+  }
+
+  /**
+   * Populate Phase A active multi-track planned route line & numbered pins on MapLibre.
+   */
+  setPlannedRoute(
+    lineFc: FeatureCollection | null,
+    pinsFc: FeatureCollection | null
+  ): void {
+    this.plannedRouteLineFc = lineFc ?? EMPTY_FEATURE_COLLECTION;
+    this.plannedRoutePinsFc = pinsFc ?? EMPTY_FEATURE_COLLECTION;
+    if (this.isLoaded) {
+      this.applyPlannedRouteData();
+    }
+  }
+
+  setRoutePlanMode(active: boolean): void {
+    this.routePlanMode = active;
+    this.container.classList.toggle("route-plan-active", active);
   }
 
   /**
@@ -539,6 +620,7 @@ export class TrailForgeMap {
     this.applyReportsData();
     this.applyUnmappedData();
     this.applyRecordedTrackData();
+    this.applyPlannedRouteData();
     this.applyUserPinsData();
   }
 
@@ -608,6 +690,7 @@ export class TrailForgeMap {
     if (this.coordPickMode !== null) return;
 
     const queryLayers = [
+      "tf-planned-route-pins-dot",
       "tf-reports-points",
       "tf-hotspots-points",
       "tf-hotspots-line",
@@ -616,6 +699,7 @@ export class TrailForgeMap {
       "tf-closures-line",
       "tf-pois-icons",
       "tf-pois-layer",
+      "tf-planned-route-line",
       "tf-steep-highlights",
       "tf-tracks-line",
       "tf-unmapped-line",
@@ -641,6 +725,44 @@ export class TrailForgeMap {
 
     const layerId = hit.layer.id;
     const props = (hit.properties ?? {}) as Record<string, unknown>;
+
+    if (layerId === "tf-planned-route-pins-dot") {
+      this.map.getCanvas().style.cursor = "pointer";
+      const title = String(props.title ?? "Planned Route Waypoint");
+      const kind = String(props.kind ?? "leg").toUpperCase();
+      this.hoverPopup
+        .setLngLat(e.lngLat)
+        .setHTML(
+          `<div class="tf-popup-title">${escapeHtml(title)}</div>
+           <div class="tf-popup-meta">
+             <span class="tf-popup-dot" style="background:#14b8a6"></span>
+             <span>Planned Route · ${escapeHtml(kind)}</span>
+           </div>`
+        )
+        .addTo(this.map);
+      return;
+    }
+
+    if (layerId === "tf-planned-route-line") {
+      this.map.getCanvas().style.cursor = "pointer";
+      const name = String(props.name ?? "Planned Route Leg");
+      const grade = String(props.grade ?? "Easy");
+      const legNum =
+        typeof props.leg_index === "number" ? `Leg ${props.leg_index + 1}` : "Planned Route";
+      const hint = this.routePlanMode ? "Already in route" : "Click to inspect track";
+      this.hoverPopup
+        .setLngLat(e.lngLat)
+        .setHTML(
+          `<div class="tf-popup-title">${escapeHtml(name)}</div>
+           <div class="tf-popup-meta">
+             <span class="tf-popup-dot" style="background:#14b8a6"></span>
+             <span>${escapeHtml(legNum)} · ${escapeHtml(grade)}</span>
+             <span class="tf-popup-hint">${escapeHtml(hint)}</span>
+           </div>`
+        )
+        .addTo(this.map);
+      return;
+    }
 
     if (layerId === "tf-reports-points") {
       this.map.getCanvas().style.cursor = "pointer";
@@ -827,6 +949,9 @@ export class TrailForgeMap {
         ? `${props.max_slope_deg.toFixed(1)}° max`
         : "";
     const color = getGradeColor(grade);
+    const clickHint = this.routePlanMode
+      ? "+ Click to add to route"
+      : "Click to inspect";
     this.hoverPopup
       .setLngLat(e.lngLat)
       .setHTML(
@@ -837,7 +962,7 @@ export class TrailForgeMap {
            ${liveGrade ? `<span>· Live: ${escapeHtml(liveGrade)}</span>` : ""}
            ${slope ? `<span>· ${escapeHtml(slope)}</span>` : ""}
            ${wetRisk ? `<span class="tf-popup-warn">· ${escapeHtml(wetRisk)}</span>` : ""}
-           <span class="tf-popup-hint">Click to inspect</span>
+           <span class="tf-popup-hint">${escapeHtml(clickHint)}</span>
          </div>`
       )
       .addTo(this.map);
@@ -982,6 +1107,17 @@ export class TrailForgeMap {
       | maplibregl.GeoJSONSource
       | undefined;
     src?.setData(this.unmappedGeoJson ?? EMPTY_FEATURE_COLLECTION);
+  }
+
+  private applyPlannedRouteData(): void {
+    const lineSrc = this.map.getSource("tf-planned-route") as
+      | maplibregl.GeoJSONSource
+      | undefined;
+    const pinsSrc = this.map.getSource("tf-planned-route-pins") as
+      | maplibregl.GeoJSONSource
+      | undefined;
+    lineSrc?.setData(this.plannedRouteLineFc);
+    pinsSrc?.setData(this.plannedRoutePinsFc);
   }
 
   private applyUserPinsData(): void {

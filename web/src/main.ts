@@ -7,9 +7,11 @@ import {
   createPin,
   createVehicle,
   deletePin,
+  deleteSavedRoute,
   deleteTrip,
   deleteVehicle,
   downloadAuthenticatedExport,
+  exportPlannedRoute,
   fetchAuthMe,
   fetchClosuresGeoJson,
   fetchClosuresStatus,
@@ -26,10 +28,16 @@ import {
   fetchTrips,
   fetchUnmappedCandidatesGeoJson,
   fetchVehicles,
+  getSavedRoute,
+  getSavedRouteExportUrl,
+  listSavedRoutes,
   loginAccount,
   logoutAccount,
+  planRoute,
   registerAccount,
   removeFavorite,
+  saveRoute,
+  updateSavedRoute,
   updateTrip,
   updateVehicle,
   uploadTripGpx,
@@ -44,6 +52,7 @@ import { renderAttributionFooter } from "./components/footer";
 import { TrackInspectorDrawer } from "./components/inspector";
 import { OfflinePacksPanel } from "./components/packsPanel";
 import { InCabRecorderHud } from "./components/recorder";
+import { RoutePlannerDrawer } from "./components/routePlanner";
 import { Sidebar } from "./components/sidebar";
 import { TopBar } from "./components/topbar";
 import {
@@ -85,6 +94,16 @@ import {
   getPresetById,
 } from "./presets";
 import { registerServiceWorker, subscribeNetworkStatus } from "./pwa";
+import {
+  addRouteTrackId,
+  buildPlannedRouteMapGeoJson,
+  extractAnalysisBBox,
+  getSavedRouteId,
+  getSavedRouteWaypoints,
+  moveRouteTrackDown,
+  moveRouteTrackUp,
+  removeRouteTrackAt,
+} from "./routeHelpers";
 import { buildTripExportUrl, getTripId } from "./tripsHelpers";
 import type {
   AuthUser,
@@ -93,8 +112,11 @@ import type {
   HealthState,
   LayerVisibilityState,
   OfflinePackRegionItem,
+  PlannedRouteAnalysis,
   RecordedBreadcrumbPoint,
   RegionPreset,
+  RouteWaypointInput,
+  SavedRouteItem,
   SyncQueueItem,
   TrackInspectorDetail,
   TripItem,
@@ -142,6 +164,7 @@ class TrailForgeApp {
   private readonly inspector: TrackInspectorDrawer;
   private readonly accountPanel: RigAccountPanel;
   private readonly packsPanel: OfflinePacksPanel;
+  private readonly routePlanner: RoutePlannerDrawer;
   private readonly recorderHud: InCabRecorderHud;
   private readonly map: TrailForgeMap;
   private readonly collapseBtnEl: HTMLButtonElement;
@@ -149,6 +172,7 @@ class TrailForgeApp {
   private readonly cursorMgrsEl: HTMLElement;
   private readonly offlineBannerEl: HTMLElement;
   private readonly pinDropBannerEl: HTMLElement;
+  private readonly routePickBannerEl: HTMLElement;
   private readonly toastContainerEl: HTMLElement;
   private readonly basemapButtons: NodeListOf<HTMLButtonElement>;
 
@@ -181,6 +205,22 @@ class TrailForgeApp {
   private offlinePins: UserPinItem[] = [];
   private isSyncingQueue = false;
 
+  // Phase A Interactive Multi-Track Route Planner state
+  private routeName = "";
+  private routeNotes = "";
+  private activeSavedRouteId: string | null = null;
+  private routeTrackIds: string[] = [];
+  private routeWaypoints: RouteWaypointInput[] = [];
+  private routeAnalysis: PlannedRouteAnalysis | null = null;
+  private routeLoading = false;
+  private routeError: string | null = null;
+  private routePlanMode = false;
+  private routeExporting: "gpx" | "geojson" | null = null;
+  private routeSaving = false;
+  private savedRoutes: SavedRouteItem[] = [];
+  private savedRoutesLoading = false;
+  private routePlanAbort: AbortController | null = null;
+
   constructor(root: HTMLElement) {
     const initiallyOnline =
       typeof navigator === "undefined" ? true : navigator.onLine;
@@ -211,6 +251,7 @@ class TrailForgeApp {
           <aside data-role="inspector"></aside>
           <aside data-role="account-panel"></aside>
           <aside data-role="packs-panel"></aside>
+          <aside data-role="route-panel"></aside>
 
           <div data-role="recorder-hud"></div>
 
@@ -236,6 +277,10 @@ class TrailForgeApp {
             ⌖ Click anywhere on the map to select coordinates · Esc to cancel
           </div>
 
+          <div class="tf-pin-drop-banner tf-route-pick-banner hidden" data-role="route-pick-banner" role="status">
+            ⇢ Click tracks on map to append to route · Esc to stop
+          </div>
+
           <div class="tf-coord-hud" data-role="coord-hud">
             <span class="mono" data-role="cursor-coords">${formatCoords(this.activePreset.center[1], this.activePreset.center[0], 4)}</span>
             <span class="tf-hud-sep" aria-hidden="true">|</span>
@@ -257,6 +302,7 @@ class TrailForgeApp {
     this.cursorMgrsEl = this.q(root, "[data-role='cursor-mgrs']");
     this.offlineBannerEl = this.q(root, "[data-role='offline-banner']");
     this.pinDropBannerEl = this.q(root, "[data-role='pin-drop-banner']");
+    this.routePickBannerEl = this.q(root, "[data-role='route-pick-banner']");
     this.toastContainerEl = this.q(root, "[data-role='toasts']");
     this.basemapButtons = root.querySelectorAll<HTMLButtonElement>("[data-basemap]");
 
@@ -275,6 +321,13 @@ class TrailForgeApp {
         },
         onSearchClear: () => this.map.clearSearchPin(),
         onPresetChange: (presetId) => this.selectPreset(presetId),
+        onRoutePlannerClick: () => {
+          if (this.routePlanner.isPanelOpen()) {
+            this.closeRoutePlanner();
+          } else {
+            this.openRoutePlanner();
+          }
+        },
         onHealthClick: () => void this.refreshHealth(true),
         onFeedStatusClick: () => {
           if (this.sidebarCollapsed) {
@@ -319,6 +372,7 @@ class TrailForgeApp {
           this.layerState = { ...this.layerState, snowLineElevationM: elevationM };
           this.map.setLayerVisibility(this.layerState);
           this.inspector.setSnowLineElevation(elevationM);
+          this.syncRoutePlannerUiState();
         },
         onResetRegion: () => {
           this.map.flyToPreset(
@@ -362,6 +416,13 @@ class TrailForgeApp {
         },
         onToggleFavorite: (trackId, currentlyFav) => {
           void this.handleToggleFavorite(trackId, currentlyFav);
+        },
+        onToggleTrackInRoute: (trackId, trackName, currentlyInRoute) => {
+          if (currentlyInRoute) {
+            this.openRoutePlanner();
+          } else {
+            void this.handleAddTrackToRoute(trackId, trackName);
+          }
         },
         onExportTrack: (trackId, fmt) => {
           void this.handleExportTrack(trackId, fmt);
@@ -437,6 +498,7 @@ class TrailForgeApp {
           this.syncRigUiState();
           this.showToast(`Rig suitability preview set to ${cls}`, "info");
           this.refreshOpenInspectorForRig();
+          this.refreshPlannedRouteForRig();
         },
         onLogin: async (email, password) => {
           const res = await loginAccount({ email, password });
@@ -444,6 +506,7 @@ class TrailForgeApp {
           await this.loadSignedInUserData();
           this.showToast(`Signed in as ${res.user.display_name}`, "success");
           this.refreshOpenInspectorForRig();
+          this.refreshPlannedRouteForRig();
         },
         onRegister: async (displayName, email, password) => {
           const res = await registerAccount({
@@ -455,6 +518,7 @@ class TrailForgeApp {
           await this.loadSignedInUserData();
           this.showToast(`Account created for ${res.user.display_name}`, "success");
           this.refreshOpenInspectorForRig();
+          this.refreshPlannedRouteForRig();
         },
         onLogout: async () => {
           await logoutAccount();
@@ -464,11 +528,15 @@ class TrailForgeApp {
           this.latestUploadedTrip = null;
           this.favorites = [];
           this.pins = [];
+          this.savedRoutes = [];
+          this.activeSavedRouteId = null;
           this.setCoordPickMode(null);
           this.map.setUserPins([]);
           this.syncRigUiState();
+          this.syncRoutePlannerUiState();
           this.showToast("Signed out — anonymous browsing active", "info");
           this.refreshOpenInspectorForRig();
+          this.refreshPlannedRouteForRig();
         },
         onSaveVehicle: async (payload, editingId) => {
           if (editingId) {
@@ -480,6 +548,7 @@ class TrailForgeApp {
           }
           await this.reloadVehicles();
           this.refreshOpenInspectorForRig();
+          this.refreshPlannedRouteForRig();
         },
         onActivateVehicle: async (id) => {
           const updated = await activateVehicle(id);
@@ -489,12 +558,14 @@ class TrailForgeApp {
             "success"
           );
           this.refreshOpenInspectorForRig();
+          this.refreshPlannedRouteForRig();
         },
         onDeleteVehicle: async (id) => {
           await deleteVehicle(id);
           await this.reloadVehicles();
           this.showToast("Vehicle profile deleted", "info");
           this.refreshOpenInspectorForRig();
+          this.refreshPlannedRouteForRig();
         },
         onUploadTripGpx: async (file, params) => {
           const uploaded = await uploadTripGpx(file, params);
@@ -763,6 +834,73 @@ class TrailForgeApp {
       }
     );
 
+    this.routePlanner = new RoutePlannerDrawer(
+      this.q(root, "[data-role='route-panel']"),
+      this.buildRoutePlannerState(),
+      {
+        onClose: () => this.closeRoutePlanner(),
+        onTogglePlanMode: (active) => this.setRoutePlanMode(active),
+        onRouteNameChange: (name) => {
+          this.routeName = name;
+        },
+        onRouteNotesChange: (notes) => {
+          this.routeNotes = notes;
+        },
+        onMoveLegUp: (idx) => {
+          this.routeTrackIds = moveRouteTrackUp(this.routeTrackIds, idx);
+          void this.recomputePlannedRoute(false);
+        },
+        onMoveLegDown: (idx) => {
+          this.routeTrackIds = moveRouteTrackDown(this.routeTrackIds, idx);
+          void this.recomputePlannedRoute(false);
+        },
+        onRemoveLeg: (idx) => {
+          this.routeTrackIds = removeRouteTrackAt(this.routeTrackIds, idx);
+          void this.recomputePlannedRoute(false);
+        },
+        onClearRoute: () => {
+          this.routePlanAbort?.abort();
+          this.routeTrackIds = [];
+          this.routeWaypoints = [];
+          this.routeAnalysis = null;
+          this.routeName = "";
+          this.routeNotes = "";
+          this.activeSavedRouteId = null;
+          this.routeError = null;
+          this.setRoutePlanMode(false);
+          this.map.setPlannedRoute(null, null);
+          this.syncRoutePlannerUiState();
+          this.syncRigUiState();
+          this.showToast("Cleared active route", "info");
+        },
+        onInspectTrack: (trackId) => {
+          this.closeRoutePlanner();
+          void this.openTrackInspector(trackId);
+        },
+        onZoomToRoute: (bbox) => {
+          this.map.fitBBox(bbox, this.sidebarCollapsed ? 24 : 360, 420);
+        },
+        onPoiSelect: (poi) => {
+          this.map.flyToCoordinate(poi.lat, poi.lon, poi.name, 14);
+          this.updateCursorReadout(poi.lat, poi.lon);
+          this.showToast(`Located ${poi.name}`, "info");
+        },
+        onOpenRigPanel: () => {
+          this.openAccountPanel("rig");
+        },
+        onOpenSignIn: () => {
+          this.openAccountPanel("account");
+        },
+        onExportRoute: (fmt) => this.handleExportPlannedRoute(fmt),
+        onSaveRoute: (asNew) => this.handleSavePlannedRoute(asNew),
+        onLoadSavedRoute: (routeId) => this.handleLoadSavedRoute(routeId),
+        onDeleteSavedRoute: (routeId) => this.handleDeleteSavedRoute(routeId),
+        onExportSavedRoute: (routeId, fmt) =>
+          this.handleExportSavedRoute(routeId, fmt),
+        onCopyGridForgeCli: (cli) => this.handleCopyGridForgeCli(cli),
+      }
+    );
+
     this.recorderHud = new InCabRecorderHud(
       this.q(root, "[data-role='recorder-hud']"),
       {
@@ -837,7 +975,12 @@ class TrailForgeApp {
           this.offlineBannerEl.classList.remove("hidden");
         },
         onTrackClick: (trackId) => {
+          if (this.routePlanMode) {
+            void this.handleAddTrackToRoute(trackId);
+            return;
+          }
           this.closeAccountPanel();
+          this.closeRoutePlanner();
           void this.openTrackInspector(trackId);
         },
         onPinDropClick: (lat, lon) => {
@@ -1014,6 +1157,7 @@ class TrailForgeApp {
       this.shellEl.classList.remove("inspector-open");
     }
     this.closeAccountPanel();
+    this.closeRoutePlanner();
     this.packsPanel.open();
     this.shellEl.classList.add("packs-open");
     void this.refreshPacksCatalog();
@@ -1022,6 +1166,371 @@ class TrailForgeApp {
   private closePacksPanel(): void {
     this.packsPanel.close();
     this.shellEl.classList.remove("packs-open");
+  }
+
+  private buildRoutePlannerState() {
+    const rig = this.getActiveRigInfo();
+    return {
+      routeName: this.routeName,
+      routeNotes: this.routeNotes,
+      activeSavedRouteId: this.activeSavedRouteId,
+      trackIds: [...this.routeTrackIds],
+      waypoints: [...this.routeWaypoints],
+      analysis: this.routeAnalysis,
+      loading: this.routeLoading,
+      error: this.routeError,
+      planModeActive: this.routePlanMode,
+      exporting: this.routeExporting,
+      saving: this.routeSaving,
+      savedRoutes: this.savedRoutes,
+      savedRoutesLoading: this.savedRoutesLoading,
+      isAuthenticated: Boolean(this.user),
+      activeVehicleClass: rig.vehicleClass,
+      activeVehicleName: rig.vehicleName,
+      snowLineElevationM: this.layerState.snowLineElevationM,
+    };
+  }
+
+  private syncRoutePlannerUiState(): void {
+    this.routePlanner.updateState(this.buildRoutePlannerState());
+    this.topbar.updateRouteSummary({
+      legCount: this.routeTrackIds.length,
+      planModeActive: this.routePlanMode,
+      panelOpen: this.routePlanner.isPanelOpen(),
+    });
+    if (this.routePlanMode) {
+      const n = this.routeTrackIds.length;
+      this.routePickBannerEl.textContent = `⇢ Click tracks on map to append to route (${n} leg${n === 1 ? "" : "s"}) · Esc to stop`;
+      this.routePickBannerEl.classList.remove("hidden");
+    } else {
+      this.routePickBannerEl.classList.add("hidden");
+    }
+  }
+
+  private openRoutePlanner(): void {
+    if (this.inspector.openState()) {
+      this.inspector.close();
+      this.shellEl.classList.remove("inspector-open");
+    }
+    this.closeAccountPanel();
+    this.closePacksPanel();
+    this.routePlanner.updateState(this.buildRoutePlannerState());
+    this.routePlanner.open();
+    this.shellEl.classList.add("route-open");
+    this.syncRoutePlannerUiState();
+    if (this.user && this.isOnline) {
+      void this.refreshSavedRoutes();
+    }
+  }
+
+  private closeRoutePlanner(): void {
+    if (this.routePlanMode) {
+      this.setRoutePlanMode(false);
+    }
+    this.routePlanner.close();
+    this.shellEl.classList.remove("route-open");
+    this.syncRoutePlannerUiState();
+  }
+
+  private setRoutePlanMode(active: boolean): void {
+    if (active && this.coordPickMode !== null) {
+      this.setCoordPickMode(null);
+    }
+    this.routePlanMode = active;
+    this.map.setRoutePlanMode(active);
+    this.syncRoutePlannerUiState();
+  }
+
+  private async handleAddTrackToRoute(
+    trackId: string,
+    trackLabel?: string
+  ): Promise<void> {
+    const res = addRouteTrackId(this.routeTrackIds, trackId);
+    if (!res.added) {
+      if (res.reason === "duplicate") {
+        this.showToast(
+          `${trackLabel ?? "Track"} is already in the active route`,
+          "info"
+        );
+      } else if (res.reason === "limit") {
+        this.showToast("Maximum of 30 legs per route reached", "error");
+      }
+      return;
+    }
+
+    this.routeTrackIds = res.trackIds;
+    this.routeError = null;
+    this.syncRoutePlannerUiState();
+    this.syncRigUiState();
+    this.showToast(
+      `Added ${trackLabel ?? "track"} to Route (${this.routeTrackIds.length} leg${this.routeTrackIds.length === 1 ? "" : "s"})`,
+      "success"
+    );
+    await this.recomputePlannedRoute(false);
+  }
+
+  private refreshPlannedRouteForRig(): void {
+    if (this.routeTrackIds.length > 0) {
+      void this.recomputePlannedRoute(false);
+    } else {
+      this.syncRoutePlannerUiState();
+    }
+  }
+
+  private buildRoutePlanRequestPayload() {
+    const rig = this.getActiveRigInfo();
+    const queryVehicleClass =
+      this.user && this.vehicles.length > 0 ? undefined : rig.vehicleClass;
+    return {
+      name: this.routeName.trim() || undefined,
+      track_ids: [...this.routeTrackIds],
+      vehicle_class: queryVehicleClass,
+      waypoints: this.routeWaypoints.length > 0 ? this.routeWaypoints : undefined,
+    };
+  }
+
+  private async recomputePlannedRoute(fitMap: boolean): Promise<void> {
+    this.routePlanAbort?.abort();
+    if (this.routeTrackIds.length === 0) {
+      this.routeAnalysis = null;
+      this.routeLoading = false;
+      this.routeError = null;
+      this.map.setPlannedRoute(null, null);
+      this.syncRoutePlannerUiState();
+      this.syncRigUiState();
+      return;
+    }
+
+    const controller = new AbortController();
+    this.routePlanAbort = controller;
+    this.routeLoading = true;
+    this.routeError = null;
+    this.syncRoutePlannerUiState();
+
+    try {
+      const analysis = await planRoute(
+        this.buildRoutePlanRequestPayload(),
+        controller.signal
+      );
+      if (controller.signal.aborted) return;
+
+      this.routeAnalysis = analysis;
+      this.routeLoading = false;
+      const { lineFc, pinsFc } = buildPlannedRouteMapGeoJson(analysis);
+      this.map.setPlannedRoute(lineFc, pinsFc);
+
+      if (fitMap) {
+        const bbox = extractAnalysisBBox(analysis);
+        if (bbox) {
+          this.map.fitBBox(bbox, this.sidebarCollapsed ? 24 : 360, 420);
+        }
+      }
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      this.routeLoading = false;
+      this.routeError =
+        err instanceof Error ? err.message : "Failed to plan route";
+    } finally {
+      if (!controller.signal.aborted) {
+        this.syncRoutePlannerUiState();
+        this.syncRigUiState();
+      }
+    }
+  }
+
+  private async refreshSavedRoutes(): Promise<void> {
+    if (!this.user) {
+      this.savedRoutes = [];
+      this.syncRoutePlannerUiState();
+      return;
+    }
+    this.savedRoutesLoading = true;
+    this.syncRoutePlannerUiState();
+    try {
+      this.savedRoutes = await listSavedRoutes();
+    } catch {
+      // Preserve last loaded saved routes if offline
+    } finally {
+      this.savedRoutesLoading = false;
+      this.syncRoutePlannerUiState();
+    }
+  }
+
+  private async handleExportPlannedRoute(
+    format: "gpx" | "geojson"
+  ): Promise<void> {
+    if (this.routeTrackIds.length === 0) return;
+    this.routeExporting = format;
+    this.syncRoutePlannerUiState();
+    try {
+      await exportPlannedRoute(
+        this.buildRoutePlanRequestPayload(),
+        format,
+        this.routeAnalysis
+      );
+      this.showToast(
+        `Exported planned route (${format.toUpperCase()})`,
+        "success"
+      );
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : "Route export failed";
+      this.showToast(msg, "error");
+    } finally {
+      this.routeExporting = null;
+      this.syncRoutePlannerUiState();
+    }
+  }
+
+  private async handleSavePlannedRoute(asNew: boolean): Promise<void> {
+    if (!this.user) {
+      this.showToast("Sign in to save routes to your account", "info");
+      this.openAccountPanel("account");
+      return;
+    }
+    if (this.routeTrackIds.length === 0) return;
+
+    const finalName =
+      this.routeName.trim() ||
+      this.routeAnalysis?.name ||
+      "Planned 4WD Route";
+    const rig = this.getActiveRigInfo();
+    this.routeSaving = true;
+    this.routeError = null;
+    this.syncRoutePlannerUiState();
+
+    try {
+      let saved: SavedRouteItem;
+      if (this.activeSavedRouteId && !asNew) {
+        saved = await updateSavedRoute(this.activeSavedRouteId, {
+          name: finalName,
+          notes: this.routeNotes.trim() || null,
+          track_ids: [...this.routeTrackIds],
+          waypoints: [...this.routeWaypoints],
+          vehicle_class: rig.vehicleClass,
+        });
+        this.showToast(`Updated saved route "${saved.name}"`, "success");
+      } else {
+        saved = await saveRoute({
+          name: finalName,
+          notes: this.routeNotes.trim() || null,
+          track_ids: [...this.routeTrackIds],
+          waypoints: [...this.routeWaypoints],
+          vehicle_class: rig.vehicleClass,
+        });
+        this.showToast(`Saved route "${saved.name}"`, "success");
+      }
+
+      this.activeSavedRouteId = getSavedRouteId(saved);
+      this.routeName = saved.name;
+      if (saved.analysis) {
+        this.routeAnalysis = saved.analysis;
+        const { lineFc, pinsFc } = buildPlannedRouteMapGeoJson(saved.analysis);
+        this.map.setPlannedRoute(lineFc, pinsFc);
+      }
+      await this.refreshSavedRoutes();
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : "Failed to save route";
+      this.routeError = msg;
+      this.showToast(msg, "error");
+    } finally {
+      this.routeSaving = false;
+      this.syncRoutePlannerUiState();
+    }
+  }
+
+  private async handleLoadSavedRoute(routeId: string): Promise<void> {
+    this.routeLoading = true;
+    this.routeError = null;
+    this.syncRoutePlannerUiState();
+    try {
+      const loaded = await getSavedRoute(routeId);
+      this.activeSavedRouteId = getSavedRouteId(loaded);
+      this.routeName = loaded.name;
+      this.routeNotes = loaded.notes ?? "";
+      this.routeTrackIds = [...(loaded.track_ids ?? [])];
+      this.routeWaypoints = getSavedRouteWaypoints(loaded);
+
+      if (loaded.analysis) {
+        this.routeAnalysis = loaded.analysis;
+        this.routeLoading = false;
+        const { lineFc, pinsFc } = buildPlannedRouteMapGeoJson(loaded.analysis);
+        this.map.setPlannedRoute(lineFc, pinsFc);
+        const bbox = extractAnalysisBBox(loaded.analysis);
+        if (bbox) {
+          this.map.fitBBox(bbox, this.sidebarCollapsed ? 24 : 360, 420);
+        }
+        this.syncRoutePlannerUiState();
+        this.syncRigUiState();
+      } else {
+        await this.recomputePlannedRoute(true);
+      }
+      this.showToast(`Loaded route "${loaded.name}"`, "success");
+    } catch (err) {
+      this.routeLoading = false;
+      const msg =
+        err instanceof Error ? err.message : "Failed to load saved route";
+      this.routeError = msg;
+      this.showToast(msg, "error");
+      this.syncRoutePlannerUiState();
+    }
+  }
+
+  private async handleDeleteSavedRoute(routeId: string): Promise<void> {
+    try {
+      await deleteSavedRoute(routeId);
+      this.savedRoutes = this.savedRoutes.filter(
+        (r) => getSavedRouteId(r) !== routeId
+      );
+      if (this.activeSavedRouteId === routeId) {
+        this.activeSavedRouteId = null;
+      }
+      this.syncRoutePlannerUiState();
+      this.showToast("Saved route deleted", "info");
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : "Failed to delete route";
+      this.showToast(msg, "error");
+    }
+  }
+
+  private async handleExportSavedRoute(
+    routeId: string,
+    format: "gpx" | "geojson"
+  ): Promise<void> {
+    try {
+      const url = getSavedRouteExportUrl(routeId, format);
+      await downloadAuthenticatedExport(
+        url,
+        `route_${routeId}.${format === "gpx" ? "gpx" : "geojson"}`
+      );
+      this.showToast(`Downloaded route (${format.toUpperCase()})`, "success");
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : "Failed to download route";
+      this.showToast(msg, "error");
+    }
+  }
+
+  private async handleCopyGridForgeCli(cli: string): Promise<void> {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(cli);
+      } else {
+        const ta = document.createElement("textarea");
+        ta.value = cli;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        ta.remove();
+      }
+      this.showToast("GridForge CLI command copied to clipboard", "success");
+    } catch {
+      this.showToast("Select & copy the CLI command manually", "info");
+    }
   }
 
   private syncRigUiState(): void {
@@ -1047,9 +1556,13 @@ class TrailForgeApp {
       isFavorite: Boolean(
         openTrackId && this.favorites.some((f) => f.track_id === openTrackId)
       ),
+      isInRoute: Boolean(
+        openTrackId && this.routeTrackIds.includes(openTrackId)
+      ),
       isAuthenticated: Boolean(this.user),
       pickedReportCoords: this.pickedReportCoords,
     });
+    this.syncRoutePlannerUiState();
   }
 
   private openAccountPanel(tab?: AccountPanelTab): void {
@@ -1058,6 +1571,7 @@ class TrailForgeApp {
       this.shellEl.classList.remove("inspector-open");
     }
     this.closePacksPanel();
+    this.closeRoutePlanner();
     this.accountPanel.updateState(this.buildAccountPanelState());
     this.accountPanel.open(tab);
     this.shellEl.classList.add("account-open");
@@ -1069,6 +1583,9 @@ class TrailForgeApp {
   }
 
   private setCoordPickMode(mode: "pin" | "report" | null): void {
+    if (mode !== null && this.routePlanMode) {
+      this.setRoutePlanMode(false);
+    }
     this.coordPickMode = mode;
     this.map.setCoordPickMode(mode);
     if (mode === "pin") {
@@ -1136,6 +1653,10 @@ class TrailForgeApp {
           if (this.inspector.openState()) {
             this.shellEl.classList.add("inspector-open");
           }
+        } else if (this.routePlanMode) {
+          this.setRoutePlanMode(false);
+        } else if (this.routePlanner.isPanelOpen()) {
+          this.closeRoutePlanner();
         } else if (this.packsPanel.isPanelOpen()) {
           this.closePacksPanel();
         } else if (this.accountPanel.isPanelOpen()) {
@@ -1221,16 +1742,18 @@ class TrailForgeApp {
 
   private async loadSignedInUserData(): Promise<void> {
     try {
-      const [vehicles, trips, favorites, pins] = await Promise.all([
+      const [vehicles, trips, favorites, pins, savedRoutes] = await Promise.all([
         fetchVehicles().catch(() => []),
         fetchTrips().catch(() => []),
         fetchFavorites().catch(() => []),
         fetchPins().catch(() => []),
+        listSavedRoutes().catch(() => []),
       ]);
       this.vehicles = vehicles;
       this.trips = trips;
       this.favorites = favorites;
       this.pins = pins;
+      this.savedRoutes = savedRoutes;
       this.renderCombinedPinsOnMap();
     } finally {
       this.syncRigUiState();
@@ -1366,6 +1889,7 @@ class TrailForgeApp {
 
     this.closeAccountPanel();
     this.closePacksPanel();
+    this.closeRoutePlanner();
     this.shellEl.classList.add("inspector-open");
     this.map.setSelectedTrackId(trackId);
     this.inspector.showLoading(trackLabel);
@@ -1386,6 +1910,7 @@ class TrailForgeApp {
         activeVehicleClass: rig.vehicleClass,
         activeVehicleName: rig.vehicleName,
         isFavorite: this.favorites.some((f) => f.track_id === trackId),
+        isInRoute: this.routeTrackIds.includes(trackId),
         isAuthenticated: Boolean(this.user),
         pickedReportCoords: this.pickedReportCoords,
       });

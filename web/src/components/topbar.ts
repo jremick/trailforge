@@ -14,6 +14,7 @@ export interface TopBarCallbacks {
   onSearchNoMatch: (query: string, remoteError: boolean) => void;
   onSearchClear: () => void;
   onPresetChange: (presetId: string) => void;
+  onRoutePlannerClick: () => void;
   onHealthClick: () => void;
   onFeedStatusClick: () => void;
   onRigAccountClick: () => void;
@@ -30,6 +31,8 @@ export class TopBar {
   private readonly searchClearBtn: HTMLButtonElement;
   private readonly searchMenuEl: HTMLElement;
   private readonly presetSelectEl: HTMLSelectElement;
+  private readonly routeBtnEl: HTMLButtonElement;
+  private readonly routeBadgeEl: HTMLElement;
   private readonly feedPillEl: HTMLButtonElement;
   private readonly feedDotEl: HTMLElement;
   private readonly feedTextEl: HTMLElement;
@@ -127,6 +130,17 @@ export class TopBar {
 
         <button
           type="button"
+          class="tf-rig-btn tf-route-btn"
+          data-role="route-btn"
+          title="Interactive Multi-Track Route Planner & GridForge Strip-Route Handoff"
+        >
+          <span class="tf-route-icon" aria-hidden="true">⇢</span>
+          <span>Route</span>
+          <span class="tf-route-badge hidden mono" data-role="route-badge">0</span>
+        </button>
+
+        <button
+          type="button"
           class="tf-rig-btn tf-packs-btn"
           data-role="packs-btn"
           title="Download VIC/NSW Offline Regional Packs & Manage Sync Queue"
@@ -175,6 +189,8 @@ export class TopBar {
     this.searchClearBtn = this.q<HTMLButtonElement>("[data-role='search-clear']");
     this.searchMenuEl = this.q("[data-role='search-menu']");
     this.presetSelectEl = this.q<HTMLSelectElement>("[data-role='preset-select']");
+    this.routeBtnEl = this.q<HTMLButtonElement>("[data-role='route-btn']");
+    this.routeBadgeEl = this.q("[data-role='route-badge']");
     this.feedPillEl = this.q<HTMLButtonElement>("[data-role='feed-pill']");
     this.feedDotEl = this.q("[data-role='feed-dot']");
     this.feedTextEl = this.q("[data-role='feed-text']");
@@ -239,6 +255,10 @@ export class TopBar {
       callbacks.onPresetChange(this.presetSelectEl.value);
     });
 
+    this.routeBtnEl.addEventListener("click", () => {
+      callbacks.onRoutePlannerClick();
+    });
+
     this.feedPillEl.addEventListener("click", () => {
       callbacks.onFeedStatusClick();
     });
@@ -268,6 +288,24 @@ export class TopBar {
 
   setSelectedPreset(presetId: string): void {
     this.presetSelectEl.value = presetId;
+  }
+
+  updateRouteSummary(params: {
+    legCount: number;
+    planModeActive: boolean;
+    panelOpen: boolean;
+  }): void {
+    const count = Math.max(0, Math.round(params.legCount));
+    this.routeBadgeEl.textContent = String(count);
+    this.routeBadgeEl.classList.toggle("hidden", count === 0);
+    this.routeBtnEl.classList.toggle(
+      "active-route",
+      params.planModeActive || params.panelOpen || count > 0
+    );
+    this.routeBtnEl.title =
+      count > 0
+        ? `Route Planner (${count} leg${count === 1 ? "" : "s"}${params.planModeActive ? " · Click-to-Chain active" : ""})`
+        : "Interactive Multi-Track Route Planner & GridForge Strip-Route Handoff";
   }
 
   updateOfflineSummary(params: {

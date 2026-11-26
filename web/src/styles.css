@@ -99,7 +99,7 @@ button {
   width: 100vw;
   height: 100vh;
   height: 100dvh;
-  overflow: hidden;
+  overflow: clip;
 }
 
 /* ---------- Top Bar ---------- */
@@ -110,7 +110,7 @@ button {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 7px;
+  gap: 6px;
   padding: 6px 10px;
   background: var(--bg-topbar);
   border-bottom: 1px solid var(--border-subtle);
@@ -162,9 +162,9 @@ button {
 
 .tf-search-wrap {
   position: relative;
-  flex: 1 1 160px;
-  max-width: 240px;
-  min-width: 140px;
+  flex: 1 1 136px;
+  max-width: 215px;
+  min-width: 120px;
 }
 
 .tf-search-form {
@@ -332,16 +332,16 @@ button {
 .tf-topbar-controls {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   flex-shrink: 0;
 }
 
 .tf-preset-wrap {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 4px;
   height: 32px;
-  padding: 0 7px;
+  padding: 0 6px;
   background: var(--bg-panel);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
@@ -362,7 +362,7 @@ button {
   font-size: 11.5px;
   font-weight: 600;
   outline: none;
-  max-width: 175px;
+  max-width: 140px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -378,14 +378,14 @@ button {
 .tf-health-pill {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 4px;
   height: 32px;
-  padding: 5px 9px;
+  padding: 4px 8px;
   border-radius: var(--radius-md);
   background: var(--bg-panel);
   border: 1px solid var(--border-subtle);
   color: var(--text-secondary);
-  font-size: 11.5px;
+  font-size: 11px;
   white-space: nowrap;
   transition: border-color 0.15s ease, background 0.15s ease;
 }
@@ -442,7 +442,7 @@ button {
   flex: 1;
   min-height: 0;
   width: 100%;
-  overflow: hidden;
+  overflow: clip;
 }
 
 .tf-map-container {
@@ -542,11 +542,15 @@ button {
   border-right: 1px solid var(--border-subtle);
   box-shadow: var(--shadow-panel);
   transform: translateX(0);
-  transition: transform 0.22s ease;
+  visibility: visible;
+  transition: transform 0.22s ease, visibility 0s linear 0s;
 }
 
 .tf-shell.sidebar-collapsed .tf-sidebar {
   transform: translateX(calc(-1 * var(--sidebar-w)));
+  visibility: hidden;
+  pointer-events: none;
+  transition: transform 0.22s ease, visibility 0s linear 0.22s;
 }
 
 .tf-sidebar-toggle {
@@ -880,11 +884,16 @@ button {
   border-left: 1px solid var(--border-subtle);
   box-shadow: var(--shadow-panel);
   transform: translateX(100%);
-  transition: transform 0.22s ease;
+  visibility: hidden;
+  pointer-events: none;
+  transition: transform 0.22s ease, visibility 0s linear 0.22s;
 }
 
 .tf-shell.inspector-open .tf-inspector {
   transform: translateX(0);
+  visibility: visible;
+  pointer-events: auto;
+  transition: transform 0.22s ease, visibility 0s linear 0s;
 }
 
 .tf-inspector-head {
@@ -1625,9 +1634,9 @@ button {
 .tf-rig-btn {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 4px;
   height: 32px;
-  padding: 5px 9px;
+  padding: 4px 8px;
   border-radius: var(--radius-md);
   background: var(--bg-elevated);
   border: 1px solid var(--border-strong);
@@ -1635,7 +1644,7 @@ button {
   font-size: 11.5px;
   font-weight: 600;
   white-space: nowrap;
-  max-width: 165px;
+  max-width: 136px;
   overflow: hidden;
   text-overflow: ellipsis;
   transition: background 0.14s ease, border-color 0.14s ease;
@@ -1779,6 +1788,12 @@ button {
   background: var(--accent-amber-soft);
   border-color: var(--accent-amber);
   color: var(--accent-amber-bright);
+}
+
+.tf-action-btn.in-route {
+  background: rgba(20, 184, 166, 0.16);
+  border-color: #14b8a6;
+  color: #5eead4;
 }
 
 .tf-closures-panel {
@@ -1970,11 +1985,16 @@ button {
   border-left: 1px solid var(--border-subtle);
   box-shadow: var(--shadow-panel);
   transform: translateX(100%);
-  transition: transform 0.22s ease;
+  visibility: hidden;
+  pointer-events: none;
+  transition: transform 0.22s ease, visibility 0s linear 0.22s;
 }
 
-.tf-shell.account-open .tf-account-panel {
+.tf-shell.account-open .tf-account-panel:not(.tf-packs-panel):not(.tf-route-panel) {
   transform: translateX(0);
+  visibility: visible;
+  pointer-events: auto;
+  transition: transform 0.22s ease, visibility 0s linear 0s;
 }
 
 .tf-shell.account-open .tf-map-toolbar,
@@ -2723,6 +2743,9 @@ button {
 
 .tf-shell.packs-open .tf-packs-panel {
   transform: translateX(0);
+  visibility: visible;
+  pointer-events: auto;
+  transition: transform 0.22s ease, visibility 0s linear 0s;
 }
 
 .tf-shell.packs-open .tf-map-toolbar,
@@ -2998,6 +3021,399 @@ button {
   display: flex;
   flex-wrap: wrap;
   gap: 5px;
+}
+
+/* ---------- Phase A Interactive Multi-Track Route Planner & GridForge Handoff ---------- */
+
+.tf-route-btn {
+  max-width: 106px;
+}
+
+.tf-route-btn.active-route {
+  border-color: rgba(20, 184, 166, 0.72);
+  background: rgba(20, 184, 166, 0.16);
+  color: #5eead4;
+}
+
+.tf-route-icon {
+  color: #14b8a6;
+  font-weight: 800;
+}
+
+.tf-route-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: #14b8a6;
+  color: #042f2e;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.tf-packs-btn {
+  max-width: 126px;
+}
+
+.tf-shell.route-open .tf-route-panel {
+  transform: translateX(0);
+  visibility: visible;
+  pointer-events: auto;
+  transition: transform 0.22s ease, visibility 0s linear 0s;
+}
+
+.tf-shell.route-open .tf-map-toolbar,
+.tf-shell.route-open .tf-offline-banner,
+.tf-shell.route-open .tf-coord-hud {
+  right: calc(var(--inspector-w) + 12px);
+}
+
+.tf-route-pick-banner {
+  border-color: #14b8a6;
+  color: #5eead4;
+}
+
+.tf-map-container.route-plan-active .maplibregl-canvas-container {
+  cursor: cell !important;
+}
+
+.tf-route-count-pill {
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(20, 184, 166, 0.16);
+  border: 1px solid rgba(20, 184, 166, 0.55);
+  color: #5eead4;
+  white-space: nowrap;
+}
+
+.tf-route-mode-box {
+  padding: 8px 9px;
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tf-route-mode-box.active {
+  border-color: rgba(20, 184, 166, 0.7);
+  background: rgba(20, 184, 166, 0.1);
+}
+
+.tf-route-mode-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.tf-route-mode-btn {
+  flex: 1;
+  min-height: 31px;
+  padding: 5px 9px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(20, 184, 166, 0.5);
+  background: rgba(20, 184, 166, 0.12);
+  color: #5eead4;
+  font-size: 11.5px;
+  font-weight: 700;
+  text-align: center;
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+}
+
+.tf-route-mode-btn:hover {
+  background: rgba(20, 184, 166, 0.24);
+  border-color: #14b8a6;
+}
+
+.tf-route-mode-btn.active {
+  background: #14b8a6;
+  border-color: #2dd4bf;
+  color: #042f2e;
+}
+
+.tf-route-mode-hint {
+  font-size: 10.5px;
+  color: var(--text-secondary);
+  line-height: 1.35;
+}
+
+.tf-route-empty {
+  padding: 10px;
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  border: 1px dashed var(--border-strong);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tf-route-empty-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.tf-route-gap-warn {
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-amber-soft);
+  border: 1px solid rgba(245, 158, 11, 0.48);
+  color: var(--accent-amber-bright);
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
+.tf-route-leg-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+}
+
+.tf-route-leg-num {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: rgba(20, 184, 166, 0.18);
+  border: 1px solid rgba(20, 184, 166, 0.55);
+  color: #5eead4;
+  font-size: 10.5px;
+  font-weight: 800;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.tf-route-leg-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.tf-route-leg-name {
+  border: none;
+  background: transparent;
+  padding: 0;
+  text-align: left;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tf-route-leg-name:hover {
+  color: #5eead4;
+}
+
+.tf-route-leg-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  font-size: 10.5px;
+  color: var(--text-secondary);
+}
+
+.tf-route-grade-chip {
+  font-size: 9.5px;
+  font-weight: 700;
+  padding: 0 5px;
+  border-radius: 99px;
+  border: 1px solid currentColor;
+  background: rgba(11, 17, 23, 0.7);
+}
+
+.tf-mini-tag.red {
+  color: #fca5a5;
+  border-color: rgba(239, 68, 68, 0.45);
+  background: var(--accent-red-soft);
+}
+
+.tf-route-leg-actions {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+}
+
+.tf-leg-btn {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+  display: grid;
+  place-items: center;
+}
+
+.tf-leg-btn:hover:not(:disabled) {
+  border-color: var(--accent-cyan);
+  color: var(--text-primary);
+}
+
+.tf-leg-btn.danger:hover:not(:disabled) {
+  border-color: var(--accent-red);
+  background: var(--accent-red-soft);
+  color: #fca5a5;
+}
+
+.tf-leg-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.tf-route-safety-banner {
+  padding: 9px 10px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-strong);
+  border-left-width: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.tf-route-safety-banner.tone-critical {
+  border-left-color: var(--accent-red);
+  background: rgba(239, 68, 68, 0.12);
+}
+
+.tf-route-safety-banner.tone-warning {
+  border-left-color: var(--accent-amber);
+  background: rgba(245, 158, 11, 0.11);
+}
+
+.tf-route-safety-banner.tone-clear {
+  border-left-color: var(--accent-emerald);
+  background: rgba(34, 197, 94, 0.08);
+}
+
+.tf-route-safety-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.tf-route-safety-badge {
+  font-size: 12.5px;
+  font-weight: 800;
+  color: var(--text-primary);
+}
+
+.tf-route-safety-banner.tone-critical .tf-route-safety-badge {
+  color: #fca5a5;
+}
+
+.tf-route-safety-banner.tone-warning .tf-route-safety-badge {
+  color: var(--accent-amber-bright);
+}
+
+.tf-route-safety-banner.tone-clear .tf-route-safety-badge {
+  color: var(--accent-emerald);
+}
+
+.tf-route-safety-detail {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.tf-route-alerts-panel.tone-critical {
+  border-color: rgba(239, 68, 68, 0.5);
+}
+
+.tf-route-alerts-panel.tone-warning {
+  border-color: rgba(245, 158, 11, 0.5);
+}
+
+.tf-gridforge-card {
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  overflow: hidden;
+}
+
+.tf-gridforge-summary {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 9px;
+  cursor: pointer;
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--text-primary);
+  user-select: none;
+}
+
+.tf-gridforge-summary::-webkit-details-marker {
+  display: none;
+}
+
+.tf-gridforge-summary:hover {
+  background: rgba(56, 189, 248, 0.08);
+}
+
+.tf-gridforge-body {
+  padding: 8px 9px 10px;
+  border-top: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.tf-cli-block {
+  margin: 0;
+  padding: 8px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-base);
+  border: 1px solid var(--border-strong);
+  color: #5eead4;
+  font-size: 10.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+.tf-copy-cli-btn.copied {
+  border-color: var(--accent-emerald);
+  background: var(--accent-emerald-soft);
+  color: var(--accent-emerald);
+}
+
+.tf-route-save-box {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.tf-saved-row.active {
+  border-color: #14b8a6;
+  background: rgba(20, 184, 166, 0.08);
+}
+
+.tf-route-signin-card {
+  border-style: dashed;
 }
 
 .tf-form-grid-2 {

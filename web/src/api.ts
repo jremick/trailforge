@@ -24,9 +24,14 @@ import type {
   OfflinePackSnapshot,
   OfflinePacksCatalogResponse,
   ParkTenureItem,
+  PlannedRouteAnalysis,
   PoiItem,
   RainfallSummaryResponse,
   ReportVoteKind,
+  RoutePlanRequest,
+  SavedRouteCreateInput,
+  SavedRouteItem,
+  SavedRouteUpdateInput,
   TileManifestResponse,
   TrackInspectorDetail,
   TripItem,
@@ -39,6 +44,15 @@ import type {
   VehicleProfileInput,
   VehicleProfileItem,
 } from "./types";
+import {
+  slugifyExportFilename,
+  triggerClientFileDownload,
+} from "./offline/exporters";
+import {
+  buildRouteClientGeoJson,
+  buildRouteClientGpx,
+  planRouteFromOfflineStore,
+} from "./routeHelpers";
 
 const AUTH_TOKEN_STORAGE_KEY = "trailforge.access_token";
 
@@ -726,4 +740,168 @@ export async function downloadAuthenticatedExport(
   } finally {
     URL.revokeObjectURL(objectUrl);
   }
+}
+
+/* ---------- Phase A Interactive Multi-Track Route Planner & Saved Routes ---------- */
+
+export async function planRoute(
+  payload: RoutePlanRequest,
+  signal?: AbortSignal
+): Promise<PlannedRouteAnalysis> {
+  if (shouldPreferOfflinePack()) {
+    const offline = await planRouteFromOfflineStore(payload);
+    if (offline) return offline;
+  }
+  try {
+    return await requestJson<PlannedRouteAnalysis>("/api/routes/plan", {
+      method: "POST",
+      body: payload,
+      signal,
+    });
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    if (err instanceof ApiError && err.status >= 400 && err.status < 500) {
+      throw err;
+    }
+    const offline = await planRouteFromOfflineStore(payload);
+    if (offline) return offline;
+    throw err;
+  }
+}
+
+export async function exportPlannedRoute(
+  payload: RoutePlanRequest,
+  format: "gpx" | "geojson",
+  offlineFallbackAnalysis?: PlannedRouteAnalysis | null
+): Promise<void> {
+  const fallbackFilename = slugifyExportFilename(
+    payload.name?.trim() || "trailforge-route",
+    format
+  );
+
+  const exportOffline = (analysis: PlannedRouteAnalysis): void => {
+    if (format === "gpx") {
+      triggerClientFileDownload(
+        buildRouteClientGpx(analysis),
+        fallbackFilename,
+        "application/gpx+xml"
+      );
+    } else {
+      triggerClientFileDownload(
+        JSON.stringify(buildRouteClientGeoJson(analysis), null, 2),
+        fallbackFilename,
+        "application/geo+json"
+      );
+    }
+  };
+
+  if (shouldPreferOfflinePack()) {
+    const offline =
+      offlineFallbackAnalysis ?? (await planRouteFromOfflineStore(payload));
+    if (offline) {
+      exportOffline(offline);
+      return;
+    }
+  }
+
+  try {
+    const res = await fetch(
+      `/api/routes/plan/export?format=${encodeURIComponent(format)}`,
+      {
+        method: "POST",
+        headers: buildHeaders({
+          "Content-Type": "application/json",
+          Accept: "*/*",
+        }),
+        credentials: "same-origin",
+        body: JSON.stringify(payload),
+      }
+    );
+    if (!res.ok) {
+      const detail = await parseErrorDetail(res);
+      throw new ApiError(detail, res.status);
+    }
+    const blob = await res.blob();
+    const disposition = res.headers.get("content-disposition") ?? "";
+    const match = /filename="?([^";]+)"?/i.exec(disposition);
+    const filename = match?.[1] ?? fallbackFilename;
+
+    const objectUrl = URL.createObjectURL(blob);
+    try {
+      const a = document.createElement("a");
+      a.href = objectUrl;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } finally {
+      URL.revokeObjectURL(objectUrl);
+    }
+  } catch (err) {
+    if (err instanceof ApiError && err.status >= 400 && err.status < 500) {
+      throw err;
+    }
+    const offline =
+      offlineFallbackAnalysis ?? (await planRouteFromOfflineStore(payload));
+    if (offline) {
+      exportOffline(offline);
+      return;
+    }
+    throw err;
+  }
+}
+
+export async function listSavedRoutes(
+  signal?: AbortSignal
+): Promise<SavedRouteItem[]> {
+  const data = await requestJson<
+    SavedRouteItem[] | { items?: SavedRouteItem[]; routes?: SavedRouteItem[] }
+  >("/api/routes", { signal });
+  if (Array.isArray(data)) return data;
+  return data.items ?? data.routes ?? [];
+}
+
+export function saveRoute(
+  payload: SavedRouteCreateInput
+): Promise<SavedRouteItem> {
+  return requestJson<SavedRouteItem>("/api/routes", {
+    method: "POST",
+    body: payload,
+  });
+}
+
+export function getSavedRoute(
+  id: string,
+  signal?: AbortSignal
+): Promise<SavedRouteItem> {
+  return requestJson<SavedRouteItem>(
+    `/api/routes/${encodeURIComponent(id)}`,
+    { signal }
+  );
+}
+
+export function updateSavedRoute(
+  id: string,
+  patch: SavedRouteUpdateInput
+): Promise<SavedRouteItem> {
+  return requestJson<SavedRouteItem>(
+    `/api/routes/${encodeURIComponent(id)}`,
+    {
+      method: "PATCH",
+      body: patch,
+    }
+  );
+}
+
+export function deleteSavedRoute(id: string): Promise<void> {
+  return requestJson<void>(`/api/routes/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
+export function getSavedRouteExportUrl(
+  id: string,
+  format: "gpx" | "geojson"
+): string {
+  return `/api/routes/${encodeURIComponent(id)}/export?format=${encodeURIComponent(format)}`;
 }

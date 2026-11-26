@@ -464,6 +464,14 @@ export function buildTrailForgeStyle(
       type: "geojson",
       data: EMPTY_FEATURE_COLLECTION,
     },
+    "tf-planned-route": {
+      type: "geojson",
+      data: EMPTY_FEATURE_COLLECTION,
+    },
+    "tf-planned-route-pins": {
+      type: "geojson",
+      data: EMPTY_FEATURE_COLLECTION,
+    },
     "tf-user-pins": {
       type: "geojson",
       data: EMPTY_FEATURE_COLLECTION,
@@ -1300,6 +1308,67 @@ export function buildTrailForgeStyle(
         "circle-color": "#FFFFFF",
         "circle-stroke-color": "#0B1117",
         "circle-stroke-width": 2,
+      },
+    }
+  );
+
+  // Phase A Interactive Multi-Track Planned Route Overlay (bright cyan/emerald #14b8a6)
+  styleLayers.push(
+    {
+      id: "tf-planned-route-casing",
+      type: "line",
+      source: "tf-planned-route",
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: {
+        "line-color": "#042F2E",
+        "line-width": ["interpolate", ["linear"], ["zoom"], 9, 8.6, 14, 12.6],
+        "line-opacity": 0.9,
+      },
+    },
+    {
+      id: "tf-planned-route-line",
+      type: "line",
+      source: "tf-planned-route",
+      layout: { "line-cap": "round", "line-join": "round" },
+      paint: {
+        "line-color": "#14b8a6",
+        "line-width": ["interpolate", ["linear"], ["zoom"], 9, 4.6, 14, 7.2],
+        "line-opacity": 0.98,
+      },
+    },
+    {
+      id: "tf-planned-route-pins-dot",
+      type: "circle",
+      source: "tf-planned-route-pins",
+      paint: {
+        "circle-radius": 11,
+        "circle-color": [
+          "match",
+          ["coalesce", ["get", "kind"], "leg"],
+          "start",
+          "#10B981",
+          "finish",
+          "#F59E0B",
+          "waypoint",
+          "#38BDF8",
+          "#14b8a6",
+        ],
+        "circle-stroke-color": "#042F2E",
+        "circle-stroke-width": 2.2,
+      },
+    },
+    {
+      id: "tf-planned-route-pins-badge",
+      type: "symbol",
+      source: "tf-planned-route-pins",
+      layout: {
+        "icon-image": [
+          "concat",
+          "route-pin-",
+          ["coalesce", ["get", "pin_key"], "start-S"],
+        ],
+        "icon-size": 1,
+        "icon-allow-overlap": true,
       },
     }
   );

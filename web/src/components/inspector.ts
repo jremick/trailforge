@@ -52,6 +52,7 @@ export interface TrackInspectorContext {
   activeVehicleClass: VehicleCapabilityClass;
   activeVehicleName: string | null;
   isFavorite: boolean;
+  isInRoute?: boolean;
   isAuthenticated: boolean;
   pickedReportCoords?: { lat: number; lon: number } | null;
 }
@@ -64,6 +65,11 @@ export interface TrackInspectorCallbacks {
   onOpenRigPanel: () => void;
   onRequireSignIn: () => void;
   onToggleFavorite: (trackId: string, currentlyFavorite: boolean) => void;
+  onToggleTrackInRoute: (
+    trackId: string,
+    trackName: string,
+    currentlyInRoute: boolean
+  ) => void;
   onExportTrack: (trackId: string, format: "gpx" | "geojson") => void;
   onPickReportLocation: () => void;
   onSubmitReport: (input: ConditionReportCreateInput) => Promise<void>;
@@ -850,6 +856,12 @@ export class TrackInspectorDrawer {
         <div class="tf-inspector-actions">
           <button
             type="button"
+            class="tf-action-btn ${this.context.isInRoute ? "in-route" : ""}"
+            data-role="toggle-route"
+            title="${this.context.isInRoute ? "Track is in active route — click to open Route Planner" : "Add this track to the active multi-track route"}"
+          >${this.context.isInRoute ? "✓ In Route" : "+ Route"}</button>
+          <button
+            type="button"
             class="tf-action-btn ${this.context.isFavorite ? "starred" : ""}"
             data-role="toggle-fav"
             title="${this.context.isAuthenticated ? "Toggle saved favorite" : "Sign in to save favorite"}"
@@ -988,6 +1000,16 @@ export class TrackInspectorDrawer {
     this.root
       .querySelector<HTMLButtonElement>("[data-role='change-rig']")
       ?.addEventListener("click", () => this.callbacks.onOpenRigPanel());
+
+    this.root
+      .querySelector<HTMLButtonElement>("[data-role='toggle-route']")
+      ?.addEventListener("click", () => {
+        this.callbacks.onToggleTrackInRoute(
+          detail.track_id,
+          norm.name,
+          Boolean(this.context.isInRoute)
+        );
+      });
 
     this.root
       .querySelector<HTMLButtonElement>("[data-role='toggle-fav']")

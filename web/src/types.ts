@@ -829,3 +829,121 @@ export interface UnifiedSearchItem {
   iconKey?: string | null;
   presetId?: string;
 }
+
+/* ---------- Phase A Interactive Multi-Track Route Planner & GridForge Handoff ---------- */
+
+export interface RouteWaypointInput {
+  name: string;
+  category?: PinCategory | string;
+  lon: number;
+  lat: number;
+}
+
+export interface RoutePlanRequest {
+  name?: string | null;
+  track_ids: string[];
+  vehicle_class?: VehicleCapabilityClass | string | null;
+  waypoints?: RouteWaypointInput[];
+}
+
+export interface RouteLegGap {
+  from_track_id: string;
+  to_track_id: string;
+  gap_m: number;
+}
+
+export interface PlannedRouteLeg {
+  index: number;
+  track_id: string;
+  name: string;
+  length_m: number;
+  grade: string;
+  score?: number | null;
+  closure_status?: TrackClosureStatus | null;
+  gate_warning_count: number;
+  reversed?: boolean;
+  gap_from_prev_m?: number | null;
+}
+
+export interface RouteSafetySummary {
+  has_blocking_closure: boolean;
+  closure_count: number;
+  gate_warning_count: number;
+  active_report_count: number;
+  unbridged_crossings: number;
+  wet_risk_level: WetRiskLevel | string;
+  warnings: string[];
+}
+
+export interface RouteElevationPoint extends ElevationProfilePoint {
+  track_id?: string | null;
+  track_name?: string | null;
+}
+
+export interface PlannedRouteAnalysis {
+  name: string;
+  track_ids: string[];
+  waypoints?: RouteWaypointInput[];
+  total_length_m: number;
+  est_duration_min: number;
+  min_elev_m?: number | null;
+  max_elev_m?: number | null;
+  elev_gain_m: number;
+  elev_loss_m: number;
+  max_slope_deg?: number | null;
+  sustained_slope_deg?: number | null;
+  worst_grade: string;
+  worst_score?: number | null;
+  effective_grade?: string | null;
+  suitability?: TrackSuitability | null;
+  safety_summary: RouteSafetySummary;
+  closures?: ClosureItem[];
+  community_gate_warnings?: ConditionReportItem[];
+  condition_reports?: ConditionReportItem[];
+  waterway_crossings?: WaterwayCrossingItem[];
+  nearby_pois?: PoiItem[];
+  capad_parks?: ParkTenureItem[];
+  elevation_profile?: RouteElevationPoint[];
+  legs: PlannedRouteLeg[];
+  leg_gaps?: RouteLegGap[];
+  bbox?: BBoxTuple | null;
+  geometry?: unknown;
+  gridforge_cli: string;
+  offline_computed?: boolean;
+}
+
+export interface SavedRouteCreateInput {
+  name: string;
+  notes?: string | null;
+  track_ids: string[];
+  waypoints?: RouteWaypointInput[];
+  vehicle_class?: VehicleCapabilityClass | string | null;
+}
+
+export interface SavedRouteUpdateInput {
+  name?: string;
+  notes?: string | null;
+  track_ids?: string[];
+  waypoints?: RouteWaypointInput[];
+  vehicle_class?: VehicleCapabilityClass | string | null;
+}
+
+export interface SavedRouteItem {
+  id: string;
+  route_id?: string;
+  user_id?: string;
+  name: string;
+  notes?: string | null;
+  track_ids: string[];
+  waypoints?: RouteWaypointInput[];
+  waypoints_json?: RouteWaypointInput[];
+  vehicle_class?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  total_length_m?: number | null;
+  est_duration_min?: number | null;
+  worst_grade?: string | null;
+  leg_count?: number | null;
+  has_blocking_closure?: boolean | null;
+  analysis?: PlannedRouteAnalysis | null;
+}
