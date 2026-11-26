@@ -1,0 +1,20 @@
+{
+  "name": "TrailForge — VIC & NSW 4WD Map",
+  "short_name": "TrailForge",
+  "description": "Open-source, self-hostable 4WD & off-road mapping, live track grading, and trail intelligence for Victoria & New South Wales.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0E151B",
+  "theme_color": "#0B1117",
+  "categories": ["navigation", "travel", "utilities"],
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

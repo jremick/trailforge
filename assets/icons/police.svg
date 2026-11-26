@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <path d="M12 2.5 L20 5.5 V11.8 C20 16.8 16.5 20.2 12 22 C7.5 20.2 4 16.8 4 11.8 V5.5 Z" fill="#FFFFFF" stroke="#1A1A1A" stroke-width="1.8"/>
+  <path d="M12 5 L17.4 7.1 V11.7 C17.4 15.2 14.9 17.8 12 19.2 C9.1 17.8 6.6 15.2 6.6 11.7 V7.1 Z" fill="#1B4F72"/>
+  <polygon points="12,7.4 13.1,10.2 16,10.4 13.8,12.2 14.5,15.1 12,13.5 9.5,15.1 10.2,12.2 8,10.4 10.9,10.2" fill="#FFFFFF"/>
+</svg>
