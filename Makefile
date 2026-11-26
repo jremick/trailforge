@@ -11,7 +11,7 @@ help:
 	@echo "  make test-integration - Run offline PostGIS integration tests inside API container"
 	@echo "  make test             - Run lint + unit tests + integration tests"
 	@echo "  make migrate          - Run Alembic migrations inside API container"
-	@echo "  make seed-corridor    - Ingest synthetic Alps corridor & build PMTiles in /data/tiles"
+	@echo "  make seed-corridor    - Ingest Alps corridor, sync closures & build PMTiles"
 	@echo "  make web-check        - Run web typecheck, build, and Vitest suite"
 	@echo "  make fixtures         - Regenerate deterministic synthetic VIC/NSW fixtures"
 
@@ -46,6 +46,7 @@ migrate:
 
 seed-corridor:
 	docker compose exec -T api python -m trailforge.ingestion.pipeline --fixtures tests/fixtures
+	docker compose exec -T api python -m trailforge.feeds.cli --fixtures tests/fixtures/closures_sample.json
 	docker compose exec -T api python -m trailforge.tiles.cli --output-dir /data/tiles --dem tests/fixtures/dem_alps_corridor.tif
 
 web-check:

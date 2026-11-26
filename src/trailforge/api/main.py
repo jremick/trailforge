@@ -11,9 +11,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from trailforge import SERVICE_NAME, __version__
+from trailforge.api.auth import router as auth_router
+from trailforge.api.closures import router as closures_router
 from trailforge.api.health import router as health_router
 from trailforge.api.tiles import router as tiles_router
 from trailforge.api.tracks import router as tracks_router
+from trailforge.api.user_data import router as user_data_router
+from trailforge.api.vehicles import router as vehicles_router
 from trailforge.config import Settings, get_settings
 from trailforge.db.session import reset_engine
 
@@ -59,6 +63,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(health_router)
     application.include_router(tiles_router)
     application.include_router(tracks_router)
+    application.include_router(closures_router)
+    application.include_router(auth_router)
+    application.include_router(vehicles_router)
+    application.include_router(user_data_router)
 
     @application.get("/", tags=["meta"])
     def root() -> dict[str, str]:

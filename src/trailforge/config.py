@@ -34,6 +34,15 @@ class Settings(BaseSettings):
     privacy_trim_meters: int = Field(default=250, ge=250, le=5000)
     snow_line_default_m: int = Field(default=1000, ge=0)
 
+    # Auth / self-hosted session settings (zero external IdP)
+    auth_secret_key: str = Field(
+        default="trailforge-dev-secret-change-in-production",
+        validation_alias=AliasChoices("AUTH_SECRET_KEY", "TRAILFORGE_AUTH_SECRET_KEY"),
+    )
+    auth_token_ttl_seconds: int = Field(default=60 * 60 * 24 * 14, ge=300)
+    auth_cookie_name: str = Field(default="tf_session")
+    auth_cookie_secure: bool = Field(default=False)
+
     # Local storage directories (streaming pack/tile outputs)
     trailforge_data_dir: str = Field(default="/data")
     tiles_dir: str = Field(

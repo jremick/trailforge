@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
+from trailforge.auth.dependencies import get_optional_current_user
 from trailforge.db.models import (
     POI,
     CAPADPark,
@@ -18,9 +19,19 @@ from trailforge.db.models import (
     Track,
     TrackSegment,
     TrackSegmentGrade,
+    User,
+    UserFavorite,
+    VehicleProfile,
 )
 from trailforge.db.session import get_db
+from trailforge.feeds.queries import get_closures_for_track_ids
 from trailforge.grading.baseline import SegmentGradeInput, compute_baseline_grade
+from trailforge.vehicles.classifier import (
+    CapabilityClassLiteral,
+    TrackSuitability,
+    evaluate_track_suitability,
+    normalize_capability_class,
+)
 
 router = APIRouter(prefix="/api", tags=["tracks"])
 
@@ -187,6 +198,10 @@ class TrackSummaryResponse(BaseModel):
     bbox: list[float] | None = None
     segment_count: int = 0
     is_active: bool
+    closure_status: str = "open"
+    active_closures: list[dict[str, Any]] = Field(default_factory=list)
+    suitability: TrackSuitability | None = None
+    is_favorite: bool = False
 
 
 class PoiResponse(BaseModel):
@@ -403,6 +418,70 @@ def _stitch_elevation_profile(
     return profile, seg_mid_dist
 
 
+def _resolve_vehicle_context(
+    db: Session,
+    current_user: User | None,
+    vehicle_class_param: str | None,
+) -> tuple[CapabilityClassLiteral | None, str | None, bool | None]:
+    """Resolve active rig capability from explicit `?vehicle_class=` or signed-in active profile."""
+    if vehicle_class_param is not None:
+        normalized = normalize_capability_class(vehicle_class_param)
+        if normalized is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    "vehicle_class must be one of: AWD, Stock 4WD, Touring 4WD, Modified 4WD"
+                ),
+            )
+        return normalized, None, None
+
+    if current_user is None:
+        return None, None, None
+
+    profile = db.execute(
+        select(VehicleProfile)
+        .where(VehicleProfile.user_id == current_user.id)
+        .order_by(VehicleProfile.is_default.desc(), VehicleProfile.created_at.asc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if profile is None:
+        return None, None, None
+    return (
+        profile.capability_class,  # type: ignore[return-value]
+        profile.name,
+        bool(profile.has_snorkel),
+    )
+
+
+def _load_closures_by_track(
+    db: Session, track_ids: list[str]
+) -> dict[str, tuple[str, list[dict[str, Any]]]]:
+    """Fetch normalized `(closure_status, active_closures)` map via Slice 04 feeds helper."""
+    if not track_ids:
+        return {}
+    raw_map = get_closures_for_track_ids(db, track_ids)
+    out: dict[str, tuple[str, list[dict[str, Any]]]] = {}
+    for tid, entry in raw_map.items():
+        out[tid] = (
+            str(entry.get("closure_status", "open")),
+            list(entry.get("active_closures") or []),
+        )
+    return out
+
+
+def _get_favorite_track_ids(db: Session, user: User | None, track_ids: list[str]) -> set[str]:
+    if user is None or not track_ids:
+        return set()
+    rows = db.execute(
+        select(UserFavorite.track_id).where(
+            UserFavorite.user_id == user.id,
+            UserFavorite.track_id.in_(track_ids),
+            UserFavorite.segment_id.is_(None),
+        )
+    ).scalars().all()
+    return {str(tid) for tid in rows if tid is not None}
+
+
 @router.get("/tracks", response_model=list[TrackSummaryResponse])
 def list_tracks(
     state: str | None = Query(default=None),
@@ -410,13 +489,16 @@ def list_tracks(
     trail_class: str | None = Query(default=None),
     bbox: str | None = Query(default=None),
     q: str | None = Query(default=None),
+    vehicle_class: str | None = Query(default=None),
     include_inactive: bool = Query(default=False),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
+    current_user: User | None = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
 ) -> list[TrackSummaryResponse]:
     """List canonical tracks with optional spatial bbox, state, grade, and name/alias filters."""
     parsed_bbox = _parse_bbox(bbox)
+    cap_class, veh_name, has_snorkel = _resolve_vehicle_context(db, current_user, vehicle_class)
 
     grade_rank_expr = case(
         (TrackSegmentGrade.effective_grade == "Easy", 1),
@@ -431,6 +513,8 @@ def list_tracks(
             func.count(TrackSegment.segment_id).label("segment_count"),
             func.max(grade_rank_expr).label("worst_rank"),
             func.max(TrackSegmentGrade.baseline_score).label("max_score"),
+            func.bool_or(TrackSegment.is_4wd_only).label("any_4wd_only"),
+            func.bool_or(TrackSegment.has_perennial_crossing).label("any_perennial"),
         )
         .outerjoin(TrackSegmentGrade, TrackSegment.segment_id == TrackSegmentGrade.segment_id)
         .where(TrackSegment.is_active.is_(True))
@@ -445,6 +529,8 @@ def list_tracks(
             func.coalesce(seg_agg.c.segment_count, 0).label("segment_count"),
             func.coalesce(seg_agg.c.worst_rank, 0).label("worst_rank"),
             seg_agg.c.max_score.label("max_score"),
+            func.coalesce(seg_agg.c.any_4wd_only, False).label("any_4wd_only"),
+            func.coalesce(seg_agg.c.any_perennial, False).label("any_perennial"),
             func.ST_XMin(Track.bbox_geom).label("xmin"),
             func.ST_YMin(Track.bbox_geom).label("ymin"),
             func.ST_XMax(Track.bbox_geom).label("xmax"),
@@ -480,9 +566,41 @@ def list_tracks(
     stmt = stmt.order_by(Track.name.asc()).offset(offset).limit(limit)
     rows = db.execute(stmt).all()
 
+    track_ids = [r[0].track_id for r in rows]
+    closures_map = _load_closures_by_track(db, track_ids)
+    fav_ids = _get_favorite_track_ids(db, current_user, track_ids)
+
     results: list[TrackSummaryResponse] = []
-    for trk, park_name, segment_count, worst_rank, max_score, xmin, ymin, xmax, ymax in rows:
+    for (
+        trk,
+        park_name,
+        segment_count,
+        worst_rank,
+        max_score,
+        any_4wd_only,
+        any_perennial,
+        xmin,
+        ymin,
+        xmax,
+        ymax,
+    ) in rows:
         eff_grade = _RANK_GRADE.get(int(worst_rank)) if worst_rank else None
+        c_status, active_closures = closures_map.get(trk.track_id, ("open", []))
+        suitability = (
+            evaluate_track_suitability(
+                grade=eff_grade,  # type: ignore[arg-type]
+                capability_class=cap_class,
+                vehicle_name=veh_name,
+                max_slope_deg=trk.max_slope_deg,
+                waterway_crossing_count=int(trk.waterway_crossing_count or 0),
+                has_perennial_crossing=bool(any_perennial),
+                is_4wd_only=bool(any_4wd_only),
+                has_snorkel=has_snorkel,
+                closure_status=c_status,
+            )
+            if cap_class is not None
+            else None
+        )
         results.append(
             TrackSummaryResponse(
                 track_id=trk.track_id,
@@ -506,6 +624,10 @@ def list_tracks(
                 bbox=_bbox_list(xmin, ymin, xmax, ymax),
                 segment_count=int(segment_count),
                 is_active=trk.is_active,
+                closure_status=c_status,
+                active_closures=active_closures,
+                suitability=suitability,
+                is_favorite=(trk.track_id in fav_ids),
             )
         )
     return results
@@ -589,9 +711,12 @@ def get_corridor_tracks_geojson(
 @router.get("/tracks/{track_id}", response_model=TrackDetailResponse)
 def get_track_detail(
     track_id: str,
+    vehicle_class: str | None = Query(default=None),
+    current_user: User | None = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
 ) -> TrackDetailResponse:
-    """Return full Track Inspector payload: profile, breakdown, crossings, POIs, & CAPAD tenure."""
+    """Return full Track Inspector payload: profile, breakdown, crossings, closures, suitability."""
+    cap_class, veh_name, has_snorkel = _resolve_vehicle_context(db, current_user, vehicle_class)
     row = db.execute(
         select(
             Track,
@@ -879,6 +1004,27 @@ def get_track_detail(
         if (summary := _park_to_summary(pk)) is not None
     ]
 
+    c_status, active_closures = _load_closures_by_track(db, [trk.track_id]).get(
+        trk.track_id, ("open", [])
+    )
+    is_fav = trk.track_id in _get_favorite_track_ids(db, current_user, [trk.track_id])
+    suitability = (
+        evaluate_track_suitability(
+            grade=eff_grade,  # type: ignore[arg-type]
+            capability_class=cap_class,
+            vehicle_name=veh_name,
+            max_slope_deg=max_slope_val if max_slope_val is not None else trk.max_slope_deg,
+            waterway_crossing_count=int(trk.waterway_crossing_count or 0),
+            has_perennial_crossing=any_unbridged_perennial,
+            is_4wd_only=is_4wd_only,
+            has_snorkel=has_snorkel,
+            surface_class=worst_surface,
+            closure_status=c_status,
+        )
+        if cap_class is not None
+        else None
+    )
+
     return TrackDetailResponse(
         track_id=trk.track_id,
         name=trk.name,
@@ -914,6 +1060,10 @@ def get_track_detail(
         waterway_crossings=waterway_crossings,
         segment_count=len(segments),
         is_active=trk.is_active,
+        closure_status=c_status,
+        active_closures=active_closures,
+        suitability=suitability,
+        is_favorite=is_fav,
         primary_park=_park_to_summary(primary_park),
         capad_parks=capad_parks_list,
         segments=segments,
