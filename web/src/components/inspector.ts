@@ -16,9 +16,21 @@ import {
   getGradeColor,
   resolvePoiIconName,
 } from "../presets";
+import {
+  CONDITION_REPORT_TYPES,
+  formatReportFreshness,
+  formatReportTypeLabel,
+  getReportId,
+  getReportTypeColor,
+  partitionTrackReports,
+  resolveReportOsmLinks,
+} from "../reportsHelpers";
 import type {
   BBoxTuple,
+  ConditionReportCreateInput,
+  ConditionReportType,
   PoiItem,
+  ReportVoteKind,
   TrackInspectorDetail,
   VehicleCapabilityClass,
 } from "../types";
@@ -33,6 +45,7 @@ export interface TrackInspectorContext {
   activeVehicleName: string | null;
   isFavorite: boolean;
   isAuthenticated: boolean;
+  pickedReportCoords?: { lat: number; lon: number } | null;
 }
 
 export interface TrackInspectorCallbacks {
@@ -40,20 +53,31 @@ export interface TrackInspectorCallbacks {
   onZoomToTrack: (bbox: BBoxTuple) => void;
   onPoiSelect: (poi: PoiItem) => void;
   onOpenRigPanel: () => void;
+  onRequireSignIn: () => void;
   onToggleFavorite: (trackId: string, currentlyFavorite: boolean) => void;
   onExportTrack: (trackId: string, format: "gpx" | "geojson") => void;
+  onPickReportLocation: () => void;
+  onSubmitReport: (input: ConditionReportCreateInput) => Promise<void>;
+  onVoteReport: (
+    reportId: string,
+    vote: ReportVoteKind
+  ) => Promise<void>;
 }
 
 export class TrackInspectorDrawer {
   private readonly root: HTMLElement;
   private readonly callbacks: TrackInspectorCallbacks;
   private currentDetail: TrackInspectorDetail | null = null;
+  private showReportForm = false;
+  private reportSubmitting = false;
+  private reportError: string | null = null;
   private context: TrackInspectorContext = {
     snowLineElevationM: 1000,
     activeVehicleClass: "Stock 4WD",
     activeVehicleName: null,
     isFavorite: false,
     isAuthenticated: false,
+    pickedReportCoords: null,
   };
   private isOpen = false;
 
@@ -76,6 +100,9 @@ export class TrackInspectorDrawer {
 
   updateContext(patch: Partial<TrackInspectorContext>): void {
     this.context = { ...this.context, ...patch };
+    if (patch.pickedReportCoords) {
+      this.showReportForm = true;
+    }
     if (this.isOpen && this.currentDetail) {
       this.renderDetail(this.currentDetail);
     }
@@ -88,6 +115,8 @@ export class TrackInspectorDrawer {
   showLoading(trackLabel?: string): void {
     this.isOpen = true;
     this.currentDetail = null;
+    this.showReportForm = false;
+    this.reportError = null;
     this.root.setAttribute("aria-hidden", "false");
     this.root.innerHTML = `
       <div class="tf-inspector-head">
@@ -98,7 +127,7 @@ export class TrackInspectorDrawer {
         <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Track Inspector">×</button>
       </div>
       <div class="tf-inspector-body">
-        <div class="tf-inspector-loading">Fetching canonical segments, closures, rig suitability &amp; elevation profile…</div>
+        <div class="tf-inspector-loading">Fetching canonical segments, closures, condition reports, rig suitability &amp; elevation profile…</div>
       </div>
     `;
     this.bindClose();
@@ -139,6 +168,8 @@ export class TrackInspectorDrawer {
   close(): void {
     this.isOpen = false;
     this.currentDetail = null;
+    this.showReportForm = false;
+    this.reportError = null;
     this.root.setAttribute("aria-hidden", "true");
   }
 
@@ -152,10 +183,26 @@ export class TrackInspectorDrawer {
         <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Track Inspector">×</button>
       </div>
       <div class="tf-inspector-body">
-        <p class="tf-inspector-muted">Click any graded track on the map or search by track name to inspect elevation profile, closures &amp; alerts, rig suitability, explainable difficulty breakdown, creek crossings, nearby POIs, and CAPAD park tenure.</p>
+        <p class="tf-inspector-muted">Click any graded track on the map or search by track name to inspect elevation profile, official closures, community condition reports &amp; gate warnings, rig suitability, explainable difficulty breakdown, creek crossings, nearby POIs, and CAPAD park tenure.</p>
       </div>
     `;
     this.bindClose();
+  }
+
+  private resolveDefaultReportCoords(detail: TrackInspectorDetail): {
+    lat: number;
+    lon: number;
+  } {
+    if (this.context.pickedReportCoords) {
+      return this.context.pickedReportCoords;
+    }
+    if (detail.bbox) {
+      const [w, s, e, n] = detail.bbox;
+      return { lat: (s + n) / 2, lon: (w + e) / 2 };
+    }
+    const poi = detail.nearby_pois?.[0];
+    if (poi) return { lat: poi.lat, lon: poi.lon };
+    return { lat: -36.615, lon: 148.125 };
   }
 
   private renderDetail(detail: TrackInspectorDetail): void {
@@ -182,9 +229,18 @@ export class TrackInspectorDrawer {
     const closureBadge = getClosureStatusBadge(closureStatus);
     const activeClosures = detail.active_closures ?? [];
 
+    // Slice 08 Community Condition Reports & Distinct Gate Warnings
+    const { gateWarnings, timelineReports } = partitionTrackReports(
+      detail.condition_reports ?? [],
+      detail.community_gate_warnings ?? null
+    );
+
     const badgesHtml = [
       closureBadge.tone !== "open"
         ? `<span class="tf-pill tf-pill-${closureBadge.tone === "critical" ? "red" : closureBadge.tone === "warning" ? "amber" : "ice"}">⚠ ${escapeHtml(closureBadge.label)}</span>`
+        : "",
+      gateWarnings.length > 0
+        ? `<span class="tf-pill tf-pill-red">⛔ ${gateWarnings.length} Gate / Access Report${gateWarnings.length === 1 ? "" : "s"}</span>`
         : "",
       `<span class="tf-pill mono">${escapeHtml(norm.state)}</span>`,
       norm.is4wdOnly
@@ -200,7 +256,7 @@ export class TrackInspectorDrawer {
       .filter(Boolean)
       .join("");
 
-    // Slice 05 Personalized Rig Suitability Card (server-authoritative when returned, client fallback offline)
+    // Slice 05 Personalized Rig Suitability Card
     const suitability =
       detail.suitability ??
       computeClientSuitability(norm.grade, this.context.activeVehicleClass, {
@@ -242,7 +298,7 @@ export class TrackInspectorDrawer {
         ? `
           <section class="tf-insp-section tf-closures-panel">
             <div class="tf-insp-sec-head">
-              <h3>⚠ Closures &amp; Access Alerts</h3>
+              <h3>⚠ Official Closures &amp; Alerts</h3>
               <span class="mono tf-insp-meta">${activeClosures.length}</span>
             </div>
             <div class="tf-card-stack">
@@ -293,6 +349,142 @@ export class TrackInspectorDrawer {
           </section>
         `
         : "";
+
+    // Slice 08 Distinct Community Gate / Private Property Warnings Callout
+    const gateWarningsHtml =
+      gateWarnings.length > 0
+        ? `
+          <section class="tf-insp-section tf-gate-warnings-panel">
+            <div class="tf-insp-sec-head">
+              <h3>⛔ Community Gate &amp; Private Access Warnings</h3>
+              <span class="mono tf-insp-meta">${gateWarnings.length}</span>
+            </div>
+            <div class="tf-card-stack">
+              ${gateWarnings
+                .map((r) => {
+                  const typeLabel = formatReportTypeLabel(r.report_type);
+                  const fresh = formatReportFreshness(
+                    r.freshness_score,
+                    r.is_stale,
+                    r.effective_status ?? r.status
+                  );
+                  const links = resolveReportOsmLinks(r);
+                  const when = formatRelativeTimestamp(
+                    r.last_confirmed_at ?? r.created_at
+                  );
+                  return `
+                    <div class="tf-closure-card tone-critical">
+                      <div class="tf-closure-top">
+                        <span class="tf-closure-type">${escapeHtml(typeLabel)}</span>
+                        <span class="tf-fresh-badge tone-${fresh.tone}">${escapeHtml(fresh.label)}</span>
+                      </div>
+                      ${r.title ? `<div class="tf-closure-title">${escapeHtml(r.title)}</div>` : ""}
+                      <p class="tf-closure-desc">${escapeHtml(r.notes)}</p>
+                      <div class="tf-closure-meta">
+                        ${r.author_display_name ? `<span>By ${escapeHtml(r.author_display_name)}</span>` : ""}
+                        ${r.vehicle_class ? `<span>· ${escapeHtml(r.vehicle_class)}</span>` : ""}
+                        <span>· ✓${r.confirm_count} / ✔${r.resolved_count}</span>
+                        <span>· ${escapeHtml(when)}</span>
+                      </div>
+                      <div class="tf-osm-links">
+                        <a class="tf-closure-link" href="${escapeHtml(links.osmEditUrl)}" target="_blank" rel="noopener noreferrer">Suggest OSM Access Fix ↗</a>
+                        <a class="tf-closure-link" href="${escapeHtml(links.osmNoteUrl)}" target="_blank" rel="noopener noreferrer">Add OSM Note ↗</a>
+                      </div>
+                    </div>
+                  `;
+                })
+                .join("")}
+            </div>
+          </section>
+        `
+        : "";
+
+    // Slice 08 Trail Condition Timeline & Report Submission Form
+    const defaultCoords = this.resolveDefaultReportCoords(detail);
+    const reportFormHtml = this.showReportForm
+      ? `
+        <form class="tf-form tf-report-form" data-role="report-form">
+          ${
+            this.reportError
+              ? `<div class="tf-inspector-error">${escapeHtml(this.reportError)}</div>`
+              : ""
+          }
+          <div class="tf-insp-sec-head">
+            <h3>Report Trail Condition</h3>
+            <button type="button" class="tf-mini-btn" data-role="pick-report-loc">⌖ Pick on Map</button>
+          </div>
+          <div class="tf-pin-coords mono">
+            Location: ${defaultCoords.lat.toFixed(5)}, ${defaultCoords.lon.toFixed(5)}
+          </div>
+          <label class="tf-field">
+            <span class="tf-label">Condition / Hazard Type</span>
+            <select class="tf-select" name="report_type">
+              ${CONDITION_REPORT_TYPES.map(
+                (t) =>
+                  `<option value="${escapeHtml(t.value)}">${escapeHtml(t.label)}${t.isGateWarning ? " (Gate/Access Warning)" : ""}</option>`
+              ).join("")}
+            </select>
+          </label>
+          <label class="tf-field">
+            <span class="tf-label">Details &amp; Advice</span>
+            <textarea class="tf-textarea" name="notes" rows="3" required maxlength="500" placeholder="Describe obstacle depth, detour, locked padlock, or clear conditions…"></textarea>
+          </label>
+          <label class="tf-field">
+            <span class="tf-label">Photo Attachment (optional, JPEG/PNG/WebP ≤ 5 MB)</span>
+            <input type="file" class="tf-file-input" name="photo" accept="image/jpeg,image/png,image/webp" />
+          </label>
+          <div class="tf-btn-row">
+            <button type="submit" class="tf-btn-primary" ${this.reportSubmitting ? "disabled" : ""}>Submit Report</button>
+            <button type="button" class="tf-btn-secondary" data-role="cancel-report">Cancel</button>
+          </div>
+        </form>
+      `
+      : "";
+
+    const timelineHtml =
+      timelineReports.length > 0
+        ? timelineReports
+            .map((r) => {
+              const rid = getReportId(r);
+              const color = getReportTypeColor(r.report_type);
+              const typeLabel = formatReportTypeLabel(r.report_type);
+              const fresh = formatReportFreshness(
+                r.freshness_score,
+                r.is_stale,
+                r.effective_status ?? r.status
+              );
+              const when = formatRelativeTimestamp(
+                r.last_confirmed_at ?? r.created_at
+              );
+              const links = resolveReportOsmLinks(r);
+              const photoHtml =
+                r.photo_url && r.photo_url.startsWith("/")
+                  ? `<a class="tf-report-photo-link" href="${escapeHtml(r.photo_url)}" target="_blank" rel="noopener noreferrer"><img class="tf-report-photo" src="${escapeHtml(r.photo_url)}" alt="${escapeHtml(typeLabel)} attachment" loading="lazy" /></a>`
+                  : "";
+              return `
+                <div class="tf-report-card" style="border-left-color:${color}">
+                  <div class="tf-report-head">
+                    <span class="tf-report-type" style="color:${color}">${escapeHtml(typeLabel)}</span>
+                    <span class="tf-fresh-badge tone-${fresh.tone}">${escapeHtml(fresh.label)}</span>
+                  </div>
+                  ${r.title ? `<div class="tf-closure-title">${escapeHtml(r.title)}</div>` : ""}
+                  <p class="tf-closure-desc">${escapeHtml(r.notes)}</p>
+                  ${photoHtml}
+                  <div class="tf-closure-meta">
+                    ${r.author_display_name ? `<span>${escapeHtml(r.author_display_name)}</span>` : ""}
+                    ${r.vehicle_class ? `<span>· ${escapeHtml(r.vehicle_class)}</span>` : ""}
+                    <span>· ${escapeHtml(when)}</span>
+                  </div>
+                  <div class="tf-report-actions">
+                    <button type="button" class="tf-mini-btn" data-vote-report="${escapeHtml(rid)}" data-vote-kind="confirm">✓ Confirm (${r.confirm_count})</button>
+                    <button type="button" class="tf-mini-btn" data-vote-report="${escapeHtml(rid)}" data-vote-kind="resolved">✔ Resolved (${r.resolved_count})</button>
+                    <a class="tf-osm-inline" href="${escapeHtml(links.osmNoteUrl)}" target="_blank" rel="noopener noreferrer" title="Report map/access fix to OpenStreetMap">OSM Fix ↗</a>
+                  </div>
+                </div>
+              `;
+            })
+            .join("")
+        : `<p class="tf-inspector-muted">No recent trail condition reports yet. Been through recently? Share an update above.</p>`;
 
     const elevRangeText =
       norm.minElevM !== null && norm.maxElevM !== null
@@ -459,6 +651,7 @@ export class TrackInspectorDrawer {
         </div>
 
         ${closuresPanelHtml}
+        ${gateWarningsHtml}
 
         <div class="tf-grade-hero" style="border-color:${gradeColor}">
           <div class="tf-grade-hero-left">
@@ -518,6 +711,15 @@ export class TrackInspectorDrawer {
           <div class="tf-elev-chart-wrap">
             ${chart.svgHtml}
           </div>
+        </section>
+
+        <section class="tf-insp-section">
+          <div class="tf-insp-sec-head">
+            <h3>Trail Condition Timeline</h3>
+            <button type="button" class="tf-mini-btn" data-role="open-report-form">+ Report</button>
+          </div>
+          ${reportFormHtml}
+          <div class="tf-card-stack">${timelineHtml}</div>
         </section>
 
         <section class="tf-insp-section">
@@ -586,6 +788,99 @@ export class TrackInspectorDrawer {
         btn.addEventListener("click", () => {
           const fmt = btn.dataset.exportTrack as "gpx" | "geojson";
           this.callbacks.onExportTrack(detail.track_id, fmt);
+        });
+      });
+
+    // Slice 08 Report form & voting handlers
+    this.root
+      .querySelector<HTMLButtonElement>("[data-role='open-report-form']")
+      ?.addEventListener("click", () => {
+        if (!this.context.isAuthenticated) {
+          this.callbacks.onRequireSignIn();
+          return;
+        }
+        this.showReportForm = !this.showReportForm;
+        this.reportError = null;
+        this.renderDetail(detail);
+      });
+
+    this.root
+      .querySelector<HTMLButtonElement>("[data-role='cancel-report']")
+      ?.addEventListener("click", () => {
+        this.showReportForm = false;
+        this.reportError = null;
+        this.renderDetail(detail);
+      });
+
+    this.root
+      .querySelector<HTMLButtonElement>("[data-role='pick-report-loc']")
+      ?.addEventListener("click", () => {
+        this.callbacks.onPickReportLocation();
+      });
+
+    this.root
+      .querySelector<HTMLFormElement>("[data-role='report-form']")
+      ?.addEventListener("submit", (e) => {
+        e.preventDefault();
+        const form = e.currentTarget as HTMLFormElement;
+        const fd = new FormData(form);
+        const reportType = String(
+          fd.get("report_type") ?? "fallen_tree"
+        ) as ConditionReportType;
+        const notes = String(fd.get("notes") ?? "").trim();
+        const photoInput = form.querySelector<HTMLInputElement>(
+          "input[name='photo']"
+        );
+        const photo = photoInput?.files?.[0] ?? null;
+
+        if (!notes) {
+          this.reportError = "Please describe the trail condition.";
+          this.renderDetail(detail);
+          return;
+        }
+
+        const coords = this.resolveDefaultReportCoords(detail);
+        this.reportSubmitting = true;
+        this.reportError = null;
+        this.renderDetail(detail);
+
+        void this.callbacks
+          .onSubmitReport({
+            report_type: reportType,
+            lon: coords.lon,
+            lat: coords.lat,
+            notes,
+            track_id: detail.track_id,
+            vehicle_class: this.context.activeVehicleClass,
+            photo,
+          })
+          .then(() => {
+            this.showReportForm = false;
+            this.reportError = null;
+          })
+          .catch((err) => {
+            this.reportError =
+              err instanceof Error ? err.message : "Failed to submit report";
+          })
+          .finally(() => {
+            this.reportSubmitting = false;
+            if (this.currentDetail) {
+              this.renderDetail(this.currentDetail);
+            }
+          });
+      });
+
+    this.root
+      .querySelectorAll<HTMLButtonElement>("[data-vote-report]")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          if (!this.context.isAuthenticated) {
+            this.callbacks.onRequireSignIn();
+            return;
+          }
+          const rid = btn.dataset.voteReport!;
+          const kind = btn.dataset.voteKind as ReportVoteKind;
+          void this.callbacks.onVoteReport(rid, kind);
         });
       });
 

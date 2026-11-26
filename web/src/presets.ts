@@ -238,6 +238,8 @@ export function createInitialLayerState(): LayerVisibilityState {
     tracks: true,
     steepHighlights: true,
     closures: true,
+    reports: true,
+    unmapped: false,
     contoursHillshade: true,
     snowLine: false,
     snowLineElevationM: DEFAULT_SNOWLINE_ELEVATION_M,

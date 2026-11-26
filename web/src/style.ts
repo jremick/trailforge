@@ -97,6 +97,33 @@ export function buildGradeColorExpression(): ExpressionSpecification {
 }
 
 /**
+ * Color expression for Slice 08 community condition reports & gate warnings.
+ */
+export function buildReportColorExpression(): ExpressionSpecification {
+  return [
+    "match",
+    ["downcase", ["coalesce", ["get", "report_type"], ""]],
+    "locked_gate",
+    "#EF4444",
+    "private_property",
+    "#F97316",
+    "washout",
+    "#EF4444",
+    "fallen_tree",
+    "#F59E0B",
+    "bog_hole",
+    "#D97706",
+    "deep_water",
+    "#38BDF8",
+    "snow_ice",
+    "#BAE6FD",
+    "track_clear",
+    "#22C55E",
+    "#F59E0B",
+  ];
+}
+
+/**
  * Color expression for Slice 04 closures, incidents, seasonal restrictions, and locked gates.
  */
 export function buildClosureColorExpression(): ExpressionSpecification {
@@ -410,6 +437,14 @@ export function buildTrailForgeStyle(
       data: EMPTY_FEATURE_COLLECTION,
     },
     "tf-closures": {
+      type: "geojson",
+      data: EMPTY_FEATURE_COLLECTION,
+    },
+    "tf-unmapped": {
+      type: "geojson",
+      data: EMPTY_FEATURE_COLLECTION,
+    },
+    "tf-reports": {
       type: "geojson",
       data: EMPTY_FEATURE_COLLECTION,
     },
@@ -1032,6 +1067,81 @@ export function buildTrailForgeStyle(
         "circle-color": closureColor,
         "circle-stroke-color": "#F8FAFC",
         "circle-stroke-width": 2,
+      },
+    }
+  );
+
+  // Slice 06 Anonymized Unmapped Track Candidates (subtle violet dashed spurs)
+  styleLayers.push(
+    {
+      id: "tf-unmapped-casing",
+      type: "line",
+      source: "tf-unmapped",
+      layout: {
+        visibility: vis(layers.unmapped),
+        "line-cap": "round",
+        "line-join": "round",
+      },
+      paint: {
+        "line-color": "#0B1117",
+        "line-width": 5.2,
+        "line-opacity": 0.65,
+      },
+    },
+    {
+      id: "tf-unmapped-line",
+      type: "line",
+      source: "tf-unmapped",
+      layout: {
+        visibility: vis(layers.unmapped),
+        "line-cap": "round",
+        "line-join": "round",
+      },
+      paint: {
+        "line-color": "#A855F7",
+        "line-width": 2.8,
+        "line-dasharray": [3, 2.5],
+        "line-opacity": 0.9,
+      },
+    }
+  );
+
+  const reportColor = buildReportColorExpression();
+
+  // Slice 08 Community Condition Reports & Distinct Locked Gate / Private Property Warnings
+  styleLayers.push(
+    {
+      id: "tf-reports-gate-halo",
+      type: "circle",
+      source: "tf-reports",
+      filter: [
+        "any",
+        ["==", ["get", "is_gate_warning"], true],
+        [
+          "in",
+          ["downcase", ["coalesce", ["get", "report_type"], ""]],
+          ["literal", ["locked_gate", "private_property"]],
+        ],
+      ],
+      layout: { visibility: vis(layers.reports) },
+      paint: {
+        "circle-radius": 13.5,
+        "circle-color": reportColor,
+        "circle-opacity": 0.24,
+        "circle-stroke-color": "#FDE047",
+        "circle-stroke-width": 1.8,
+      },
+    },
+    {
+      id: "tf-reports-points",
+      type: "circle",
+      source: "tf-reports",
+      layout: { visibility: vis(layers.reports) },
+      paint: {
+        "circle-radius": 7.2,
+        "circle-color": reportColor,
+        "circle-stroke-color": "#F8FAFC",
+        "circle-stroke-width": 2.0,
       },
     }
   );

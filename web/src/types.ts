@@ -10,6 +10,8 @@ export type LayerKey =
   | "tracks"
   | "steepHighlights"
   | "closures"
+  | "reports"
+  | "unmapped"
   | "contoursHillshade"
   | "snowLine"
   | "parksWaterways"
@@ -19,6 +21,8 @@ export interface LayerVisibilityState {
   tracks: boolean;
   steepHighlights: boolean;
   closures: boolean;
+  reports: boolean;
+  unmapped: boolean;
   contoursHillshade: boolean;
   snowLine: boolean;
   snowLineElevationM: number;
@@ -301,6 +305,111 @@ export interface UserPinItem {
   created_at?: string | null;
 }
 
+/* ---------- Slice 06 Telemetry, Trips & Unmapped Candidates ---------- */
+
+export type TripVisibility = "private" | "community_anonymous";
+
+export interface TelemetryPointInput {
+  lon: number;
+  lat: number;
+  elev_m?: number | null;
+  timestamp?: string | null;
+  speed_mps?: number | null;
+  roughness_rms?: number | null;
+}
+
+export interface TripUploadJsonPayload {
+  name: string;
+  points: TelemetryPointInput[];
+  vehicle_profile_id?: string | null;
+  visibility: TripVisibility;
+  privacy_trim_m?: number;
+}
+
+export interface TripMatchedSegment {
+  segment_id: string;
+  track_id?: string | null;
+  confidence?: number | null;
+  duration_s?: number | null;
+  avg_speed_kmh?: number | null;
+  roughness_rms?: number | null;
+}
+
+export interface TripItem {
+  trip_id?: string;
+  id?: string;
+  name: string;
+  visibility: TripVisibility;
+  vehicle_profile_id?: string | null;
+  vehicle_class?: string | null;
+  vehicle_capability_class?: string | null;
+  privacy_trim_m?: number | null;
+  raw_length_m?: number | null;
+  trimmed_length_m?: number | null;
+  matched_segment_count?: number;
+  avg_match_confidence?: number | null;
+  observations_published?: number;
+  unmapped_candidate_count?: number;
+  match_status?: string | null;
+  created_at?: string | null;
+  matched_segments?: TripMatchedSegment[];
+  unmapped_candidates?: unknown[];
+}
+
+/* ---------- Slice 08 Community Condition Reports & Gate Warnings ---------- */
+
+export type ConditionReportType =
+  | "fallen_tree"
+  | "bog_hole"
+  | "washout"
+  | "deep_water"
+  | "locked_gate"
+  | "private_property"
+  | "snow_ice"
+  | "track_clear";
+
+export type ReportVoteKind = "confirm" | "resolved";
+
+export interface ConditionReportItem {
+  id?: string | number;
+  report_id?: string | number;
+  report_type: ConditionReportType | string;
+  title?: string | null;
+  notes: string;
+  severity?: string | null;
+  lon: number;
+  lat: number;
+  track_id?: string | null;
+  segment_id?: string | null;
+  vehicle_class?: string | null;
+  author_display_name?: string | null;
+  photo_url?: string | null;
+  confirm_count: number;
+  resolved_count: number;
+  freshness_score?: number | null;
+  is_stale?: boolean;
+  effective_status?: string | null;
+  status?: string | null;
+  is_gate_warning?: boolean;
+  osm_note_url?: string | null;
+  osm_edit_url?: string | null;
+  created_at?: string | null;
+  last_confirmed_at?: string | null;
+}
+
+export interface ConditionReportCreateInput {
+  report_type: ConditionReportType;
+  lon: number;
+  lat: number;
+  title?: string | null;
+  notes: string;
+  severity?: string;
+  track_id?: string | null;
+  segment_id?: string | null;
+  vehicle_class?: string | null;
+  photo?: File | null;
+}
+
 /* ---------- Slice 03 Track Inspector & Search Types ---------- */
 
 export interface ParkTenureItem {
@@ -453,6 +562,8 @@ export interface TrackInspectorDetail {
   access_status?: string;
   closure_status?: TrackClosureStatus | null;
   active_closures?: ClosureItem[];
+  condition_reports?: ConditionReportItem[];
+  community_gate_warnings?: ConditionReportItem[];
   suitability?: TrackSuitability | null;
   bbox?: BBoxTuple | null;
   baseline_breakdown?: BaselineBreakdown | null;

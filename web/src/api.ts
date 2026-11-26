@@ -6,10 +6,16 @@ import type {
   AuthTokenResponse,
   ClosuresListResponse,
   ClosuresStatusResponse,
+  ConditionReportCreateInput,
+  ConditionReportItem,
   ParkTenureItem,
   PoiItem,
+  ReportVoteKind,
   TileManifestResponse,
   TrackInspectorDetail,
+  TripItem,
+  TripUploadJsonPayload,
+  TripVisibility,
   UserFavoriteItem,
   UserPinInput,
   UserPinItem,
@@ -374,6 +380,147 @@ export function deletePin(id: string): Promise<void> {
   return requestJson<void>(`/api/pins/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
+}
+
+/* ---------- Slice 06 Trips, Telemetry & Unmapped Candidates ---------- */
+
+export async function fetchTrips(signal?: AbortSignal): Promise<TripItem[]> {
+  const data = await requestJson<TripItem[] | { items: TripItem[] }>(
+    "/api/trips",
+    { signal }
+  );
+  return Array.isArray(data) ? data : (data.items ?? []);
+}
+
+export async function uploadTripGpx(
+  file: File,
+  params: {
+    name: string;
+    vehicle_profile_id?: string | null;
+    visibility: TripVisibility;
+    privacy_trim_m: number;
+  }
+): Promise<TripItem> {
+  const form = new FormData();
+  form.append("file", file, file.name);
+  form.append("name", params.name);
+  form.append("visibility", params.visibility);
+  form.append("privacy_trim_m", String(params.privacy_trim_m));
+  if (params.vehicle_profile_id) {
+    form.append("vehicle_profile_id", params.vehicle_profile_id);
+  }
+
+  const res = await fetch("/api/trips/upload", {
+    method: "POST",
+    headers: buildHeaders(),
+    credentials: "same-origin",
+    body: form,
+  });
+  if (!res.ok) {
+    const detail = await parseErrorDetail(res);
+    throw new ApiError(detail, res.status);
+  }
+  return (await res.json()) as TripItem;
+}
+
+export function uploadTripJson(
+  payload: TripUploadJsonPayload
+): Promise<TripItem> {
+  return requestJson<TripItem>("/api/trips/upload", {
+    method: "POST",
+    body: payload,
+  });
+}
+
+export function updateTrip(
+  tripId: string,
+  patch: { name?: string; visibility?: TripVisibility }
+): Promise<TripItem> {
+  return requestJson<TripItem>(`/api/trips/${encodeURIComponent(tripId)}`, {
+    method: "PATCH",
+    body: patch,
+  });
+}
+
+export function deleteTrip(tripId: string): Promise<void> {
+  return requestJson<void>(`/api/trips/${encodeURIComponent(tripId)}`, {
+    method: "DELETE",
+  });
+}
+
+export function fetchUnmappedCandidatesGeoJson(
+  signal?: AbortSignal
+): Promise<FeatureCollection> {
+  return requestJson<FeatureCollection>("/api/telemetry/unmapped", { signal });
+}
+
+/* ---------- Slice 08 Community Condition Reports & Gate Warnings ---------- */
+
+export function fetchReportsGeoJson(
+  signal?: AbortSignal
+): Promise<FeatureCollection> {
+  return requestJson<FeatureCollection>(
+    "/api/reports/geojson?include_resolved=false",
+    { signal }
+  );
+}
+
+export async function createConditionReport(
+  input: ConditionReportCreateInput
+): Promise<ConditionReportItem> {
+  if (input.photo) {
+    const form = new FormData();
+    form.append("report_type", input.report_type);
+    form.append("lon", String(input.lon));
+    form.append("lat", String(input.lat));
+    form.append("notes", input.notes);
+    if (input.title) form.append("title", input.title);
+    if (input.severity) form.append("severity", input.severity);
+    if (input.track_id) form.append("track_id", input.track_id);
+    if (input.segment_id) form.append("segment_id", input.segment_id);
+    if (input.vehicle_class) form.append("vehicle_class", input.vehicle_class);
+    form.append("photo", input.photo, input.photo.name);
+
+    const res = await fetch("/api/reports", {
+      method: "POST",
+      headers: buildHeaders(),
+      credentials: "same-origin",
+      body: form,
+    });
+    if (!res.ok) {
+      const detail = await parseErrorDetail(res);
+      throw new ApiError(detail, res.status);
+    }
+    return (await res.json()) as ConditionReportItem;
+  }
+
+  return requestJson<ConditionReportItem>("/api/reports", {
+    method: "POST",
+    body: {
+      report_type: input.report_type,
+      lon: input.lon,
+      lat: input.lat,
+      title: input.title ?? null,
+      notes: input.notes,
+      severity: input.severity ?? null,
+      track_id: input.track_id ?? null,
+      segment_id: input.segment_id ?? null,
+      vehicle_class: input.vehicle_class ?? null,
+    },
+  });
+}
+
+export function voteConditionReport(
+  reportId: string | number,
+  vote: ReportVoteKind
+): Promise<ConditionReportItem> {
+  return requestJson<ConditionReportItem>(
+    `/api/reports/${encodeURIComponent(String(reportId))}/vote`,
+    {
+      method: "POST",
+      body: { vote },
+    }
+  );
 }
 
 export async function downloadAuthenticatedExport(

@@ -131,6 +131,19 @@ describe("MapLibre 5 PMTiles & offline fallback style builder", () => {
       source: "tf-closures",
       layout: { visibility: "visible" },
     });
+    // Slice 06 unmapped spurs (hidden by default) & Slice 08 reports/gate warnings
+    expect(byId.get("tf-unmapped-line")).toMatchObject({
+      source: "tf-unmapped",
+      layout: { visibility: "none" },
+    });
+    expect(byId.get("tf-reports-gate-halo")).toMatchObject({
+      source: "tf-reports",
+      layout: { visibility: "visible" },
+    });
+    expect(byId.get("tf-reports-points")).toMatchObject({
+      source: "tf-reports",
+      layout: { visibility: "visible" },
+    });
     expect(byId.get("tf-user-pins-dot")).toMatchObject({
       source: "tf-user-pins",
     });

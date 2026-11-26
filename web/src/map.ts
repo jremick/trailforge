@@ -22,6 +22,7 @@ import {
   userPinsToGeoJson,
 } from "./style";
 import { formatClosureTypeLabel } from "./closuresHelpers";
+import { formatReportTypeLabel, isGateWarningType } from "./reportsHelpers";
 import type {
   BasemapId,
   BBoxTuple,
@@ -108,6 +109,7 @@ export interface TrailForgeMapCallbacks {
   onBasemapTileError?: () => void;
   onTrackClick?: (trackId: string, segmentId?: string) => void;
   onPinDropClick?: (lat: number, lon: number) => void;
+  onReportPickClick?: (lat: number, lon: number) => void;
 }
 
 export interface TrailForgeMapOptions {
@@ -127,11 +129,13 @@ export class TrailForgeMap {
   private currentManifest: TileManifestResponse | null = null;
   private selectedTrackId: string | null = null;
   private reportedTileError = false;
-  private pinDropMode = false;
+  private coordPickMode: "pin" | "report" | null = null;
   private pendingPin: { lat: number; lon: number; label: string } | null = null;
   private fallbackTracks: FeatureCollection | null = null;
   private fallbackPois: PoiItem[] | null = null;
   private closuresGeoJson: FeatureCollection | null = null;
+  private reportsGeoJson: FeatureCollection | null = null;
+  private unmappedGeoJson: FeatureCollection | null = null;
   private userPins: UserPinItem[] = [];
   private readonly loadedIconIds = new Set<string>();
   private readonly loadingIcons = new Set<string>();
@@ -183,12 +187,17 @@ export class TrailForgeMap {
     });
 
     this.map.on("click", (e) => {
-      if (this.pinDropMode) {
+      if (this.coordPickMode === "pin") {
         callbacks.onPinDropClick?.(e.lngLat.lat, e.lngLat.lng);
+        return;
+      }
+      if (this.coordPickMode === "report") {
+        callbacks.onReportPickClick?.(e.lngLat.lat, e.lngLat.lng);
         return;
       }
 
       const hitLayers = [
+        "tf-reports-points",
         "tf-closures-points",
         "tf-closures-line",
         "tf-steep-highlights",
@@ -311,6 +320,26 @@ export class TrailForgeMap {
   }
 
   /**
+   * Populate Slice 08 community hazard & gate reports GeoJSON layer.
+   */
+  setReportsGeoJson(fc: FeatureCollection | null): void {
+    this.reportsGeoJson = fc;
+    if (this.isLoaded) {
+      this.applyReportsData();
+    }
+  }
+
+  /**
+   * Populate Slice 06 anonymized unmapped track candidates GeoJSON layer.
+   */
+  setUnmappedGeoJson(fc: FeatureCollection | null): void {
+    this.unmappedGeoJson = fc;
+    if (this.isLoaded) {
+      this.applyUnmappedData();
+    }
+  }
+
+  /**
    * Populate Slice 05 signed-in user's personal pins on the map.
    */
   setUserPins(pins: readonly UserPinItem[]): void {
@@ -320,12 +349,16 @@ export class TrailForgeMap {
     }
   }
 
-  setPinDropMode(active: boolean): void {
-    this.pinDropMode = active;
-    this.container.classList.toggle("pin-drop-active", active);
-    if (active) {
+  setCoordPickMode(mode: "pin" | "report" | null): void {
+    this.coordPickMode = mode;
+    this.container.classList.toggle("pin-drop-active", mode !== null);
+    if (mode !== null) {
       this.hoverPopup.remove();
     }
+  }
+
+  setPinDropMode(active: boolean): void {
+    this.setCoordPickMode(active ? "pin" : null);
   }
 
   setBasemap(basemap: BasemapId): void {
@@ -470,6 +503,8 @@ export class TrailForgeMap {
       this.applyFallbackData();
     }
     this.applyClosuresData();
+    this.applyReportsData();
+    this.applyUnmappedData();
     this.applyUserPinsData();
   }
 
@@ -536,9 +571,10 @@ export class TrailForgeMap {
   }
 
   private handlePointerHover(e: maplibregl.MapMouseEvent): void {
-    if (this.pinDropMode) return;
+    if (this.coordPickMode !== null) return;
 
     const queryLayers = [
+      "tf-reports-points",
       "tf-user-pins-dot",
       "tf-closures-points",
       "tf-closures-line",
@@ -546,6 +582,7 @@ export class TrailForgeMap {
       "tf-pois-layer",
       "tf-steep-highlights",
       "tf-tracks-line",
+      "tf-unmapped-line",
       "tf-closures-polygon-fill",
     ].filter((id) => Boolean(this.map.getLayer(id)));
 
@@ -568,6 +605,45 @@ export class TrailForgeMap {
 
     const layerId = hit.layer.id;
     const props = (hit.properties ?? {}) as Record<string, unknown>;
+
+    if (layerId === "tf-reports-points") {
+      this.map.getCanvas().style.cursor = "pointer";
+      const reportType = String(props.report_type ?? "hazard");
+      const label = formatReportTypeLabel(reportType);
+      const isGate =
+        props.is_gate_warning === true || isGateWarningType(reportType);
+      const notes = typeof props.notes === "string" ? props.notes.slice(0, 90) : "";
+      const confirms = typeof props.confirm_count === "number" ? props.confirm_count : 0;
+      const stale = props.is_stale === true ? " · Stale" : "";
+      this.hoverPopup
+        .setLngLat(e.lngLat)
+        .setHTML(
+          `<div class="tf-popup-title">${isGate ? "⛔ " : "⚠ "}${escapeHtml(label)}</div>
+           <div class="tf-popup-meta">
+             <span class="tf-popup-warn">${isGate ? "Gate / Access Warning" : "Community Report"}</span>
+             <span>· ✓${confirms}${escapeHtml(stale)}</span>
+           </div>
+           ${notes ? `<div class="tf-popup-note">${escapeHtml(notes)}</div>` : ""}`
+        )
+        .addTo(this.map);
+      return;
+    }
+
+    if (layerId === "tf-unmapped-line") {
+      this.map.getCanvas().style.cursor = "pointer";
+      const count =
+        typeof props.observation_count === "number"
+          ? `${props.observation_count} trace${props.observation_count === 1 ? "" : "s"}`
+          : "Anonymized spur";
+      this.hoverPopup
+        .setLngLat(e.lngLat)
+        .setHTML(
+          `<div class="tf-popup-title">Unmapped Track Candidate</div>
+           <div class="tf-popup-meta">${escapeHtml(count)} · Off-network telemetry</div>`
+        )
+        .addTo(this.map);
+      return;
+    }
 
     if (layerId === "tf-user-pins-dot") {
       this.map.getCanvas().style.cursor = "pointer";
@@ -692,6 +768,10 @@ export class TrailForgeMap {
     this.setLayerVis("tf-closures-line-casing", this.currentLayers.closures);
     this.setLayerVis("tf-closures-line", this.currentLayers.closures);
     this.setLayerVis("tf-closures-points", this.currentLayers.closures);
+    this.setLayerVis("tf-reports-gate-halo", this.currentLayers.reports);
+    this.setLayerVis("tf-reports-points", this.currentLayers.reports);
+    this.setLayerVis("tf-unmapped-casing", this.currentLayers.unmapped);
+    this.setLayerVis("tf-unmapped-line", this.currentLayers.unmapped);
     this.setLayerVis("tf-hillshade", this.currentLayers.contoursHillshade);
     this.setLayerVis(
       "tf-contours-hillshade",
@@ -764,6 +844,20 @@ export class TrailForgeMap {
       | maplibregl.GeoJSONSource
       | undefined;
     src?.setData(this.closuresGeoJson ?? EMPTY_FEATURE_COLLECTION);
+  }
+
+  private applyReportsData(): void {
+    const src = this.map.getSource("tf-reports") as
+      | maplibregl.GeoJSONSource
+      | undefined;
+    src?.setData(this.reportsGeoJson ?? EMPTY_FEATURE_COLLECTION);
+  }
+
+  private applyUnmappedData(): void {
+    const src = this.map.getSource("tf-unmapped") as
+      | maplibregl.GeoJSONSource
+      | undefined;
+    src?.setData(this.unmappedGeoJson ?? EMPTY_FEATURE_COLLECTION);
   }
 
   private applyUserPinsData(): void {

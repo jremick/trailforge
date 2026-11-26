@@ -1,9 +1,21 @@
 import { escapeHtml, getGradeColor } from "../presets";
+import {
+  MIN_PRIVACY_TRIM_M,
+  formatMatchConfidence,
+  formatTrimmedDistance,
+  formatTripVisibility,
+  getTripId,
+  parseTelemetryJsonInput,
+  validatePrivacyTrimMeters,
+} from "../tripsHelpers";
 import type {
   AuthUser,
   DrivetrainType,
   PinCategory,
   TireClassType,
+  TripItem,
+  TripUploadJsonPayload,
+  TripVisibility,
   UserFavoriteItem,
   UserPinInput,
   UserPinItem,
@@ -22,12 +34,14 @@ import {
   isVehicleActive,
 } from "../vehicleHelpers";
 
-export type AccountPanelTab = "rig" | "saved" | "account";
+export type AccountPanelTab = "rig" | "trips" | "saved" | "account";
 
 export interface AccountPanelState {
   user: AuthUser | null;
   anonymousRigClass: VehicleCapabilityClass;
   vehicles: VehicleProfileItem[];
+  trips: TripItem[];
+  latestUploadedTrip: TripItem | null;
   favorites: UserFavoriteItem[];
   pins: UserPinItem[];
   pinDropActive: boolean;
@@ -50,6 +64,22 @@ export interface AccountPanelCallbacks {
   ) => Promise<void>;
   onActivateVehicle: (id: string) => Promise<void>;
   onDeleteVehicle: (id: string) => Promise<void>;
+  onUploadTripGpx: (
+    file: File,
+    params: {
+      name: string;
+      vehicle_profile_id: string | null;
+      visibility: TripVisibility;
+      privacy_trim_m: number;
+    }
+  ) => Promise<void>;
+  onUploadTripJson: (payload: TripUploadJsonPayload) => Promise<void>;
+  onToggleTripVisibility: (
+    tripId: string,
+    nextVisibility: TripVisibility
+  ) => Promise<void>;
+  onExportTrip: (tripId: string, format: "gpx" | "geojson") => Promise<void>;
+  onDeleteTrip: (tripId: string) => Promise<void>;
   onOpenFavoriteTrack: (trackId: string) => void;
   onRemoveFavorite: (trackId: string) => Promise<void>;
   onTogglePinDropMode: (active: boolean) => void;
@@ -81,6 +111,7 @@ export class RigAccountPanel {
   private isOpen = false;
   private activeTab: AccountPanelTab = "rig";
   private authMode: "login" | "register" = "login";
+  private tripInputMode: "gpx" | "json" = "gpx";
   private editingVehicleId: string | null = null;
   private showVehicleForm = false;
   private vehicleDraft: VehicleProfileInput = defaultVehicleDraft();
@@ -97,7 +128,10 @@ export class RigAccountPanel {
     this.state = initialState;
     this.callbacks = callbacks;
     this.root.className = "tf-account-panel";
-    this.root.setAttribute("aria-label", "Rig profiles, saved tracks, pins, and account");
+    this.root.setAttribute(
+      "aria-label",
+      "Rig profiles, trip telemetry, saved tracks, pins, and account"
+    );
     this.root.setAttribute("aria-hidden", "true");
     this.render();
   }
@@ -126,13 +160,13 @@ export class RigAccountPanel {
   }
 
   private render(): void {
-    const { user, favorites, pins } = this.state;
+    const { user, trips, favorites, pins } = this.state;
     const savedCount = favorites.length + pins.length;
 
     this.root.innerHTML = `
       <div class="tf-inspector-head">
         <div>
-          <div class="tf-inspector-kicker">Rig &amp; Personal Data</div>
+          <div class="tf-inspector-kicker">Rig, Telemetry &amp; Data</div>
           <h2 class="tf-inspector-title">${
             user ? escapeHtml(user.display_name) : "Anonymous Mode"
           }</h2>
@@ -140,9 +174,10 @@ export class RigAccountPanel {
         <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Rig & Account panel">×</button>
       </div>
 
-      <div class="tf-panel-tabs" role="tablist">
+      <div class="tf-panel-tabs tf-panel-tabs-4" role="tablist">
         <button type="button" class="tf-tab-btn ${this.activeTab === "rig" ? "active" : ""}" data-tab="rig" role="tab" aria-selected="${this.activeTab === "rig"}">My Rig</button>
-        <button type="button" class="tf-tab-btn ${this.activeTab === "saved" ? "active" : ""}" data-tab="saved" role="tab" aria-selected="${this.activeTab === "saved"}">Saved &amp; Pins${savedCount > 0 ? ` (${savedCount})` : ""}</button>
+        <button type="button" class="tf-tab-btn ${this.activeTab === "trips" ? "active" : ""}" data-tab="trips" role="tab" aria-selected="${this.activeTab === "trips"}">Trips${trips.length > 0 ? ` (${trips.length})` : ""}</button>
+        <button type="button" class="tf-tab-btn ${this.activeTab === "saved" ? "active" : ""}" data-tab="saved" role="tab" aria-selected="${this.activeTab === "saved"}">Saved${savedCount > 0 ? ` (${savedCount})` : ""}</button>
         <button type="button" class="tf-tab-btn ${this.activeTab === "account" ? "active" : ""}" data-tab="account" role="tab" aria-selected="${this.activeTab === "account"}">${user ? "Account" : "Sign In"}</button>
       </div>
 
@@ -155,9 +190,11 @@ export class RigAccountPanel {
         ${
           this.activeTab === "rig"
             ? this.renderRigTab()
-            : this.activeTab === "saved"
-              ? this.renderSavedTab()
-              : this.renderAccountTab()
+            : this.activeTab === "trips"
+              ? this.renderTripsTab()
+              : this.activeTab === "saved"
+                ? this.renderSavedTab()
+                : this.renderAccountTab()
         }
       </div>
     `;
@@ -325,6 +362,185 @@ export class RigAccountPanel {
     `;
   }
 
+  private renderTripsTab(): string {
+    const { user, vehicles, trips, latestUploadedTrip } = this.state;
+
+    if (!user) {
+      return `
+        <section class="tf-insp-section">
+          <div class="tf-insp-sec-head">
+            <h3>Trip Logbook &amp; Telemetry Upload</h3>
+            <span class="mono tf-insp-meta">Sign In Required</span>
+          </div>
+          <p class="tf-inspector-muted">Sign in to upload GPX traces or telemetry JSON, snap trips onto canonical 4WD segments via our in-PostGIS HMM matcher, and control Private vs Anonymous Community sharing.</p>
+          <div class="tf-privacy-note">
+            🔒 <strong>Privacy by Design:</strong> Every upload automatically trims at least <strong>${MIN_PRIVACY_TRIM_M} m</strong> from both start and end before matching. Public telemetry contains zero user or trip IDs.
+          </div>
+          <button type="button" class="tf-btn-primary" data-jump-tab="account">Sign In / Create Account</button>
+        </section>
+      `;
+    }
+
+    const activeRig = vehicles.find((v) => isVehicleActive(v)) ?? vehicles[0];
+
+    const latestCard = latestUploadedTrip
+      ? `
+        <div class="tf-match-summary">
+          <div class="tf-insp-sec-head">
+            <h3>Latest Upload Matched</h3>
+            <span class="mono tf-insp-meta">${escapeHtml(formatMatchConfidence(latestUploadedTrip.avg_match_confidence))}</span>
+          </div>
+          <div class="tf-kv-grid">
+            <span class="tf-kv-key">Trip</span>
+            <span class="tf-kv-val">${escapeHtml(latestUploadedTrip.name)}</span>
+            <span class="tf-kv-key">Trimmed Length</span>
+            <span class="tf-kv-val mono">${escapeHtml(formatTrimmedDistance(latestUploadedTrip.raw_length_m, latestUploadedTrip.trimmed_length_m))}</span>
+            <span class="tf-kv-key">Matched Segs</span>
+            <span class="tf-kv-val mono">${latestUploadedTrip.matched_segment_count ?? 0}</span>
+            <span class="tf-kv-key">Published Obs</span>
+            <span class="tf-kv-val mono">${latestUploadedTrip.observations_published ?? 0}</span>
+            <span class="tf-kv-key">Unmapped Spurs</span>
+            <span class="tf-kv-val mono">${latestUploadedTrip.unmapped_candidate_count ?? 0}</span>
+          </div>
+        </div>
+      `
+      : "";
+
+    const tripsHtml =
+      trips.length > 0
+        ? trips
+            .map((t) => {
+              const tid = getTripId(t);
+              const vis = formatTripVisibility(t.visibility);
+              const nextVis: TripVisibility =
+                t.visibility === "community_anonymous"
+                  ? "private"
+                  : "community_anonymous";
+              const rigLabel =
+                t.vehicle_class ?? t.vehicle_capability_class ?? "Stock 4WD";
+              return `
+                <div class="tf-vehicle-card">
+                  <div class="tf-vehicle-head">
+                    <div>
+                      <div class="tf-vehicle-name">${escapeHtml(t.name)}</div>
+                      <div class="tf-vehicle-specs mono">
+                        ${escapeHtml(rigLabel)} · ${t.matched_segment_count ?? 0} segs · ${escapeHtml(formatMatchConfidence(t.avg_match_confidence))} · ${escapeHtml(formatTrimmedDistance(t.raw_length_m, t.trimmed_length_m))}
+                      </div>
+                    </div>
+                    <span class="tf-pill ${vis.tone === "community" ? "tf-pill-ice" : ""}">${escapeHtml(vis.shortLabel)}</span>
+                  </div>
+                  <div class="tf-vehicle-actions">
+                    <button
+                      type="button"
+                      class="tf-mini-btn"
+                      data-toggle-trip-vis="${escapeHtml(tid)}"
+                      data-next-vis="${nextVis}"
+                      title="${nextVis === "private" ? "Immediately revoke anonymized observations from public telemetry" : "Publish anonymized segment traversals (zero user ID)"}"
+                    >${nextVis === "private" ? "Make Private" : "Share Anon"}</button>
+                    <button type="button" class="tf-mini-btn" data-export-trip="${escapeHtml(tid)}" data-export-fmt="gpx">GPX</button>
+                    <button type="button" class="tf-mini-btn" data-export-trip="${escapeHtml(tid)}" data-export-fmt="geojson">GeoJSON</button>
+                    <button type="button" class="tf-mini-btn danger" data-delete-trip="${escapeHtml(tid)}">Delete</button>
+                  </div>
+                </div>
+              `;
+            })
+            .join("")
+        : `<p class="tf-inspector-muted">No trips uploaded yet. Upload a .gpx trace below to test HMM map-matching and privacy trimming.</p>`;
+
+    return `
+      <section class="tf-insp-section">
+        <div class="tf-insp-sec-head">
+          <h3>Upload GPX / Telemetry</h3>
+          <span class="mono tf-insp-meta">HMM Matcher</span>
+        </div>
+
+        <div class="tf-privacy-note">
+          🔒 Automatic <strong>≥${MIN_PRIVACY_TRIM_M} m</strong> start &amp; end privacy buffer trims home/camp locations before map-matching. Community mode strips your account &amp; trip IDs and can be revoked anytime.
+        </div>
+
+        <div class="tf-auth-switch">
+          <button type="button" class="tf-mini-btn ${this.tripInputMode === "gpx" ? "active" : ""}" data-trip-mode="gpx">Upload .GPX File</button>
+          <button type="button" class="tf-mini-btn ${this.tripInputMode === "json" ? "active" : ""}" data-trip-mode="json">Paste Telemetry JSON</button>
+        </div>
+
+        <form class="tf-form" data-role="trip-upload-form">
+          <label class="tf-field">
+            <span class="tf-label">Trip Name</span>
+            <input type="text" class="tf-input" name="name" required maxlength="80" placeholder="e.g. Davies Plain Autumn Run" />
+          </label>
+
+          ${
+            this.tripInputMode === "gpx"
+              ? `
+                <label class="tf-field">
+                  <span class="tf-label">GPX Trace (.gpx)</span>
+                  <input type="file" class="tf-file-input" name="gpx_file" accept=".gpx,application/gpx+xml,text/xml" required />
+                </label>
+              `
+              : `
+                <label class="tf-field">
+                  <span class="tf-label">Telemetry JSON (array or {"points": [{lon, lat, ...}]})</span>
+                  <textarea class="tf-textarea mono" name="json_points" rows="4" required placeholder='{"points":[{"lon":148.120,"lat":-36.570},{"lon":148.123,"lat":-36.600}]}'></textarea>
+                </label>
+              `
+          }
+
+          <div class="tf-field-row">
+            <label class="tf-field">
+              <span class="tf-label">Vehicle Profile</span>
+              <select class="tf-select" name="vehicle_profile_id">
+                ${
+                  vehicles.length > 0
+                    ? vehicles
+                        .map(
+                          (v) =>
+                            `<option value="${escapeHtml(v.id)}" ${v.id === activeRig?.id ? "selected" : ""}>${escapeHtml(v.name)} (${escapeHtml(v.capability_class)})</option>`
+                        )
+                        .join("")
+                    : `<option value="">Default (Stock 4WD)</option>`
+                }
+              </select>
+            </label>
+            <label class="tf-field">
+              <span class="tf-label">Privacy Trim (m)</span>
+              <input type="number" class="tf-input mono" name="privacy_trim_m" min="${MIN_PRIVACY_TRIM_M}" max="5000" step="50" value="${MIN_PRIVACY_TRIM_M}" />
+            </label>
+          </div>
+
+          <div class="tf-field">
+            <span class="tf-label">Sharing Visibility</span>
+            <label class="tf-radio-card">
+              <input type="radio" name="visibility" value="private" checked />
+              <span>
+                <strong>Private Logbook Only</strong>
+                <small>Stored privately; zero public telemetry observations.</small>
+              </span>
+            </label>
+            <label class="tf-radio-card">
+              <input type="radio" name="visibility" value="community_anonymous" />
+              <span>
+                <strong>Anonymous Community Contribution</strong>
+                <small>Publishes de-identified segment metrics (toggle back anytime to revoke).</small>
+              </span>
+            </label>
+          </div>
+
+          <button type="submit" class="tf-btn-primary" ${this.busy ? "disabled" : ""}>Upload &amp; Map-Match Trace</button>
+        </form>
+
+        ${latestCard}
+      </section>
+
+      <section class="tf-insp-section">
+        <div class="tf-insp-sec-head">
+          <h3>My Trip Logbook</h3>
+          <span class="mono tf-insp-meta">${trips.length}</span>
+        </div>
+        <div class="tf-card-stack">${tripsHtml}</div>
+      </section>
+    `;
+  }
+
   private renderSavedTab(): string {
     const { user, favorites, pins, pinDropActive, pendingPinCoords } =
       this.state;
@@ -457,7 +673,7 @@ export class RigAccountPanel {
   }
 
   private renderAccountTab(): string {
-    const { user, vehicles, favorites, pins } = this.state;
+    const { user, vehicles, trips, favorites, pins } = this.state;
 
     if (user) {
       const activeRig = vehicles.find((v) => isVehicleActive(v));
@@ -474,8 +690,8 @@ export class RigAccountPanel {
             <span class="tf-kv-val mono">${escapeHtml(user.email)}</span>
             <span class="tf-kv-key">Active Rig</span>
             <span class="tf-kv-val">${escapeHtml(activeRig ? `${activeRig.name} (${activeRig.capability_class})` : "None set")}</span>
-            <span class="tf-kv-key">Saved</span>
-            <span class="tf-kv-val mono">${favorites.length} tracks · ${pins.length} pins</span>
+            <span class="tf-kv-key">Data</span>
+            <span class="tf-kv-val mono">${trips.length} trips · ${favorites.length} favs · ${pins.length} pins</span>
           </div>
           <button type="button" class="tf-btn-secondary danger-outline" data-role="logout-btn" ${this.busy ? "disabled" : ""}>Sign Out</button>
         </section>
@@ -565,6 +781,16 @@ export class RigAccountPanel {
       });
 
     this.root
+      .querySelectorAll<HTMLButtonElement>("[data-trip-mode]")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          this.tripInputMode = btn.dataset.tripMode as "gpx" | "json";
+          this.formError = null;
+          this.render();
+        });
+      });
+
+    this.root
       .querySelector<HTMLFormElement>("[data-role='auth-form']")
       ?.addEventListener("submit", (e) => {
         e.preventDefault();
@@ -591,6 +817,96 @@ export class RigAccountPanel {
           await this.callbacks.onLogout();
           this.showVehicleForm = false;
           this.editingVehicleId = null;
+        });
+      });
+
+    // Slice 06 Trip Upload & Logbook handlers
+    this.root
+      .querySelector<HTMLFormElement>("[data-role='trip-upload-form']")
+      ?.addEventListener("submit", (e) => {
+        e.preventDefault();
+        const form = e.currentTarget as HTMLFormElement;
+        const fd = new FormData(form);
+        const name = String(fd.get("name") ?? "").trim();
+        const vehicleProfileId = String(fd.get("vehicle_profile_id") ?? "").trim() || null;
+        const visibility = (String(fd.get("visibility") ?? "private") === "community_anonymous"
+          ? "community_anonymous"
+          : "private") as TripVisibility;
+        const trimCheck = validatePrivacyTrimMeters(
+          Number(fd.get("privacy_trim_m") ?? MIN_PRIVACY_TRIM_M)
+        );
+        if (!trimCheck.valid) {
+          this.formError = trimCheck.error ?? "Invalid privacy trim value.";
+          this.render();
+          return;
+        }
+
+        if (this.tripInputMode === "gpx") {
+          const fileInput = form.querySelector<HTMLInputElement>(
+            "input[name='gpx_file']"
+          );
+          const file = fileInput?.files?.[0];
+          if (!file) {
+            this.formError = "Select a .gpx file to upload.";
+            this.render();
+            return;
+          }
+          void this.runAsync(() =>
+            this.callbacks.onUploadTripGpx(file, {
+              name,
+              vehicle_profile_id: vehicleProfileId,
+              visibility,
+              privacy_trim_m: trimCheck.value,
+            })
+          );
+        } else {
+          const rawJson = String(fd.get("json_points") ?? "");
+          const parsed = parseTelemetryJsonInput(rawJson);
+          if (!parsed.ok) {
+            this.formError = parsed.error;
+            this.render();
+            return;
+          }
+          void this.runAsync(() =>
+            this.callbacks.onUploadTripJson({
+              name,
+              points: parsed.points,
+              vehicle_profile_id: vehicleProfileId,
+              visibility,
+              privacy_trim_m: trimCheck.value,
+            })
+          );
+        }
+      });
+
+    this.root
+      .querySelectorAll<HTMLButtonElement>("[data-toggle-trip-vis]")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const tripId = btn.dataset.toggleTripVis!;
+          const nextVis = btn.dataset.nextVis as TripVisibility;
+          void this.runAsync(() =>
+            this.callbacks.onToggleTripVisibility(tripId, nextVis)
+          );
+        });
+      });
+
+    this.root
+      .querySelectorAll<HTMLButtonElement>("[data-export-trip]")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const tripId = btn.dataset.exportTrip!;
+          const fmt = btn.dataset.exportFmt as "gpx" | "geojson";
+          void this.runAsync(() => this.callbacks.onExportTrip(tripId, fmt));
+        });
+      });
+
+    this.root
+      .querySelectorAll<HTMLButtonElement>("[data-delete-trip]")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const tripId = btn.dataset.deleteTrip!;
+          void this.runAsync(() => this.callbacks.onDeleteTrip(tripId));
         });
       });
 

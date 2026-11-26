@@ -48,6 +48,16 @@ const LAYER_TOGGLES: readonly LayerToggleDef[] = [
     hint: "Official VIC/NSW seasonal closures, fire/park alerts & locked gates",
   },
   {
+    key: "reports",
+    label: "Hazard & Gate Reports",
+    hint: "Community trail condition reports & distinct locked-gate warnings",
+  },
+  {
+    key: "unmapped",
+    label: "Unmapped Track Spurs",
+    hint: "Anonymized off-network GPS traces discovered outside canonical roads",
+  },
+  {
     key: "contoursHillshade",
     label: "Contours & Hillshade",
     hint: "20 m minor / 100 m index topo contours + Terrain-RGB shaded relief",
