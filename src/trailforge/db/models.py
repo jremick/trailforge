@@ -1233,6 +1233,39 @@ class OfflinePack(Base):
     )
 
 
+class PlannedRoute(Base):
+    """User-saved multi-track planned route (Tier C — zero OSM geometries or raw OSM tags)."""
+
+    __tablename__ = "planned_routes"
+    __table_args__ = (
+        CheckConstraint(
+            "vehicle_class IN ('AWD','Stock 4WD','Touring 4WD','Modified 4WD')",
+            name="vehicle_class_valid",
+        ),
+        Index("ix_planned_routes_user_id", "user_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    track_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    waypoints_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    vehicle_class: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 __all__ = [
     "Base",
     "CAPADPark",
@@ -1242,6 +1275,7 @@ __all__ = [
     "FeedSyncStatus",
     "OfflinePack",
     "POI",
+    "PlannedRoute",
     "RainfallSnapshot",
     "SegmentClosureLink",
     "SegmentReconciliationLog",

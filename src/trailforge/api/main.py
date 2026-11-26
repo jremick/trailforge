@@ -17,6 +17,7 @@ from trailforge.api.grading import router as grading_router
 from trailforge.api.health import router as health_router
 from trailforge.api.packs import router as packs_router
 from trailforge.api.reports import router as reports_router
+from trailforge.api.routes import router as routes_router
 from trailforge.api.tiles import router as tiles_router
 from trailforge.api.tracks import router as tracks_router
 from trailforge.api.trips import router as trips_router
@@ -75,6 +76,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(auth_router)
     application.include_router(vehicles_router)
     application.include_router(user_data_router)
+    application.include_router(routes_router)
 
     @application.get("/", tags=["meta"])
     def root() -> dict[str, str]:

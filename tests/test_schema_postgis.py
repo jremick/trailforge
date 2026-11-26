@@ -1,4 +1,4 @@
-"""Offline PostGIS integration tests verifying all 26 tables, GIST indexes, ODbL & privacy rules."""
+"""Offline PostGIS integration tests verifying all 27 tables, GIST indexes, ODbL & privacy rules."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ EXPECTED_TABLES = frozenset(
         "track_segments",
         "segment_reconciliation_log",
         "pois",
-        # Tier C — Independent TrailForge intelligence, community & live tables (15)
+        # Tier C — Independent TrailForge intelligence, community & live tables (16)
         "track_segment_grades",
         "closures_alerts",
         "segment_closure_links",
@@ -46,6 +46,7 @@ EXPECTED_TABLES = frozenset(
         "condition_report_votes",
         "rainfall_snapshots",
         "offline_packs",
+        "planned_routes",
     }
 )
 
@@ -81,7 +82,7 @@ def test_postgis_health_and_schema_revision(postgis_engine: Engine) -> None:
     assert status.db_ok is True
     assert status.postgis_version is not None
     assert status.postgis_version.startswith("3.")
-    assert status.schema_revision == "0001_initial_spatial_schema"
+    assert status.schema_revision == "0002_planned_routes"
 
 
 @pytest.mark.integration
@@ -96,11 +97,11 @@ def test_fastapi_health_against_live_postgis(postgis_engine: Engine) -> None:
     body = resp.json()
     assert body["status"] == "ok"
     assert body["db_ok"] is True
-    assert body["schema_revision"] == "0001_initial_spatial_schema"
+    assert body["schema_revision"] == "0002_planned_routes"
 
 
 @pytest.mark.integration
-def test_all_26_tables_and_20_gist_indexes_exist(postgis_engine: Engine) -> None:
+def test_all_27_tables_and_20_gist_indexes_exist(postgis_engine: Engine) -> None:
     inspector = inspect(postgis_engine)
     tables = set(inspector.get_table_names(schema="public"))
     missing_tables = EXPECTED_TABLES - tables
@@ -159,11 +160,14 @@ def test_odbl_and_privacy_column_invariants(postgis_engine: Engine) -> None:
         "condition_reports",
         "rainfall_snapshots",
         "offline_packs",
+        "planned_routes",
     )
     for table_name in tier_c_tables:
         cols = {col["name"] for col in inspector.get_columns(table_name)}
         assert "osm_way_id" not in cols
         assert "tags" not in cols
+    planned_cols = {col["name"] for col in inspector.get_columns("planned_routes")}
+    assert "geom" not in planned_cols
 
 
 @pytest.mark.integration
