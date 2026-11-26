@@ -18,6 +18,9 @@ from trailforge.api.closures import router as closures_router
 from trailforge.api.grading import router as grading_router
 from trailforge.api.health import router as health_router
 from trailforge.api.middleware import (
+    BodySizeLimitMiddleware,
+    CookieCSRFMiddleware,
+    SecurityHeadersMiddleware,
     SlidingWindowRateLimiter,
     UsageAndRateLimitMiddleware,
     flush_usage_metrics,
@@ -30,16 +33,62 @@ from trailforge.api.tracks import router as tracks_router
 from trailforge.api.trips import router as trips_router
 from trailforge.api.user_data import router as user_data_router
 from trailforge.api.vehicles import router as vehicles_router
-from trailforge.config import Settings, get_settings
+from trailforge.auth import security as auth_security
+from trailforge.config import (
+    DEV_DEFAULT_AUTH_SECRET_KEY,
+    DEV_DEFAULT_PRIVACY_SECRET_KEY,
+    Settings,
+    get_settings,
+)
 from trailforge.db.session import reset_engine
 from trailforge.reports.photos import PhotoStorageQuotaError
 
 logger = logging.getLogger(__name__)
 
+_MIN_SECRET_LENGTH = 32
+
+
+def _validate_startup_secrets(cfg: Settings) -> None:
+    """Fail closed at app creation if production mode runs with default or weak secrets."""
+    validator = getattr(auth_security, "validate_production_secrets", None)
+    if callable(validator):
+        validator(cfg)
+        return
+
+    issues: list[str] = []
+    auth_key = cfg.auth_secret_key.strip()
+    if auth_key == DEV_DEFAULT_AUTH_SECRET_KEY or len(auth_key) < _MIN_SECRET_LENGTH:
+        issues.append(
+            "AUTH_SECRET_KEY must be changed from the dev default and be at least 32 characters"
+        )
+
+    privacy_key = cfg.privacy_secret_key.strip()
+    if privacy_key == DEV_DEFAULT_PRIVACY_SECRET_KEY or len(privacy_key) < _MIN_SECRET_LENGTH:
+        issues.append(
+            "TRAILFORGE_PRIVACY_SECRET must be changed from the dev default and be at least "
+            "32 characters"
+        )
+
+    if not issues:
+        return
+
+    summary = "; ".join(issues)
+    if cfg.is_production_mode:
+        raise RuntimeError(
+            f"Refusing to start TrailForge in production mode with unsafe secrets: {summary}. "
+            "Generate strong random secrets with `openssl rand -hex 32`."
+        )
+    logger.warning(
+        "TrailForge is running in local development mode with non-production secrets: %s",
+        summary,
+    )
+
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Construct and configure the TrailForge FastAPI application."""
     cfg = settings or get_settings()
+    _validate_startup_secrets(cfg)
+    docs_enabled = cfg.docs_enabled
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -63,6 +112,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ),
         version=__version__,
         license_info={"name": "GPL-3.0-or-later", "identifier": "GPL-3.0-or-later"},
+        docs_url="/docs" if docs_enabled else None,
+        redoc_url="/redoc" if docs_enabled else None,
+        openapi_url="/openapi.json" if docs_enabled else None,
         lifespan=lifespan,
     )
 
@@ -82,7 +134,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             content={"detail": str(exc)},
         )
 
-    # Register rate limiter inside CORSMiddleware so 429/507 responses retain CORS headers
+    # Middleware execution order (outermost -> innermost):
+    # SecurityHeaders -> CORS -> UsageAndRateLimit (incl. Origin Secret)
+    #   -> CookieCSRF -> BodySizeLimit -> FastAPI route handlers.
+    # Registering inner middlewares first keeps CORS & security headers on 403/413/429/507.
+    application.add_middleware(BodySizeLimitMiddleware)
+    application.add_middleware(CookieCSRFMiddleware, settings=settings)
     application.add_middleware(
         UsageAndRateLimitMiddleware,
         settings=settings,
@@ -95,6 +152,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    application.add_middleware(SecurityHeadersMiddleware, settings=settings)
 
     application.include_router(health_router)
     application.include_router(tiles_router)
@@ -112,12 +170,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.get("/", tags=["meta"])
     def root() -> dict[str, str]:
-        return {
+        payload = {
             "service": SERVICE_NAME,
             "version": __version__,
             "health": "/api/health",
-            "docs": "/docs",
         }
+        if docs_enabled:
+            payload["docs"] = "/docs"
+        return payload
 
     return application
 

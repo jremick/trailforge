@@ -47,13 +47,14 @@ test-integration:
 		|| psql -U "$${POSTGRES_USER:-trailforge}" -d postgres -c "CREATE DATABASE \"$(TEST_DB)\";"; \
 		psql -U "$${POSTGRES_USER:-trailforge}" -d "$(TEST_DB)" -c "CREATE EXTENSION IF NOT EXISTS postgis;" \
 	'
-	docker compose exec -T api sh -ec '\
-		TEST_URL="$${TEST_DATABASE_URL:-$${DATABASE_URL%/*}/$(TEST_DB)}"; \
-		export DATABASE_URL="$$TEST_URL"; \
-		export TEST_DATABASE_URL="$$TEST_URL"; \
-		alembic upgrade head; \
-		pytest -m "not live" \
-	'
+	docker compose run --rm --no-deps -T \
+		-e "TEST_DATABASE_URL=$${TEST_DATABASE_URL:-}" \
+		api sh -ec '\
+			TEST_URL="$${TEST_DATABASE_URL:-$${DATABASE_URL%/*}/$(TEST_DB)}"; \
+			export DATABASE_URL="$$TEST_URL"; \
+			export TEST_DATABASE_URL="$$TEST_URL"; \
+			alembic upgrade head && pytest -m "not live" \
+		'
 
 test: lint test-unit test-integration
 

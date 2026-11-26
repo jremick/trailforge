@@ -1,19 +1,22 @@
-"""Zero-Redis sliding-window rate limiter, upload quota helper, and hourly usage telemetry.
+"""Zero-Redis edge security, sliding-window rate limiter, quotas, and hourly usage telemetry.
 
-Implemented as a pure ASGI middleware so RFC 9110 Range `StreamingResponse`s
+Implemented as pure ASGI middlewares so RFC 9110 Range `StreamingResponse`s
 (PMTiles & regional pack downloads) stream without response buffering while
-still measuring exact `bytes_out` and enforcing per-IP sliding-window limits.
+enforcing origin authentication, streaming body-size caps, cookie CSRF checks,
+global security response headers, and per-IP sliding-window limits.
 """
 
 from __future__ import annotations
 
 import contextlib
+import hmac
+import ipaddress
 import logging
 import math
 import threading
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -41,12 +44,33 @@ RATE_LIMIT_BYPASS_PATHS: Final[frozenset[str]] = frozenset(
         "/redoc",
     }
 )
+ORIGIN_SECRET_HEADER: Final[str] = "x-trailforge-origin-secret"
+ORIGIN_SECRET_BYPASS_PATHS: Final[frozenset[str]] = frozenset(
+    {
+        "/api/health",
+        "/healthz",
+    }
+)
 AUTH_RATE_LIMIT_PATHS: Final[frozenset[str]] = frozenset(
     {
         "/api/auth/login",
         "/api/auth/register",
     }
 )
+MAX_BODY_TRIPS_BYTES: Final[int] = 16 * 1024 * 1024  # 16 MiB on /api/trips/*
+MAX_BODY_REPORTS_BYTES: Final[int] = 6 * 1024 * 1024  # 6 MiB on /api/reports*
+MAX_BODY_API_DEFAULT_BYTES: Final[int] = 1 * 1024 * 1024  # 1 MiB on all other /api/*
+
+MUTATING_HTTP_METHODS: Final[frozenset[str]] = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+ALLOWED_SEC_FETCH_SITES: Final[frozenset[str]] = frozenset({"same-origin", "none"})
+
+SECURITY_RESPONSE_HEADERS: Final[tuple[tuple[str, str], ...]] = (
+    ("X-Content-Type-Options", "nosniff"),
+    ("X-Frame-Options", "DENY"),
+    ("Referrer-Policy", "strict-origin-when-cross-origin"),
+    ("Permissions-Policy", "camera=(), microphone=(), geolocation=(self)"),
+)
+HSTS_HEADER_VALUE: Final[str] = "max-age=31536000; includeSubDomains"
 ROUTE_GROUPS: Final[tuple[str, ...]] = (
     "tracks",
     "tiles",
@@ -110,23 +134,37 @@ def _sanitize_ip(value: str | None) -> str | None:
     return cleaned
 
 
+def _validate_proxy_ip(value: str | None) -> str | None:
+    """Validate and canonicalize a header-supplied IP address; reject non-IP strings."""
+    cleaned = _sanitize_ip(value)
+    if not cleaned:
+        return None
+    try:
+        return str(ipaddress.ip_address(cleaned))
+    except ValueError:
+        return None
+
+
 def extract_client_ip_from_headers(
     headers: Headers,
     client_host: str | None = None,
     *,
     trust_proxy_headers: bool = True,
 ) -> str:
-    """Extract client IP safely honoring Cloudflare & reverse-proxy headers when trusted."""
+    """Extract client IP safely honoring validated Cloudflare & reverse-proxy headers."""
     if trust_proxy_headers:
-        cf_ip = _sanitize_ip(headers.get("cf-connecting-ip"))
-        if cf_ip:
-            return cf_ip
-        xff = headers.get("x-forwarded-for")
-        if xff:
+        if "cf-connecting-ip" in headers:
+            cf_ip = _validate_proxy_ip(headers.get("cf-connecting-ip"))
+            if cf_ip:
+                return cf_ip
+        elif "x-forwarded-for" in headers:
+            xff = headers.get("x-forwarded-for") or ""
             for part in xff.split(","):
-                candidate = _sanitize_ip(part)
-                if candidate:
-                    return candidate
+                if part.strip():
+                    candidate = _validate_proxy_ip(part)
+                    if candidate:
+                        return candidate
+                    break
     host = _sanitize_ip(client_host)
     return host or "unknown"
 
@@ -152,7 +190,7 @@ class RateLimitResult:
 
 
 class SlidingWindowRateLimiter:
-    """Thread-safe, memory-bounded in-process sliding-window rate limiter (zero Redis)."""
+    """Thread-safe, O(1)-LRU memory-bounded in-process sliding-window rate limiter."""
 
     def __init__(
         self,
@@ -163,27 +201,18 @@ class SlidingWindowRateLimiter:
         self._clock: Callable[[], float] = clock or time.monotonic
         self._max_keys = max(64, max_keys)
         self._lock = threading.Lock()
-        self._buckets: dict[str, tuple[deque[float], float]] = {}
-        self._ops = 0
+        self._buckets: OrderedDict[str, tuple[deque[float], float]] = OrderedDict()
 
-    def _prune_locked(self, now: float) -> None:
-        expired_keys = [
-            key
-            for key, (dq, window_s) in self._buckets.items()
-            if not dq or (now - dq[-1]) >= window_s
-        ]
-        for key in expired_keys:
-            self._buckets.pop(key, None)
-
-        if len(self._buckets) > self._max_keys:
-            # Evict least-recently-seen buckets first so memory stays strictly bounded
-            sorted_keys = sorted(
-                self._buckets.keys(),
-                key=lambda k: self._buckets[k][0][-1] if self._buckets[k][0] else 0.0,
-            )
-            excess = len(self._buckets) - self._max_keys
-            for key in sorted_keys[:excess]:
-                self._buckets.pop(key, None)
+    def _evict_expired_head_locked(self, now: float, *, skip_key: str) -> None:
+        """Pop already-expired LRU entries from the front of the OrderedDict in O(1) amortized."""
+        while self._buckets:
+            oldest_key, (oldest_dq, oldest_window) = next(iter(self._buckets.items()))
+            if oldest_key == skip_key:
+                break
+            if not oldest_dq or (now - oldest_dq[-1]) >= oldest_window:
+                self._buckets.popitem(last=False)
+            else:
+                break
 
     def check(self, key: str, *, limit: int, window_s: float) -> RateLimitResult:
         """Record a hit for ``key`` if under ``limit`` within ``window_s`` seconds."""
@@ -192,17 +221,19 @@ class SlidingWindowRateLimiter:
 
         with self._lock:
             now = self._clock()
-            self._ops += 1
-            if self._ops % 256 == 0 or len(self._buckets) > self._max_keys:
-                self._prune_locked(now)
+            self._evict_expired_head_locked(now, skip_key=key)
 
             entry = self._buckets.get(key)
             if entry is None:
+                # O(1) LRU eviction keeps memory strictly bounded even under spoofed IP floods
+                while len(self._buckets) >= self._max_keys:
+                    self._buckets.popitem(last=False)
                 dq: deque[float] = deque()
                 self._buckets[key] = (dq, effective_window)
             else:
                 dq, _prev_window = entry
                 self._buckets[key] = (dq, effective_window)
+                self._buckets.move_to_end(key)
 
             cutoff = now - effective_window
             while dq and dq[0] <= cutoff:
@@ -231,7 +262,6 @@ class SlidingWindowRateLimiter:
         """Clear all tracked rate-limit windows."""
         with self._lock:
             self._buckets.clear()
-            self._ops = 0
 
 
 @dataclass(slots=True)
@@ -566,8 +596,287 @@ def reset_usage_metrics(*, store: UsageMetricsStore | None = None) -> None:
     (store or _DEFAULT_USAGE_STORE).reset()
 
 
+def _resolve_settings_from_scope(scope: Scope, explicit: Settings | None) -> Settings:
+    if explicit is not None:
+        return explicit
+    fastapi_app = scope.get("app")
+    custom = getattr(getattr(fastapi_app, "state", None), "custom_settings", None)
+    if isinstance(custom, Settings):
+        return custom
+    return get_settings()
+
+
+def resolve_body_size_limit(
+    path: str,
+    *,
+    trips_max_bytes: int = MAX_BODY_TRIPS_BYTES,
+    reports_max_bytes: int = MAX_BODY_REPORTS_BYTES,
+    default_api_max_bytes: int = MAX_BODY_API_DEFAULT_BYTES,
+) -> int | None:
+    """Return the maximum permitted request body size in bytes for ``path``."""
+    normalized = path.rstrip("/") or "/"
+    if normalized != "/api" and not normalized.startswith("/api/"):
+        return None
+    if normalized == "/api/trips" or normalized.startswith("/api/trips/"):
+        return trips_max_bytes
+    if normalized == "/api/reports" or normalized.startswith("/api/reports/"):
+        return reports_max_bytes
+    return default_api_max_bytes
+
+
+class _PayloadTooLargeError(Exception):
+    """Internal sentinel raised by wrapped ASGI receive() when streamed bytes exceed limit."""
+
+    def __init__(self, max_bytes: int) -> None:
+        super().__init__(f"Request body exceeds {max_bytes} bytes")
+        self.max_bytes = max_bytes
+
+
+class BodySizeLimitMiddleware:
+    """Pure ASGI streaming body-size limiter rejecting oversized payloads with HTTP 413.
+
+    Enforces both ``Content-Length`` fast-fail and incremental ASGI ``receive``
+    chunk counting *before* FastAPI parses JSON or spools multipart form bodies.
+    """
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        trips_max_bytes: int = MAX_BODY_TRIPS_BYTES,
+        reports_max_bytes: int = MAX_BODY_REPORTS_BYTES,
+        default_api_max_bytes: int = MAX_BODY_API_DEFAULT_BYTES,
+    ) -> None:
+        self.app = app
+        self._trips_max_bytes = max(1, int(trips_max_bytes))
+        self._reports_max_bytes = max(1, int(reports_max_bytes))
+        self._default_api_max_bytes = max(1, int(default_api_max_bytes))
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        method = str(scope.get("method", "GET")).upper()
+        if method == "OPTIONS":
+            await self.app(scope, receive, send)
+            return
+
+        path = str(scope.get("path", "/"))
+        max_bytes = resolve_body_size_limit(
+            path,
+            trips_max_bytes=self._trips_max_bytes,
+            reports_max_bytes=self._reports_max_bytes,
+            default_api_max_bytes=self._default_api_max_bytes,
+        )
+        if max_bytes is None:
+            await self.app(scope, receive, send)
+            return
+
+        headers = Headers(scope=scope)
+        content_length_raw = headers.get("content-length")
+        if content_length_raw is not None:
+            try:
+                content_length = int(content_length_raw.strip())
+                if content_length < 0:
+                    raise ValueError("negative")
+            except ValueError:
+                bad_req = JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content={"detail": "Invalid Content-Length header."},
+                )
+                await bad_req(scope, receive, send)
+                return
+
+            if content_length > max_bytes:
+                too_large = JSONResponse(
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    content={
+                        "detail": (
+                            f"Payload Too Large: request body exceeds maximum allowed size "
+                            f"({max_bytes} bytes)."
+                        )
+                    },
+                )
+                await too_large(scope, receive, send)
+                return
+
+        received_bytes = 0
+        payload_too_large = False
+        response_started = False
+
+        async def limited_receive() -> Message:
+            nonlocal received_bytes, payload_too_large
+            message = await receive()
+            if message.get("type") == "http.request":
+                chunk = message.get("body") or b""
+                received_bytes += len(chunk)
+                if received_bytes > max_bytes:
+                    payload_too_large = True
+                    raise _PayloadTooLargeError(max_bytes)
+            return message
+
+        async def tracked_send(message: Message) -> None:
+            nonlocal response_started
+            # If receive() already tripped the byte cap, suppress any downstream
+            # 400/500 error that FastAPI/Starlette generated by catching the exception
+            # so we emit a clean HTTP 413 Payload Too Large response instead.
+            if payload_too_large and not response_started:
+                return
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracked_send)
+        except _PayloadTooLargeError:
+            if response_started:
+                raise
+
+        if payload_too_large and not response_started:
+            too_large = JSONResponse(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                content={
+                    "detail": (
+                        f"Payload Too Large: request body exceeds maximum allowed size "
+                        f"({max_bytes} bytes)."
+                    )
+                },
+            )
+            await too_large(scope, receive, send)
+
+
+def _has_bearer_authorization(headers: Headers) -> bool:
+    auth = (headers.get("authorization") or "").strip()
+    scheme, sep, token = auth.partition(" ")
+    return bool(sep and scheme.lower() == "bearer" and token.strip())
+
+
+def _has_cookie(headers: Headers, cookie_name: str) -> bool:
+    for header_val in headers.getlist("cookie"):
+        for part in header_val.split(";"):
+            name, sep, val = part.partition("=")
+            if sep == "=" and name.strip() == cookie_name and bool(val.strip()):
+                return True
+    return False
+
+
+def _allowed_csrf_origins(scope: Scope, headers: Headers, cfg: Settings) -> set[str]:
+    allowed: set[str] = set()
+    for origin in cfg.cors_origins_list:
+        cleaned = origin.strip().rstrip("/").lower()
+        if cleaned and cleaned != "*":
+            allowed.add(cleaned)
+
+    scheme = str(scope.get("scheme", "http")).strip().lower() or "http"
+    host = (headers.get("host") or "").strip().lower()
+    if host:
+        allowed.add(f"{scheme}://{host}")
+
+    if cfg.trust_proxy_headers:
+        xf_proto = (headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip().lower()
+        xf_host = (headers.get("x-forwarded-host") or "").split(",", 1)[0].strip().lower()
+        effective_proto = xf_proto or scheme
+        effective_host = xf_host or host
+        if effective_proto and effective_host:
+            allowed.add(f"{effective_proto}://{effective_host}")
+
+    return allowed
+
+
+class CookieCSRFMiddleware:
+    """Pure ASGI CSRF guard for cookie-authenticated mutating HTTP requests.
+
+    On mutating requests (POST/PUT/PATCH/DELETE) carrying the ``tf_session`` cookie
+    without an ``Authorization: Bearer`` header:
+    - If ``Sec-Fetch-Site`` is present, requires it to be ``same-origin`` or ``none``.
+    - Else if ``Origin`` is present, requires it to match the request origin or an
+      allowlisted entry in ``CORS_ORIGINS``.
+    """
+
+    def __init__(self, app: ASGIApp, *, settings: Settings | None = None) -> None:
+        self.app = app
+        self._explicit_settings = settings
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        method = str(scope.get("method", "GET")).upper()
+        if method not in MUTATING_HTTP_METHODS:
+            await self.app(scope, receive, send)
+            return
+
+        headers = Headers(scope=scope)
+        if _has_bearer_authorization(headers):
+            await self.app(scope, receive, send)
+            return
+
+        cfg = _resolve_settings_from_scope(scope, self._explicit_settings)
+        if not _has_cookie(headers, cfg.auth_cookie_name):
+            await self.app(scope, receive, send)
+            return
+
+        if "sec-fetch-site" in headers:
+            sec_fetch_site = (headers.get("sec-fetch-site") or "").strip().lower()
+            if sec_fetch_site not in ALLOWED_SEC_FETCH_SITES:
+                response = JSONResponse(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    content={"detail": "Cross-site request blocked"},
+                )
+                await response(scope, receive, send)
+                return
+        elif "origin" in headers:
+            origin = (headers.get("origin") or "").strip().rstrip("/").lower()
+            allowed_origins = _allowed_csrf_origins(scope, headers, cfg)
+            if not origin or origin == "null" or origin not in allowed_origins:
+                response = JSONResponse(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    content={"detail": "Cross-site request blocked"},
+                )
+                await response(scope, receive, send)
+                return
+
+        await self.app(scope, receive, send)
+
+
+class SecurityHeadersMiddleware:
+    """Pure ASGI middleware emitting baseline security response headers on all responses."""
+
+    def __init__(self, app: ASGIApp, *, settings: Settings | None = None) -> None:
+        self.app = app
+        self._explicit_settings = settings
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        cfg = _resolve_settings_from_scope(scope, self._explicit_settings)
+        req_headers = Headers(scope=scope)
+        xf_proto = (req_headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip().lower()
+        is_https = (
+            cfg.auth_cookie_secure
+            or str(scope.get("scheme", "")).lower() == "https"
+            or xf_proto == "https"
+        )
+
+        async def send_with_security_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                resp_headers = MutableHeaders(scope=message)
+                for hdr_key, hdr_val in SECURITY_RESPONSE_HEADERS:
+                    if hdr_key.lower() not in resp_headers:
+                        resp_headers[hdr_key] = hdr_val
+                if is_https and "strict-transport-security" not in resp_headers:
+                    resp_headers["Strict-Transport-Security"] = HSTS_HEADER_VALUE
+            await send(message)
+
+        await self.app(scope, receive, send_with_security_headers)
+
+
 class UsageAndRateLimitMiddleware:
-    """Pure ASGI middleware enforcing per-IP sliding-window limits & hourly telemetry."""
+    """Pure ASGI middleware enforcing origin secret, per-IP sliding-window limits & telemetry."""
 
     def __init__(
         self,
@@ -583,13 +892,7 @@ class UsageAndRateLimitMiddleware:
         self.usage_store = usage_store or _DEFAULT_USAGE_STORE
 
     def _resolve_settings(self, scope: Scope) -> Settings:
-        if self._explicit_settings is not None:
-            return self._explicit_settings
-        fastapi_app = scope.get("app")
-        custom = getattr(getattr(fastapi_app, "state", None), "custom_settings", None)
-        if isinstance(custom, Settings):
-            return custom
-        return get_settings()
+        return _resolve_settings_from_scope(scope, self._explicit_settings)
 
     def _resolve_limiter(self, scope: Scope) -> SlidingWindowRateLimiter:
         fastapi_app = scope.get("app")
@@ -611,33 +914,66 @@ class UsageAndRateLimitMiddleware:
 
         method = str(scope.get("method", "GET")).upper()
         path = str(scope.get("path", "/"))
-        is_api_route = path.startswith("/api/")
+        normalized_path = path.rstrip("/") or "/"
+        is_api_route = normalized_path == "/api" or normalized_path.startswith("/api/")
         is_options = method == "OPTIONS"
-        is_bypass = is_options or (not is_api_route) or (path in RATE_LIMIT_BYPASS_PATHS)
-        route_group = classify_route_group(path)
+        route_group = classify_route_group(normalized_path)
 
         cfg = self._resolve_settings(scope)
+        headers = Headers(scope=scope)
+
+        # Shared origin secret check blocks direct unauthenticated origin access (e.g. Railway URL)
+        expected_origin_secret = cfg.origin_shared_secret.strip()
+        if expected_origin_secret and normalized_path not in ORIGIN_SECRET_BYPASS_PATHS:
+            provided_secret = headers.get(ORIGIN_SECRET_HEADER, "")
+            if not provided_secret or not hmac.compare_digest(
+                provided_secret.encode("utf-8"),
+                expected_origin_secret.encode("utf-8"),
+            ):
+                forbidden = JSONResponse(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    content={"detail": "Direct origin access forbidden"},
+                )
+                if is_api_route and not is_options:
+                    self.usage_store.record(
+                        route_group=route_group,
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        bytes_out=len(forbidden.body),
+                        rate_limited=False,
+                    )
+                    self.usage_store.maybe_flush()
+                await forbidden(scope, receive, send)
+                return
+
+        is_bypass = is_options or (not is_api_route) or (normalized_path in RATE_LIMIT_BYPASS_PATHS)
         rl_headers: dict[str, str] = {}
 
         if cfg.rate_limit_enabled and not is_bypass:
-            headers = Headers(scope=scope)
             client_tuple = scope.get("client")
             client_host = client_tuple[0] if client_tuple else None
+            has_proxy_ip_header = (
+                ("cf-connecting-ip" in headers) or ("x-forwarded-for" in headers)
+            )
             client_ip = extract_client_ip_from_headers(
                 headers,
                 client_host=client_host,
                 trust_proxy_headers=cfg.trust_proxy_headers,
             )
 
-            if method == "POST" and path in AUTH_RATE_LIMIT_PATHS:
+            if method == "POST" and normalized_path in AUTH_RATE_LIMIT_PATHS:
                 bucket_name = "auth"
                 limit = cfg.rate_limit_auth_per_min
             else:
                 bucket_name = "api"
                 limit = cfg.rate_limit_read_per_min
 
-            bypass_testclient = client_ip == "testclient" and not (
-                self._should_enforce_for_testclient(scope)
+            # Never bypass rate limiting based on header-derived client_ip == "testclient".
+            # Only exempt Starlette TestClient when the raw ASGI peer is "testclient" AND
+            # no proxy IP headers were supplied (and tests did not opt into enforcement).
+            bypass_testclient = (
+                client_host == "testclient"
+                and not has_proxy_ip_header
+                and not self._should_enforce_for_testclient(scope)
             )
             if bypass_testclient:
                 rl_headers = {

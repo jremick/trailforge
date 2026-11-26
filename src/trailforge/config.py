@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
-from typing import Literal
+from typing import Any, Final, Literal
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+DEV_DEFAULT_AUTH_SECRET_KEY: Final[str] = "trailforge-dev-secret-change-in-production"
+DEV_DEFAULT_PRIVACY_SECRET_KEY: Final[str] = "trailforge-dev-privacy-secret-change-in-production"
 
 
 class Settings(BaseSettings):
@@ -87,11 +91,11 @@ class Settings(BaseSettings):
 
     # Auth & privacy secrets (self-hosted, zero external IdP)
     auth_secret_key: str = Field(
-        default="trailforge-dev-secret-change-in-production",
+        default=DEV_DEFAULT_AUTH_SECRET_KEY,
         validation_alias=AliasChoices("AUTH_SECRET_KEY", "TRAILFORGE_AUTH_SECRET_KEY"),
     )
     privacy_secret_key: str = Field(
-        default="trailforge-dev-privacy-secret-change-in-production",
+        default=DEV_DEFAULT_PRIVACY_SECRET_KEY,
         validation_alias=AliasChoices("TRAILFORGE_PRIVACY_SECRET", "PRIVACY_SECRET_KEY"),
         description="HMAC secret used to derive revocable telemetry contribution hashes.",
     )
@@ -205,6 +209,37 @@ class Settings(BaseSettings):
         ),
         description="Trust CF-Connecting-IP and X-Forwarded-For proxy headers for client IP.",
     )
+    origin_shared_secret: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "TRAILFORGE_ORIGIN_SHARED_SECRET",
+            "ORIGIN_SHARED_SECRET",
+            "origin_shared_secret",
+        ),
+        description=(
+            "Optional shared secret required via X-TrailForge-Origin-Secret from the "
+            "Cloudflare Pages/Worker proxy to block direct origin bypass."
+        ),
+    )
+    enable_docs: bool | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "TRAILFORGE_ENABLE_DOCS",
+            "ENABLE_DOCS",
+            "enable_docs",
+        ),
+        description=(
+            "Explicitly enable or disable OpenAPI /docs, /redoc, and /openapi.json "
+            "(defaults to enabled in local dev, disabled in production mode)."
+        ),
+    )
+
+    @field_validator("enable_docs", mode="before")
+    @classmethod
+    def _coerce_blank_enable_docs(cls, value: Any) -> Any:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     # Cloudflare R2 / CDN static offload & pure-Python SigV4 sync
     tiles_public_base_url: str = Field(
@@ -284,6 +319,23 @@ class Settings(BaseSettings):
     @property
     def enabled_states_list(self) -> list[str]:
         return [state.strip().upper() for state in self.enabled_states.split(",") if state.strip()]
+
+    @property
+    def is_production_mode(self) -> bool:
+        """True when running in hardened/production mode (HTTPS cookies, Railway, or locked reg)."""
+        railway_env = (os.environ.get("RAILWAY_ENVIRONMENT") or "").strip()
+        return bool(
+            self.auth_cookie_secure
+            or railway_env
+            or self.registration_mode != "open"
+        )
+
+    @property
+    def docs_enabled(self) -> bool:
+        """Whether OpenAPI /docs, /redoc, and /openapi.json should be exposed."""
+        if self.enable_docs is not None:
+            return bool(self.enable_docs)
+        return not self.is_production_mode
 
 
 @lru_cache(maxsize=1)

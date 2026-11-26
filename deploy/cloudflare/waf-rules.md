@@ -71,6 +71,17 @@ TrailForge enforces `Depends(require_admin)` in FastAPI on all `/api/admin/*` ro
 
 - **Action:** `Managed Challenge`
 
+### 2.3 Origin Lock-Down (`X-TrailForge-Origin-Secret`) & Production Docs
+
+Because Railway assigns a public origin hostname (`*.up.railway.app`), lock FastAPI down so attackers cannot bypass Cloudflare WAF or spoof `CF-Connecting-IP` by calling Railway directly:
+
+1. Generate a 64-hex shared secret (`openssl rand -hex 32`) and set it in **both** places:
+   - **Railway `api` service:** `TRAILFORGE_ORIGIN_SHARED_SECRET=<secret>`
+   - **Cloudflare Pages Functions:** `ORIGIN_SHARED_SECRET=<secret>`
+2. [`pages-proxy-worker.js`](./pages-proxy-worker.js) strips any client-supplied `X-TrailForge-Origin-Secret`, injects the trusted Worker secret on every upstream request, rewrites any `307`/`3xx` `Location` headers back to the public Pages origin (never leaking `*.up.railway.app`), and enforces baseline security response headers (`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`, `Strict-Transport-Security`).
+3. FastAPI validates `X-TrailForge-Origin-Secret` in constant time (`hmac.compare_digest`) on every route except `/api/health` and `/healthz`, returning `HTTP 403 Direct origin access forbidden` on direct unauthenticated origin calls.
+4. Keep `TRAILFORGE_ENABLE_DOCS=false` (the automatic default in production mode) so `/docs`, `/redoc`, and `/openapi.json` remain disabled on public instances.
+
 ---
 
 ## 3. Cache Rules for R2 Custom Domain (`tiles.example.com/*`)

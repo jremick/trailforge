@@ -4,17 +4,24 @@
  * Mount at `web/functions/api/[[path]].js` in Cloudflare Pages (or adapt into a
  * standalone Cloudflare Worker route for `https://trails.example.com/api/*`).
  *
- * Required Pages / Worker environment variable:
- *   RAILWAY_API_ORIGIN = "https://api.example.com"
+ * Required Pages / Worker environment variables:
+ *   RAILWAY_API_ORIGIN    = "https://api.example.com"
+ *   ORIGIN_SHARED_SECRET  = "<same-secret-as-TRAILFORGE_ORIGIN_SHARED_SECRET>" (recommended)
  *
  * Behavior:
  *   - Proxies `/api/*` requests to `env.RAILWAY_API_ORIGIN` without buffering
  *     request or response bodies (preserving HTTP 206 Partial Content PMTiles
  *     range streaming and multi-MB GPX/photo/pack streams).
  *   - Forwards `CF-Connecting-IP`, `Range`, `If-Range`, `If-None-Match`,
- *     `Cookie`, and `Authorization` headers to FastAPI.
+ *     `Cookie`, and `Authorization` headers to FastAPI, and injects
+ *     `X-TrailForge-Origin-Secret` when `env.ORIGIN_SHARED_SECRET` is configured.
  *   - Preserves all upstream `Set-Cookie`, `Content-Range`, `Accept-Ranges`,
  *     `ETag`, `X-RateLimit-*`, and `Retry-After` response headers.
+ *   - Rewrites upstream redirect `Location` headers (e.g. FastAPI trailing-slash
+ *     `307` redirects) back to the public client origin so internal Railway
+ *     hostnames (`*.up.railway.app`) are never leaked.
+ *   - Adds baseline security response headers (`X-Content-Type-Options`,
+ *     `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`, and `HSTS`).
  *   - Strips internal upstream error pages/details on 5xx gateway faults so
  *     Railway hostnames or stack traces are never exposed to clients.
  */
@@ -29,6 +36,7 @@ const HOP_BY_HOP_REQUEST_HEADERS = new Set([
   "transfer-encoding",
   "upgrade",
   "host",
+  "x-trailforge-origin-secret",
 ]);
 
 const HOP_BY_HOP_RESPONSE_HEADERS = new Set([
@@ -54,15 +62,37 @@ const EXPLICIT_FORWARD_HEADERS = [
   "authorization",
 ];
 
+const SECURITY_RESPONSE_HEADERS = [
+  ["X-Content-Type-Options", "nosniff"],
+  ["X-Frame-Options", "DENY"],
+  ["Referrer-Policy", "strict-origin-when-cross-origin"],
+  ["Permissions-Policy", "camera=(), microphone=(), geolocation=(self)"],
+];
+
+const HSTS_HEADER_VALUE = "max-age=31536000; includeSubDomains";
+
 const SANITIZED_5XX_STATUSES = new Set([500, 502, 503, 504]);
 
-function jsonError(status, detail) {
+function applySecurityHeaders(headers, incomingUrl) {
+  for (const [name, value] of SECURITY_RESPONSE_HEADERS) {
+    if (!headers.has(name)) {
+      headers.set(name, value);
+    }
+  }
+  if (incomingUrl?.protocol === "https:" && !headers.has("strict-transport-security")) {
+    headers.set("Strict-Transport-Security", HSTS_HEADER_VALUE);
+  }
+}
+
+function jsonError(status, detail, incomingUrl = null) {
+  const headers = new Headers({
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
+  applySecurityHeaders(headers, incomingUrl);
   return new Response(JSON.stringify({ detail }), {
     status,
-    headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": "no-store",
-    },
+    headers,
   });
 }
 
@@ -82,7 +112,30 @@ function resolveUpstreamOrigin(env) {
   }
 }
 
-function buildUpstreamHeaders(request, incomingUrl) {
+function rewriteRedirectLocation(location, upstreamOrigin, incomingUrl) {
+  if (!location || !upstreamOrigin || !incomingUrl) {
+    return location;
+  }
+  const trimmed = location.trim();
+  if (!trimmed) {
+    return location;
+  }
+  // Keep normal relative paths (starting with single '/') unchanged.
+  if (trimmed.startsWith("/") && !trimmed.startsWith("//")) {
+    return location;
+  }
+  try {
+    const parsed = new URL(trimmed, upstreamOrigin);
+    if (parsed.origin === upstreamOrigin) {
+      return `${incomingUrl.origin}${parsed.pathname}${parsed.search}${parsed.hash}`;
+    }
+    return location;
+  } catch {
+    return location;
+  }
+}
+
+function buildUpstreamHeaders(request, incomingUrl, env) {
   const headers = new Headers();
 
   for (const [key, value] of request.headers.entries()) {
@@ -113,10 +166,16 @@ function buildUpstreamHeaders(request, incomingUrl) {
   headers.set("X-Forwarded-Proto", incomingUrl.protocol.replace(":", ""));
   headers.set("X-Forwarded-Host", incomingUrl.host);
 
+  const originSecret =
+    typeof env?.ORIGIN_SHARED_SECRET === "string" ? env.ORIGIN_SHARED_SECRET.trim() : "";
+  if (originSecret) {
+    headers.set("X-TrailForge-Origin-Secret", originSecret);
+  }
+
   return headers;
 }
 
-function buildClientResponseHeaders(upstreamHeaders) {
+function buildClientResponseHeaders(upstreamHeaders, { upstreamOrigin = null, incomingUrl = null } = {}) {
   // Constructing Headers from upstreamHeaders preserves multiple Set-Cookie entries
   // as well as Content-Range, Content-Length, Accept-Ranges, ETag, and rate-limit headers.
   const headers = new Headers(upstreamHeaders);
@@ -136,6 +195,17 @@ function buildClientResponseHeaders(upstreamHeaders) {
     }
   }
 
+  // Never leak internal Railway upstream origins in 3xx redirect Location headers.
+  const rawLocation = headers.get("location");
+  if (rawLocation && upstreamOrigin && incomingUrl) {
+    const rewritten = rewriteRedirectLocation(rawLocation, upstreamOrigin, incomingUrl);
+    if (rewritten !== rawLocation) {
+      headers.set("Location", rewritten);
+    }
+  }
+
+  applySecurityHeaders(headers, incomingUrl);
+
   return headers;
 }
 
@@ -147,19 +217,19 @@ export async function onRequest(context) {
     if (typeof context.next === "function") {
       return context.next();
     }
-    return jsonError(404, "Not found.");
+    return jsonError(404, "Not found.", incomingUrl);
   }
 
   const upstreamOrigin = resolveUpstreamOrigin(env);
   if (!upstreamOrigin) {
-    return jsonError(503, "API proxy origin is not configured.");
+    return jsonError(503, "API proxy origin is not configured.", incomingUrl);
   }
 
   const upstreamUrl = new URL(incomingUrl.pathname + incomingUrl.search, upstreamOrigin);
   const method = request.method.toUpperCase();
   const hasBody = method !== "GET" && method !== "HEAD";
 
-  const upstreamHeaders = buildUpstreamHeaders(request, incomingUrl);
+  const upstreamHeaders = buildUpstreamHeaders(request, incomingUrl, env);
 
   let upstreamResponse;
   try {
@@ -171,7 +241,7 @@ export async function onRequest(context) {
     });
   } catch {
     // Never expose internal Railway hostnames, DNS errors, or stack traces.
-    return jsonError(502, "Upstream TrailForge API is temporarily unavailable.");
+    return jsonError(502, "Upstream TrailForge API is temporarily unavailable.", incomingUrl);
   }
 
   // Sanitize unexpected gateway/server errors (500/502/503/504 or non-JSON 5xx)
@@ -192,10 +262,13 @@ export async function onRequest(context) {
       safeStatus === 503 || safeStatus === 504
         ? "TrailForge API is temporarily unavailable. Please retry shortly."
         : "An internal error occurred while contacting the TrailForge API.";
-    return jsonError(safeStatus, safeMessage);
+    return jsonError(safeStatus, safeMessage, incomingUrl);
   }
 
-  const responseHeaders = buildClientResponseHeaders(upstreamResponse.headers);
+  const responseHeaders = buildClientResponseHeaders(upstreamResponse.headers, {
+    upstreamOrigin,
+    incomingUrl,
+  });
 
   // Stream upstreamResponse.body directly without buffering so HTTP 206 Partial Content
   // PMTiles range slices and offline pack archives transfer at full edge speed.

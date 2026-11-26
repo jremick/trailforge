@@ -59,7 +59,7 @@ RUN set -eux; \
 # ---------------------------------------------------------------------------
 FROM python:3.12-slim-bookworm AS runtime
 
-ARG INSTALL_DEV=true
+ARG INSTALL_DEV=false
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -117,7 +117,12 @@ ENV GDAL_CACHEMAX=192 \
     TRAILFORGE_PACKS_DIR=/data/packs \
     PYTHONUNBUFFERED=1
 
-RUN mkdir -p /data/tiles /data/packs /data/cache
+RUN groupadd --system --gid 10001 trailforge \
+    && useradd --system --uid 10001 --gid trailforge --home-dir /app --shell /usr/sbin/nologin trailforge \
+    && mkdir -p /data/tiles /data/packs /data/cache /data/uploads \
+    && chown -R trailforge:trailforge /data /app
+
+USER trailforge
 
 EXPOSE 8000
 

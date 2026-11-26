@@ -88,6 +88,7 @@ For both options:
    ```bash
    openssl rand -hex 32   # -> AUTH_SECRET_KEY
    openssl rand -hex 32   # -> TRAILFORGE_PRIVACY_SECRET
+   openssl rand -hex 32   # -> TRAILFORGE_ORIGIN_SHARED_SECRET (also Cloudflare ORIGIN_SHARED_SECRET)
    ```
 3. Paste the production variables from [`env.railway.example`](./env.railway.example) into `api -> Variables`, making sure you set:
    - `DATABASE_URL=postgresql+psycopg://${{postgis.POSTGRES_USER}}:${{postgis.POSTGRES_PASSWORD}}@${{postgis.RAILWAY_PRIVATE_DOMAIN}}:5432/${{postgis.POSTGRES_DB}}`
@@ -95,6 +96,8 @@ For both options:
    - `TRAILFORGE_ADMIN_EMAIL=admin@example.com`
    - `AUTH_SECRET_KEY=<generated-64-hex>`
    - `TRAILFORGE_PRIVACY_SECRET=<generated-64-hex>`
+   - `TRAILFORGE_ORIGIN_SHARED_SECRET=<generated-64-hex>` *(blocks direct unauthenticated `*.up.railway.app` access with HTTP 403)*
+   - `TRAILFORGE_ENABLE_DOCS=false` *(disables public `/docs`, `/redoc`, and `/openapi.json` in production)*
    - `AUTH_COOKIE_SECURE=true`
    - `CORS_ORIGINS=https://trails.example.com`
    - `TILES_PUBLIC_BASE_URL=https://tiles.example.com`
@@ -136,9 +139,10 @@ For both options:
 3. Under **Pages Project -> Settings -> Environment Variables (Production)**, set:
    ```dotenv
    RAILWAY_API_ORIGIN=https://api.example.com
+   ORIGIN_SHARED_SECRET=<same-64-hex-as-TRAILFORGE_ORIGIN_SHARED_SECRET>
    ```
-   *(Replace with your Railway `api` service HTTPS origin, with no trailing slash.)*
-4. Attach your custom domain `trails.example.com` to the Pages project. Same-origin `/api/*` requests now forward `CF-Connecting-IP`, `Cookie`, `Authorization`, and `Range` headers cleanly while preserving `Set-Cookie` and unbuffered `206 Partial Content` streaming.
+   *(Replace `RAILWAY_API_ORIGIN` with your Railway `api` service HTTPS origin, with no trailing slash. `ORIGIN_SHARED_SECRET` is injected as `X-TrailForge-Origin-Secret` on every proxied request so direct hits to Railway are blocked with `403`.)*
+4. Attach your custom domain `trails.example.com` to the Pages project. Same-origin `/api/*` requests now forward `CF-Connecting-IP`, `X-TrailForge-Origin-Secret`, `Cookie`, `Authorization`, and `Range` headers cleanly while preserving `Set-Cookie`, rewriting upstream `307` redirect `Location` headers back to `https://trails.example.com`, emitting global security response headers, and streaming unbuffered `206 Partial Content` slices.
 
 ### 3.3 Cloudflare WAF, Rate Limits, R2 Cache Rule & Web Analytics
 
@@ -241,6 +245,11 @@ curl -sS -o /dev/null -w "%{http_code}\n" -X POST https://trails.example.com/api
 
 # 3. Confirm tile manifest points directly to your R2 custom domain
 curl -fsS https://trails.example.com/api/tiles/manifest.json
+
+# 4. Confirm direct Railway origin access (without X-TrailForge-Origin-Secret) returns 403
+#    and OpenAPI docs are disabled (404) in production mode
+curl -sS -o /dev/null -w "%{http_code}\n" https://api.example.com/api/tracks
+curl -sS -o /dev/null -w "%{http_code}\n" https://trails.example.com/docs
 ```
 
 ---

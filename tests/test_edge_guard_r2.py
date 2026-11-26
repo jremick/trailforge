@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import gc
 import hashlib
 import json
 import os
@@ -10,6 +12,7 @@ import subprocess
 import sys
 import uuid
 import zlib
+from collections import OrderedDict
 from collections.abc import Generator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,7 +30,12 @@ from starlette.datastructures import Headers
 from trailforge.api.health import get_health_checker
 from trailforge.api.main import create_app
 from trailforge.api.middleware import (
+    MAX_BODY_API_DEFAULT_BYTES,
+    MAX_BODY_REPORTS_BYTES,
+    MAX_BODY_TRIPS_BYTES,
+    BodySizeLimitMiddleware,
     SlidingWindowRateLimiter,
+    UsageAndRateLimitMiddleware,
     UsageMetricsStore,
     check_upload_quota,
     classify_route_group,
@@ -36,6 +44,7 @@ from trailforge.api.middleware import (
     get_live_usage_snapshot,
     reset_rate_limiter,
     reset_usage_metrics,
+    resolve_body_size_limit,
 )
 from trailforge.api.tiles import get_tiles_dir
 from trailforge.config import Settings, get_settings
@@ -49,19 +58,26 @@ from trailforge.reports.photos import (
 
 
 def _make_valid_png_bytes(payload_pad: int = 0) -> bytes:
-    """Build a valid 1x1 RGB PNG image in memory (optionally padded with a tEXt chunk)."""
+    """Build a valid RGB PNG image in memory (using real pixel rows when padded)."""
 
     def _chunk(chunk_type: bytes, data: bytes) -> bytes:
         crc = zlib.crc32(chunk_type + data) & 0xFFFFFFFF
         return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", crc)
 
-    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
-    idat = zlib.compress(b"\x00\x34\x88\x55")
-    extra = _chunk(b"tEXt", b"pad\x00" + (b"x" * payload_pad)) if payload_pad > 0 else b""
+    width = 32 if payload_pad > 0 else 1
+    height = max(1, min(64, (payload_pad // 32) + 8)) if payload_pad > 0 else 1
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    rows = bytearray()
+    for y in range(height):
+        rows.append(0)
+        for x in range(width):
+            rows.append((x * 37 + y * 91 + 17) & 0xFF)
+            rows.append((x * 73 + y * 29 + 53) & 0xFF)
+            rows.append((x * 19 + y * 67 + 97) & 0xFF)
+    idat = zlib.compress(bytes(rows))
     return (
         b"\x89PNG\r\n\x1a\n"
         + _chunk(b"IHDR", ihdr)
-        + extra
         + _chunk(b"IDAT", idat)
         + _chunk(b"IEND", b"")
     )
@@ -152,6 +168,632 @@ def test_hardening_and_r2_settings_defaults_aliases_and_bounds(
         Settings(rate_limit_upload_per_day=0)
     with pytest.raises(ValidationError):
         Settings(uploads_max_total_mb=5)
+
+
+# -----------------------------------------------------------------------------
+# 1b. Security Audit Fixes (H-1, H-2, H-3, M-3, M-5, L-4) — Exploit-First Tests
+# -----------------------------------------------------------------------------
+
+
+_STRONG_AUTH_SECRET = "a" * 64
+_STRONG_PRIVACY_SECRET = "b" * 64
+
+
+async def _run_asgi_request(
+    app: Any,
+    *,
+    method: str = "GET",
+    path: str = "/api/health",
+    headers: list[tuple[bytes, bytes]] | None = None,
+    client: tuple[str, int] = ("203.0.113.5", 54321),
+    chunks: list[bytes] | None = None,
+    scheme: str = "http",
+) -> tuple[int, dict[str, str], bytes]:
+    """Execute a single raw ASGI HTTP request with controllable peer IP and body chunks."""
+    scope: dict[str, Any] = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": scheme,
+        "path": path,
+        "raw_path": path.encode("ascii"),
+        "query_string": b"",
+        "headers": headers or [],
+        "client": client,
+        "server": ("api.example.com", 443 if scheme == "https" else 80),
+    }
+    body_chunks = list(chunks) if chunks is not None else [b""]
+    chunk_iter = iter(body_chunks)
+
+    async def receive() -> dict[str, Any]:
+        try:
+            data = next(chunk_iter)
+            more = True
+        except StopIteration:
+            data = b""
+            more = False
+        return {"type": "http.request", "body": data, "more_body": more}
+
+    status_code = 500
+    resp_headers: dict[str, str] = {}
+    body_parts: list[bytes] = []
+
+    async def send(message: dict[str, Any]) -> None:
+        nonlocal status_code
+        if message["type"] == "http.response.start":
+            status_code = int(message["status"])
+            for k, v in message.get("headers", []):
+                resp_headers[k.decode("latin-1").lower()] = v.decode("latin-1")
+        elif message["type"] == "http.response.body":
+            body_parts.append(message.get("body") or b"")
+
+    await app(scope, receive, send)
+    return status_code, resp_headers, b"".join(body_parts)
+
+
+def test_h1_ip_validation_spoofed_testclient_bypass_trailing_slash_and_o1_lru(
+    tmp_path: Path,
+) -> None:
+    # 1. Invalid header IPs (including "testclient" and garbage) fall back to raw peer IP
+    assert (
+        extract_client_ip_from_headers(
+            Headers({"CF-Connecting-IP": "testclient"}), client_host="203.0.113.5"
+        )
+        == "203.0.113.5"
+    )
+    assert (
+        extract_client_ip_from_headers(
+            Headers({"CF-Connecting-IP": "not-an-ip", "X-Forwarded-For": "198.51.100.1"}),
+            client_host="203.0.113.5",
+        )
+        == "203.0.113.5"
+    )
+    assert (
+        extract_client_ip_from_headers(
+            Headers({"X-Forwarded-For": "testclient, 203.0.113.5"}),
+            client_host="198.51.100.44",
+        )
+        == "198.51.100.44"
+    )
+    assert (
+        extract_client_ip_from_headers(
+            Headers({"CF-Connecting-IP": "2001:0db8:0000::0001"}),
+            client_host="10.0.0.1",
+        )
+        == "2001:db8::1"
+    )
+
+    # 2. Exploit proof: CF-Connecting-IP: testclient STILL hits 429 on TestClient!
+    cfg = Settings(
+        rate_limit_enabled=True,
+        rate_limit_read_per_min=10,
+        rate_limit_auth_per_min=3,
+        trust_proxy_headers=True,
+    )
+    app = _make_healthy_app(settings=cfg, tiles_dir=tmp_path)
+    with TestClient(app) as client:
+        statuses = [
+            client.post(
+                "/api/auth/login",
+                headers={"CF-Connecting-IP": "testclient"},
+                json={},
+            ).status_code
+            for _ in range(5)
+        ]
+        assert statuses == [422, 422, 422, 429, 429]
+
+        # Same exploit via X-Forwarded-For: testclient also hits 429
+        reset_rate_limiter(app)
+        xff_statuses = [
+            client.post(
+                "/api/auth/login",
+                headers={"X-Forwarded-For": "testclient, 203.0.113.5"},
+                json={},
+            ).status_code
+            for _ in range(5)
+        ]
+        assert xff_statuses == [422, 422, 422, 429, 429]
+
+        # 3. Trailing-slash normalization: POST /api/auth/login/ hits the 3/min auth bucket!
+        reset_rate_limiter(app)
+        slash_statuses = [
+            client.post(
+                "/api/auth/login/",
+                headers={"CF-Connecting-IP": "198.51.100.77"},
+                json={},
+                follow_redirects=False,
+            ).status_code
+            for _ in range(5)
+        ]
+        assert slash_statuses[:3] == [307, 307, 307]
+        assert slash_statuses[3:] == [429, 429]
+    app.dependency_overrides.clear()
+
+    # 4. Raw ASGI real peer (203.0.113.5) spoofing CF-Connecting-IP: testclient shares peer bucket
+    async def ok_app(scope: Any, receive: Any, send: Any) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send({"type": "http.response.body", "body": b'{"ok":true}'})
+
+    mw = UsageAndRateLimitMiddleware(
+        ok_app,
+        settings=cfg,
+        rate_limiter=SlidingWindowRateLimiter(),
+    )
+    raw_statuses: list[int] = []
+    for _ in range(5):
+        code, _, _ = asyncio.run(
+            _run_asgi_request(
+                mw,
+                method="POST",
+                path="/api/auth/login/",
+                headers=[(b"cf-connecting-ip", b"testclient")],
+                client=("203.0.113.5", 54321),
+            )
+        )
+        raw_statuses.append(code)
+    assert raw_statuses == [200, 200, 200, 429, 429]
+
+    # 5. O(1) OrderedDict LRU eviction under flood (preserves recently used key, strictly <= max)
+    now = [1000.0]
+    lru_limiter = SlidingWindowRateLimiter(clock=lambda: now[0], max_keys=64)
+    assert isinstance(lru_limiter._buckets, OrderedDict)
+    assert not hasattr(lru_limiter, "_prune_locked")
+
+    for i in range(64):
+        now[0] += 0.001
+        lru_limiter.check(f"api:198.51.100.{i}", limit=5, window_s=60.0)
+    # Touch key 0 so it moves to MRU; key 1 becomes the LRU victim
+    now[0] += 0.001
+    lru_limiter.check("api:198.51.100.0", limit=5, window_s=60.0)
+    # Insert 1 key beyond max_keys -> evicts key 1, keeps key 0
+    now[0] += 0.001
+    lru_limiter.check("api:198.51.100.999", limit=5, window_s=60.0)
+    assert len(lru_limiter._buckets) == 64
+    assert "api:198.51.100.0" in lru_limiter._buckets
+    assert "api:198.51.100.1" not in lru_limiter._buckets
+
+    # Flood 2,000 distinct keys -> stays strictly bounded at 64
+    for i in range(2_000):
+        now[0] += 0.0001
+        lru_limiter.check(f"flood:{i}", limit=5, window_s=60.0)
+    assert len(lru_limiter._buckets) == 64
+
+
+def test_h1_origin_shared_secret_blocks_direct_origin_and_allows_health(
+    tmp_path: Path,
+) -> None:
+    secret = "origin-edge-shared-secret-0123456789abcdef"
+    cfg = Settings(origin_shared_secret=secret)
+    app = _make_healthy_app(settings=cfg, tiles_dir=tmp_path)
+
+    with TestClient(app) as client:
+        # Missing secret -> 403 on API routes AND root
+        r_missing = client.get("/api/tiles/manifest.json")
+        assert r_missing.status_code == 403
+        assert r_missing.json() == {"detail": "Direct origin access forbidden"}
+        assert r_missing.headers.get("x-content-type-options") == "nosniff"
+        assert r_missing.headers.get("x-frame-options") == "DENY"
+
+        r_root = client.get("/")
+        assert r_root.status_code == 403
+
+        # Wrong secret -> 403
+        assert (
+            client.get(
+                "/api/tiles/manifest.json",
+                headers={"X-TrailForge-Origin-Secret": "wrong-secret"},
+            ).status_code
+            == 403
+        )
+
+        # Non-ASCII raw header bytes -> 403 (never 500 TypeError from compare_digest)
+        code_non_ascii, _, _ = asyncio.run(
+            _run_asgi_request(
+                app,
+                method="GET",
+                path="/api/tiles/manifest.json",
+                headers=[(b"x-trailforge-origin-secret", b"invalid-\xe9-secret")],
+            )
+        )
+        assert code_non_ascii == 403
+
+        # Health endpoints remain exempt for Railway healthchecks
+        assert client.get("/api/health").status_code == 200
+        assert client.get("/healthz").status_code == 404  # bypassed secret check (not 403)
+
+        # Correct shared secret -> 200
+        r_ok = client.get(
+            "/api/tiles/manifest.json",
+            headers={"X-TrailForge-Origin-Secret": secret},
+        )
+        assert r_ok.status_code == 200
+    app.dependency_overrides.clear()
+
+
+def test_h2_create_app_fails_closed_on_prod_default_or_short_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("RAILWAY_ENVIRONMENT", raising=False)
+    monkeypatch.delenv("TRAILFORGE_ENABLE_DOCS", raising=False)
+
+    # Local dev mode allows dev defaults (not production mode)
+    dev_cfg = Settings()
+    assert dev_cfg.is_production_mode is False
+    assert create_app(settings=dev_cfg) is not None
+
+    # Production mode via auth_cookie_secure=True fails closed with default secrets
+    with pytest.raises(RuntimeError, match="AUTH_SECRET_KEY|secret"):
+        create_app(settings=Settings(auth_cookie_secure=True))
+
+    # Production mode via registration_mode=invite_only fails closed with default secrets
+    with pytest.raises(RuntimeError, match="secret"):
+        create_app(settings=Settings(registration_mode="invite_only"))
+
+    # Production mode via short (<32 chars) secret fails closed
+    with pytest.raises(RuntimeError, match="secret"):
+        create_app(
+            settings=Settings(
+                auth_cookie_secure=True,
+                auth_secret_key="short-secret",
+                privacy_secret_key=_STRONG_PRIVACY_SECRET,
+            )
+        )
+
+    # Missing strong privacy secret also fails closed
+    with pytest.raises(RuntimeError, match="secret"):
+        create_app(
+            settings=Settings(
+                auth_cookie_secure=True,
+                auth_secret_key=_STRONG_AUTH_SECRET,
+            )
+        )
+
+    # RAILWAY_ENVIRONMENT triggers production mode even if registration_mode=open
+    monkeypatch.setenv("RAILWAY_ENVIRONMENT", "production")
+    assert Settings().is_production_mode is True
+    with pytest.raises(RuntimeError, match="secret"):
+        create_app(settings=Settings())
+
+    # Strong >= 32-char secrets succeed cleanly in production mode
+    prod_cfg = Settings(
+        auth_cookie_secure=True,
+        registration_mode="invite_only",
+        auth_secret_key=_STRONG_AUTH_SECRET,
+        privacy_secret_key=_STRONG_PRIVACY_SECRET,
+    )
+    assert prod_cfg.is_production_mode is True
+    assert create_app(settings=prod_cfg) is not None
+
+
+def test_h3_streaming_body_size_limit_middleware_rejects_oversized_413() -> None:
+    # 1. Route tier caps
+    assert resolve_body_size_limit("/api/trips/upload") == MAX_BODY_TRIPS_BYTES == 16 * 1024 * 1024
+    assert resolve_body_size_limit("/api/trips/mobile-sync") == 16 * 1024 * 1024
+    assert resolve_body_size_limit("/api/reports") == MAX_BODY_REPORTS_BYTES == 6 * 1024 * 1024
+    assert resolve_body_size_limit("/api/reports/") == 6 * 1024 * 1024
+    assert resolve_body_size_limit("/api/auth/login") == MAX_BODY_API_DEFAULT_BYTES == 1024 * 1024
+    assert resolve_body_size_limit("/api/routes/plan") == 1024 * 1024
+    assert resolve_body_size_limit("/docs") is None
+
+    # 2. Content-Length fast-fail rejects BEFORE downstream handler executes
+    handler_called = False
+
+    async def reader_app(scope: Any, receive: Any, send: Any) -> None:
+        nonlocal handler_called
+        handler_called = True
+        total = 0
+        while True:
+            msg = await receive()
+            total += len(msg.get("body") or b"")
+            if not msg.get("more_body", False):
+                break
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [(b"content-type", b"application/json")],
+            }
+        )
+        await send({"type": "http.response.body", "body": f'{{"bytes":{total}}}'.encode()})
+
+    mw = BodySizeLimitMiddleware(
+        reader_app,
+        trips_max_bytes=4096,
+        reports_max_bytes=2048,
+        default_api_max_bytes=1024,
+    )
+
+    code_cl, _, body_cl = asyncio.run(
+        _run_asgi_request(
+            mw,
+            method="POST",
+            path="/api/auth/login",
+            headers=[(b"content-length", b"1025")],
+            chunks=[b"x" * 1025],
+        )
+    )
+    assert code_cl == 413
+    assert handler_called is False
+    assert "Payload Too Large" in json.loads(body_cl)["detail"]
+
+    # 3. Chunked stream WITHOUT Content-Length aborts mid-stream with 413
+    code_stream, _, body_stream = asyncio.run(
+        _run_asgi_request(
+            mw,
+            method="POST",
+            path="/api/auth/login",
+            headers=[],  # No Content-Length (chunked transfer)
+            chunks=[b"a" * 512, b"b" * 512, b"c" * 10],
+        )
+    )
+    assert code_stream == 413
+    assert "Payload Too Large" in json.loads(body_stream)["detail"]
+
+    # 4. Reports & trips tiers honor their higher limits
+    code_rep_ok, _, _ = asyncio.run(
+        _run_asgi_request(
+            mw,
+            method="POST",
+            path="/api/reports",
+            headers=[],
+            chunks=[b"r" * 2000],
+        )
+    )
+    assert code_rep_ok == 200
+
+    code_rep_big, _, _ = asyncio.run(
+        _run_asgi_request(
+            mw,
+            method="POST",
+            path="/api/reports",
+            headers=[],
+            chunks=[b"r" * 1500, b"r" * 1500],
+        )
+    )
+    assert code_rep_big == 413
+
+    code_trip_ok, _, _ = asyncio.run(
+        _run_asgi_request(
+            mw,
+            method="POST",
+            path="/api/trips/mobile-sync",
+            headers=[],
+            chunks=[b"t" * 4000],
+        )
+    )
+    assert code_trip_ok == 200
+
+    code_trip_big, _, _ = asyncio.run(
+        _run_asgi_request(
+            mw,
+            method="POST",
+            path="/api/trips/mobile-sync",
+            headers=[],
+            chunks=[b"t" * 3000, b"t" * 2000],
+        )
+    )
+    assert code_trip_big == 413
+
+    # 5. End-to-end FastAPI app rejects > 1 MiB chunked POST to /api/auth/login with 413
+    app = _make_healthy_app()
+    large_chunks = [
+        b'{"email":"a@b.co","password":"' + (b"x" * (600 * 1024)),
+        b"y" * (600 * 1024),
+    ]
+    code_e2e, hdrs_e2e, body_e2e = asyncio.run(
+        _run_asgi_request(
+            app,
+            method="POST",
+            path="/api/auth/login",
+            headers=[(b"content-type", b"application/json")],
+            chunks=large_chunks,
+        )
+    )
+    assert code_e2e == 413
+    assert "Payload Too Large" in json.loads(body_e2e)["detail"]
+    assert hdrs_e2e.get("x-content-type-options") == "nosniff"
+    app.dependency_overrides.clear()
+    del large_chunks, app
+    gc.collect()
+
+
+def test_m3_global_security_headers_and_conditional_hsts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("RAILWAY_ENVIRONMENT", raising=False)
+    dev_app = _make_healthy_app(tiles_dir=tmp_path)
+    with TestClient(dev_app) as client:
+        r_http = client.get("/api/health")
+        assert r_http.status_code == 200
+        assert r_http.headers["x-content-type-options"] == "nosniff"
+        assert r_http.headers["x-frame-options"] == "DENY"
+        assert r_http.headers["referrer-policy"] == "strict-origin-when-cross-origin"
+        assert (
+            r_http.headers["permissions-policy"]
+            == "camera=(), microphone=(), geolocation=(self)"
+        )
+        assert "strict-transport-security" not in r_http.headers
+
+        # X-Forwarded-Proto: https enables HSTS
+        r_xfp = client.get("/api/health", headers={"X-Forwarded-Proto": "https"})
+        assert r_xfp.status_code == 200
+        assert (
+            r_xfp.headers["strict-transport-security"] == "max-age=31536000; includeSubDomains"
+        )
+    dev_app.dependency_overrides.clear()
+
+    # auth_cookie_secure=True always emits HSTS
+    prod_cfg = Settings(
+        auth_cookie_secure=True,
+        auth_secret_key=_STRONG_AUTH_SECRET,
+        privacy_secret_key=_STRONG_PRIVACY_SECRET,
+    )
+    prod_app = _make_healthy_app(settings=prod_cfg, tiles_dir=tmp_path)
+    with TestClient(prod_app) as client:
+        r_prod = client.get("/api/health")
+        assert r_prod.status_code == 200
+        assert (
+            r_prod.headers["strict-transport-security"] == "max-age=31536000; includeSubDomains"
+        )
+    prod_app.dependency_overrides.clear()
+
+
+def test_m5_cookie_csrf_guard_blocks_cross_site_and_allows_legitimate_clients(
+    tmp_path: Path,
+) -> None:
+    cfg = Settings(cors_origins="https://trails.example.com")
+    app = _make_healthy_app(settings=cfg, tiles_dir=tmp_path)
+
+    @app.post("/api/_test_csrf_target")
+    def _csrf_target() -> dict[str, bool]:
+        return {"mutated": True}
+
+    with TestClient(app) as client:
+        cookie_hdr = {"Cookie": "tf_session=fake-session-token"}
+
+        # 1. Cross-site & same-site (sibling subdomain) browser POST with cookie -> 403
+        r_cross = client.post(
+            "/api/_test_csrf_target",
+            headers={**cookie_hdr, "Sec-Fetch-Site": "cross-site", "Origin": "https://evil.example"},
+        )
+        assert r_cross.status_code == 403
+        assert r_cross.json() == {"detail": "Cross-site request blocked"}
+
+        r_sibling = client.post(
+            "/api/_test_csrf_target",
+            headers={
+                **cookie_hdr,
+                "Sec-Fetch-Site": "same-site",
+                "Origin": "https://blog.example.com",
+            },
+        )
+        assert r_sibling.status_code == 403
+
+        # 2. Missing Sec-Fetch-Site with untrusted Origin or Origin: null -> 403
+        r_bad_origin = client.post(
+            "/api/_test_csrf_target",
+            headers={**cookie_hdr, "Origin": "https://evil.example"},
+        )
+        assert r_bad_origin.status_code == 403
+
+        r_null_origin = client.post(
+            "/api/_test_csrf_target",
+            headers={**cookie_hdr, "Origin": "null"},
+        )
+        assert r_null_origin.status_code == 403
+
+        # 3. Same-origin / none Sec-Fetch-Site allowed
+        assert (
+            client.post(
+                "/api/_test_csrf_target",
+                headers={**cookie_hdr, "Sec-Fetch-Site": "same-origin"},
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                "/api/_test_csrf_target",
+                headers={**cookie_hdr, "Sec-Fetch-Site": "none"},
+            ).status_code
+            == 200
+        )
+
+        # 4. Allowlisted CORS Origin or matching request host allowed when Sec-Fetch-Site absent
+        assert (
+            client.post(
+                "/api/_test_csrf_target",
+                headers={**cookie_hdr, "Origin": "https://trails.example.com"},
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                "/api/_test_csrf_target",
+                headers={**cookie_hdr, "Origin": "http://testserver"},
+            ).status_code
+            == 200
+        )
+
+        # 5. Non-browser client without Origin or Sec-Fetch-Site continues working
+        assert client.post("/api/_test_csrf_target", headers=cookie_hdr).status_code == 200
+
+        # 6. Bearer Authorization bypasses cookie CSRF guard
+        assert (
+            client.post(
+                "/api/_test_csrf_target",
+                headers={
+                    **cookie_hdr,
+                    "Authorization": "Bearer some-jwt-token",
+                    "Sec-Fetch-Site": "cross-site",
+                },
+            ).status_code
+            == 200
+        )
+
+        # 7. Requests without tf_session cookie & safe GET requests are never blocked
+        assert (
+            client.post(
+                "/api/_test_csrf_target",
+                headers={"Sec-Fetch-Site": "cross-site"},
+            ).status_code
+            == 200
+        )
+        assert (
+            client.get(
+                "/api/health",
+                headers={**cookie_hdr, "Sec-Fetch-Site": "cross-site"},
+            ).status_code
+            == 200
+        )
+    app.dependency_overrides.clear()
+
+
+def test_l4_openapi_docs_disabled_in_production_mode_unless_explicitly_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("RAILWAY_ENVIRONMENT", raising=False)
+    monkeypatch.setenv("TRAILFORGE_ENABLE_DOCS", "")
+    dev_cfg = Settings()
+    assert dev_cfg.enable_docs is None
+    assert dev_cfg.docs_enabled is True
+
+    with TestClient(create_app(settings=dev_cfg)) as dev_client:
+        assert dev_client.get("/docs").status_code == 200
+        assert dev_client.get("/openapi.json").status_code == 200
+        assert dev_client.get("/").json().get("docs") == "/docs"
+
+    # Production mode disables /docs, /redoc, /openapi.json by default
+    prod_cfg = Settings(
+        auth_cookie_secure=True,
+        auth_secret_key=_STRONG_AUTH_SECRET,
+        privacy_secret_key=_STRONG_PRIVACY_SECRET,
+    )
+    assert prod_cfg.docs_enabled is False
+    with TestClient(create_app(settings=prod_cfg)) as prod_client:
+        assert prod_client.get("/docs").status_code == 404
+        assert prod_client.get("/redoc").status_code == 404
+        assert prod_client.get("/openapi.json").status_code == 404
+        assert "docs" not in prod_client.get("/").json()
+
+    # Explicit TRAILFORGE_ENABLE_DOCS=true re-enables docs even in production mode
+    prod_docs_cfg = Settings(
+        auth_cookie_secure=True,
+        auth_secret_key=_STRONG_AUTH_SECRET,
+        privacy_secret_key=_STRONG_PRIVACY_SECRET,
+        enable_docs=True,
+    )
+    assert prod_docs_cfg.docs_enabled is True
+    with TestClient(create_app(settings=prod_docs_cfg)) as prod_docs_client:
+        assert prod_docs_client.get("/docs").status_code == 200
+        assert prod_docs_client.get("/openapi.json").status_code == 200
 
 
 # -----------------------------------------------------------------------------
@@ -365,25 +1007,28 @@ def test_rate_limit_disabled_allows_burst_and_upload_quota_helper(tmp_path: Path
 
 
 def test_photo_storage_disk_quota_guard_and_507_handler(tmp_path: Path) -> None:
-    png_small = _make_valid_png_bytes(payload_pad=128)
+    png_small = _make_valid_png_bytes(payload_pad=256)
     assert get_directory_size_bytes(tmp_path) == 0
 
-    # Save first photo within quota
-    quota = len(png_small) * 2 + 10
-    saved1 = save_report_photo(png_small, uploads_dir=tmp_path, max_total_bytes=quota)
+    # Save first photo with generous cap to measure exact stored size (works with EXIF re-encoding)
+    saved1 = save_report_photo(png_small, uploads_dir=tmp_path, max_total_bytes=1024 * 1024)
     assert saved1.path.is_file()
-    assert get_directory_size_bytes(tmp_path) == len(png_small)
+    stored_size = saved1.size_bytes
+    assert stored_size > 0
+    assert get_directory_size_bytes(tmp_path) == stored_size
 
-    # Save second photo still within quota
+    # Tight quota allowing exactly two stored copies
+    quota = stored_size * 2 + 10
     saved2 = save_report_photo(png_small, uploads_dir=tmp_path, max_total_bytes=quota)
     assert saved2.path.is_file()
-    assert get_directory_size_bytes(tmp_path) == len(png_small) * 2
+    expected_two_size = stored_size + saved2.size_bytes
+    assert get_directory_size_bytes(tmp_path) == expected_two_size
 
     # Symlinks inside uploads dir are ignored by size calculation
     outside = tmp_path.parent / "outside_blob.bin"
     outside.write_bytes(b"0" * 10_000)
     (tmp_path / "ignore_link.bin").symlink_to(outside)
-    assert get_directory_size_bytes(tmp_path) == len(png_small) * 2
+    assert get_directory_size_bytes(tmp_path) == expected_two_size
 
     # Third photo exceeds quota -> raises PhotoStorageQuotaError with no orphan temp files
     with pytest.raises(PhotoStorageQuotaError):
