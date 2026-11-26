@@ -23,7 +23,7 @@ export interface TopBarCallbacks {
   onAdminClick?: () => void;
 }
 
-const SEARCH_DEBOUNCE_MS = 180;
+const SEARCH_DEBOUNCE_MS = 200;
 
 export class TopBar {
   private readonly root: HTMLElement;
@@ -34,6 +34,7 @@ export class TopBar {
   private readonly searchKbdEl: HTMLElement;
   private readonly searchClearBtn: HTMLButtonElement;
   private readonly searchMenuEl: HTMLElement;
+  private readonly presetWrapEl: HTMLElement;
   private readonly presetSelectEl: HTMLSelectElement;
   private readonly routeBtnEl: HTMLButtonElement;
   private readonly routeBadgeEl: HTMLElement;
@@ -60,6 +61,9 @@ export class TopBar {
 
   private searchTimer: number | null = null;
   private searchAbort: AbortController | null = null;
+  private inFlightQuery: string | null = null;
+  private inFlightPromise: Promise<UnifiedSearchItem[]> | null = null;
+  private resultsQuery = "";
   private results: UnifiedSearchItem[] = [];
   private activeIdx = -1;
   private lastRemoteError = false;
@@ -292,7 +296,9 @@ export class TopBar {
     this.searchKbdEl = this.q("[data-role='search-kbd']");
     this.searchClearBtn = this.q<HTMLButtonElement>("[data-role='search-clear']");
     this.searchMenuEl = this.q("[data-role='search-menu']");
+    this.presetWrapEl = this.q(".tf-preset-wrap");
     this.presetSelectEl = this.q<HTMLSelectElement>("[data-role='preset-select']");
+    this.syncPresetTooltip();
     this.routeBtnEl = this.q<HTMLButtonElement>("[data-role='route-btn']");
     this.routeBadgeEl = this.q("[data-role='route-badge']");
     this.statusWrapEl = this.q("[data-role='status-wrap']");
@@ -329,12 +335,21 @@ export class TopBar {
       const q = this.searchInputEl.value.trim();
       this.syncSearchAccessoryState(q.length > 0);
       if (!q) {
+        this.cancelPendingSearch();
+        this.results = [];
+        this.resultsQuery = "";
         this.hideMenu();
         return;
       }
       const instant = resolveLocalSearch(q);
       if (instant.length > 0) {
+        this.resultsQuery = q;
         this.renderMenu(instant, false);
+      } else {
+        this.results = [];
+        this.resultsQuery = "";
+        this.activeIdx = -1;
+        this.renderSearchingMenu(q);
       }
       this.scheduleSearch(q);
     });
@@ -385,6 +400,9 @@ export class TopBar {
     });
 
     this.searchClearBtn.addEventListener("click", () => {
+      this.cancelPendingSearch();
+      this.results = [];
+      this.resultsQuery = "";
       this.searchInputEl.value = "";
       this.syncSearchAccessoryState(false);
       this.hideMenu();
@@ -393,6 +411,7 @@ export class TopBar {
     });
 
     this.presetSelectEl.addEventListener("change", () => {
+      this.syncPresetTooltip();
       callbacks.onPresetChange(this.presetSelectEl.value);
     });
 
@@ -446,6 +465,14 @@ export class TopBar {
 
   setSelectedPreset(presetId: string): void {
     this.presetSelectEl.value = presetId;
+    this.syncPresetTooltip();
+  }
+
+  private syncPresetTooltip(): void {
+    const selected = this.presetSelectEl.selectedOptions[0]?.textContent?.trim();
+    this.presetWrapEl.title = selected
+      ? `Region: ${selected}`
+      : "Jump to Australian region or corridor";
   }
 
   updateRouteSummary(params: {
@@ -647,6 +674,17 @@ export class TopBar {
     this.searchKbdEl.classList.toggle("hidden", hasValue || focused);
   }
 
+  private cancelPendingSearch(): void {
+    if (this.searchTimer !== null) {
+      window.clearTimeout(this.searchTimer);
+      this.searchTimer = null;
+    }
+    this.searchAbort?.abort();
+    this.searchAbort = null;
+    this.inFlightQuery = null;
+    this.inFlightPromise = null;
+  }
+
   private scheduleSearch(query: string): void {
     if (this.searchTimer !== null) {
       window.clearTimeout(this.searchTimer);
@@ -658,40 +696,73 @@ export class TopBar {
   }
 
   private async executeSearch(query: string): Promise<UnifiedSearchItem[]> {
+    if (this.inFlightQuery === query && this.inFlightPromise) {
+      return this.inFlightPromise;
+    }
+
     this.searchAbort?.abort();
     const controller = new AbortController();
     this.searchAbort = controller;
+    this.inFlightQuery = query;
 
-    try {
-      const { items, remoteError } = await runUnifiedSearch(query, {
-        limit: 10,
-        signal: controller.signal,
-      });
-      if (controller.signal.aborted) return [];
-      this.lastRemoteError = remoteError;
-      this.renderMenu(items, remoteError);
-      return items;
-    } catch {
-      return [];
-    }
+    const promise = (async (): Promise<UnifiedSearchItem[]> => {
+      try {
+        const { items, remoteError } = await runUnifiedSearch(query, {
+          limit: 10,
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted) return [];
+        this.lastRemoteError = remoteError;
+        this.resultsQuery = query;
+        this.renderMenu(items, remoteError);
+        return items;
+      } catch {
+        return [];
+      } finally {
+        if (this.inFlightQuery === query && this.searchAbort === controller) {
+          this.inFlightQuery = null;
+          this.inFlightPromise = null;
+        }
+      }
+    })();
+
+    this.inFlightPromise = promise;
+    return promise;
   }
 
   private async handleSubmit(): Promise<void> {
     const query = this.searchInputEl.value.trim();
     if (!query) return;
 
-    if (this.activeIdx >= 0 && this.results[this.activeIdx]) {
+    if (this.searchTimer !== null) {
+      window.clearTimeout(this.searchTimer);
+      this.searchTimer = null;
+    }
+
+    if (
+      this.resultsQuery === query &&
+      this.activeIdx >= 0 &&
+      this.results[this.activeIdx]
+    ) {
       this.selectResult(this.results[this.activeIdx]!);
       return;
     }
 
+    this.renderSearchingMenu(query);
     const items = await this.executeSearch(query);
+    if (this.searchInputEl.value.trim() !== query) return;
     if (items.length > 0 && items[0]) {
       this.selectResult(items[0]);
     } else {
       this.hideMenu();
       this.callbacks.onSearchNoMatch(query, this.lastRemoteError);
     }
+  }
+
+  private renderSearchingMenu(query: string): void {
+    this.searchMenuEl.innerHTML = `<div class="tf-search-empty">Searching tracks, POIs &amp; parks for “${escapeHtml(query)}”…</div>`;
+    this.searchMenuEl.classList.remove("hidden");
+    this.searchInputEl.setAttribute("aria-expanded", "true");
   }
 
   private selectResult(item: UnifiedSearchItem): void {

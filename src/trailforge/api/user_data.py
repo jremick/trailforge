@@ -251,35 +251,37 @@ def list_favorites(
     db: Session = Depends(get_db),
 ) -> list[FavoriteResponse]:
     """List the signed-in user's saved favorite tracks."""
-    grade_rank_expr = case(
-        (TrackSegmentGrade.effective_grade == "Easy", 1),
-        (TrackSegmentGrade.effective_grade == "Medium", 2),
-        (TrackSegmentGrade.effective_grade == "Hard", 3),
-        (TrackSegmentGrade.effective_grade == "Extreme", 4),
-        else_=0,
-    )
-    seg_agg = (
-        select(
-            TrackSegment.track_id.label("track_id"),
-            func.max(grade_rank_expr).label("worst_rank"),
-        )
-        .outerjoin(TrackSegmentGrade, TrackSegment.segment_id == TrackSegmentGrade.segment_id)
-        .where(TrackSegment.is_active.is_(True))
-        .group_by(TrackSegment.track_id)
-        .subquery("fav_seg_agg")
-    )
-
-    rows = db.execute(
-        select(
-            UserFavorite,
-            Track,
-            func.coalesce(seg_agg.c.worst_rank, 0).label("worst_rank"),
-        )
+    fav_rows = db.execute(
+        select(UserFavorite, Track)
         .join(Track, UserFavorite.track_id == Track.track_id)
-        .outerjoin(seg_agg, Track.track_id == seg_agg.c.track_id)
         .where(UserFavorite.user_id == user.id, UserFavorite.track_id.is_not(None))
         .order_by(UserFavorite.created_at.desc())
     ).all()
+
+    rank_by_track: dict[str, int] = {}
+    if fav_rows:
+        fav_track_ids = list({trk.track_id for _, trk in fav_rows})
+        grade_rank_expr = case(
+            (TrackSegmentGrade.effective_grade == "Easy", 1),
+            (TrackSegmentGrade.effective_grade == "Medium", 2),
+            (TrackSegmentGrade.effective_grade == "Hard", 3),
+            (TrackSegmentGrade.effective_grade == "Extreme", 4),
+            else_=0,
+        )
+        for tid, worst_rank in db.execute(
+            select(
+                TrackSegment.track_id,
+                func.coalesce(func.max(grade_rank_expr), 0),
+            )
+            .outerjoin(TrackSegmentGrade, TrackSegment.segment_id == TrackSegmentGrade.segment_id)
+            .where(
+                TrackSegment.is_active.is_(True),
+                TrackSegment.track_id.in_(fav_track_ids),
+            )
+            .group_by(TrackSegment.track_id)
+        ).all():
+            if tid is not None:
+                rank_by_track[tid] = int(worst_rank or 0)
 
     return [
         FavoriteResponse(
@@ -287,12 +289,14 @@ def list_favorites(
             track_id=trk.track_id,
             track_name=trk.name,
             state=trk.state,
-            grade=_RANK_GRADE.get(int(worst_rank)) if worst_rank else None,
+            grade=_RANK_GRADE.get(rank_by_track.get(trk.track_id, 0))
+            if rank_by_track.get(trk.track_id, 0)
+            else None,
             total_length_m=float(trk.total_length_m or 0.0),
             notes=fav.notes,
             created_at=fav.created_at,
         )
-        for fav, trk, worst_rank in rows
+        for fav, trk in fav_rows
     ]
 
 

@@ -177,9 +177,9 @@ button {
 
 .tf-search-wrap {
   position: relative;
-  flex: 1 1 240px;
-  max-width: 440px;
-  min-width: 170px;
+  flex: 1 1 200px;
+  max-width: 420px;
+  min-width: 150px;
 }
 
 .tf-search-form {
@@ -357,7 +357,8 @@ button {
   display: flex;
   align-items: center;
   gap: 4px;
-  flex-shrink: 0;
+  flex: 0 1 auto;
+  min-width: 0;
 }
 
 .tf-topbar-divider {
@@ -379,6 +380,9 @@ button {
   border-radius: var(--radius-md);
   transition: background 0.14s ease, border-color 0.14s ease;
   cursor: pointer;
+  flex: 0 1 auto;
+  min-width: 112px;
+  max-width: 380px;
 }
 
 .tf-preset-wrap:hover,
@@ -399,7 +403,11 @@ button {
   font-size: 12px;
   font-weight: 500;
   outline: none;
-  max-width: 158px;
+  field-sizing: content;
+  width: auto;
+  min-width: 0;
+  max-width: 100%;
+  padding-right: 2px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -425,6 +433,7 @@ button {
   font-size: 12px;
   font-weight: 500;
   white-space: nowrap;
+  flex-shrink: 0;
   transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
 }
 
@@ -462,7 +471,9 @@ button {
   font-size: 12px;
   font-weight: 500;
   white-space: nowrap;
-  max-width: 170px;
+  flex: 0 1 auto;
+  min-width: 96px;
+  max-width: 260px;
   transition: background 0.14s ease, border-color 0.14s ease;
 }
 
@@ -1917,17 +1928,26 @@ button {
 
 /* ---------- Responsive Breakpoints ---------- */
 
+@media (max-width: 1180px) {
+  .tf-preset-wrap {
+    max-width: 220px;
+  }
+}
+
 @media (max-width: 1040px) {
-  .tf-preset-select {
-    max-width: 132px;
+  .tf-preset-wrap {
+    max-width: 158px;
   }
 
   .tf-account-btn {
-    max-width: 140px;
+    max-width: 160px;
   }
 }
 
 @media (max-width: 860px) {
+  .tf-preset-wrap {
+    max-width: none;
+  }
   .tf-topbar {
     flex-wrap: wrap;
     padding: 8px 10px;

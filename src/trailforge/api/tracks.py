@@ -9,7 +9,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import case, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session
 
 from trailforge.api.geocoder import geocode_au_places
@@ -575,66 +575,16 @@ def list_tracks(
         (TrackSegmentGrade.wet_risk_level == "saturated", 3),
         else_=0,
     )
-    seg_agg = (
-        select(
-            TrackSegment.track_id.label("track_id"),
-            func.count(TrackSegment.segment_id).label("segment_count"),
-            func.max(grade_rank_expr).label("worst_rank"),
-            func.max(live_rank_expr).label("worst_live_rank"),
-            func.max(TrackSegmentGrade.baseline_score).label("max_score"),
-            func.max(TrackSegmentGrade.live_score).label("max_live_score"),
-            func.max(conf_rank_expr).label("max_conf_rank"),
-            func.max(TrackSegmentGrade.sample_count).label("max_samples"),
-            func.max(TrackSegmentGrade.last_driven_at).label("last_driven_at"),
-            func.avg(TrackSegmentGrade.avg_speed_kmh).label("avg_speed_kmh"),
-            func.max(wet_rank_expr).label("max_wet_rank"),
-            func.bool_or(TrackSegment.is_4wd_only).label("any_4wd_only"),
-            func.bool_or(TrackSegment.has_perennial_crossing).label("any_perennial"),
-        )
-        .outerjoin(TrackSegmentGrade, TrackSegment.segment_id == TrackSegmentGrade.segment_id)
-        .where(TrackSegment.is_active.is_(True))
-        .group_by(TrackSegment.track_id)
-        .subquery("seg_agg")
-    )
-
-    stmt = (
-        select(
-            Track,
-            CAPADPark.name.label("park_name"),
-            func.coalesce(seg_agg.c.segment_count, 0).label("segment_count"),
-            func.coalesce(seg_agg.c.worst_rank, 0).label("worst_rank"),
-            func.coalesce(seg_agg.c.worst_live_rank, 0).label("worst_live_rank"),
-            seg_agg.c.max_score.label("max_score"),
-            seg_agg.c.max_live_score.label("max_live_score"),
-            func.coalesce(seg_agg.c.max_conf_rank, 0).label("max_conf_rank"),
-            func.coalesce(seg_agg.c.max_samples, 0).label("max_samples"),
-            seg_agg.c.last_driven_at.label("last_driven_at"),
-            seg_agg.c.avg_speed_kmh.label("avg_speed_kmh"),
-            func.coalesce(seg_agg.c.max_wet_rank, 0).label("max_wet_rank"),
-            func.coalesce(seg_agg.c.any_4wd_only, False).label("any_4wd_only"),
-            func.coalesce(seg_agg.c.any_perennial, False).label("any_perennial"),
-            func.ST_XMin(Track.bbox_geom).label("xmin"),
-            func.ST_YMin(Track.bbox_geom).label("ymin"),
-            func.ST_XMax(Track.bbox_geom).label("xmax"),
-            func.ST_YMax(Track.bbox_geom).label("ymax"),
-        )
-        .outerjoin(CAPADPark, Track.primary_park_id == CAPADPark.id)
-        .outerjoin(seg_agg, Track.track_id == seg_agg.c.track_id)
-    )
+    track_filters: list[Any] = []
     if not include_inactive:
-        stmt = stmt.where(Track.is_active.is_(True))
+        track_filters.append(Track.is_active.is_(True))
     if state:
-        stmt = stmt.where(or_(Track.state == state, Track.state.ilike(f"%{state}%")))
+        track_filters.append(or_(Track.state == state, Track.state.ilike(f"%{state}%")))
     if trail_class:
-        stmt = stmt.where(Track.trail_class == trail_class)
-    if grade:
-        target_rank = _GRADE_RANK.get(grade)
-        if target_rank is None:
-            return []
-        stmt = stmt.where(seg_agg.c.worst_rank == target_rank)
+        track_filters.append(Track.trail_class == trail_class)
     if q:
         pattern = f"%{q.strip()}%"
-        stmt = stmt.where(
+        track_filters.append(
             or_(
                 Track.name.ilike(pattern),
                 func.array_to_string(Track.alt_names, " ").ilike(pattern),
@@ -643,10 +593,127 @@ def list_tracks(
     if parsed_bbox is not None:
         min_lon, min_lat, max_lon, max_lat = parsed_bbox
         env = func.ST_MakeEnvelope(min_lon, min_lat, max_lon, max_lat, 4326)
-        stmt = stmt.where(func.ST_Intersects(Track.bbox_geom, env))
+        track_filters.append(func.ST_Intersects(Track.bbox_geom, env))
 
-    stmt = stmt.order_by(Track.name.asc()).offset(offset).limit(limit)
-    rows = db.execute(stmt).all()
+    seg_agg_cols = (
+        TrackSegment.track_id.label("track_id"),
+        func.count(TrackSegment.segment_id).label("segment_count"),
+        func.max(grade_rank_expr).label("worst_rank"),
+        func.max(live_rank_expr).label("worst_live_rank"),
+        func.max(TrackSegmentGrade.baseline_score).label("max_score"),
+        func.max(TrackSegmentGrade.live_score).label("max_live_score"),
+        func.max(conf_rank_expr).label("max_conf_rank"),
+        func.max(TrackSegmentGrade.sample_count).label("max_samples"),
+        func.max(TrackSegmentGrade.last_driven_at).label("last_driven_at"),
+        func.avg(TrackSegmentGrade.avg_speed_kmh).label("avg_speed_kmh"),
+        func.max(wet_rank_expr).label("max_wet_rank"),
+        func.bool_or(TrackSegment.is_4wd_only).label("any_4wd_only"),
+        func.bool_or(TrackSegment.has_perennial_crossing).label("any_perennial"),
+    )
+
+    if grade is None:
+        # Fast path: filter & paginate tracks FIRST, then aggregate segments ONLY for <=limit IDs.
+        page_rows = db.execute(
+            select(
+                Track,
+                CAPADPark.name.label("park_name"),
+                func.ST_XMin(Track.bbox_geom).label("xmin"),
+                func.ST_YMin(Track.bbox_geom).label("ymin"),
+                func.ST_XMax(Track.bbox_geom).label("xmax"),
+                func.ST_YMax(Track.bbox_geom).label("ymax"),
+            )
+            .outerjoin(CAPADPark, Track.primary_park_id == CAPADPark.id)
+            .where(*track_filters)
+            .order_by(Track.name.asc())
+            .offset(offset)
+            .limit(limit)
+        ).all()
+
+        page_track_ids = [r[0].track_id for r in page_rows]
+        agg_by_track: dict[str, Any] = {}
+        if page_track_ids:
+            for agg_row in db.execute(
+                select(*seg_agg_cols)
+                .outerjoin(
+                    TrackSegmentGrade, TrackSegment.segment_id == TrackSegmentGrade.segment_id
+                )
+                .where(
+                    TrackSegment.is_active.is_(True),
+                    TrackSegment.track_id.in_(page_track_ids),
+                )
+                .group_by(TrackSegment.track_id)
+            ).all():
+                if agg_row.track_id is not None:
+                    agg_by_track[agg_row.track_id] = agg_row
+
+        rows = []
+        for trk, park_name, xmin, ymin, xmax, ymax in page_rows:
+            agg = agg_by_track.get(trk.track_id)
+            rows.append(
+                (
+                    trk,
+                    park_name,
+                    int(agg.segment_count) if agg is not None else 0,
+                    int(agg.worst_rank or 0) if agg is not None else 0,
+                    int(agg.worst_live_rank or 0) if agg is not None else 0,
+                    agg.max_score if agg is not None else None,
+                    agg.max_live_score if agg is not None else None,
+                    int(agg.max_conf_rank or 0) if agg is not None else 0,
+                    int(agg.max_samples or 0) if agg is not None else 0,
+                    agg.last_driven_at if agg is not None else None,
+                    agg.avg_speed_kmh if agg is not None else None,
+                    int(agg.max_wet_rank or 0) if agg is not None else 0,
+                    bool(agg.any_4wd_only) if agg is not None else False,
+                    bool(agg.any_perennial) if agg is not None else False,
+                    xmin,
+                    ymin,
+                    xmax,
+                    ymax,
+                )
+            )
+    else:
+        target_rank = _GRADE_RANK.get(grade)
+        if target_rank is None:
+            return []
+        seg_agg_stmt = (
+            select(*seg_agg_cols)
+            .outerjoin(TrackSegmentGrade, TrackSegment.segment_id == TrackSegmentGrade.segment_id)
+            .where(TrackSegment.is_active.is_(True))
+        )
+        if track_filters:
+            candidate_ids_sq = select(Track.track_id).where(*track_filters)
+            seg_agg_stmt = seg_agg_stmt.where(TrackSegment.track_id.in_(candidate_ids_sq))
+        seg_agg = seg_agg_stmt.group_by(TrackSegment.track_id).subquery("seg_agg")
+
+        stmt = (
+            select(
+                Track,
+                CAPADPark.name.label("park_name"),
+                func.coalesce(seg_agg.c.segment_count, 0).label("segment_count"),
+                func.coalesce(seg_agg.c.worst_rank, 0).label("worst_rank"),
+                func.coalesce(seg_agg.c.worst_live_rank, 0).label("worst_live_rank"),
+                seg_agg.c.max_score.label("max_score"),
+                seg_agg.c.max_live_score.label("max_live_score"),
+                func.coalesce(seg_agg.c.max_conf_rank, 0).label("max_conf_rank"),
+                func.coalesce(seg_agg.c.max_samples, 0).label("max_samples"),
+                seg_agg.c.last_driven_at.label("last_driven_at"),
+                seg_agg.c.avg_speed_kmh.label("avg_speed_kmh"),
+                func.coalesce(seg_agg.c.max_wet_rank, 0).label("max_wet_rank"),
+                func.coalesce(seg_agg.c.any_4wd_only, False).label("any_4wd_only"),
+                func.coalesce(seg_agg.c.any_perennial, False).label("any_perennial"),
+                func.ST_XMin(Track.bbox_geom).label("xmin"),
+                func.ST_YMin(Track.bbox_geom).label("ymin"),
+                func.ST_XMax(Track.bbox_geom).label("xmax"),
+                func.ST_YMax(Track.bbox_geom).label("ymax"),
+            )
+            .outerjoin(CAPADPark, Track.primary_park_id == CAPADPark.id)
+            .join(seg_agg, Track.track_id == seg_agg.c.track_id)
+            .where(*track_filters, seg_agg.c.worst_rank == target_rank)
+            .order_by(Track.name.asc())
+            .offset(offset)
+            .limit(limit)
+        )
+        rows = list(db.execute(stmt).all())
 
     track_ids = [r[0].track_id for r in rows]
     closures_map = _load_closures_by_track(db, track_ids)
@@ -1330,24 +1397,41 @@ def search_network(
     """Search canonical tracks (name & aliases), POIs, and CAPAD parks with coordinates/bbox."""
     term = q.strip()
     pattern = f"%{term}%"
+    prefix_pattern = f"{term}%"
+    tokens = [tok for tok in term.split() if tok][:6]
     items: list[SearchResultItem] = []
 
-    grade_rank_expr = case(
-        (TrackSegmentGrade.effective_grade == "Easy", 1),
-        (TrackSegmentGrade.effective_grade == "Medium", 2),
-        (TrackSegmentGrade.effective_grade == "Hard", 3),
-        (TrackSegmentGrade.effective_grade == "Extreme", 4),
-        else_=0,
-    )
-    seg_agg = (
-        select(
-            TrackSegment.track_id.label("track_id"),
-            func.max(grade_rank_expr).label("worst_rank"),
+    def _token_match_track() -> Any:
+        if len(tokens) <= 1:
+            return or_(
+                Track.name.ilike(pattern),
+                func.array_to_string(Track.alt_names, " ").ilike(pattern),
+            )
+        alt_text = func.array_to_string(Track.alt_names, " ")
+        return and_(
+            *(
+                or_(Track.name.ilike(f"%{tok}%"), alt_text.ilike(f"%{tok}%"))
+                for tok in tokens
+            )
         )
-        .outerjoin(TrackSegmentGrade, TrackSegment.segment_id == TrackSegmentGrade.segment_id)
-        .where(TrackSegment.is_active.is_(True))
-        .group_by(TrackSegment.track_id)
-        .subquery("search_seg_agg")
+
+    def _token_match_col(col: Any) -> Any:
+        if len(tokens) <= 1:
+            return col.ilike(pattern)
+        return and_(*(col.ilike(f"%{tok}%") for tok in tokens))
+
+    # 1. Filter tracks FIRST (no 267k-segment full-table GROUP BY before filtering!)
+    relevance_rank = case(
+        (func.lower(Track.name) == term.lower(), 0),
+        (Track.name.ilike(prefix_pattern), 1),
+        (Track.name.ilike(pattern), 2),
+        else_=3,
+    )
+    class_rank = case(
+        (Track.trail_class == "4wd_track", 0),
+        (Track.trail_class == "4wd_route", 0),
+        (Track.trail_class == "unsealed_road", 1),
+        else_=2,
     )
 
     track_rows = db.execute(
@@ -1356,7 +1440,6 @@ def search_network(
             Track.name,
             Track.state,
             Track.trail_class,
-            func.coalesce(seg_agg.c.worst_rank, 0).label("worst_rank"),
             func.ST_X(func.ST_Centroid(Track.bbox_geom)).label("lon"),
             func.ST_Y(func.ST_Centroid(Track.bbox_geom)).label("lat"),
             func.ST_XMin(Track.bbox_geom).label("xmin"),
@@ -1364,19 +1447,48 @@ def search_network(
             func.ST_XMax(Track.bbox_geom).label("xmax"),
             func.ST_YMax(Track.bbox_geom).label("ymax"),
         )
-        .outerjoin(seg_agg, Track.track_id == seg_agg.c.track_id)
         .where(
             Track.is_active.is_(True),
-            or_(
-                Track.name.ilike(pattern),
-                func.array_to_string(Track.alt_names, " ").ilike(pattern),
-            ),
+            _token_match_track(),
         )
-        .order_by(Track.name.asc())
+        .order_by(
+            relevance_rank.asc(),
+            class_rank.asc(),
+            func.length(Track.name).asc(),
+            Track.name.asc(),
+        )
         .limit(limit)
     ).all()
-    for tid, name, state, trail_class, worst_rank, lon, lat, xmin, ymin, xmax, ymax in track_rows:
-        eff_grade = _RANK_GRADE.get(int(worst_rank)) if worst_rank else None
+
+    # 2. Aggregate effective grade ONLY for the <=limit matched track IDs (indexed lookup)
+    rank_by_track: dict[str, int] = {}
+    if track_rows:
+        matched_ids = [r.track_id for r in track_rows]
+        grade_rank_expr = case(
+            (TrackSegmentGrade.effective_grade == "Easy", 1),
+            (TrackSegmentGrade.effective_grade == "Medium", 2),
+            (TrackSegmentGrade.effective_grade == "Hard", 3),
+            (TrackSegmentGrade.effective_grade == "Extreme", 4),
+            else_=0,
+        )
+        for tid, worst_rank in db.execute(
+            select(
+                TrackSegment.track_id,
+                func.coalesce(func.max(grade_rank_expr), 0),
+            )
+            .outerjoin(TrackSegmentGrade, TrackSegment.segment_id == TrackSegmentGrade.segment_id)
+            .where(
+                TrackSegment.is_active.is_(True),
+                TrackSegment.track_id.in_(matched_ids),
+            )
+            .group_by(TrackSegment.track_id)
+        ).all():
+            if tid is not None:
+                rank_by_track[tid] = int(worst_rank or 0)
+
+    for tid, name, state, trail_class, lon, lat, xmin, ymin, xmax, ymax in track_rows:
+        worst_rank = rank_by_track.get(tid, 0)
+        eff_grade = _RANK_GRADE.get(worst_rank) if worst_rank else None
         items.append(
             SearchResultItem(
                 kind="track",
@@ -1401,8 +1513,8 @@ def search_network(
             func.ST_X(POI.geom).label("lon"),
             func.ST_Y(POI.geom).label("lat"),
         )
-        .where(POI.name.ilike(pattern))
-        .order_by(POI.name.asc())
+        .where(_token_match_col(POI.name))
+        .order_by(func.length(POI.name).asc(), POI.name.asc())
         .limit(limit)
     ).all()
     for pid, name, state, poi_type, lon, lat in poi_rows:
@@ -1434,8 +1546,8 @@ def search_network(
             func.ST_XMax(CAPADPark.geom).label("xmax"),
             func.ST_YMax(CAPADPark.geom).label("ymax"),
         )
-        .where(CAPADPark.name.ilike(pattern))
-        .order_by(CAPADPark.name.asc())
+        .where(_token_match_col(CAPADPark.name))
+        .order_by(func.length(CAPADPark.name).asc(), CAPADPark.name.asc())
         .limit(limit)
     ).all()
     for pk_id, name, state, park_type, lon, lat, xmin, ymin, xmax, ymax in park_rows:
@@ -1454,9 +1566,11 @@ def search_network(
             )
         )
 
-    if len(items) < min(3, limit) and len(term) >= 3 and get_settings().enable_geocoder:
+    # Fall back to external AU Nominatim geocoding ONLY when no local track/POI/park matched
+    # so searching baked tracks returns in ~25 ms without blocking on external HTTP calls.
+    if not items and len(term) >= 3 and get_settings().enable_geocoder:
         seen_names = {item.name.strip().lower() for item in items}
-        remaining = max(1, min(5, limit - len(items)))
+        remaining = max(1, min(5, limit))
         for place in geocode_au_places(term, limit=remaining):
             if place.name.strip().lower() in seen_names:
                 continue
