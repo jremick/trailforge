@@ -9,7 +9,7 @@ from typing import Any, Final, Literal
 from urllib.parse import quote, urlencode
 
 from mcp import types
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 from shapely.geometry import LineString
 
 from trailforge.ingestion.connectors.base import (
@@ -101,7 +101,7 @@ class CompactTrackCard(BaseModel):
     bbox: list[float] | None = None
     suitability: CompactSuitability | None = None
     deep_link_url: str = ""
-    coords_preview: list[list[float]] = Field(default_factory=list)
+    preview_coords: list[list[float]] = Field(default_factory=list)
 
 
 class CompactClosureItem(BaseModel):
@@ -155,6 +155,12 @@ class CompactPoiItem(BaseModel):
     distance_m: float | None = None
     access_note: str | None = None
     capad_park_name: str | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def category(self) -> str:
+        """Canonical alias matching W3 MCP App widget `CompactPoiItem.category`."""
+        return self.poi_type
 
 
 class CompactCrossingItem(BaseModel):
@@ -590,12 +596,12 @@ def _simplify_payload_dict(
     explore = data.get("explore")
     if isinstance(explore, dict):
         for card in explore.get("tracks") or []:
-            if isinstance(card, dict) and isinstance(card.get("coords_preview"), list):
+            if isinstance(card, dict) and isinstance(card.get("preview_coords"), list):
                 if drop_explore_previews:
-                    card["coords_preview"] = []
-                elif len(card["coords_preview"]) > 2:
-                    card["coords_preview"] = simplify_linestring_coords(
-                        card["coords_preview"],
+                    card["preview_coords"] = []
+                elif len(card["preview_coords"]) > 2:
+                    card["preview_coords"] = simplify_linestring_coords(
+                        card["preview_coords"],
                         tolerance_deg=tolerance_deg,
                         precision=4,
                         max_points=max_seg_pts,

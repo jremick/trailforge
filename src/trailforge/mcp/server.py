@@ -40,6 +40,7 @@ from trailforge.mcp.context import (
     McpAuthContext,
     McpAuthResolver,
     default_auth_resolver,
+    extract_bare_origin,
     get_mcp_auth_mode,
     get_mcp_settings,
     invoke_auth_resolver,
@@ -127,8 +128,10 @@ def _decode_scope_headers(scope: Scope) -> dict[str, str]:
 
 
 def _build_cors_headers(origin: str | None) -> list[tuple[bytes, bytes]]:
-    # Bearer-only / public discovery MCP routes never use cookies -> safe wildcard or origin mirror
-    allow_origin = origin.strip() if origin and origin.strip() else "*"
+    # Bearer-only / public discovery MCP routes never use cookies -> safe wildcard or bare origin
+    raw_origin = (origin or "").strip()
+    bare = extract_bare_origin(raw_origin) if raw_origin else None
+    allow_origin = bare if (bare is not None and bare == raw_origin.lower()) else "*"
     return [
         (b"access-control-allow-origin", allow_origin.encode("latin-1")),
         (b"access-control-allow-methods", MCP_ALLOWED_METHODS.encode("latin-1")),
@@ -218,7 +221,8 @@ class TrailForgeMcpAsgiApp:
         return custom if isinstance(custom, Settings) else get_mcp_settings()
 
     def _build_www_authenticate(self, public_origin: str) -> str:
-        meta_url = f"{public_origin}/.well-known/oauth-protected-resource{self.resource_path}"
+        safe_origin = extract_bare_origin(public_origin) or "http://localhost:8000"
+        meta_url = f"{safe_origin}/.well-known/oauth-protected-resource{self.resource_path}"
         return f'Bearer resource_metadata="{meta_url}", scope="trailforge:read trailforge:write"'
 
     async def _dispatch_stateless_fallback(

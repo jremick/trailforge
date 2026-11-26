@@ -1434,7 +1434,7 @@ def _tool_search_trails(db: Session, args: dict[str, Any]) -> types.CallToolResu
         trail_class=None,
         bbox=bbox_str,
         q=query,
-        vehicle_class=cap_class,
+        vehicle_class=cap_class if args.get("vehicle_class") else None,
         include_inactive=False,
         limit=min(200, limit * 5),
         offset=0,
@@ -1522,14 +1522,14 @@ def _tool_search_trails(db: Session, args: dict[str, Any]) -> types.CallToolResu
                     trk.track_id,
                     vehicle_class=rig_ctx.capability_class if rig_ctx else None,
                 ),
-                coords_preview=previews.get(trk.track_id, []),
+                preview_coords=previews.get(trk.track_id, []),
             )
         )
 
     eff_bbox = (
         list(bbox)
         if bbox is not None
-        else compute_bbox_from_coords([c.coords_preview for c in cards if c.coords_preview])
+        else compute_bbox_from_coords([c.preview_coords for c in cards if c.preview_coords])
     )
     pois = _query_pois(
         db,
@@ -1608,10 +1608,10 @@ def _tool_search_trails(db: Session, args: dict[str, Any]) -> types.CallToolResu
                 segment_id=c.track_id,
                 grade=c.grade or "Medium",
                 length_m=c.total_length_m,
-                coords=c.coords_preview,
+                coords=c.preview_coords,
             )
             for c in cards
-            if len(c.coords_preview) >= 2
+            if len(c.preview_coords) >= 2
         ]
         png = render_map_card_png(
             title=payload.title,
@@ -1734,7 +1734,7 @@ def _tool_inspect_track(
     try:
         detail = get_track_detail(
             track_id=resolved_id,
-            vehicle_class=cap_class,
+            vehicle_class=cap_class if args.get("vehicle_class") else None,
             current_user=current_user,
             db=db,
         )
@@ -2007,7 +2007,7 @@ def _tool_compare_tracks(db: Session, args: dict[str, Any]) -> types.CallToolRes
         try:
             detail = get_track_detail(
                 track_id=tid,
-                vehicle_class=cap_class,
+                vehicle_class=cap_class if args.get("vehicle_class") else None,
                 current_user=current_user,
                 db=db,
             )
@@ -2197,7 +2197,7 @@ def _tool_check_area_conditions(db: Session, args: dict[str, Any]) -> types.Call
             closure_status=t.closure_status,
             bbox=t.bbox,
             deep_link_url=build_track_deep_link(public_base, t.track_id),
-            coords_preview=previews.get(t.track_id, []),
+            preview_coords=previews.get(t.track_id, []),
         )
         for t in area_tracks
     ]
@@ -2212,7 +2212,7 @@ def _tool_check_area_conditions(db: Session, args: dict[str, Any]) -> types.Call
     eff_bbox = (
         list(bbox)
         if bbox is not None
-        else compute_bbox_from_coords([c.coords_preview for c in track_cards if c.coords_preview])
+        else compute_bbox_from_coords([c.preview_coords for c in track_cards if c.preview_coords])
     )
     deep_link = build_area_deep_link(
         public_base,
@@ -2277,10 +2277,10 @@ def _tool_check_area_conditions(db: Session, args: dict[str, Any]) -> types.Call
                 segment_id=c.track_id,
                 grade=c.grade or "Medium",
                 length_m=c.total_length_m,
-                coords=c.coords_preview,
+                coords=c.preview_coords,
             )
             for c in track_cards
-            if len(c.coords_preview) >= 2
+            if len(c.preview_coords) >= 2
         ]
         png = render_map_card_png(
             title=payload.title,
@@ -2593,7 +2593,7 @@ def _tool_app_search_viewport(db: Session, args: dict[str, Any]) -> types.CallTo
                 closure_status=t.closure_status,
                 bbox=t.bbox,
                 deep_link_url=build_track_deep_link(public_base, t.track_id),
-                coords_preview=previews.get(t.track_id, []),
+                preview_coords=previews.get(t.track_id, []),
             )
         )
 

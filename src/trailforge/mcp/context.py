@@ -7,6 +7,7 @@ import importlib
 import inspect
 import logging
 import os
+import re
 import uuid
 from collections.abc import Awaitable, Callable, Generator, Mapping
 from contextvars import ContextVar, Token
@@ -229,19 +230,31 @@ def get_mcp_app_html_path(cfg: Settings | None = None) -> str:
     return str(raw or "").strip()
 
 
+_VALID_HOST_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9.\-:\[\]]{1,255}$")
+
+
+def is_valid_host_header(host: str) -> bool:
+    """Validate an HTTP Host / X-Forwarded-Host header value (strict host[:port] syntax)."""
+    cleaned = (host or "").strip()
+    if not cleaned or len(cleaned) > 255:
+        return False
+    if any(ch in cleaned for ch in ("@", "/", "\\", '"', "'", " ", "\t", "\r", "\n")):
+        return False
+    return bool(_VALID_HOST_RE.match(cleaned))
+
+
 def extract_bare_origin(url: str) -> str | None:
     """Return a validated ``scheme://host[:port]`` bare origin, or ``None`` if invalid."""
     raw = (url or "").strip()
-    if not raw:
+    if not raw or any(ch in raw for ch in ("\r", "\n", '"', "'", "\\")):
         return None
     parts = urlsplit(raw)
     if parts.scheme.lower() not in ("http", "https"):
         return None
-    if not parts.netloc:
+    if not parts.netloc or "@" in parts.netloc:
         return None
-    # Strip credentials if accidentally present
-    host_port = parts.netloc.rsplit("@", 1)[-1].strip()
-    if not host_port:
+    host_port = parts.netloc.strip()
+    if not is_valid_host_header(host_port):
         return None
     return f"{parts.scheme.lower()}://{host_port}"
 
@@ -292,21 +305,24 @@ def resolve_public_origin_from_headers(
     settings = cfg or get_mcp_settings()
     configured = get_mcp_public_base_url_setting(settings)
     if configured:
-        return configured
+        bare = extract_bare_origin(configured)
+        return bare or configured
 
     lower_headers = {k.lower(): v for k, v in headers.items()}
     trust_proxy = bool(getattr(settings, "trust_proxy_headers", True))
     if trust_proxy:
         fwd_host = (lower_headers.get("x-forwarded-host") or "").split(",")[0].strip()
         fwd_proto = (lower_headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
-        if fwd_host:
+        if is_valid_host_header(fwd_host):
             proto = fwd_proto if fwd_proto in ("http", "https") else scheme
-            return f"{proto}://{fwd_host}".rstrip("/")
+            if proto not in ("http", "https"):
+                proto = "http"
+            return f"{proto}://{fwd_host}"
 
     host = (lower_headers.get("host") or "").strip()
-    if host:
+    if is_valid_host_header(host):
         proto = scheme if scheme in ("http", "https") else "http"
-        return f"{proto}://{host}".rstrip("/")
+        return f"{proto}://{host}"
 
     return "http://localhost:8000"
 

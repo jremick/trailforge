@@ -256,13 +256,45 @@ def test_mcp_protocol_endpoints_auth_modes_kill_switch_and_cors(
     app = _build_test_mcp_app()
 
     with TestClient(app) as client:
-        # 1. OPTIONS CORS preflight on /mcp and /mcp/auth
+        # 1. OPTIONS CORS preflight on /mcp and /mcp/auth (valid origin + spoofed origin rejection)
         opt = client.options("/mcp", headers={"Origin": "https://claude.ai"})
         assert opt.status_code == 204
         assert opt.headers["access-control-allow-origin"] == "https://claude.ai"
         assert "Mcp-Session-Id" in opt.headers["access-control-expose-headers"]
         assert "WWW-Authenticate" in opt.headers["access-control-expose-headers"]
         assert "access-control-allow-credentials" not in opt.headers
+
+        for bad_origin in (
+            "javascript:alert(1)",
+            "https://evil.example.com/path",
+            "https://user:pass@evil.example.com",
+            "not-a-url",
+        ):
+            bad_opt = client.options("/mcp", headers={"Origin": bad_origin})
+            assert bad_opt.status_code == 204
+            assert bad_opt.headers["access-control-allow-origin"] == "*"
+
+        # Spoofed Host / X-Forwarded-Host must never inject quotes or paths into WWW-Authenticate
+        monkeypatch.delenv("TRAILFORGE_PUBLIC_BASE_URL", raising=False)
+        spoof_401 = _mcp_rpc(
+            client,
+            "tools/list",
+            path="/mcp/auth",
+            headers={
+                "Host": 'evil.com",realm="pwned',
+                "X-Forwarded-Host": "attacker.example.com/inject",
+            },
+            req_id=99,
+        )
+        assert spoof_401.status_code == 401
+        spoof_www = spoof_401.headers["www-authenticate"]
+        assert "pwned" not in spoof_www
+        assert "attacker.example.com" not in spoof_www
+        expected_meta = (
+            'resource_metadata="http://localhost:8000/.well-known/oauth-protected-resource/mcp/auth"'
+        )
+        assert expected_meta in spoof_www
+        monkeypatch.setenv("TRAILFORGE_PUBLIC_BASE_URL", "https://trails.example.com")
 
         # 2. Stateless initialize -> tools/list -> resources/list -> resources/read -> prompts/list
         init_resp = _mcp_rpc(
@@ -711,6 +743,9 @@ def test_all_public_and_app_tools_end_to_end_offline(seeded_mcp_env: dict[str, A
     assert sc["schema_version"] == "1.0"
     assert sc["view_mode"] == "explore"
     assert len(sc["explore"]["tracks"]) >= 2
+    assert any(len(t.get("preview_coords") or []) >= 2 for t in sc["explore"]["tracks"])
+    assert all("coords_preview" not in t for t in sc["explore"]["tracks"])
+    assert all(p.get("category") == p.get("poi_type") for p in sc["explore"]["pois"])
     assert not any(b["type"] == "image" for b in s_res["content"])
 
     s_img = call(
@@ -782,10 +817,12 @@ def test_all_public_and_app_tools_end_to_end_offline(seeded_mcp_env: dict[str, A
     assert len(cond_imgs) == 1
     _assert_valid_png_block(cond_imgs[0], (960, 540))
 
-    # 6. find_pois_near
+    # 6. find_pois_near (verifies W3-compatible category field alongside poi_type)
     poi_res = call("find_pois_near", {"track_id": first_tid, "radius_km": 20})
     assert poi_res["structuredContent"]["view_mode"] == "explore"
-    assert len(poi_res["structuredContent"]["explore"]["pois"]) >= 1
+    found_pois = poi_res["structuredContent"]["explore"]["pois"]
+    assert len(found_pois) >= 1
+    assert all(p["category"] == p["poi_type"] for p in found_pois)
 
     # 7. export_route_file (GPX + GeoJSON)
     gpx_res = call("export_route_file", {"track_ids": track_ids[:2], "format": "gpx"})
@@ -873,13 +910,18 @@ def test_personal_tools_scope_enforcement_and_cross_user_isolation(
     assert vehicles[0]["capability_class"] == "Touring 4WD"
     assert "Bob" not in json.dumps(garage)
 
-    # Auto-resolved rig context when vehicle_class omitted by signed-in user
+    # Auto-resolved rig context when vehicle_class omitted by signed-in user (preserves snorkel!)
     insp = call_raw(
         "inspect_track", {"track_id": track_ids[0], "include_images": False}, headers=alice_ro
     )
     assert insp["isError"] is False
     assert insp["structuredContent"]["rig_context"]["vehicle_name"] == "Alice 200 Series"
     assert insp["structuredContent"]["rig_context"]["has_snorkel"] is True
+    # Suitability evaluated with Alice's saved rig (has_snorkel=True -> no snorkel warning)
+    suit = insp["structuredContent"]["track"]["summary"]["suitability"]
+    assert suit is not None
+    assert suit["vehicle_class"] == "Touring 4WD"
+    assert not any("snorkel recommended" in r.lower() for r in suit.get("reasons") or [])
 
     routes = call_raw("list_my_saved_routes", {}, headers=alice_ro)
     assert routes["isError"] is False
