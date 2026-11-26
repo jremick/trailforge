@@ -1631,6 +1631,7 @@ button {
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 8px;
+  flex-shrink: 0;
 }
 
 .tf-elev-stage {
@@ -1638,6 +1639,7 @@ button {
   border: 1px solid rgba(148, 163, 184, 0.22);
   border-radius: 10px;
   overflow: hidden;
+  flex-shrink: 0;
 }
 
 .tf-elev-scrub-hud {
@@ -1684,6 +1686,7 @@ button {
   display: grid;
   grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
   gap: 12px;
+  flex-shrink: 0;
 }
 
 .tf-elev-panel {
