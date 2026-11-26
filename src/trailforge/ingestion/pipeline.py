@@ -55,7 +55,10 @@ from trailforge.ingestion.connectors.base import (
     dedupe_poi_features,
 )
 from trailforge.ingestion.connectors.fixtures import load_corridor_fixtures
-from trailforge.ingestion.crossings import count_waterway_crossings, find_capad_tenure
+from trailforge.ingestion.crossings import (
+    CapadSpatialIndex,
+    WaterwaySpatialIndex,
+)
 from trailforge.ingestion.reconcile import ExistingSegmentSnapshot, reconcile_segments
 from trailforge.ingestion.segmenter import (
     CanonicalTrackGroup,
@@ -468,6 +471,7 @@ def _upsert_canonical_pois(
     capad_parks: list[RawCapadFeature],
     capad_id_map: dict[str, int],
     active_seg_geoms: list[tuple[str, LineString]],
+    capad_index: CapadSpatialIndex | None = None,
 ) -> int:
     deduped = dedupe_poi_features(raw_pois)
     if not deduped:
@@ -476,6 +480,7 @@ def _upsert_canonical_pois(
     seg_ids = [sid for sid, _ in active_seg_geoms]
     seg_lines = [geom for _, geom in active_seg_geoms]
     seg_tree = STRtree(seg_lines) if seg_lines else None
+    park_index = capad_index if capad_index is not None else CapadSpatialIndex(capad_parks)
     now = datetime.now(UTC)
 
     count = 0
@@ -486,7 +491,7 @@ def _upsert_canonical_pois(
         lon = float(pt_wgs84.x)
         lat = float(pt_wgs84.y)
 
-        tenure = find_capad_tenure(pt_wgs84, capad_parks)
+        tenure = park_index.find_tenure(pt_wgs84)
         park_id = capad_id_map.get(tenure["source_feature_id"]) if tenure else None
         state = poi.state or (tenure["state"] if tenure else infer_state_from_lonlat(lon, lat))
 
@@ -574,9 +579,11 @@ def ingest_corridor_dataset(
     # 2. Multi-Source Conflation & Canonical 50-100 m Segmentation
     # -------------------------------------------------------------------------
     conflation = conflate_tracks(dataset.all_tracks)
+    capad_index = CapadSpatialIndex(dataset.capad_parks)
+    waterway_index = WaterwaySpatialIndex(dataset.waterways)
 
     def _resolve_state(lon: float, lat: float) -> str:
-        tenure = find_capad_tenure(Point(lon, lat), dataset.capad_parks)
+        tenure = capad_index.find_tenure(Point(lon, lat))
         if tenure and tenure.get("state") in AU_STATE_CODES:
             return str(tenure["state"])
         return infer_state_from_lonlat(lon, lat)
@@ -634,10 +641,15 @@ def ingest_corridor_dataset(
             else:
                 terrain = SegmentTerrainMetrics(length_m=cand.length_m)
 
-            crossings = count_waterway_crossings(
-                cand.geom_wgs84, dataset.waterways, is_bridged=cand.is_bridged
+            crossings = waterway_index.count_crossings(
+                cand.geom_wgs84,
+                geom_3577=cand.geom_3577,
+                is_bridged=cand.is_bridged,
             )
-            tenure = find_capad_tenure(cand.geom_wgs84, dataset.capad_parks)
+            tenure = capad_index.find_tenure(
+                cand.geom_wgs84,
+                geom_3577=cand.geom_3577,
+            )
             park_id = capad_id_map.get(tenure["source_feature_id"]) if tenure else None
 
             grade_input = SegmentGradeInput(
@@ -886,7 +898,12 @@ def ingest_corridor_dataset(
     # 8. Upsert Deduplicated Canonical `pois`
     # -------------------------------------------------------------------------
     n_pois_canonical = _upsert_canonical_pois(
-        session, dataset.pois, dataset.capad_parks, capad_id_map, active_seg_geoms
+        session,
+        dataset.pois,
+        dataset.capad_parks,
+        capad_id_map,
+        active_seg_geoms,
+        capad_index=capad_index,
     )
 
     if commit:
