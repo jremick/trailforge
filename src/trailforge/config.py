@@ -60,12 +60,21 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("TRAILFORGE_UPLOADS_DIR", "UPLOADS_DIR"),
         description="Directory storing validated community condition report photo attachments.",
     )
-    trailforge_packs_dir: str = Field(default="/data/packs")
+    packs_dir: str = Field(
+        default="/data/packs",
+        validation_alias=AliasChoices("PACKS_DIR", "TRAILFORGE_PACKS_DIR"),
+        description="Directory storing built offline regional pack bundles and manifests.",
+    )
 
     @property
     def trailforge_tiles_dir(self) -> str:
         """Backward-compatible alias for `tiles_dir`."""
         return self.tiles_dir
+
+    @property
+    def trailforge_packs_dir(self) -> str:
+        """Backward-compatible alias for `packs_dir`."""
+        return self.packs_dir
 
     @property
     def cors_origins_list(self) -> list[str]:

@@ -13,7 +13,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from trailforge import SERVICE_NAME, __version__
 from trailforge.api.auth import router as auth_router
 from trailforge.api.closures import router as closures_router
+from trailforge.api.grading import router as grading_router
 from trailforge.api.health import router as health_router
+from trailforge.api.packs import router as packs_router
 from trailforge.api.reports import router as reports_router
 from trailforge.api.tiles import router as tiles_router
 from trailforge.api.tracks import router as tracks_router
@@ -66,6 +68,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(tiles_router)
     application.include_router(tracks_router)
     application.include_router(closures_router)
+    application.include_router(grading_router)
+    application.include_router(packs_router)
     application.include_router(reports_router)
     application.include_router(trips_router)
     application.include_router(auth_router)

@@ -26,6 +26,7 @@ from trailforge.db.models import (
 from trailforge.db.session import get_db
 from trailforge.feeds.queries import get_closures_for_track_ids
 from trailforge.grading.baseline import SegmentGradeInput, compute_baseline_grade
+from trailforge.grading.live import get_live_summaries_for_tracks, get_track_live_summary
 from trailforge.reports.queries import get_reports_for_track
 from trailforge.vehicles.classifier import (
     CapabilityClassLiteral,
@@ -196,6 +197,13 @@ class TrackSummaryResponse(BaseModel):
     effective_grade: str | None = None
     grade: str | None = None
     score: float | None = None
+    live_grade: str | None = None
+    live_score: float | None = None
+    confidence_level: str = "none"
+    sample_count: int = 0
+    last_driven_at: str | None = None
+    avg_speed_kmh: float | None = None
+    est_duration_min: float | None = None
     bbox: list[float] | None = None
     segment_count: int = 0
     is_active: bool
@@ -234,6 +242,10 @@ class TrackDetailResponse(TrackSummaryResponse):
     has_gate_barrier: bool = False
     access_status: str = "public"
     baseline_breakdown: dict[str, Any] | None = None
+    vehicle_class_split: dict[str, Any] = Field(default_factory=dict)
+    live_breakdown: dict[str, Any] | None = None
+    rainfall_context: dict[str, Any] | None = None
+    obstacle_hotspots: list[dict[str, Any]] = Field(default_factory=list)
     elevation_profile: list[ElevationProfilePoint] = Field(default_factory=list)
     waterway_crossings: list[WaterwayCrossingItem] = Field(default_factory=list)
     primary_park: ParkSummary | None = None
@@ -483,6 +495,18 @@ def _load_reports_for_track(
     )
 
 
+def _normalize_confidence(raw: str | None) -> str:
+    if not raw or raw == "baseline_only":
+        return "none"
+    return raw if raw in ("low", "medium", "high") else "none"
+
+
+def _wet_for_suitability(raw: str | None) -> str:
+    if raw == "heavy_rain":
+        return "saturated"
+    return raw if raw in ("dry", "damp", "wet", "saturated") else "dry"
+
+
 def _get_favorite_track_ids(db: Session, user: User | None, track_ids: list[str]) -> set[str]:
     if user is None or not track_ids:
         return set()
@@ -521,12 +545,38 @@ def list_tracks(
         (TrackSegmentGrade.effective_grade == "Extreme", 4),
         else_=0,
     )
+    live_rank_expr = case(
+        (TrackSegmentGrade.live_grade == "Easy", 1),
+        (TrackSegmentGrade.live_grade == "Medium", 2),
+        (TrackSegmentGrade.live_grade == "Hard", 3),
+        (TrackSegmentGrade.live_grade == "Extreme", 4),
+        else_=0,
+    )
+    conf_rank_expr = case(
+        (TrackSegmentGrade.confidence_level == "low", 1),
+        (TrackSegmentGrade.confidence_level == "medium", 2),
+        (TrackSegmentGrade.confidence_level == "high", 3),
+        else_=0,
+    )
+    wet_rank_expr = case(
+        (TrackSegmentGrade.wet_risk_level == "damp", 1),
+        (TrackSegmentGrade.wet_risk_level == "wet", 2),
+        (TrackSegmentGrade.wet_risk_level == "saturated", 3),
+        else_=0,
+    )
     seg_agg = (
         select(
             TrackSegment.track_id.label("track_id"),
             func.count(TrackSegment.segment_id).label("segment_count"),
             func.max(grade_rank_expr).label("worst_rank"),
+            func.max(live_rank_expr).label("worst_live_rank"),
             func.max(TrackSegmentGrade.baseline_score).label("max_score"),
+            func.max(TrackSegmentGrade.live_score).label("max_live_score"),
+            func.max(conf_rank_expr).label("max_conf_rank"),
+            func.max(TrackSegmentGrade.sample_count).label("max_samples"),
+            func.max(TrackSegmentGrade.last_driven_at).label("last_driven_at"),
+            func.avg(TrackSegmentGrade.avg_speed_kmh).label("avg_speed_kmh"),
+            func.max(wet_rank_expr).label("max_wet_rank"),
             func.bool_or(TrackSegment.is_4wd_only).label("any_4wd_only"),
             func.bool_or(TrackSegment.has_perennial_crossing).label("any_perennial"),
         )
@@ -542,7 +592,14 @@ def list_tracks(
             CAPADPark.name.label("park_name"),
             func.coalesce(seg_agg.c.segment_count, 0).label("segment_count"),
             func.coalesce(seg_agg.c.worst_rank, 0).label("worst_rank"),
+            func.coalesce(seg_agg.c.worst_live_rank, 0).label("worst_live_rank"),
             seg_agg.c.max_score.label("max_score"),
+            seg_agg.c.max_live_score.label("max_live_score"),
+            func.coalesce(seg_agg.c.max_conf_rank, 0).label("max_conf_rank"),
+            func.coalesce(seg_agg.c.max_samples, 0).label("max_samples"),
+            seg_agg.c.last_driven_at.label("last_driven_at"),
+            seg_agg.c.avg_speed_kmh.label("avg_speed_kmh"),
+            func.coalesce(seg_agg.c.max_wet_rank, 0).label("max_wet_rank"),
             func.coalesce(seg_agg.c.any_4wd_only, False).label("any_4wd_only"),
             func.coalesce(seg_agg.c.any_perennial, False).label("any_perennial"),
             func.ST_XMin(Track.bbox_geom).label("xmin"),
@@ -583,14 +640,23 @@ def list_tracks(
     track_ids = [r[0].track_id for r in rows]
     closures_map = _load_closures_by_track(db, track_ids)
     fav_ids = _get_favorite_track_ids(db, current_user, track_ids)
+    live_map = get_live_summaries_for_tracks(db, track_ids)
 
+    _wet_by_rank = {0: "dry", 1: "damp", 2: "wet", 3: "saturated"}
     results: list[TrackSummaryResponse] = []
     for (
         trk,
         park_name,
         segment_count,
         worst_rank,
+        _worst_live_rank,
         max_score,
+        _max_live_score,
+        _max_conf_rank,
+        _max_samples,
+        _last_driven_at,
+        _avg_speed_kmh,
+        max_wet_rank,
         any_4wd_only,
         any_perennial,
         xmin,
@@ -599,6 +665,11 @@ def list_tracks(
         ymax,
     ) in rows:
         eff_grade = _RANK_GRADE.get(int(worst_rank)) if worst_rank else None
+        live_s = live_map.get(trk.track_id, {})
+        rain_ctx = live_s.get("rainfall_context") or {}
+        wet_lvl = _wet_for_suitability(
+            str(rain_ctx.get("wet_risk_level") or _wet_by_rank.get(int(max_wet_rank), "dry"))
+        )
         c_status, active_closures = closures_map.get(trk.track_id, ("open", []))
         suitability = (
             evaluate_track_suitability(
@@ -610,6 +681,7 @@ def list_tracks(
                 has_perennial_crossing=bool(any_perennial),
                 is_4wd_only=bool(any_4wd_only),
                 has_snorkel=has_snorkel,
+                wet_risk_level=wet_lvl,  # type: ignore[arg-type]
                 closure_status=c_status,
             )
             if cap_class is not None
@@ -635,6 +707,13 @@ def list_tracks(
                 effective_grade=eff_grade,
                 grade=eff_grade,
                 score=round(float(max_score), 1) if max_score is not None else None,
+                live_grade=live_s.get("live_grade"),
+                live_score=live_s.get("live_score"),
+                confidence_level=str(live_s.get("confidence_level") or "none"),
+                sample_count=int(live_s.get("sample_count") or 0),
+                last_driven_at=live_s.get("last_driven_at"),
+                avg_speed_kmh=live_s.get("avg_speed_kmh"),
+                est_duration_min=live_s.get("est_duration_min"),
                 bbox=_bbox_list(xmin, ymin, xmax, ymax),
                 segment_count=int(segment_count),
                 is_active=trk.is_active,
@@ -680,6 +759,8 @@ def get_corridor_tracks_geojson(
 
     features: list[dict[str, Any]] = []
     for seg, geom_json, grd in rows:
+        live_bd = grd.live_breakdown if grd and isinstance(grd.live_breakdown, dict) else {}
+        rain_ctx = grd.rainfall_context if grd and isinstance(grd.rainfall_context, dict) else {}
         features.append(
             {
                 "type": "Feature",
@@ -712,10 +793,23 @@ def get_corridor_tracks_geojson(
                     "primary_source": seg.primary_source,
                     "has_osm_source": seg.has_osm_source,
                     "grade": grd.effective_grade if grd else None,
-                    "score": grd.baseline_score if grd else None,
+                    "score": (
+                        grd.live_score
+                        if grd and grd.live_score is not None
+                        else (grd.baseline_score if grd else None)
+                    ),
                     "baseline_grade": grd.baseline_grade if grd else None,
                     "baseline_score": grd.baseline_score if grd else None,
                     "effective_grade": grd.effective_grade if grd else None,
+                    "live_grade": grd.live_grade if grd else None,
+                    "live_score": grd.live_score if grd else None,
+                    "confidence_level": _normalize_confidence(
+                        grd.confidence_level if grd else None
+                    ),
+                    "is_obstacle_hotspot": bool(live_bd.get("is_obstacle_hotspot", False)),
+                    "wet_risk_level": str(
+                        rain_ctx.get("wet_risk_level") or (grd.wet_risk_level if grd else "dry")
+                    ),
                 },
             }
         )
@@ -1022,6 +1116,9 @@ def get_track_detail(
         trk.track_id, ("open", [])
     )
     condition_reports, community_gate_warnings = _load_reports_for_track(db, trk.track_id)
+    live_summary = get_track_live_summary(db, trk.track_id)
+    rain_ctx = live_summary.get("rainfall_context") or {}
+    suit_wet = _wet_for_suitability(str(rain_ctx.get("wet_risk_level") or "dry"))
     is_fav = trk.track_id in _get_favorite_track_ids(db, current_user, [trk.track_id])
     suitability = (
         evaluate_track_suitability(
@@ -1033,6 +1130,7 @@ def get_track_detail(
             has_perennial_crossing=any_unbridged_perennial,
             is_4wd_only=is_4wd_only,
             has_snorkel=has_snorkel,
+            wet_risk_level=suit_wet,  # type: ignore[arg-type]
             surface_class=worst_surface,
             closure_status=c_status,
         )
@@ -1068,6 +1166,17 @@ def get_track_detail(
         effective_grade=eff_grade,
         grade=eff_grade,
         score=peak_score,
+        live_grade=live_summary["live_grade"],
+        live_score=live_summary["live_score"],
+        confidence_level=live_summary["confidence_level"],
+        sample_count=live_summary["sample_count"],
+        last_driven_at=live_summary["last_driven_at"],
+        avg_speed_kmh=live_summary["avg_speed_kmh"],
+        est_duration_min=live_summary["est_duration_min"],
+        vehicle_class_split=live_summary["vehicle_class_split"],
+        live_breakdown=live_summary["live_breakdown"],
+        rainfall_context=live_summary["rainfall_context"],
+        obstacle_hotspots=live_summary["obstacle_hotspots"],
         bbox=_bbox_list(xmin, ymin, xmax, ymax),
         source_refs=merged_refs,
         baseline_breakdown=baseline_breakdown,

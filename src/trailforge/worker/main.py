@@ -15,18 +15,20 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import FrameType
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from trailforge import __version__
 from trailforge.config import Settings, get_settings
-from trailforge.db.models import FeedSyncStatus
+from trailforge.db.models import FeedSyncStatus, TelemetryObservation, TrackSegmentGrade
 from trailforge.db.session import DbHealthStatus, check_db_health, get_engine, reset_engine
 from trailforge.feeds.adapters import build_default_adapters
 from trailforge.feeds.sync import FeedSyncResult, sync_feed
+from trailforge.grading.live import LiveGradingRecomputeSummary, recompute_live_grades
 
 logger = logging.getLogger("trailforge.worker")
 HEARTBEAT_PATH = Path("/tmp/worker-healthy")
+DEFAULT_LIVE_GRADING_INTERVAL_S = 900
 
 
 def touch_heartbeat(path: Path = HEARTBEAT_PATH) -> None:
@@ -110,6 +112,75 @@ def run_due_closure_syncs(
     return results
 
 
+def run_due_live_grading(
+    *,
+    now: datetime | None = None,
+    interval_s: int | None = None,
+    enable_live_rainfall: bool | None = None,
+) -> LiveGradingRecomputeSummary | None:
+    """Periodically recompute live crowdsourced grades & cached rainfall context (offline-safe).
+
+    Never performs outbound HTTP unless ``TRAILFORGE_ENABLE_LIVE_FEEDS`` is explicitly enabled.
+    Skips cleanly when no ``telemetry_observations`` or un-evaluated segments need refresh.
+    """
+    current = now or datetime.now(UTC)
+    if interval_s is None:
+        raw_int = os.environ.get("TRAILFORGE_LIVE_GRADING_INTERVAL_S")
+        interval_s = (
+            int(raw_int) if raw_int and raw_int.isdigit() else DEFAULT_LIVE_GRADING_INTERVAL_S
+        )
+    live_rain = (
+        enable_live_rainfall
+        if enable_live_rainfall is not None
+        else _is_truthy(os.environ.get("TRAILFORGE_ENABLE_LIVE_FEEDS"))
+    )
+
+    engine = get_engine()
+    with Session(engine) as session:
+        obs_count = int(
+            session.execute(select(func.count(TelemetryObservation.id))).scalar_one() or 0
+        )
+        if obs_count == 0 and not live_rain:
+            return None
+
+        last_computed = session.execute(
+            select(func.max(TrackSegmentGrade.live_computed_at))
+        ).scalar_one_or_none()
+        if last_computed is not None:
+            last_dt = (
+                last_computed.astimezone(UTC)
+                if last_computed.tzinfo
+                else last_computed.replace(tzinfo=UTC)
+            )
+            latest_obs = session.execute(
+                select(func.max(TelemetryObservation.created_at))
+            ).scalar_one_or_none()
+            has_newer_obs = False
+            if latest_obs is not None:
+                obs_dt = (
+                    latest_obs.astimezone(UTC)
+                    if latest_obs.tzinfo
+                    else latest_obs.replace(tzinfo=UTC)
+                )
+                has_newer_obs = obs_dt > last_dt
+            if not has_newer_obs and (current - last_dt) < timedelta(seconds=interval_s):
+                return None
+
+        summary = recompute_live_grades(
+            session,
+            now=current,
+            fetch_live_rainfall=live_rain,
+        )
+        session.commit()
+        logger.info(
+            "Recomputed live grades (segments=%d, with_telemetry=%d, hotspots=%d)",
+            summary.segments_evaluated,
+            summary.segments_with_telemetry,
+            summary.obstacle_hotspots_count,
+        )
+        return summary
+
+
 def run_worker_tick(heartbeat_path: Path = HEARTBEAT_PATH) -> DbHealthStatus:
     """Execute one lightweight worker poll cycle and update the liveness file when DB is ready."""
     status = check_db_health()
@@ -124,6 +195,10 @@ def run_worker_tick(heartbeat_path: Path = HEARTBEAT_PATH) -> DbHealthStatus:
             run_due_closure_syncs()
         except Exception:
             logger.exception("Closure sync tick failed unexpectedly; worker remains healthy")
+        try:
+            run_due_live_grading()
+        except Exception:
+            logger.exception("Live grading tick failed unexpectedly; worker remains healthy")
     else:
         logger.warning("Worker DB health check failed; skipping scheduled jobs this cycle")
     return status

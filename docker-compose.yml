@@ -46,6 +46,8 @@ services:
       PRIVACY_TRIM_METERS: ${PRIVACY_TRIM_METERS:-250}
       SNOW_LINE_DEFAULT_M: ${SNOW_LINE_DEFAULT_M:-1000}
       TILES_DIR: ${TILES_DIR:-/data/tiles}
+      PACKS_DIR: ${PACKS_DIR:-/data/packs}
+      TRAILFORGE_PACKS_DIR: ${TRAILFORGE_PACKS_DIR:-/data/packs}
       TRAILFORGE_UPLOADS_DIR: ${TRAILFORGE_UPLOADS_DIR:-/data/uploads}
       GDAL_CACHEMAX: ${GDAL_CACHEMAX:-192}
       OMP_THREAD_LIMIT: ${OMP_THREAD_LIMIT:-1}
@@ -54,6 +56,7 @@ services:
     volumes:
       - trailforge-data:/data
       - trailforge_tiles:/data/tiles
+      - trailforge_packs:/data/packs
       - trailforge_uploads:/data/uploads
     depends_on:
       db:
@@ -79,11 +82,14 @@ services:
       WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-30}
       PRIVACY_TRIM_METERS: ${PRIVACY_TRIM_METERS:-250}
       TILES_DIR: ${TILES_DIR:-/data/tiles}
+      PACKS_DIR: ${PACKS_DIR:-/data/packs}
+      TRAILFORGE_PACKS_DIR: ${TRAILFORGE_PACKS_DIR:-/data/packs}
       GDAL_CACHEMAX: ${GDAL_CACHEMAX:-192}
       OMP_THREAD_LIMIT: ${OMP_THREAD_LIMIT:-1}
     volumes:
       - trailforge-data:/data
       - trailforge_tiles:/data/tiles
+      - trailforge_packs:/data/packs
     depends_on:
       db:
         condition: service_healthy
@@ -125,4 +131,5 @@ volumes:
   trailforge-pgdata:
   trailforge-data:
   trailforge_tiles:
+  trailforge_packs:
   trailforge_uploads:

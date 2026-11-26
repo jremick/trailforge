@@ -226,7 +226,26 @@ def export_postgis_vector_layers(
             if grd is not None and grd.effective_grade
             else (grd.baseline_grade if grd is not None else "Easy")
         )
-        score_val = float(grd.baseline_score) if grd is not None else 0.0
+        score_val = (
+            float(grd.live_score)
+            if grd is not None and grd.live_score is not None
+            else (float(grd.baseline_score) if grd is not None else 0.0)
+        )
+        live_bd = (
+            grd.live_breakdown
+            if grd is not None and isinstance(grd.live_breakdown, dict)
+            else {}
+        )
+        rain_ctx = (
+            grd.rainfall_context
+            if grd is not None and isinstance(grd.rainfall_context, dict)
+            else {}
+        )
+        raw_conf = grd.confidence_level if grd is not None else "baseline_only"
+        conf_level = "none" if raw_conf in (None, "", "baseline_only") else raw_conf
+        wet_risk = str(
+            rain_ctx.get("wet_risk_level") or (grd.wet_risk_level if grd is not None else "dry")
+        )
 
         seg_props: dict[str, Any] = {
             "segment_id": seg.segment_id,
@@ -234,6 +253,15 @@ def export_postgis_vector_layers(
             "track_name": resolved_name,
             "grade": grade_val,
             "score": round(score_val, 1),
+            "live_grade": grd.live_grade if grd is not None else None,
+            "live_score": (
+                round(float(grd.live_score), 1)
+                if grd is not None and grd.live_score is not None
+                else None
+            ),
+            "confidence_level": conf_level,
+            "is_obstacle_hotspot": bool(live_bd.get("is_obstacle_hotspot", False)),
+            "wet_risk_level": wet_risk,
             "max_slope_deg": round(seg.max_slope_deg, 2) if seg.max_slope_deg is not None else 0.0,
             "sustained_slope_deg": (
                 round(seg.sustained_slope_deg, 2) if seg.sustained_slope_deg is not None else 0.0
