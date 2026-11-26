@@ -182,7 +182,8 @@ globalThis.fetch = async (url, init) => {{
     return new Response(null, {{
       status: 307,
       headers: {{
-        Location: "https://internal-secret-svc.up.railway.app/api/packs?region=alps",
+        // TLS-terminating origins (e.g. Railway) may emit http:// in 307 redirects.
+        Location: "http://internal-secret-svc.up.railway.app/api/packs?region=alps",
       }},
     }});
   }}

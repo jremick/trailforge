@@ -126,7 +126,10 @@ function rewriteRedirectLocation(location, upstreamOrigin, incomingUrl) {
   }
   try {
     const parsed = new URL(trimmed, upstreamOrigin);
-    if (parsed.origin === upstreamOrigin) {
+    const upstreamHost = new URL(upstreamOrigin).host.toLowerCase();
+    // Match by host (ignoring http vs https) because origins behind TLS-terminating
+    // proxies (such as Railway) may emit http://<upstream-host>/... in 307 redirects.
+    if (parsed.host.toLowerCase() === upstreamHost) {
       return `${incomingUrl.origin}${parsed.pathname}${parsed.search}${parsed.hash}`;
     }
     return location;
