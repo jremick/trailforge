@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "trailforge"
-version = "1.0.0b1"
+version = "1.0.0"
 description = "Open-source, self-hostable 4WD & off-road mapping, live track-grading, and trail-intelligence platform for Victoria & New South Wales"
 readme = "README.md"
 license = "GPL-3.0-or-later"
@@ -14,7 +14,7 @@ authors = [
 ]
 keywords = ["gis", "4wd", "offroad", "postgis", "pmtiles", "maplibre", "victoria", "nsw", "tracks"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Web Environment",
     "Intended Audience :: End Users/Desktop",
     "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",

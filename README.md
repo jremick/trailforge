@@ -5,7 +5,7 @@
 **Open-source, self-hostable 4WD & off-road mapping, live track-grading, multi-track route planning, and trail-intelligence platform across all 8 Australian states & territories (`VIC`, `NSW`, `ACT`, `TAS`, `QLD`, `WA`, `SA`, `NT`).**
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-[![Release: v1.0.0-beta.1](https://img.shields.io/badge/Release-v1.0.0--beta.1-8b5cf6)](CHANGELOG.md)
+[![Release: v1.0.0](https://img.shields.io/badge/Release-v1.0.0-16a34a)](CHANGELOG.md)
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![PostGIS 3.4 + PMTiles](https://img.shields.io/badge/PostGIS-3.4%20%2B%20PMTiles-336791?logo=postgresql&logoColor=white)](Dockerfile)
 [![MapLibre GL JS 5](https://img.shields.io/badge/MapLibre%20GL%20JS-5-396CB2?logo=maplibre&logoColor=white)](web/package.json)
@@ -301,19 +301,20 @@ See [`docs/PLAN.md`](docs/PLAN.md) for the vertical-slice roadmap, [`docs/SPEC_G
 
 ---
 
-## Release Status & Roadmap (`v1.0.0-beta.1` → `v1.1.0`)
+## Release Status & Roadmap (`v1.0.0` → `v1.1.0`)
 
-- **Landed on `main` (Phase B — targeting `v1.1.0`):**
+- **Shipped in `v1.0.0` (Inaugural Stable GA Release — publishes `:v1.0.0`, `:v1.0` & `:latest` multi-arch GHCR images):**
   - **Pan-Australia 8-State Connectors & 15-Region Pack Catalog:** Full connectors for `ACT`, `TAS`, `QLD`, `WA` (strictly excluding `CC BY-NC`), `SA`, and `NT` alongside `VIC` & `NSW` via `AutoAUStateTrailsRouter`, Tier A `0003_pan_au_source_tracks` migration (28 base tables / 21 GIST indexes), and 15 offline pack regions (`7` iconic 4WD + `8` statewide) with dynamic per-state attributions.
-  - **Pan-Australia Official Closure & Emergency Feeds:** 6 new state adapters (`act_esa`, `tas_alert`, `qld_des_alerts`, `wa_emergency`, `sa_cfs_parks`, `nt_securent`) alongside the 5 core VIC/NSW/OSM feeds, CAPAD park joins, `?state=` filtering, and lean `TRAILFORGE_ENABLED_STATES` scoping.
+  - **Pan-Australia Official Closure & Emergency Feeds:** 6 new state adapters (`act_esa`, `tas_alert`, `qld_des_alerts`, `wa_emergency`, `sa_cfs_parks`, `nt_securent`) alongside the 5 core VIC/NSW/OSM feeds (11 feeds total), CAPAD park joins, `?state=` filtering, and lean `TRAILFORGE_ENABLED_STATES` scoping.
   - **Pluggable Valhalla `TrackMatcher` Sidecar & 50 Hz Mobile IMU:** `ValhallaTrackMatcher` + pure-Python Polyline6 decoder + canonical PostGIS `track_segments` projection + automatic `postgis_hmm_fallback`, opt-in `deploy/valhalla-compose.override.yml`, high-rate IMU roughness/shock/clinometer processor (`matching/imu.py`) with mandatory `≥ 250 m` privacy trimming, and `POST /api/trips/mobile-sync`.
   - **Capacitor 7 Mobile Shell, Live 4WD Clinometer & Pan-AU UI:** `web/capacitor.config.ts`, `web/src/native/bridge.ts`, `mobile/` iOS/Android background GPS & sensor templates, live Pitch°/Roll° 4WD Clinometer in the In-Cab Recorder, Pan-AU 15-region presets & pack category filters, and CarPlay / Android Auto projection spec.
-- **Shipped in `v1.0.0-beta.1`:**
+  - **Graduated to Stable GA:** All `v1.0.0-beta.1` and `v1.0.0-alpha.1` capabilities including the Interactive Multi-Track Route Planner & GridForge 300 DPI Strip Atlas handoff, streaming OSM PBF regional bake pipeline, zero-build multi-arch GHCR + HTTPS deploy kit, and all 9 core vertical slices.
+- **Previously shipped in `v1.0.0-beta.1`:**
   - Streaming OSM PBF + live VIC/NSW open-data tiled regional bake pipeline (`bake_cli`), real-data AU corridor bake verification (Blue Mountains & Tom Groggin), and `11,179`-segment PostGIS GIST scale benchmark (`13.65 MiB` heap, `0.18–0.63 ms` index scans).
   - Multi-arch GHCR release workflow (`.github/workflows/release-images.yml`), zero-build `docker-compose.ghcr.yml`, turnkey HTTPS deploy kit (`deploy/`), and isolated `trailforge_test` PostGIS integration test DB (`make test-integration`).
   - Interactive Multi-Track Route Planner (`planned_routes` migration, DP leg orientation, combined 4-grade elevation profile, saved routes CRUD, GPX/GeoJSON export, and 1-click GridForge 300 DPI Strip Atlas CLI handoff).
 - **Previously shipped in `v1.0.0-alpha.1`:** All **9 vertical slices** from [`docs/PLAN.md`](docs/PLAN.md) verified end-to-end across Checkpoints A, B, and C on the VIC/NSW Australian Alps corridor.
-- **Next Milestones:** Statewide production PBF/DEM pack bakes across Australia, multi-week live agency soak testing, and native iOS CarPlay (`CPMapTemplate`) & Android Auto (`NavigationTemplate`) companion packaging.
+- **Next Milestones (`v1.1+`):** Statewide production PBF/DEM pack bakes across Australia, multi-week live agency soak testing, and native iOS CarPlay (`CPMapTemplate`) & Android Auto (`NavigationTemplate`) companion packaging.
 
 ---
 
