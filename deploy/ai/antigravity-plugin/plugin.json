@@ -1,0 +1,21 @@
+{
+  "name": "trailforge",
+  "displayName": "TrailForge 4WD Trail Intelligence",
+  "version": "1.2.0",
+  "description": "Australian 4WD track search, explainable DEM/telemetry grading, live agency closures, rig suitability, multi-track route planning, and interactive maps via TrailForge MCP.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Find open Moderate tracks in the Australian Alps suitable for a Touring 4WD with campsites nearby",
+    "Check current closures, locked gates, and 72-hour rainfall wet-risk around Kosciuszko and Davies Plain",
+    "Plan a 2-track High Country route, show the interactive map and elevation profile, and export GPX"
+  ],
+  "author": {
+    "name": "TrailForge Contributors",
+    "url": "https://github.com/jremick/trailforge"
+  },
+  "homepage": "https://github.com/jremick/trailforge",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jremick/trailforge.git"
+  }
+}

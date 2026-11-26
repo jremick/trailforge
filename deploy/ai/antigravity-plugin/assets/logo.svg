@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="TrailForge Logo">
+  <!-- Transparent outer margin (~10%) for clean framing across light and dark host themes -->
+  <rect x="10" y="10" width="108" height="108" rx="24" fill="#0B1117" stroke="#334155" stroke-width="3"/>
+  <!-- Topographic contour accents -->
+  <path d="M22 92 Q46 78 68 82 T106 68" fill="none" stroke="#1E293B" stroke-width="2" stroke-linecap="round"/>
+  <path d="M22 100 Q54 88 78 92 T106 80" fill="none" stroke="#1E293B" stroke-width="1.8" stroke-linecap="round"/>
+  <!-- Topographic alpine ridge silhouette -->
+  <path d="M22 86 L46 44 L66 66 L84 38 L106 86 Z" fill="#15222E" stroke="#38BDF8" stroke-width="3.5" stroke-linejoin="round"/>
+  <!-- Graded 4WD trail ribbon (Easy green -> Hard amber) -->
+  <path d="M24 96 C40 88, 50 80, 62 74 C74 68, 82 56, 102 46" fill="none" stroke="#F59E0B" stroke-width="6.5" stroke-linecap="round"/>
+  <path d="M24 96 C38 89, 47 82, 56 77" fill="none" stroke="#22C55E" stroke-width="6.5" stroke-linecap="round"/>
+  <!-- Summit waypoint beacon -->
+  <circle cx="84" cy="38" r="7" fill="#22C55E" stroke="#0B1117" stroke-width="3"/>
+</svg>

@@ -5,6 +5,7 @@
 #
 # Required TrailForge `.env` settings behind HTTPS:
 #   CORS_ORIGINS=https://trails.example.com
+#   TRAILFORGE_PUBLIC_BASE_URL=https://trails.example.com
 #   AUTH_COOKIE_SECURE=true
 #   AUTH_SECRET_KEY=<64-hex-chars from: openssl rand -hex 32>
 #   TRAILFORGE_PRIVACY_SECRET=<64-hex-chars from: openssl rand -hex 32>
@@ -15,6 +16,14 @@
 #     offline pack `bundle.tar.gz` archives without proxy buffering.
 #   - Compression (`encode`) is explicitly excluded from `/api/tiles/*` and
 #     `/api/packs/*/tiles/*` so binary PMTiles byte ranges are never re-encoded.
+#
+# MCP Streamable HTTP & OAuth 2.1 notes:
+#   - `/mcp` and `/mcp/*` are excluded from `@compressible` so Streamable HTTP
+#     SSE frames flush immediately (`flush_interval -1`) without gzip/zstd buffering.
+#   - Caddy forwards `Authorization`, `Accept`, `Content-Type`, `Mcp-Session-Id`,
+#     `MCP-Protocol-Version`, and `Last-Event-ID` verbatim, sets `X-Forwarded-Host`
+#     and `X-Forwarded-Proto` for `/.well-known/oauth-*` discovery metadata, and
+#     preserves upstream `Mcp-Session-Id` and `WWW-Authenticate` response headers.
 
 trails.example.com {
 	# Match web/nginx.conf (`client_max_body_size 15m`) for GPX trace uploads
@@ -23,10 +32,11 @@ trails.example.com {
 		max_size 15MB
 	}
 
-	# Compress HTML/JS/CSS/JSON/SVG while keeping PMTiles Range endpoints and
-	# pre-compressed offline pack archives byte-exact for HTTP 206 responses.
+	# Compress HTML/JS/CSS/JSON/SVG while keeping PMTiles Range endpoints,
+	# pre-compressed offline pack archives, and MCP Streamable HTTP SSE streams
+	# (`/mcp`, `/mcp/*`) unbuffered and uncompressed.
 	@compressible {
-		not path /api/tiles/* /api/packs/*/tiles/* /api/packs/*/bundle.tar.gz
+		not path /api/tiles/* /api/packs/*/tiles/* /api/packs/*/bundle.tar.gz /mcp /mcp/*
 	}
 	encode @compressible zstd gzip
 
@@ -42,9 +52,12 @@ trails.example.com {
 	reverse_proxy 127.0.0.1:5173 {
 		flush_interval -1
 		header_up Host {http.request.host}
+		header_up X-Forwarded-Host {http.request.host}
 		header_up X-Forwarded-Proto {http.request.scheme}
-		# Client `Range`, `If-Range`, and `If-None-Match` headers are forwarded
-		# verbatim by Caddy for PMTiles HTTP 206 Partial Content streaming.
+		# Client `Range`, `If-Range`, `If-None-Match`, `Authorization`, `Accept`,
+		# `Mcp-Session-Id`, `MCP-Protocol-Version`, and `Last-Event-ID` headers
+		# are forwarded verbatim by Caddy; upstream `Mcp-Session-Id` and
+		# `WWW-Authenticate` headers are preserved unchanged.
 		transport http {
 			read_timeout 180s
 			write_timeout 180s

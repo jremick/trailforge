@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "trailforge": {
+      "url": "https://trails.example.com/mcp"
+    }
+  }
+}
