@@ -1,4 +1,5 @@
 import { getPresetById } from "./presets";
+import type { VehicleCapabilityClass } from "./types";
 
 export interface AppUrlState {
   trackId: string | null;
@@ -7,9 +8,27 @@ export interface AppUrlState {
   lon: number | null;
   zoom: number | null;
   profileOpen: boolean;
+  /** Ordered canonical track IDs for `?route=id1,id2,...` Route Planner deep links. */
+  routeTrackIds?: string[];
+  /** Canonical vehicle class for `?rig=<vehicle_class>` deep links. */
+  rigClass?: VehicleCapabilityClass | null;
 }
 
+export interface ParsedAppUrlState extends AppUrlState {
+  routeTrackIds: string[];
+  rigClass: VehicleCapabilityClass | null;
+}
+
+export const MAX_ROUTE_URL_TRACKS = 30;
+
 const TRACK_ID_PATTERN = /^[A-Za-z0-9_.:-]{1,120}$/;
+
+const CANONICAL_RIG_MAP: Readonly<Record<string, VehicleCapabilityClass>> = {
+  awd: "AWD",
+  "stock 4wd": "Stock 4WD",
+  "touring 4wd": "Touring 4WD",
+  "modified 4wd": "Modified 4WD",
+};
 
 function parseFinite(raw: string | null, min: number, max: number): number | null {
   if (raw === null || raw.trim() === "") return null;
@@ -19,14 +38,56 @@ function parseFinite(raw: string | null, min: number, max: number): number | nul
 }
 
 /**
- * Parse bookmarkable/shareable TrailForge deep-link state from `window.location.search`.
- * Supports `?track=<id>&region=<preset>&lat=<deg>&lon=<deg>&z=<zoom>&profile=1`.
+ * Validate and normalize a `?rig=` query parameter into one of TrailForge's
+ * 4 canonical `VehicleCapabilityClass` values (`AWD`, `Stock 4WD`, `Touring 4WD`,
+ * `Modified 4WD`), accepting space/underscore/hyphen separators case-insensitively.
  */
-export function parseAppUrlState(search: string): AppUrlState {
+export function parseVehicleClassParam(
+  raw: string | null | undefined
+): VehicleCapabilityClass | null {
+  if (!raw) return null;
+  const normalized = raw
+    .trim()
+    .toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ");
+  return CANONICAL_RIG_MAP[normalized] ?? null;
+}
+
+/**
+ * Validate and normalize ordered track IDs from `?route=id1,id2,...` (or repeated
+ * `?route=id1&route=id2` params), rejecting malformed IDs and capping at 30 legs.
+ */
+export function parseRouteTrackIdsParam(
+  rawValues: readonly string[]
+): string[] {
+  const result: string[] = [];
+  for (const raw of rawValues) {
+    if (!raw) continue;
+    for (const part of raw.split(",")) {
+      const candidate = part.trim();
+      if (!candidate || !TRACK_ID_PATTERN.test(candidate)) continue;
+      result.push(candidate);
+      if (result.length >= MAX_ROUTE_URL_TRACKS) {
+        return result;
+      }
+    }
+  }
+  return result;
+}
+
+/**
+ * Parse bookmarkable/shareable TrailForge deep-link state from `window.location.search`.
+ * Supports `?track=<id>&route=<id1,id2,...>&rig=<vehicle_class>&region=<preset>&lat=<deg>&lon=<deg>&z=<zoom>&profile=1`.
+ */
+export function parseAppUrlState(search: string): ParsedAppUrlState {
   const params = new URLSearchParams(search.startsWith("?") ? search.slice(1) : search);
 
   const rawTrack = params.get("track")?.trim() ?? "";
   const trackId = rawTrack && TRACK_ID_PATTERN.test(rawTrack) ? rawTrack : null;
+
+  const routeTrackIds = parseRouteTrackIdsParam(params.getAll("route"));
+  const rigClass = parseVehicleClassParam(params.get("rig"));
 
   const rawRegion = params.get("region")?.trim() ?? "";
   const regionId = rawRegion && getPresetById(rawRegion) ? rawRegion : null;
@@ -46,6 +107,8 @@ export function parseAppUrlState(search: string): AppUrlState {
     lon: hasCoords ? parsedLon : null,
     zoom: hasCoords ? zoom : null,
     profileOpen,
+    routeTrackIds,
+    rigClass,
   };
 }
 
@@ -62,7 +125,16 @@ export function buildAppUrlSearch(
   );
 
   // Remove managed keys first so parameter ordering is clean & deterministic
-  const managedKeys = ["track", "region", "lat", "lon", "z", "profile"];
+  const managedKeys = [
+    "track",
+    "route",
+    "rig",
+    "region",
+    "lat",
+    "lon",
+    "z",
+    "profile",
+  ];
   const preserved: Array<[string, string]> = [];
   params.forEach((value, key) => {
     if (!managedKeys.includes(key)) {
@@ -76,6 +148,16 @@ export function buildAppUrlSearch(
     if (state.profileOpen) {
       next.set("profile", "1");
     }
+  }
+  if (Array.isArray(state.routeTrackIds) && state.routeTrackIds.length > 0) {
+    const validIds = parseRouteTrackIdsParam(state.routeTrackIds);
+    if (validIds.length > 0) {
+      next.set("route", validIds.join(","));
+    }
+  }
+  const normalizedRig = parseVehicleClassParam(state.rigClass ?? null);
+  if (normalizedRig) {
+    next.set("rig", normalizedRig);
   }
   if (state.regionId && getPresetById(state.regionId)) {
     next.set("region", state.regionId);
@@ -97,6 +179,12 @@ export function buildAppUrlSearch(
     next.append(k, v);
   }
 
-  const encoded = next.toString();
+  // Keep comma delimiters in `route` readable (RFC 3986 permits `,` in query values
+  // and validated track IDs contain only [A-Za-z0-9_.:-]).
+  const encoded = next
+    .toString()
+    .replace(/((?:^|&)route=[^&]*)/, (segment) =>
+      segment.replace(/%2C/g, ",")
+    );
   return encoded ? `?${encoded}` : "";
 }
