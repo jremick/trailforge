@@ -600,7 +600,7 @@ def run_bake(
         and not options.dry_run
     ):
         for rec in existing_manifest.tiles:
-            if rec.status == "completed":
+            if rec.status in ("completed", "skipped"):
                 prior_completed[rec.tile_id] = rec
 
     bake_id = (
