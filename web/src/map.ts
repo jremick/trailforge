@@ -611,6 +611,22 @@ export class TrailForgeMap {
     this.map.easeTo({ bearing: 0, pitch: 0, duration: 280 });
   }
 
+  setView(lat: number, lon: number, zoom: number): void {
+    this.map.jumpTo({
+      center: [lon, lat],
+      zoom,
+    });
+  }
+
+  getView(): { lat: number; lon: number; zoom: number } {
+    const c = this.map.getCenter();
+    return {
+      lat: c.lat,
+      lon: c.lng,
+      zoom: this.map.getZoom(),
+    };
+  }
+
   resize(): void {
     this.map.resize();
   }

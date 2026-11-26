@@ -110,7 +110,6 @@ import {
 } from "./offline/syncQueue";
 import {
   BASEMAP_OPTIONS,
-  DEFAULT_PRESET_ID,
   createInitialLayerState,
   escapeHtml,
   getDefaultPreset,
@@ -170,6 +169,11 @@ import {
   buildUserExportUrl,
   isVehicleActive,
 } from "./vehicleHelpers";
+import {
+  buildAppUrlSearch,
+  parseAppUrlState,
+  type AppUrlState,
+} from "./urlState";
 
 const HEALTH_POLL_INTERVAL_MS = 15000;
 const CLOSURES_POLL_INTERVAL_MS = 60000;
@@ -243,6 +247,14 @@ class TrailForgeApp {
   private healthAbort: AbortController | null = null;
   private inspectorAbort: AbortController | null = null;
 
+  // Bookmarkable / shareable URL state
+  private readonly initialUrlState: AppUrlState;
+  private urlTrackId: string | null = null;
+  private urlRegionId: string | null = null;
+  private urlProfileOpen = false;
+  private urlView: { lat: number; lon: number; zoom: number } | null = null;
+  private suppressUrlSync = false;
+
   // Slice 05 + 06 + 08 + v1.1.0 User, Access Control, Admin & Vehicle state
   private user: AuthUser | null = null;
   private authConfig: AuthConfigResponse = { ...DEFAULT_AUTH_CONFIG };
@@ -292,6 +304,48 @@ class TrailForgeApp {
       typeof navigator === "undefined" ? true : navigator.onLine;
     this.isOnline = initiallyOnline;
     this.activeBasemap = initiallyOnline ? "opentopo" : "offline-topo";
+
+    this.initialUrlState =
+      typeof window !== "undefined"
+        ? parseAppUrlState(window.location.search)
+        : {
+            trackId: null,
+            regionId: null,
+            lat: null,
+            lon: null,
+            zoom: null,
+            profileOpen: false,
+          };
+
+    if (this.initialUrlState.regionId) {
+      const parsedPreset = getPresetById(this.initialUrlState.regionId);
+      if (parsedPreset) {
+        this.activePreset = parsedPreset;
+      }
+    }
+
+    this.urlTrackId = this.initialUrlState.trackId;
+    this.urlRegionId = this.initialUrlState.regionId;
+    this.urlProfileOpen = this.initialUrlState.profileOpen;
+    if (
+      this.initialUrlState.lat !== null &&
+      this.initialUrlState.lon !== null
+    ) {
+      this.urlView = {
+        lat: this.initialUrlState.lat,
+        lon: this.initialUrlState.lon,
+        zoom: this.initialUrlState.zoom ?? this.activePreset.zoom,
+      };
+    }
+
+    const initialCenter: readonly [number, number] =
+      this.initialUrlState.lat !== null && this.initialUrlState.lon !== null
+        ? [this.initialUrlState.lon, this.initialUrlState.lat]
+        : this.activePreset.center;
+    const initialZoom =
+      this.initialUrlState.lat !== null && this.initialUrlState.lon !== null
+        ? (this.initialUrlState.zoom ?? this.activePreset.zoom)
+        : this.activePreset.zoom;
 
     const initialViewportWidth =
       typeof window !== "undefined" ? window.innerWidth : undefined;
@@ -357,6 +411,12 @@ class TrailForgeApp {
               <button type="button" class="tf-map-icon-btn" data-map-action="zoom-in" title="Zoom in" aria-label="Zoom in">+</button>
               <button type="button" class="tf-map-icon-btn" data-map-action="zoom-out" title="Zoom out" aria-label="Zoom out">−</button>
               <button type="button" class="tf-map-icon-btn" data-map-action="north" title="Reset north" aria-label="Reset north">N</button>
+              <button type="button" class="tf-map-icon-btn" data-map-action="share" title="Copy shareable link to current map view" aria-label="Copy shareable link">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
+                  <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+                </svg>
+              </button>
             </div>
           </div>
 
@@ -373,9 +433,9 @@ class TrailForgeApp {
           </div>
 
           <div class="tf-coord-hud" data-role="coord-hud">
-            <span class="mono" data-role="cursor-coords">${formatCoords(this.activePreset.center[1], this.activePreset.center[0], 4)}</span>
+            <span class="mono" data-role="cursor-coords">${formatCoords(initialCenter[1], initialCenter[0], 4)}</span>
             <span class="tf-hud-sep" aria-hidden="true">|</span>
-            <span class="mono tf-accent-cyan" data-role="cursor-mgrs">${latLonToMgrs(this.activePreset.center[1], this.activePreset.center[0], 4)}</span>
+            <span class="mono tf-accent-cyan" data-role="cursor-mgrs">${latLonToMgrs(initialCenter[1], initialCenter[0], 4)}</span>
           </div>
         </main>
 
@@ -401,7 +461,7 @@ class TrailForgeApp {
 
     this.topbar = new TopBar(
       this.q(root, "[data-role='topbar']"),
-      DEFAULT_PRESET_ID,
+      this.activePreset.id,
       {
         onToggleSidebar: () => {
           this.setSidebarCollapsed(!this.sidebarCollapsed, { persist: true });
@@ -517,6 +577,7 @@ class TrailForgeApp {
           this.shellEl.classList.remove("inspector-open");
           this.map.setSelectedTrackId(null);
           this.pickedReportCoords = null;
+          this.syncUrlState({ trackId: null, profileOpen: false }, "push");
         },
         onZoomToTrack: (bbox) => {
           this.map.fitBBox(bbox, this.getMapLeftPadding(24), 420);
@@ -550,6 +611,12 @@ class TrailForgeApp {
         },
         onExportTrack: (trackId, fmt) => {
           void this.handleExportTrack(trackId, fmt);
+        },
+        onShareTrack: (trackId) => {
+          void this.handleShareTrack(trackId);
+        },
+        onElevationModalChange: (open) => {
+          this.syncUrlState({ profileOpen: open }, "replace");
         },
         onPickReportLocation: () => {
           this.setCoordPickMode("report");
@@ -1244,6 +1311,9 @@ class TrailForgeApp {
       this.q(root, "[data-role='map']"),
       {
         onCursorMove: (lat, lon) => this.updateCursorReadout(lat, lon),
+        onMapMoveEnd: (lat, lon, zoom) => {
+          this.syncUrlState({ lat, lon, zoom }, "replace");
+        },
         onBasemapTileError: () => {
           this.offlineBannerEl.textContent =
             "External basemap tiles unreachable — rendering corridor PMTiles & offline topo grid";
@@ -1280,8 +1350,8 @@ class TrailForgeApp {
         },
       },
       {
-        initialCenter: this.activePreset.center,
-        initialZoom: this.activePreset.zoom,
+        initialCenter,
+        initialZoom,
         initialBasemap: this.activeBasemap,
         initialLayers: this.layerState,
       }
@@ -2002,8 +2072,13 @@ class TrailForgeApp {
           if (action === "zoom-in") this.map.zoomIn();
           else if (action === "zoom-out") this.map.zoomOut();
           else if (action === "north") this.map.resetNorth();
+          else if (action === "share") void this.handleShareCurrentView();
         });
       });
+
+    window.addEventListener("popstate", () => {
+      this.handlePopState();
+    });
 
     window.addEventListener("keydown", (e) => {
       const target = e.target as HTMLElement | null;
@@ -2043,6 +2118,7 @@ class TrailForgeApp {
           this.inspector.close();
           this.shellEl.classList.remove("inspector-open");
           this.map.setSelectedTrackId(null);
+          this.syncUrlState({ trackId: null, profileOpen: false }, "push");
         }
       }
     });
@@ -2091,6 +2167,14 @@ class TrailForgeApp {
     void this.refreshUnmappedCandidates();
     void this.refreshPacksCatalog();
     void this.hydrateAuthSession();
+
+    if (this.initialUrlState.trackId) {
+      void this.openTrackInspector(this.initialUrlState.trackId, undefined, {
+        autoZoomIfNoCoords: this.initialUrlState.lat === null,
+        autoOpenProfile: this.initialUrlState.profileOpen,
+        skipHistoryPush: true,
+      });
+    }
 
     window.setInterval(
       () => void this.refreshHealth(false),
@@ -2275,13 +2359,20 @@ class TrailForgeApp {
   private refreshOpenInspectorForRig(): void {
     const trackId = this.inspector.getCurrentTrackId();
     if (trackId && this.inspector.openState()) {
-      void this.openTrackInspector(trackId);
+      void this.openTrackInspector(trackId, undefined, {
+        skipHistoryPush: true,
+      });
     }
   }
 
   private async openTrackInspector(
     trackId: string,
-    trackLabel?: string
+    trackLabel?: string,
+    options?: {
+      autoZoomIfNoCoords?: boolean;
+      autoOpenProfile?: boolean;
+      skipHistoryPush?: boolean;
+    }
   ): Promise<void> {
     this.inspectorAbort?.abort();
     const controller = new AbortController();
@@ -2294,6 +2385,14 @@ class TrailForgeApp {
     this.shellEl.classList.add("inspector-open");
     this.map.setSelectedTrackId(trackId);
     this.inspector.showLoading(trackLabel);
+
+    this.syncUrlState(
+      {
+        trackId,
+        profileOpen: Boolean(options?.autoOpenProfile),
+      },
+      options?.skipHistoryPush ? "replace" : "push"
+    );
 
     const rig = this.getActiveRigInfo();
     try {
@@ -2315,6 +2414,13 @@ class TrailForgeApp {
         isAuthenticated: Boolean(this.user),
         pickedReportCoords: this.pickedReportCoords,
       });
+
+      if (options?.autoZoomIfNoCoords && detail.bbox) {
+        this.map.fitBBox(detail.bbox, this.getMapLeftPadding(24), 420);
+      }
+      if (options?.autoOpenProfile) {
+        this.inspector.openElevationModal();
+      }
     } catch (err) {
       if (controller.signal.aborted) return;
       const msg =
@@ -2488,7 +2594,203 @@ class TrailForgeApp {
     this.topbar.setSelectedPreset(preset.id);
     this.sidebar.updatePreset(preset);
     this.map.flyToPreset(preset, this.getMapLeftPadding(16));
+    this.syncUrlState(
+      {
+        regionId: preset.id,
+        lat: preset.center[1],
+        lon: preset.center[0],
+        zoom: preset.zoom,
+      },
+      "push"
+    );
     this.showToast(`Centered on ${preset.shortLabel}`, "info");
+  }
+
+  private syncUrlState(
+    patch: Partial<{
+      trackId: string | null;
+      regionId: string | null;
+      profileOpen: boolean;
+      lat: number | null;
+      lon: number | null;
+      zoom: number | null;
+    }>,
+    mode: "push" | "replace" = "replace"
+  ): void {
+    if (this.suppressUrlSync || typeof window === "undefined") return;
+
+    if ("trackId" in patch) {
+      this.urlTrackId = patch.trackId ?? null;
+      if (!this.urlTrackId) {
+        this.urlProfileOpen = false;
+      }
+    }
+    if ("regionId" in patch) {
+      this.urlRegionId = patch.regionId ?? null;
+    }
+    if ("profileOpen" in patch) {
+      this.urlProfileOpen = Boolean(this.urlTrackId && patch.profileOpen);
+    }
+    if ("lat" in patch && "lon" in patch) {
+      if (
+        typeof patch.lat === "number" &&
+        Number.isFinite(patch.lat) &&
+        typeof patch.lon === "number" &&
+        Number.isFinite(patch.lon)
+      ) {
+        this.urlView = {
+          lat: patch.lat,
+          lon: patch.lon,
+          zoom:
+            typeof patch.zoom === "number" && Number.isFinite(patch.zoom)
+              ? patch.zoom
+              : (this.urlView?.zoom ?? this.activePreset.zoom),
+        };
+      } else {
+        this.urlView = null;
+      }
+    } else if (!this.urlView && (this.urlTrackId || this.urlRegionId) && this.map) {
+      this.urlView = this.map.getView();
+    }
+
+    const nextSearch = buildAppUrlSearch(
+      {
+        trackId: this.urlTrackId,
+        regionId: this.urlRegionId,
+        profileOpen: this.urlProfileOpen,
+        lat: this.urlView?.lat ?? null,
+        lon: this.urlView?.lon ?? null,
+        zoom: this.urlView?.zoom ?? null,
+      },
+      window.location.search
+    );
+
+    if (nextSearch === window.location.search) return;
+
+    const nextUrl = `${window.location.pathname}${nextSearch}${window.location.hash}`;
+    try {
+      if (mode === "push") {
+        window.history.pushState(null, "", nextUrl);
+      } else {
+        window.history.replaceState(null, "", nextUrl);
+      }
+    } catch (err) {
+      // Ignore history restrictions in sandboxed environments
+      console.debug("TrailForge URL history sync skipped:", err);
+    }
+  }
+
+  private handlePopState(): void {
+    if (typeof window === "undefined") return;
+    const state = parseAppUrlState(window.location.search);
+    this.suppressUrlSync = true;
+    try {
+      this.urlTrackId = state.trackId;
+      this.urlRegionId = state.regionId;
+      this.urlProfileOpen = state.profileOpen;
+      this.urlView =
+        state.lat !== null && state.lon !== null
+          ? {
+              lat: state.lat,
+              lon: state.lon,
+              zoom: state.zoom ?? this.activePreset.zoom,
+            }
+          : null;
+
+      if (state.regionId) {
+        const preset = getPresetById(state.regionId);
+        if (preset) {
+          this.activePreset = preset;
+          this.topbar.setSelectedPreset(preset.id);
+          this.sidebar.updatePreset(preset);
+        }
+      }
+
+      if (state.lat !== null && state.lon !== null) {
+        this.map.setView(
+          state.lat,
+          state.lon,
+          state.zoom ?? this.activePreset.zoom
+        );
+      } else if (state.regionId) {
+        const preset = getPresetById(state.regionId);
+        if (preset) {
+          this.map.setView(preset.center[1], preset.center[0], preset.zoom);
+        }
+      }
+
+      if (state.trackId) {
+        if (
+          this.inspector.getCurrentTrackId() === state.trackId &&
+          this.inspector.openState()
+        ) {
+          if (state.profileOpen && !this.inspector.isElevationModalOpen()) {
+            this.inspector.openElevationModal();
+          } else if (
+            !state.profileOpen &&
+            this.inspector.isElevationModalOpen()
+          ) {
+            this.inspector.closeElevationModal();
+          }
+        } else {
+          void this.openTrackInspector(state.trackId, undefined, {
+            autoZoomIfNoCoords: state.lat === null,
+            autoOpenProfile: state.profileOpen,
+            skipHistoryPush: true,
+          });
+        }
+      } else if (this.inspector.openState()) {
+        this.inspector.close();
+        this.shellEl.classList.remove("inspector-open");
+        this.map.setSelectedTrackId(null);
+        this.pickedReportCoords = null;
+      }
+    } finally {
+      window.setTimeout(() => {
+        this.suppressUrlSync = false;
+      }, 120);
+    }
+  }
+
+  private async handleShareTrack(trackId: string): Promise<void> {
+    const view = this.map.getView();
+    this.syncUrlState(
+      {
+        trackId,
+        profileOpen: this.inspector.isElevationModalOpen(),
+        lat: view.lat,
+        lon: view.lon,
+        zoom: view.zoom,
+      },
+      "replace"
+    );
+    await this.copyTextToClipboard(
+      window.location.href,
+      "Shareable track link copied to clipboard",
+      "Copy the URL directly from your browser address bar"
+    );
+  }
+
+  private async handleShareCurrentView(): Promise<void> {
+    const view = this.map.getView();
+    const activeTrackId = this.inspector.openState()
+      ? this.inspector.getCurrentTrackId()
+      : null;
+    this.syncUrlState(
+      {
+        trackId: activeTrackId,
+        profileOpen: activeTrackId ? this.inspector.isElevationModalOpen() : false,
+        lat: view.lat,
+        lon: view.lon,
+        zoom: view.zoom,
+      },
+      "replace"
+    );
+    await this.copyTextToClipboard(
+      window.location.href,
+      "Shareable map view link copied to clipboard",
+      "Copy the URL directly from your browser address bar"
+    );
   }
 
   private renderSidebarToggleMarkup(collapsed: boolean): string {

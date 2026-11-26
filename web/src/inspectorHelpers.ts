@@ -813,3 +813,565 @@ export function buildElevationProfileSvg(
     },
   };
 }
+
+export interface TrackCourseVertex {
+  distM: number;
+  lon: number;
+  lat: number;
+  x: number;
+  y: number;
+  grade: string;
+  segmentId: string;
+  polylineId: number;
+}
+
+export interface TrackCoursePoint {
+  distM: number;
+  lon: number;
+  lat: number;
+  x: number;
+  y: number;
+  grade: string;
+  segmentId: string;
+}
+
+export interface TrackCourseSvgResult {
+  svgHtml: string;
+  vertices: TrackCourseVertex[];
+  totalDistM: number;
+  width: number;
+  height: number;
+  bbox: [number, number, number, number] | null;
+  scaleBarLabel: string;
+}
+
+function haversineMeters(
+  lon1: number,
+  lat1: number,
+  lon2: number,
+  lat2: number
+): number {
+  const rad = Math.PI / 180;
+  const dLat = (lat2 - lat1) * rad;
+  const dLon = (lon2 - lon1) * rad;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(dLon / 2) ** 2;
+  return 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function extractSegmentCoordinateLines(
+  geometry: SegmentSummaryItem["geometry"]
+): Array<Array<[number, number]>> {
+  if (!geometry || typeof geometry !== "object" || !Array.isArray(geometry.coordinates)) {
+    return [];
+  }
+  const parseLine = (raw: unknown): Array<[number, number]> => {
+    if (!Array.isArray(raw)) return [];
+    const pts: Array<[number, number]> = [];
+    for (const pt of raw) {
+      if (
+        Array.isArray(pt) &&
+        pt.length >= 2 &&
+        typeof pt[0] === "number" &&
+        typeof pt[1] === "number" &&
+        Number.isFinite(pt[0]) &&
+        Number.isFinite(pt[1])
+      ) {
+        pts.push([pt[0], pt[1]]);
+      }
+    }
+    return pts;
+  };
+
+  if (geometry.type === "LineString") {
+    const line = parseLine(geometry.coordinates);
+    return line.length >= 2 ? [line] : [];
+  }
+  if (geometry.type === "MultiLineString") {
+    const lines: Array<Array<[number, number]>> = [];
+    for (const part of geometry.coordinates) {
+      const line = parseLine(part);
+      if (line.length >= 2) lines.push(line);
+    }
+    return lines;
+  }
+  return [];
+}
+
+function chooseNiceScaleBarMeters(targetM: number): { meters: number; label: string } {
+  const candidates = [100, 200, 250, 500, 1000, 2000, 5000, 10000, 20000, 50000];
+  let chosen = candidates[0]!;
+  for (const c of candidates) {
+    if (c <= targetM * 1.15) chosen = c;
+  }
+  const label = chosen >= 1000 ? `${chosen / 1000} km` : `${chosen} m`;
+  return { meters: chosen, label };
+}
+
+/**
+ * Build a true-aspect-ratio (North-up) interactive SVG plan view of a track's course
+ * aligned 1-to-1 by cumulative distance with `elevation_profile`, enabling bidirectional
+ * cursor synchronization between the elevation graph and track course.
+ */
+export function buildTrackCourseSvg(
+  segments: readonly SegmentSummaryItem[],
+  profile: readonly ElevationProfilePoint[],
+  options?: {
+    width?: number;
+    height?: number;
+    crossings?: readonly WaterwayCrossingItem[];
+    steepZones?: readonly ElevationSteepZone[];
+  }
+): TrackCourseSvgResult {
+  const width = options?.width ?? 440;
+  const height = options?.height ?? 340;
+  const crossings = options?.crossings ?? [];
+  const steepZones = options?.steepZones ?? [];
+
+  // Map each segment_id to its exact [startDistM, endDistM] span from the stitched profile
+  const segSpanMap = new Map<string, { start: number; end: number }>();
+  for (const pt of profile) {
+    if (!pt.segment_id) continue;
+    const prev = segSpanMap.get(pt.segment_id);
+    if (!prev) {
+      segSpanMap.set(pt.segment_id, { start: pt.dist_m, end: pt.dist_m });
+    } else {
+      prev.start = Math.min(prev.start, pt.dist_m);
+      prev.end = Math.max(prev.end, pt.dist_m);
+    }
+  }
+
+  interface RawVertex {
+    distM: number;
+    lon: number;
+    lat: number;
+    grade: string;
+    segmentId: string;
+    polylineId: number;
+  }
+
+  const rawVertices: RawVertex[] = [];
+  let runningDistM = 0;
+  let polylineId = 0;
+
+  // Pre-parse coordinate lines so we can orient each segment continuously along the track chain
+  // matching backend `_stitch_elevation_profile` start/end continuity.
+  const parsedSegments = segments.map((seg) => ({
+    seg,
+    lines: extractSegmentCoordinateLines(seg.geometry),
+  }));
+
+  let prevExitCoord: [number, number] | null = null;
+
+  for (let segIdx = 0; segIdx < parsedSegments.length; segIdx += 1) {
+    const { seg, lines: origLines } = parsedSegments[segIdx]!;
+    const segLenFallback =
+      typeof seg.length_m === "number" && seg.length_m > 0 ? seg.length_m : 75;
+    const span = segSpanMap.get(seg.segment_id);
+    const segStartDist =
+      segIdx === 0 && span ? Math.min(runningDistM, span.start) : runningDistM;
+    const segEndDist =
+      span && span.end > segStartDist + 0.5
+        ? span.end
+        : segStartDist + segLenFallback;
+
+    if (origLines.length === 0) {
+      runningDistM = segEndDist;
+      continue;
+    }
+
+    // Orient single-part segments continuously with neighbor endpoints
+    const lines = origLines.map((l) => [...l]);
+    if (lines.length === 1) {
+      const line = lines[0]!;
+      const firstPt = line[0]!;
+      const lastPt = line[line.length - 1]!;
+      let shouldReverse = false;
+
+      if (segIdx === 0) {
+        const nextSeg = parsedSegments
+          .slice(1)
+          .find((item) => item.lines.length > 0);
+        if (nextSeg && nextSeg.lines[0]!.length >= 2) {
+          const nLine = nextSeg.lines[0]!;
+          const nStart = nLine[0]!;
+          const nEnd = nLine[nLine.length - 1]!;
+          const dEndToNext = Math.min(
+            haversineMeters(lastPt[0], lastPt[1], nStart[0], nStart[1]),
+            haversineMeters(lastPt[0], lastPt[1], nEnd[0], nEnd[1])
+          );
+          const dStartToNext = Math.min(
+            haversineMeters(firstPt[0], firstPt[1], nStart[0], nStart[1]),
+            haversineMeters(firstPt[0], firstPt[1], nEnd[0], nEnd[1])
+          );
+          if (dStartToNext + 2 < dEndToNext && dStartToNext < 60) {
+            shouldReverse = true;
+          }
+        }
+      } else if (prevExitCoord) {
+        const dStart = haversineMeters(
+          prevExitCoord[0],
+          prevExitCoord[1],
+          firstPt[0],
+          firstPt[1]
+        );
+        const dEnd = haversineMeters(
+          prevExitCoord[0],
+          prevExitCoord[1],
+          lastPt[0],
+          lastPt[1]
+        );
+        if (dEnd + 2 < dStart && dEnd < 60) {
+          shouldReverse = true;
+        }
+      }
+
+      if (shouldReverse) {
+        line.reverse();
+      }
+      prevExitCoord = line[line.length - 1]!;
+    } else {
+      const lastLine = lines[lines.length - 1]!;
+      prevExitCoord = lastLine[lastLine.length - 1]!;
+    }
+
+    const grade = extractSegmentGrade(seg) ?? "Easy";
+
+    // Total metric arc length across all parts of this segment
+    let segArcTotal = 0;
+    const lineArcs: number[][] = [];
+    for (const line of lines) {
+      const cum: number[] = [0];
+      for (let i = 1; i < line.length; i += 1) {
+        const prevPt = line[i - 1]!;
+        const currPt = line[i]!;
+        segArcTotal += haversineMeters(prevPt[0], prevPt[1], currPt[0], currPt[1]);
+        cum.push(segArcTotal);
+      }
+      lineArcs.push(cum);
+    }
+
+    for (let li = 0; li < lines.length; li += 1) {
+      const line = lines[li]!;
+      const cum = lineArcs[li]!;
+      polylineId += 1;
+      for (let i = 0; i < line.length; i += 1) {
+        const [lon, lat] = line[i]!;
+        const frac = segArcTotal > 0 ? cum[i]! / segArcTotal : i / Math.max(1, line.length - 1);
+        const distM = segStartDist + frac * (segEndDist - segStartDist);
+        rawVertices.push({
+          distM,
+          lon,
+          lat,
+          grade,
+          segmentId: seg.segment_id,
+          polylineId,
+        });
+      }
+    }
+
+    runningDistM = segEndDist;
+  }
+
+  if (rawVertices.length < 2) {
+    return {
+      svgHtml: `<div class="tf-elev-empty">Track course geometry unavailable for plan view.</div>`,
+      vertices: [],
+      totalDistM: 0,
+      width,
+      height,
+      bbox: null,
+      scaleBarLabel: "",
+    };
+  }
+
+  let minLon = Infinity;
+  let maxLon = -Infinity;
+  let minLat = Infinity;
+  let maxLat = -Infinity;
+  for (const v of rawVertices) {
+    if (v.lon < minLon) minLon = v.lon;
+    if (v.lon > maxLon) maxLon = v.lon;
+    if (v.lat < minLat) minLat = v.lat;
+    if (v.lat > maxLat) maxLat = v.lat;
+  }
+
+  const midLatRad = (((minLat + maxLat) / 2) * Math.PI) / 180;
+  const cosLat = Math.max(0.2, Math.cos(midLatRad));
+  const rawW = Math.max(1e-5, (maxLon - minLon) * cosLat);
+  const rawH = Math.max(1e-5, maxLat - minLat);
+
+  const pad = 34;
+  const availW = width - pad * 2;
+  const availH = height - pad * 2;
+  const scale = Math.min(availW / rawW, availH / rawH);
+  const drawnW = rawW * scale;
+  const drawnH = rawH * scale;
+  const offX = pad + (availW - drawnW) / 2;
+  const offY = pad + (availH - drawnH) / 2;
+
+  const projectX = (lon: number): number => offX + (lon - minLon) * cosLat * scale;
+  const projectY = (lat: number): number => offY + (maxLat - lat) * scale;
+
+  const vertices: TrackCourseVertex[] = rawVertices.map((v) => ({
+    ...v,
+    x: projectX(v.lon),
+    y: projectY(v.lat),
+  }));
+
+  const profileTotalDistM =
+    profile.length > 0 ? profile[profile.length - 1]!.dist_m : 0;
+  const totalDistM = Math.max(
+    1,
+    profileTotalDistM,
+    vertices[vertices.length - 1]!.distM
+  );
+
+  // Subtle topographic grid lines
+  const gridLines: string[] = [];
+  for (let i = 1; i <= 4; i += 1) {
+    const gx = ((width * i) / 5).toFixed(1);
+    const gy = ((height * i) / 5).toFixed(1);
+    gridLines.push(
+      `<line x1="${gx}" y1="0" x2="${gx}" y2="${height}" stroke="#16222D" stroke-width="1"/>`,
+      `<line x1="0" y1="${gy}" x2="${width}" y2="${gy}" stroke="#16222D" stroke-width="1"/>`
+    );
+  }
+
+  // Group vertices by polylineId so multi-part / tile gaps render cleanly without stray chords
+  const polyGroups: TrackCourseVertex[][] = [];
+  for (const v of vertices) {
+    const last = polyGroups[polyGroups.length - 1];
+    if (last && last[0]!.polylineId === v.polylineId) {
+      last.push(v);
+    } else {
+      polyGroups.push([v]);
+    }
+  }
+
+  const casingPolylinesHtml = polyGroups
+    .map((pts) => {
+      const coords = pts.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+      return `<polyline points="${coords}" fill="none" stroke="#070B10" stroke-width="8.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.92"/>`;
+    })
+    .join("");
+
+  const gradePolylinesHtml = polyGroups
+    .map((pts) => {
+      const coords = pts.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+      const color = getGradeColor(pts[0]!.grade);
+      return `<polyline points="${coords}" fill="none" stroke="${color}" stroke-width="4.4" stroke-linecap="round" stroke-linejoin="round"/>`;
+    })
+    .join("");
+
+  // Waterway crossing dots projected onto exact course coordinates
+  const crossingDotsHtml = crossings
+    .filter((c) => typeof c.dist_m === "number" && Number.isFinite(c.dist_m))
+    .map((c) => {
+      const pt = sampleTrackCourseAtDistance(vertices, c.dist_m!);
+      if (!pt) return "";
+      const title = escapeHtml(`${c.name || "Waterway crossing"} (${(c.dist_m! / 1000).toFixed(2)} km)`);
+      return `<circle cx="${pt.x.toFixed(1)}" cy="${pt.y.toFixed(1)}" r="4.2" fill="#38BDF8" stroke="#070B10" stroke-width="1.4"><title>${title}</title></circle>`;
+    })
+    .join("");
+
+  // Subtle steep-zone ticks projected onto the course
+  const steepDotsHtml = steepZones
+    .map((z) => {
+      const pt = sampleTrackCourseAtDistance(vertices, z.peakDistM);
+      if (!pt) return "";
+      return `<circle cx="${pt.x.toFixed(1)}" cy="${pt.y.toFixed(1)}" r="3.1" fill="${getGradeColor(z.grade)}" stroke="#F8FAFC" stroke-width="1.1" opacity="0.88"><title>Steep zone #${z.index + 1}: ${z.peakSlopeDeg.toFixed(1)}°</title></circle>`;
+    })
+    .join("");
+
+  // Start & End markers
+  const startPt = sampleTrackCourseAtDistance(vertices, 0) ?? vertices[0]!;
+  const endPt = sampleTrackCourseAtDistance(vertices, totalDistM) ?? vertices[vertices.length - 1]!;
+  const endpointsHtml = `
+    <g pointer-events="none">
+      <circle cx="${startPt.x.toFixed(1)}" cy="${startPt.y.toFixed(1)}" r="8" fill="#22C55E" stroke="#070B10" stroke-width="2"/>
+      <text x="${startPt.x.toFixed(1)}" y="${(startPt.y + 3.5).toFixed(1)}" text-anchor="middle" fill="#07130C" font-size="9.5" font-weight="800" font-family="ui-monospace, monospace">S</text>
+      <circle cx="${endPt.x.toFixed(1)}" cy="${endPt.y.toFixed(1)}" r="8" fill="#E2E8F0" stroke="#070B10" stroke-width="2"/>
+      <text x="${endPt.x.toFixed(1)}" y="${(endPt.y + 3.5).toFixed(1)}" text-anchor="middle" fill="#0B1117" font-size="9.5" font-weight="800" font-family="ui-monospace, monospace">E</text>
+    </g>
+  `;
+
+  // Metric scale bar (1 deg lat ≈ 111,132 m)
+  const metersPerPx = 111132 / scale;
+  const niceBar = chooseNiceScaleBarMeters(metersPerPx * 82);
+  const barWidthPx = Math.max(28, Math.min(120, niceBar.meters / metersPerPx));
+  const barX = 14;
+  const barY = height - 14;
+
+  const chromeHtml = `
+    <g pointer-events="none">
+      <g transform="translate(${width - 26}, 22)">
+        <circle cx="0" cy="0" r="13" fill="rgba(11, 17, 23, 0.85)" stroke="#293B4D" stroke-width="1"/>
+        <path d="M 0 -8 L 4 2 L 0 -1 L -4 2 Z" fill="#38BDF8"/>
+        <text x="0" y="10" text-anchor="middle" fill="#94A3B8" font-size="7.5" font-weight="700" font-family="ui-monospace, monospace">N</text>
+      </g>
+      <line x1="${barX}" y1="${barY}" x2="${(barX + barWidthPx).toFixed(1)}" y2="${barY}" stroke="#94A3B8" stroke-width="2" stroke-linecap="square"/>
+      <line x1="${barX}" y1="${barY - 4}" x2="${barX}" y2="${barY}" stroke="#94A3B8" stroke-width="1.5"/>
+      <line x1="${(barX + barWidthPx).toFixed(1)}" y1="${barY - 4}" x2="${(barX + barWidthPx).toFixed(1)}" y2="${barY}" stroke="#94A3B8" stroke-width="1.5"/>
+      <text x="${(barX + barWidthPx / 2).toFixed(1)}" y="${barY - 6}" text-anchor="middle" fill="#94A3B8" font-size="9.5" font-family="ui-monospace, monospace">${niceBar.label}</text>
+    </g>
+  `;
+
+  const cursorOverlayHtml = `
+    <g class="tf-course-cursor hidden" data-role="course-cursor" pointer-events="none">
+      <circle data-role="course-cursor-glow" cx="${startPt.x.toFixed(1)}" cy="${startPt.y.toFixed(1)}" r="14" fill="rgba(253, 224, 71, 0.30)"/>
+      <circle data-role="course-cursor-ring" cx="${startPt.x.toFixed(1)}" cy="${startPt.y.toFixed(1)}" r="7.5" fill="none" stroke="#FFFFFF" stroke-width="2.2"/>
+      <circle data-role="course-cursor-dot" cx="${startPt.x.toFixed(1)}" cy="${startPt.y.toFixed(1)}" r="4.8" fill="#FDE047" stroke="#070B10" stroke-width="1.8"/>
+    </g>
+    <rect class="tf-course-scrub-hit" data-role="course-scrub-hit" x="0" y="0" width="${width}" height="${height}" fill="transparent"/>
+  `;
+
+  const svgHtml = `
+    <svg class="tf-course-svg" viewBox="0 0 ${width} ${height}" width="100%" height="${height}" role="img" aria-label="Track course plan view synchronized with terrain elevation profile">
+      ${gridLines.join("")}
+      ${casingPolylinesHtml}
+      ${gradePolylinesHtml}
+      ${crossingDotsHtml}
+      ${steepDotsHtml}
+      ${endpointsHtml}
+      ${chromeHtml}
+      ${cursorOverlayHtml}
+    </svg>
+  `;
+
+  return {
+    svgHtml,
+    vertices,
+    totalDistM,
+    width,
+    height,
+    bbox: [minLon, minLat, maxLon, maxLat],
+    scaleBarLabel: niceBar.label,
+  };
+}
+
+/**
+ * Sample the exact projected SVG point & geographic coordinate along the track course
+ * corresponding to a cumulative distance `targetDistM` on the elevation profile.
+ */
+export function sampleTrackCourseAtDistance(
+  vertices: readonly TrackCourseVertex[],
+  targetDistM: number
+): TrackCoursePoint | null {
+  if (vertices.length === 0) return null;
+  if (vertices.length === 1) {
+    const v = vertices[0]!;
+    return {
+      distM: v.distM,
+      lon: v.lon,
+      lat: v.lat,
+      x: v.x,
+      y: v.y,
+      grade: v.grade,
+      segmentId: v.segmentId,
+    };
+  }
+
+  // First check for an exact containing polyline segment [a.distM, b.distM]
+  let bestNearest = vertices[0]!;
+  let bestDelta = Math.abs(vertices[0]!.distM - targetDistM);
+
+  for (let i = 1; i < vertices.length; i += 1) {
+    const a = vertices[i - 1]!;
+    const b = vertices[i]!;
+    const dCurr = Math.abs(b.distM - targetDistM);
+    if (dCurr < bestDelta) {
+      bestDelta = dCurr;
+      bestNearest = b;
+    }
+
+    if (a.polylineId !== b.polylineId) continue;
+    const lo = Math.min(a.distM, b.distM);
+    const hi = Math.max(a.distM, b.distM);
+    if (targetDistM >= lo && targetDistM <= hi) {
+      const span = b.distM - a.distM;
+      const t = Math.abs(span) > 1e-6 ? (targetDistM - a.distM) / span : 0;
+      const clampedT = Math.max(0, Math.min(1, t));
+      return {
+        distM: targetDistM,
+        lon: a.lon + (b.lon - a.lon) * clampedT,
+        lat: a.lat + (b.lat - a.lat) * clampedT,
+        x: a.x + (b.x - a.x) * clampedT,
+        y: a.y + (b.y - a.y) * clampedT,
+        grade: clampedT < 0.5 ? a.grade : b.grade,
+        segmentId: clampedT < 0.5 ? a.segmentId : b.segmentId,
+      };
+    }
+  }
+
+  return {
+    distM: bestNearest.distM,
+    lon: bestNearest.lon,
+    lat: bestNearest.lat,
+    x: bestNearest.x,
+    y: bestNearest.y,
+    grade: bestNearest.grade,
+    segmentId: bestNearest.segmentId,
+  };
+}
+
+/**
+ * Given a pointer coordinate `(svgX, svgY)` inside the Track Course SVG, project onto the
+ * nearest point along the track course polyline and return its exact cumulative distance `distM`
+ * so the Elevation Profile crosshair moves in lockstep.
+ */
+export function findNearestPointOnTrackCourse(
+  vertices: readonly TrackCourseVertex[],
+  svgX: number,
+  svgY: number
+): TrackCoursePoint | null {
+  if (vertices.length === 0) return null;
+  if (vertices.length === 1) {
+    const v = vertices[0]!;
+    return {
+      distM: v.distM,
+      lon: v.lon,
+      lat: v.lat,
+      x: v.x,
+      y: v.y,
+      grade: v.grade,
+      segmentId: v.segmentId,
+    };
+  }
+
+  let bestDistSq = Infinity;
+  let bestPoint: TrackCoursePoint | null = null;
+
+  for (let i = 1; i < vertices.length; i += 1) {
+    const a = vertices[i - 1]!;
+    const b = vertices[i]!;
+    if (a.polylineId !== b.polylineId) continue;
+
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const lenSq = dx * dx + dy * dy;
+    const t =
+      lenSq > 1e-6
+        ? Math.max(0, Math.min(1, ((svgX - a.x) * dx + (svgY - a.y) * dy) / lenSq))
+        : 0;
+    const px = a.x + dx * t;
+    const py = a.y + dy * t;
+    const distSq = (svgX - px) ** 2 + (svgY - py) ** 2;
+
+    if (distSq < bestDistSq) {
+      bestDistSq = distSq;
+      bestPoint = {
+        distM: a.distM + (b.distM - a.distM) * t,
+        lon: a.lon + (b.lon - a.lon) * t,
+        lat: a.lat + (b.lat - a.lat) * t,
+        x: px,
+        y: py,
+        grade: t < 0.5 ? a.grade : b.grade,
+        segmentId: t < 0.5 ? a.segmentId : b.segmentId,
+      };
+    }
+  }
+
+  return bestPoint;
+}

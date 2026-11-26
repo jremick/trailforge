@@ -75,6 +75,8 @@ export interface TrackInspectorCallbacks {
     currentlyInRoute: boolean
   ) => void;
   onExportTrack: (trackId: string, format: "gpx" | "geojson") => void;
+  onShareTrack?: (trackId: string) => void;
+  onElevationModalChange?: (open: boolean) => void;
   onPickReportLocation: () => void;
   onSubmitReport: (input: ConditionReportCreateInput) => Promise<void>;
   onVoteReport: (
@@ -108,6 +110,8 @@ export class TrackInspectorDrawer {
       onZoomToTrack: (bbox) => this.callbacks.onZoomToTrack(bbox),
       onExportTrack: (trackId, format) =>
         this.callbacks.onExportTrack(trackId, format),
+      onShareTrack: (trackId) => this.callbacks.onShareTrack?.(trackId),
+      onOpenStateChange: (open) => this.callbacks.onElevationModalChange?.(open),
     });
     this.root.className = "tf-inspector";
     this.root.setAttribute("aria-label", "Track Inspector");
@@ -121,6 +125,25 @@ export class TrackInspectorDrawer {
 
   getCurrentTrackId(): string | null {
     return this.currentDetail?.track_id ?? null;
+  }
+
+  openElevationModal(): void {
+    if (!this.currentDetail) return;
+    const norm = normalizeTrackInspector(this.currentDetail);
+    if (norm.profile.length >= 2) {
+      this.elevationModal.open(
+        this.currentDetail,
+        this.context.snowLineElevationM
+      );
+    }
+  }
+
+  closeElevationModal(): void {
+    this.elevationModal.close();
+  }
+
+  isElevationModalOpen(): boolean {
+    return this.elevationModal.isModalOpen();
   }
 
   updateContext(patch: Partial<TrackInspectorContext>): void {
@@ -879,6 +902,7 @@ export class TrackInspectorDrawer {
           >${this.context.isFavorite ? "★ Saved" : "☆ Save"}</button>
           <button type="button" class="tf-action-btn" data-export-track="gpx" title="Download GridForge-compatible GPX 1.1">⬇ GPX</button>
           <button type="button" class="tf-action-btn" data-export-track="geojson" title="Download GeoJSON FeatureCollection">⬇ GeoJSON</button>
+          <button type="button" class="tf-action-btn" data-role="share-track" title="Copy shareable link to this track and map view">🔗 Share</button>
           ${
             detail.bbox
               ? `<button type="button" class="tf-action-btn" data-role="zoom-track">⌖ Zoom</button>`
@@ -1057,6 +1081,12 @@ export class TrackInspectorDrawer {
           const fmt = btn.dataset.exportTrack as "gpx" | "geojson";
           this.callbacks.onExportTrack(detail.track_id, fmt);
         });
+      });
+
+    this.root
+      .querySelector<HTMLButtonElement>("[data-role='share-track']")
+      ?.addEventListener("click", () => {
+        this.callbacks.onShareTrack?.(detail.track_id);
       });
 
     // Slice 08 Report form & voting handlers

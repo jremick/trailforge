@@ -1530,28 +1530,28 @@ button {
   box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.1);
 }
 
-/* ---------- Large-Scale Terrain Elevation Profile Pop-Over Modal ---------- */
+/* ---------- Large-Scale Terrain Elevation Profile & Track Course Modal ---------- */
 
 .tf-elev-modal-backdrop {
   position: fixed;
   inset: 0;
   z-index: 120;
-  background: rgba(5, 10, 15, 0.78);
+  background: rgba(5, 10, 15, 0.8);
   backdrop-filter: blur(8px);
   display: grid;
   place-items: center;
-  padding: 18px;
+  padding: 14px;
 }
 
 .tf-elev-modal {
-  width: min(1100px, 95vw);
-  max-height: min(90vh, 880px);
+  width: min(1440px, 96vw);
+  max-height: 94vh;
   display: flex;
   flex-direction: column;
   background: #0d151c;
   border: 1px solid var(--border-strong);
   border-radius: 14px;
-  box-shadow: 0 28px 68px rgba(0, 0, 0, 0.68);
+  box-shadow: 0 28px 68px rgba(0, 0, 0, 0.72);
   overflow: hidden;
 }
 
@@ -1560,7 +1560,7 @@ button {
   align-items: flex-start;
   justify-content: space-between;
   gap: 14px;
-  padding: 14px 18px 12px;
+  padding: 14px 20px 12px;
   border-bottom: 1px solid var(--border-subtle);
   background: rgba(17, 26, 34, 0.94);
   flex-shrink: 0;
@@ -1581,7 +1581,7 @@ button {
 
 .tf-elev-modal-title {
   margin: 0;
-  font-size: 18px;
+  font-size: 20px;
   font-weight: 700;
   color: var(--text-primary);
   letter-spacing: -0.01em;
@@ -1595,14 +1595,14 @@ button {
   border-radius: 999px;
   border: 1px solid var(--border-strong);
   background: rgba(11, 17, 23, 0.8);
-  font-size: 11.5px;
+  font-size: 12px;
   font-weight: 700;
   white-space: nowrap;
 }
 
 .tf-elev-grade-chip.sm {
-  padding: 1px 7px;
-  font-size: 10.5px;
+  padding: 1px 8px;
+  font-size: 11px;
 }
 
 .tf-elev-grade-dot {
@@ -1620,7 +1620,7 @@ button {
 }
 
 .tf-elev-modal-body {
-  padding: 14px 18px 18px;
+  padding: 14px 20px 18px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -1636,7 +1636,7 @@ button {
 
 .tf-elev-stage {
   background: #0a1016;
-  border: 1px solid rgba(148, 163, 184, 0.22);
+  border: 1px solid rgba(148, 163, 184, 0.24);
   border-radius: 10px;
   overflow: hidden;
   flex-shrink: 0;
@@ -1646,46 +1646,97 @@ button {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 10px 14px;
-  min-height: 36px;
-  padding: 7px 14px;
-  background: rgba(17, 26, 34, 0.86);
+  gap: 10px 16px;
+  min-height: 40px;
+  padding: 8px 16px;
+  background: rgba(17, 26, 34, 0.9);
   border-bottom: 1px solid var(--border-subtle);
-  font-size: 12px;
+  font-size: 12.5px;
   color: var(--text-primary);
 }
 
 .tf-elev-scrub-hint {
   color: var(--text-muted);
-  font-size: 11.5px;
+  font-size: 12px;
 }
 
 .tf-elev-hud-item {
   display: inline-flex;
   align-items: baseline;
-  gap: 5px;
+  gap: 6px;
 }
 
 .tf-elev-hud-k {
-  font-size: 9.5px;
+  font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.06em;
   color: var(--text-muted);
 }
 
-.tf-elev-stage-svg {
-  padding: 10px 10px 4px;
+.tf-elev-visual-split {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  align-items: stretch;
 }
 
-.tf-elev-svg-lg {
+.tf-elev-pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.tf-elev-pane-course {
+  border-left: 1px solid rgba(148, 163, 184, 0.16);
+  background: #080d12;
+}
+
+.tf-elev-pane-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 14px 4px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+}
+
+.tf-elev-pane-title {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.tf-elev-pane-meta {
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.tf-elev-stage-svg {
+  padding: 8px 10px 4px;
+}
+
+.tf-elev-course-svg-wrap {
+  padding: 8px 10px 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+}
+
+.tf-elev-svg-lg,
+.tf-course-svg {
   cursor: crosshair;
   touch-action: none;
+  display: block;
+  width: 100%;
+  height: auto;
 }
 
 .tf-elev-detail-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
-  gap: 12px;
+  gap: 14px;
   flex-shrink: 0;
 }
 
@@ -1693,7 +1744,7 @@ button {
   background: rgba(17, 26, 34, 0.65);
   border: 1px solid var(--border-subtle);
   border-radius: 10px;
-  padding: 12px 14px;
+  padding: 13px 15px;
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -1708,7 +1759,7 @@ button {
 
 .tf-elev-grade-bar {
   display: flex;
-  height: 10px;
+  height: 11px;
   border-radius: 999px;
   overflow: hidden;
   background: rgba(255, 255, 255, 0.06);
@@ -1723,14 +1774,14 @@ button {
 .tf-elev-grade-legend {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px 12px;
+  gap: 8px 14px;
 }
 
 .tf-elev-grade-pill {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  font-size: 11.5px;
+  font-size: 12px;
   color: var(--text-secondary);
 }
 
@@ -1748,7 +1799,7 @@ button {
 .tf-elev-factors-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px 12px;
+  gap: 9px 14px;
 }
 
 .tf-elev-factor-item {
@@ -1760,12 +1811,12 @@ button {
 .tf-elev-factor-head {
   display: flex;
   justify-content: space-between;
-  font-size: 11px;
+  font-size: 11.5px;
   color: var(--text-secondary);
 }
 
 .tf-elev-factor-detail {
-  font-size: 10.5px;
+  font-size: 11px;
   color: var(--text-muted);
 }
 
@@ -1773,7 +1824,7 @@ button {
   display: flex;
   flex-direction: column;
   gap: 5px;
-  max-height: 175px;
+  max-height: 190px;
   overflow-y: auto;
   padding-right: 2px;
 }
@@ -1783,7 +1834,7 @@ button {
   border: 1px solid var(--border-subtle);
   background: rgba(11, 17, 23, 0.72);
   border-radius: 7px;
-  padding: 6px 9px;
+  padding: 7px 10px;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -1817,7 +1868,7 @@ button {
 }
 
 .tf-elev-jump-title {
-  font-size: 11.5px;
+  font-size: 12px;
   font-weight: 600;
   color: var(--text-primary);
   white-space: nowrap;
@@ -1826,18 +1877,27 @@ button {
 }
 
 .tf-elev-jump-sub {
-  font-size: 10.5px;
+  font-size: 11px;
   color: var(--text-muted);
 }
 
 .tf-elev-jump-val {
-  font-size: 11px;
+  font-size: 11.5px;
   font-weight: 600;
   color: var(--text-primary);
   flex-shrink: 0;
 }
 
-@media (max-width: 920px) {
+@media (max-width: 980px) {
+  .tf-elev-visual-split {
+    grid-template-columns: 1fr;
+  }
+
+  .tf-elev-pane-course {
+    border-left: none;
+    border-top: 1px solid rgba(148, 163, 184, 0.16);
+  }
+
   .tf-elev-kpi-strip {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }

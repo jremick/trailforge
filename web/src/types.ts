@@ -928,6 +928,10 @@ export interface SegmentSummaryItem {
     | null;
   score?: number | null;
   effective_grade?: string | null;
+  geometry?: {
+    type: string;
+    coordinates?: unknown;
+  } | null;
 }
 
 export interface TrackInspectorDetail {

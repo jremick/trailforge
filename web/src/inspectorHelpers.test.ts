@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
   buildElevationProfileSvg,
+  buildTrackCourseSvg,
   computeTrackGradeDistribution,
+  findNearestPointOnTrackCourse,
   formatBreakdownFactors,
   formatOverrideLabel,
   normalizeTrackInspector,
   sampleElevationAtDistance,
+  sampleTrackCourseAtDistance,
 } from "./inspectorHelpers";
 import type { BaselineBreakdown, TrackInspectorDetail } from "./types";
 
@@ -273,5 +276,87 @@ describe("Track Inspector explainable helpers", () => {
     const dist = computeTrackGradeDistribution(detail.segments ?? [], norm.profile);
     expect(dist.map((d) => d.grade)).toEqual(["Medium", "Extreme"]);
     expect(dist.reduce((acc, d) => acc + d.pct, 0)).toBeCloseTo(100, 0);
+  });
+
+  it("builds a North-up synchronized Track Course SVG with accurate bidirectional distance lookup", () => {
+    const segments = [
+      {
+        segment_id: "seg_a",
+        length_m: 1000,
+        grade: "Medium",
+        geometry: {
+          type: "LineString",
+          coordinates: [
+            [147.08, -37.24],
+            [147.09, -37.23],
+          ],
+        },
+      },
+      {
+        segment_id: "seg_b",
+        length_m: 1000,
+        grade: "Extreme",
+        geometry: {
+          type: "LineString",
+          coordinates: [
+            [147.09, -37.23],
+            [147.10, -37.22],
+          ],
+        },
+      },
+    ];
+    const profile = [
+      { dist_m: 0, elev_m: 1400, slope_deg: 9.0, grade: "Medium", segment_id: "seg_a" },
+      { dist_m: 1000, elev_m: 1050, slope_deg: 18.5, grade: "Medium", segment_id: "seg_a" },
+      { dist_m: 2000, elev_m: 620, slope_deg: 22.0, grade: "Extreme", segment_id: "seg_b" },
+    ];
+
+    const course = buildTrackCourseSvg(segments, profile, {
+      width: 460,
+      height: 340,
+      crossings: [
+        {
+          name: "Wonnangatta River",
+          waterway_type: "river",
+          perennial: true,
+          bridged: false,
+          dist_m: 1850,
+        },
+      ],
+    });
+
+    expect(course.vertices.length).toBe(4);
+    expect(course.svgHtml).toContain('data-role="course-cursor"');
+    expect(course.svgHtml).toContain('data-role="course-scrub-hit"');
+    expect(course.svgHtml).toContain("Wonnangatta River");
+    expect(course.scaleBarLabel).toMatch(/(m|km)$/);
+
+    // Forward lookup: elevation distM -> course SVG coordinate
+    const midPt = sampleTrackCourseAtDistance(course.vertices, 1500);
+    expect(midPt).not.toBeNull();
+    expect(midPt!.lat).toBeCloseTo(-37.225, 3);
+    expect(midPt!.lon).toBeCloseTo(147.095, 3);
+
+    // Reverse lookup: exact & perpendicular-offset pointer on Track Course -> matching elevation distM
+    const exactNearest = findNearestPointOnTrackCourse(
+      course.vertices,
+      midPt!.x,
+      midPt!.y
+    );
+    expect(exactNearest).not.toBeNull();
+    expect(exactNearest!.distM).toBeCloseTo(1500, 1);
+
+    const perpNearest = findNearestPointOnTrackCourse(
+      course.vertices,
+      midPt!.x + 4,
+      midPt!.y + 4
+    );
+    expect(perpNearest).not.toBeNull();
+    expect(Math.abs(perpNearest!.distM - 1500)).toBeLessThan(15);
+
+    // North-up check: higher latitude (-37.22) must have smaller SVG Y than southern start (-37.24)
+    const startPt = sampleTrackCourseAtDistance(course.vertices, 0);
+    const endPt = sampleTrackCourseAtDistance(course.vertices, 2000);
+    expect(endPt!.y).toBeLessThan(startPt!.y);
   });
 });

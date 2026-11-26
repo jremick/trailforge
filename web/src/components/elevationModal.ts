@@ -1,12 +1,17 @@
 import {
   buildElevationProfileSvg,
+  buildTrackCourseSvg,
   computeTrackGradeDistribution,
+  findNearestPointOnTrackCourse,
   formatBreakdownFactors,
   formatOverrideLabel,
   normalizeTrackInspector,
   sampleElevationAtDistance,
+  sampleTrackCourseAtDistance,
   type ElevationChartGeometry,
   type NormalizedTrackSummary,
+  type TrackCoursePoint,
+  type TrackCourseSvgResult,
 } from "../inspectorHelpers";
 import { escapeHtml, getGradeColor } from "../presets";
 import type { BBoxTuple, SegmentSummaryItem, TrackInspectorDetail } from "../types";
@@ -14,13 +19,15 @@ import type { BBoxTuple, SegmentSummaryItem, TrackInspectorDetail } from "../typ
 export interface ElevationModalCallbacks {
   onZoomToTrack?: (bbox: BBoxTuple) => void;
   onExportTrack?: (trackId: string, format: "gpx" | "geojson") => void;
+  onShareTrack?: (trackId: string) => void;
+  onOpenStateChange?: (isOpen: boolean) => void;
 }
 
 /**
- * Large-scale interactive Terrain Elevation Profile & Track Intelligence Pop-Over Modal.
- * Features live pointer/touch crosshair scrubbing along the full terrain curve, grade
- * distribution breakdown, clickable steep (>=14°) zones, waterway crossings, and surface/tenure
- * context.
+ * Large-scale interactive Terrain Elevation Profile & Synchronized Track Course Pop-Over Modal.
+ * Features a linked North-up Track Course plan view alongside the Elevation Profile so scrubbing
+ * either graph moves both position markers in lockstep, plus grade distribution, clickable steep
+ * (>=14°) zones, waterway crossings, and surface/tenure context.
  */
 export class ElevationProfileModal {
   private readonly backdropEl: HTMLDivElement;
@@ -34,7 +41,10 @@ export class ElevationProfileModal {
     this.backdropEl.className = "tf-elev-modal-backdrop hidden";
     this.backdropEl.setAttribute("role", "dialog");
     this.backdropEl.setAttribute("aria-modal", "true");
-    this.backdropEl.setAttribute("aria-label", "Expanded terrain elevation profile");
+    this.backdropEl.setAttribute(
+      "aria-label",
+      "Expanded terrain elevation profile and track course"
+    );
     document.body.appendChild(this.backdropEl);
 
     this.backdropEl.addEventListener("click", (e) => {
@@ -52,11 +62,16 @@ export class ElevationProfileModal {
     document.addEventListener("keydown", this.keydownHandler);
   }
 
+  isModalOpen(): boolean {
+    return this.isOpen;
+  }
+
   open(detail: TrackInspectorDetail, snowLineElevationM: number): void {
+    const wasOpen = this.isOpen;
     const norm = normalizeTrackInspector(detail);
     const chart = buildElevationProfileSvg(norm.profile, {
       width: 920,
-      height: 290,
+      height: 340,
       snowLineElevationM,
       crossings: norm.crossings,
       detailed: true,
@@ -68,6 +83,14 @@ export class ElevationProfileModal {
     for (const seg of segments) {
       segById.set(seg.segment_id, seg);
     }
+
+    const course = buildTrackCourseSvg(segments, norm.profile, {
+      width: 460,
+      height: 340,
+      crossings: norm.crossings,
+      steepZones: chart.steepZones,
+    });
+    const hasCourse = course.vertices.length >= 2;
 
     const gradeColor = getGradeColor(norm.grade);
     const gradeDist = computeTrackGradeDistribution(segments, norm.profile);
@@ -198,11 +221,40 @@ export class ElevationProfileModal {
       )
       .join("");
 
+    const visualStageHtml = hasCourse
+      ? `
+        <div class="tf-elev-visual-split">
+          <div class="tf-elev-pane tf-elev-pane-profile">
+            <div class="tf-elev-pane-head">
+              <span class="tf-elev-pane-title">Elevation Profile</span>
+              <span class="tf-elev-pane-meta mono">0 → ${norm.totalLengthKm.toFixed(1)} km · Linked scrub</span>
+            </div>
+            <div class="tf-elev-stage-svg">
+              ${chart.svgHtml}
+            </div>
+          </div>
+          <div class="tf-elev-pane tf-elev-pane-course">
+            <div class="tf-elev-pane-head">
+              <span class="tf-elev-pane-title">Track Course (Plan View)</span>
+              <span class="tf-elev-pane-meta mono">S → E · North-up</span>
+            </div>
+            <div class="tf-elev-course-svg-wrap">
+              ${course.svgHtml}
+            </div>
+          </div>
+        </div>
+      `
+      : `
+        <div class="tf-elev-stage-svg">
+          ${chart.svgHtml}
+        </div>
+      `;
+
     this.backdropEl.innerHTML = `
       <div class="tf-elev-modal">
         <div class="tf-elev-modal-head">
           <div class="tf-elev-modal-title-group">
-            <div class="tf-inspector-kicker">Terrain Elevation &amp; Track Profile</div>
+            <div class="tf-inspector-kicker">Terrain Elevation &amp; Synchronized Track Profile</div>
             <div class="tf-elev-modal-title-row">
               <h2 class="tf-elev-modal-title">${escapeHtml(norm.name)}</h2>
               <span class="tf-elev-grade-chip" style="border-color:${gradeColor};color:${gradeColor}">
@@ -215,6 +267,7 @@ export class ElevationProfileModal {
           </div>
 
           <div class="tf-elev-modal-actions">
+            <button type="button" class="tf-action-btn" data-modal-action="share" title="Copy shareable link to this track and profile view">🔗 Share</button>
             ${
               detail.bbox
                 ? `<button type="button" class="tf-action-btn" data-modal-action="zoom">⌖ Zoom Map</button>`
@@ -259,11 +312,13 @@ export class ElevationProfileModal {
 
           <div class="tf-elev-stage">
             <div class="tf-elev-scrub-hud" data-role="scrub-hud">
-              <span class="tf-elev-scrub-hint">Move cursor or drag across the profile to inspect exact elevation, slope, grade, and surface.</span>
+              <span class="tf-elev-scrub-hint">${
+                hasCourse
+                  ? "Move cursor or drag across the Elevation Profile or Track Course — both markers stay synced in real time."
+                  : "Move cursor or drag across the profile to inspect exact elevation, slope, grade, and surface."
+              }</span>
             </div>
-            <div class="tf-elev-stage-svg">
-              ${chart.svgHtml}
-            </div>
+            ${visualStageHtml}
           </div>
 
           <div class="tf-elev-detail-grid">
@@ -311,10 +366,19 @@ export class ElevationProfileModal {
 
     this.backdropEl.classList.remove("hidden");
     this.isOpen = true;
+    if (!wasOpen) {
+      this.callbacks.onOpenStateChange?.(true);
+    }
 
     this.backdropEl
       .querySelector<HTMLButtonElement>("[data-modal-action='close']")
       ?.addEventListener("click", () => this.close());
+
+    this.backdropEl
+      .querySelector<HTMLButtonElement>("[data-modal-action='share']")
+      ?.addEventListener("click", () => {
+        this.callbacks.onShareTrack?.(detail.track_id);
+      });
 
     this.backdropEl
       .querySelector<HTMLButtonElement>("[data-modal-action='zoom']")
@@ -332,14 +396,24 @@ export class ElevationProfileModal {
       });
 
     if (chart.geometry) {
-      this.bindScrubbing(norm, chart.geometry, snowLineElevationM, segById);
+      this.bindScrubbing(
+        norm,
+        chart.geometry,
+        hasCourse ? course : null,
+        snowLineElevationM,
+        segById
+      );
     }
   }
 
   close(): void {
+    const wasOpen = this.isOpen;
     this.isOpen = false;
     this.backdropEl.classList.add("hidden");
     this.backdropEl.innerHTML = "";
+    if (wasOpen) {
+      this.callbacks.onOpenStateChange?.(false);
+    }
   }
 
   destroy(): void {
@@ -350,11 +424,12 @@ export class ElevationProfileModal {
   private bindScrubbing(
     norm: NormalizedTrackSummary,
     geom: ElevationChartGeometry,
+    course: TrackCourseSvgResult | null,
     snowLineElevationM: number,
     segById: Map<string, SegmentSummaryItem>
   ): void {
-    const svg = this.backdropEl.querySelector<SVGSVGElement>(".tf-elev-svg-lg");
-    const hitRect = this.backdropEl.querySelector<SVGRectElement>(
+    const elevSvg = this.backdropEl.querySelector<SVGSVGElement>(".tf-elev-svg-lg");
+    const elevHit = this.backdropEl.querySelector<SVGRectElement>(
       "[data-role='elev-scrub-hit']"
     );
     const crosshair = this.backdropEl.querySelector<SVGGElement>(
@@ -371,11 +446,31 @@ export class ElevationProfileModal {
     );
     const hud = this.backdropEl.querySelector<HTMLElement>("[data-role='scrub-hud']");
 
-    if (!svg || !hitRect || !crosshair || !crossLine || !crossHalo || !crossDot || !hud) {
+    const courseSvg = this.backdropEl.querySelector<SVGSVGElement>(".tf-course-svg");
+    const courseHit = this.backdropEl.querySelector<SVGRectElement>(
+      "[data-role='course-scrub-hit']"
+    );
+    const courseCursor = this.backdropEl.querySelector<SVGGElement>(
+      "[data-role='course-cursor']"
+    );
+    const courseGlow = this.backdropEl.querySelector<SVGCircleElement>(
+      "[data-role='course-cursor-glow']"
+    );
+    const courseRing = this.backdropEl.querySelector<SVGCircleElement>(
+      "[data-role='course-cursor-ring']"
+    );
+    const courseDot = this.backdropEl.querySelector<SVGCircleElement>(
+      "[data-role='course-cursor-dot']"
+    );
+
+    if (!elevSvg || !elevHit || !crosshair || !crossLine || !crossHalo || !crossDot || !hud) {
       return;
     }
 
-    const renderAtDistance = (distM: number): void => {
+    const syncAtDistance = (
+      distM: number,
+      explicitCoursePt?: TrackCoursePoint | null
+    ): void => {
       const sample = sampleElevationAtDistance(norm.profile, distM);
       if (!sample) return;
 
@@ -394,6 +489,24 @@ export class ElevationProfileModal {
       crossDot.setAttribute("cy", y.toFixed(1));
       crossDot.setAttribute("fill", color);
       crosshair.classList.remove("hidden");
+
+      // Synchronize the Track Course marker to the matching distance/coordinate
+      const coursePt =
+        explicitCoursePt ??
+        (course ? sampleTrackCourseAtDistance(course.vertices, sample.distM) : null);
+
+      if (coursePt && courseCursor && courseGlow && courseRing && courseDot) {
+        const cx = coursePt.x.toFixed(1);
+        const cy = coursePt.y.toFixed(1);
+        courseGlow.setAttribute("cx", cx);
+        courseGlow.setAttribute("cy", cy);
+        courseRing.setAttribute("cx", cx);
+        courseRing.setAttribute("cy", cy);
+        courseDot.setAttribute("cx", cx);
+        courseDot.setAttribute("cy", cy);
+        courseDot.setAttribute("fill", color);
+        courseCursor.classList.remove("hidden");
+      }
 
       const seg = sample.segmentId ? segById.get(sample.segmentId) : undefined;
       const surfaceText = seg?.surface_class
@@ -414,6 +527,11 @@ export class ElevationProfileModal {
             ? `${sample.slopeDeg.toFixed(1)}° (${Math.round(sample.slopePct ?? 0)}%)`
             : "—"
         }</strong></span>
+        ${
+          coursePt
+            ? `<span class="tf-elev-hud-item"><span class="tf-elev-hud-k">COORDS</span><strong class="mono">${coursePt.lat.toFixed(4)}, ${coursePt.lon.toFixed(4)}</strong></span>`
+            : ""
+        }
         <span class="tf-elev-grade-chip sm" style="border-color:${color};color:${color}">${escapeHtml(sample.grade)}</span>
         ${surfaceText ? `<span class="tf-mini-tag">${escapeHtml(surfaceText)}</span>` : ""}
         ${aboveSnow ? `<span class="tf-pill tf-pill-ice">Above ${snowLineElevationM}m snow-line</span>` : ""}
@@ -421,26 +539,45 @@ export class ElevationProfileModal {
       `;
     };
 
-    const handlePointer = (clientX: number): void => {
-      const rect = svg.getBoundingClientRect();
+    const handleElevPointer = (clientX: number): void => {
+      const rect = elevSvg.getBoundingClientRect();
       if (rect.width <= 0) return;
       const svgX = ((clientX - rect.left) / rect.width) * geom.width;
       const clampedX = Math.max(geom.padL, Math.min(geom.padL + geom.plotW, svgX));
       const frac = (clampedX - geom.padL) / Math.max(1, geom.plotW);
-      renderAtDistance(frac * geom.totalDistM);
+      syncAtDistance(frac * geom.totalDistM);
     };
 
-    hitRect.addEventListener("pointermove", (e) => handlePointer(e.clientX));
-    hitRect.addEventListener("pointerdown", (e) => handlePointer(e.clientX));
+    elevHit.addEventListener("pointermove", (e) => handleElevPointer(e.clientX));
+    elevHit.addEventListener("pointerdown", (e) => handleElevPointer(e.clientX));
 
-    // Clicking or hovering any steep zone / crossing row highlights that exact point on the chart
+    if (course && courseSvg && courseHit) {
+      const handleCoursePointer = (clientX: number, clientY: number): void => {
+        const rect = courseSvg.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return;
+        const svgX = ((clientX - rect.left) / rect.width) * course.width;
+        const svgY = ((clientY - rect.top) / rect.height) * course.height;
+        const nearest = findNearestPointOnTrackCourse(course.vertices, svgX, svgY);
+        if (!nearest) return;
+        syncAtDistance(nearest.distM, nearest);
+      };
+
+      courseHit.addEventListener("pointermove", (e) =>
+        handleCoursePointer(e.clientX, e.clientY)
+      );
+      courseHit.addEventListener("pointerdown", (e) =>
+        handleCoursePointer(e.clientX, e.clientY)
+      );
+    }
+
+    // Clicking or hovering any steep zone / crossing row highlights that exact point on BOTH graphs
     this.backdropEl
       .querySelectorAll<HTMLButtonElement>("[data-focus-dist]")
       .forEach((btn) => {
         const dist = Number(btn.dataset.focusDist);
         if (!Number.isFinite(dist)) return;
-        btn.addEventListener("mouseenter", () => renderAtDistance(dist));
-        btn.addEventListener("click", () => renderAtDistance(dist));
+        btn.addEventListener("mouseenter", () => syncAtDistance(dist));
+        btn.addEventListener("click", () => syncAtDistance(dist));
       });
   }
 }
