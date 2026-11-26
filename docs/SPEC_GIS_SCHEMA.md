@@ -9,7 +9,7 @@
 
 ## 1. Reusable Australian Data Connectors (Audited from GridForge)
 
-TrailForge adapts the verified, production-tested Australian open-data connectors audited from sibling project GridForge (`/Users/jarel/projects/oss-mapper`, read-only reference). Every connector supports an air-gapped local file override (`local_gpkg` / `local_geojson` / `local_dem` / `local_pbf`) so CI and offline packs run with zero network calls.
+TrailForge adapts the verified, production-tested Australian open-data connectors from sibling project [GridForge](https://github.com/jremick/gridforge). Every connector supports an air-gapped local file override (`local_gpkg` / `local_geojson` / `local_dem` / `local_pbf`) so CI and offline packs run with zero network calls.
 
 ### 1.1 Coverage Bounds & v1 Regional Pack Presets (`EPSG:4326`)
 

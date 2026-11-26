@@ -8,7 +8,7 @@ TrailForge is an open-source, self-hostable 4WD & off-road mapping, live track-g
 - **OSM ODbL Separation:** Keep OpenStreetMap geometries/tags in dedicated source/base tables and keep crowdsourced telemetry, computed difficulty ratings, closures, and user condition reports in independent relational/PostGIS tables linked by stable segment IDs or spatial joins. Never strip required attributions (OSM ODbL, GA/DEA/CAPAD/NSW Spatial/DEECA CC BY 4.0, Open-Meteo CC BY 4.0).
 
 ## Read-Only Reference Repo (`GridForge`)
-Sibling repo GridForge lives at `/Users/jarel/projects/oss-mapper`. **Treat `/Users/jarel/projects/oss-mapper` as strictly READ-ONLY** — never modify files inside it.
+TrailForge shares Australian open-data patterns with its sibling open-source project [GridForge](https://github.com/jremick/gridforge). If a local checkout of GridForge is available as a reference, treat it as **strictly READ-ONLY** — never modify files inside it.
 
 Reuse and adapt its verified Australian patterns rather than reinventing from scratch:
 - `src/gridforge/sources/overlays_au_states.py` — NSW Spatial Services (`NSW_Transport_Theme` layers 5 & 9, `SurveyMarkGDA2020`, `NSW_POI`) and VIC DataVic/Vicmap WFS (`tr_road`, `recweb_tracks`, `recweb_hut`, `recweb_site`, `foi_point`, `geomark_point`).
@@ -30,4 +30,4 @@ Reuse and adapt its verified Australian patterns rather than reinventing from sc
 ## Testing & Verification Discipline
 - All unit and integration CI tests must run **100% offline** using compact synthetic VIC/NSW fixtures under `tests/fixtures/`.
 - Mark live upstream network checks (Overpass, DataVic WFS, NSW ArcGIS, DEA S3, MapShareVic, VicEmergency, NSW RFS/NPWS, Open-Meteo) with `@pytest.mark.live`.
-- Follow the vertical-slice roadmap in `docs/PLAN.md` (and local `.jstack/plans/v1-roadmap/`). Prove every slice end-to-end and keep CI green before moving to the next slice, especially Checkpoints A, B, and C.
+- Follow the vertical-slice roadmap in `docs/PLAN.md`. Prove every slice end-to-end and keep CI green before moving to the next slice, especially Checkpoints A, B, and C.
