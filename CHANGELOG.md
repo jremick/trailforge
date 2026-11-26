@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.0.1] - 2026-11-26
+
+Patch release fixing 4 real-world Pan-Australia upstream agency endpoint quirks discovered during live `v1.0.0` verification so all 8 Australian states & territories (`VIC`, `NSW`, `ACT`, `TAS`, `QLD`, `WA`, `SA`, `NT`) return live HTTP `200` data cleanly out of the box.
+
+### Fixed
+- **NTG Road Centrelines (`src/trailforge/ingestion/connectors/au_states.py`):** Replaced nonexistent `OBJECTID` in `outFields` with the layer's actual `esriFieldTypeOID` field (`UFI`) on `https://gis-d.nt.gov.au/arcgis/rest/services/ROAD_CENTRELINES/FeatureServer/0/query` (eliminating ArcGIS `400 Unable to complete operation` errors) and added `UFI` fallback ID extraction so West MacDonnell and NT corridors return real NTG road tracks alongside GA Topo250K & NTLIS WFS POIs.
+- **QLD Live Alerts (`qld_des_alerts` in `src/trailforge/feeds/base.py`, `src/trailforge/feeds/adapters_au.py`):** Switched default endpoint from the deprecated `https://parks.desi.qld.gov.au/park-alerts/rss.xml` URL (HTTP `404`) to Queensland Fire Department's live public GeoJSON feed (`https://www.fire.qld.gov.au/data/alerts/bushfireAlert.json`) with full QFD schema normalization (`UniqueID`, `WarningTitle`, `WarningLevel`, `Header`/`WarningText`, `EventType`, `WarningArea`, Polygon/Point geometry, and ISO timestamps) while retaining 100% backward compatibility with RSS/GeoJSON park alert fixtures.
+- **WA Emergency Live Alerts (`wa_emergency` in `src/trailforge/feeds/base.py`, `src/trailforge/feeds/adapters_au.py`):** Switched default endpoint from the legacy SPA HTML URL (`https://www.emergency.wa.gov.au/data/message_DFES.json`) to Emergency WA's public v1 JSON API (`https://api.emergency.wa.gov.au/v1/warnings`) with `geo-source` `FeatureCollection` geometry extraction (preferring warning `Polygon`s over icon `Point`s), dict `location` fallback, `warning-type` severity mapping, non-fire `hazard_warning` classification, and direct `https://www.emergency.wa.gov.au/alerts/{id}` links.
+- **NT Live Alerts (`nt_securent` in `src/trailforge/feeds/base.py`, `src/trailforge/feeds/adapters_au.py`):** Switched default endpoint from Cloudflare-gated `https://securent.nt.gov.au/alerts/feed` (HTTP `403`) to Northern Territory DIPL's official live public **Road Report NT** API (`https://roadreport.nt.gov.au/api/Obstruction/GetAll`), parsing live NT road closures, impassable tracks, flooding, and high-clearance 4WD restrictions into `LineString`/`Point` geometries while filtering out commercial heavy-vehicle axle-limit advisories and preserving compatibility with SecureNT & NTG `Hosted/Fire_Incidents` GeoJSON payloads.
+
+### Testing
+- Added offline unit tests in `tests/test_au_closure_feeds.py` and `tests/test_au_states_connectors.py` covering the exact live QFD GeoJSON, Emergency WA v1, Road Report NT JSON, and NTG `UFI` ArcGIS query parameter contracts.
+- Expanded `@pytest.mark.live` smoke suites (`test_live_pan_au_closure_feeds_smoke` and `test_live_pan_au_connectors_smoke`) to verify all 6 Pan-AU states (`ACT`, `TAS`, `QLD`, `WA`, `SA`, `NT`) live alongside `VIC` & `NSW`.
+
+---
+
 ## [1.0.0] - 2026-11-26
 
 Inaugural stable GA release of **TrailForge**, graduating `v1.0.0-alpha.1` and `v1.0.0-beta.1` to production stability (publishing `:v1.0.0`, `:v1.0`, and `:latest` multi-arch `linux/amd64` + `linux/arm64` GHCR images) and delivering full **Pan-Australia 8-state support**, **11 official closure/emergency feeds**, an optional **Valhalla `/trace_attributes` sidecar**, **high-rate 50 Hz mobile IMU processing**, and a **Capacitor 7 mobile shell with live 4WD Clinometer** alongside the Interactive Multi-Track Route Planner, GridForge 300 DPI Strip Atlas handoff, zero-build GHCR + HTTPS deploy kit, and all 9 core vertical slices.
