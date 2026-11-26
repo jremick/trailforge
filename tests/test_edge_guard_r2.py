@@ -1,0 +1,889 @@
+"""Offline unit & PostGIS integration tests for Edge Guard, quotas, telemetry & R2 sync."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import struct
+import subprocess
+import sys
+import uuid
+import zlib
+from collections.abc import Generator
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+from fastapi import HTTPException
+from fastapi.testclient import TestClient
+from pydantic import ValidationError
+from sqlalchemy import Engine, text
+from sqlalchemy.orm import Session
+from starlette.datastructures import Headers
+
+from trailforge.api.health import get_health_checker
+from trailforge.api.main import create_app
+from trailforge.api.middleware import (
+    SlidingWindowRateLimiter,
+    UsageMetricsStore,
+    check_upload_quota,
+    classify_route_group,
+    extract_client_ip_from_headers,
+    flush_usage_metrics,
+    get_live_usage_snapshot,
+    reset_rate_limiter,
+    reset_usage_metrics,
+)
+from trailforge.api.tiles import get_tiles_dir
+from trailforge.config import Settings, get_settings
+from trailforge.db.session import DbHealthStatus, get_db
+from trailforge.packs import r2_sync
+from trailforge.reports.photos import (
+    PhotoStorageQuotaError,
+    get_directory_size_bytes,
+    save_report_photo,
+)
+
+
+def _make_valid_png_bytes(payload_pad: int = 0) -> bytes:
+    """Build a valid 1x1 RGB PNG image in memory (optionally padded with a tEXt chunk)."""
+
+    def _chunk(chunk_type: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(chunk_type + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", crc)
+
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    idat = zlib.compress(b"\x00\x34\x88\x55")
+    extra = _chunk(b"tEXt", b"pad\x00" + (b"x" * payload_pad)) if payload_pad > 0 else b""
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", ihdr)
+        + extra
+        + _chunk(b"IDAT", idat)
+        + _chunk(b"IEND", b"")
+    )
+
+
+def _make_healthy_app(
+    settings: Settings | None = None,
+    *,
+    tiles_dir: Path | None = None,
+) -> Any:
+    app = create_app(settings=settings)
+    app.dependency_overrides[get_health_checker] = lambda: (
+        lambda: DbHealthStatus(
+            db_ok=True,
+            postgis_version="3.4 USE_GEOS=1 USE_PROJ=1",
+            schema_revision="0004_public_access_control",
+        )
+    )
+    if tiles_dir is not None:
+        app.dependency_overrides[get_tiles_dir] = lambda: tiles_dir
+    return app
+
+
+# -----------------------------------------------------------------------------
+# 1. Configuration Fields & Env Aliases
+# -----------------------------------------------------------------------------
+
+
+def test_hardening_and_r2_settings_defaults_aliases_and_bounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    defaults = Settings()
+    assert defaults.registration_mode == "open"
+    assert defaults.admin_email == ""
+    assert defaults.demo_banner == ""
+    assert defaults.rate_limit_enabled is True
+    assert defaults.rate_limit_read_per_min == 180
+    assert defaults.rate_limit_auth_per_min == 12
+    assert defaults.rate_limit_upload_per_day == 25
+    assert defaults.uploads_max_total_mb == 500
+    assert defaults.uploads_max_total_bytes == 500 * 1024 * 1024
+    assert defaults.trust_proxy_headers is True
+    assert defaults.tiles_public_base_url == ""
+    assert defaults.packs_public_base_url == ""
+    assert defaults.r2_endpoint_url == ""
+    assert defaults.r2_bucket == ""
+    assert defaults.r2_access_key_id == ""
+    assert defaults.r2_secret_access_key == ""
+
+    monkeypatch.setenv("TRAILFORGE_REGISTRATION_MODE", "invite_only")
+    monkeypatch.setenv("TRAILFORGE_ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("TRAILFORGE_DEMO_BANNER", "Public demo instance")
+    monkeypatch.setenv("TRAILFORGE_RATE_LIMIT_ENABLED", "false")
+    monkeypatch.setenv("TRAILFORGE_RATE_LIMIT_READ_PER_MIN", "90")
+    monkeypatch.setenv("TRAILFORGE_RATE_LIMIT_AUTH_PER_MIN", "6")
+    monkeypatch.setenv("TRAILFORGE_RATE_LIMIT_UPLOAD_PER_DAY", "10")
+    monkeypatch.setenv("TRAILFORGE_UPLOADS_MAX_TOTAL_MB", "250")
+    monkeypatch.setenv("TRAILFORGE_TRUST_PROXY_HEADERS", "false")
+    monkeypatch.setenv("TILES_PUBLIC_BASE_URL", "https://tiles.example.com")
+    monkeypatch.setenv("PACKS_PUBLIC_BASE_URL", "https://packs.example.com")
+    monkeypatch.setenv("TRAILFORGE_R2_ENDPOINT_URL", "https://acct.r2.example.com")
+    monkeypatch.setenv("TRAILFORGE_R2_BUCKET", "trailforge-public")
+    monkeypatch.setenv("TRAILFORGE_R2_ACCESS_KEY_ID", "test-access-key")
+    monkeypatch.setenv("TRAILFORGE_R2_SECRET_ACCESS_KEY", "test-secret-key")
+
+    cfg = Settings()
+    assert cfg.registration_mode == "invite_only"
+    assert cfg.admin_email == "admin@example.com"
+    assert cfg.demo_banner == "Public demo instance"
+    assert cfg.rate_limit_enabled is False
+    assert cfg.rate_limit_read_per_min == 90
+    assert cfg.rate_limit_auth_per_min == 6
+    assert cfg.rate_limit_upload_per_day == 10
+    assert cfg.uploads_max_total_mb == 250
+    assert cfg.trust_proxy_headers is False
+    assert cfg.tiles_public_base_url == "https://tiles.example.com"
+    assert cfg.packs_public_base_url == "https://packs.example.com"
+    assert cfg.r2_endpoint_url == "https://acct.r2.example.com"
+    assert cfg.r2_bucket == "trailforge-public"
+    assert cfg.r2_access_key_id == "test-access-key"
+    assert cfg.r2_secret_access_key == "test-secret-key"
+
+    with pytest.raises(ValidationError):
+        Settings(rate_limit_read_per_min=5)
+    with pytest.raises(ValidationError):
+        Settings(rate_limit_auth_per_min=2)
+    with pytest.raises(ValidationError):
+        Settings(rate_limit_upload_per_day=0)
+    with pytest.raises(ValidationError):
+        Settings(uploads_max_total_mb=5)
+
+
+# -----------------------------------------------------------------------------
+# 2. Client IP Extraction, Sliding Window Limiter & HTTP 429 Middleware
+# -----------------------------------------------------------------------------
+
+
+def test_extract_client_ip_and_route_group_classification() -> None:
+    hdrs = Headers(
+        {
+            "CF-Connecting-IP": "198.51.100.11",
+            "X-Forwarded-For": "203.0.113.5, 10.0.0.1",
+        }
+    )
+    assert extract_client_ip_from_headers(hdrs, client_host="127.0.0.1") == "198.51.100.11"
+    assert (
+        extract_client_ip_from_headers(
+            hdrs, client_host="127.0.0.1", trust_proxy_headers=False
+        )
+        == "127.0.0.1"
+    )
+
+    xff_only = Headers({"X-Forwarded-For": " 203.0.113.42 , 192.0.2.9 "})
+    assert extract_client_ip_from_headers(xff_only, client_host="10.0.0.2") == "203.0.113.42"
+    assert (
+        extract_client_ip_from_headers(Headers({}), client_host="192.0.2.77") == "192.0.2.77"
+    )
+    assert extract_client_ip_from_headers(Headers({}), client_host=None) == "unknown"
+
+    assert classify_route_group("/api/tracks") == "tracks"
+    assert classify_route_group("/api/segments/seg-1") == "tracks"
+    assert classify_route_group("/api/tiles/manifest.json") == "tiles"
+    assert classify_route_group("/api/packs/australian-alps/manifest.json") == "packs"
+    assert classify_route_group("/api/routes/plan") == "routes"
+    assert classify_route_group("/api/trips/upload") == "trips"
+    assert classify_route_group("/api/telemetry/unmapped") == "trips"
+    assert classify_route_group("/api/reports/geojson") == "reports"
+    assert classify_route_group("/api/closures") == "closures"
+    assert classify_route_group("/api/grading/recompute") == "grading"
+    assert classify_route_group("/api/auth/login") == "auth"
+    assert classify_route_group("/api/search") == "search"
+    assert classify_route_group("/api/admin/stats") == "admin"
+    assert classify_route_group("/api/vehicles") == "other"
+    assert classify_route_group("/healthz") == "other"
+
+
+def test_sliding_window_limiter_expiry_and_bounded_memory() -> None:
+    now = [1000.0]
+    limiter = SlidingWindowRateLimiter(clock=lambda: now[0], max_keys=64)
+
+    r1 = limiter.check("api:198.51.100.1", limit=2, window_s=60.0)
+    r2 = limiter.check("api:198.51.100.1", limit=2, window_s=60.0)
+    r3 = limiter.check("api:198.51.100.1", limit=2, window_s=60.0)
+    assert r1.allowed is True and r1.remaining == 1
+    assert r2.allowed is True and r2.remaining == 0
+    assert r3.allowed is False and r3.remaining == 0 and r3.retry_after_s == 60
+
+    # Advance past window -> allowed again
+    now[0] += 60.5
+    r4 = limiter.check("api:198.51.100.1", limit=2, window_s=60.0)
+    assert r4.allowed is True and r4.remaining == 1
+
+    # Flood distinct keys -> stays strictly bounded at max_keys
+    for idx in range(150):
+        now[0] += 0.01
+        limiter.check(f"api:198.51.100.{idx}", limit=10, window_s=60.0)
+    assert len(limiter._buckets) <= 65
+
+
+def test_http_rate_limiting_auth_and_read_buckets_429_headers_and_health_bypass(
+    tmp_path: Path,
+) -> None:
+    reset_usage_metrics()
+    cfg = Settings(
+        rate_limit_enabled=True,
+        rate_limit_read_per_min=10,
+        rate_limit_auth_per_min=3,
+        cors_origins="http://localhost:5173",
+    )
+    app = _make_healthy_app(settings=cfg, tiles_dir=tmp_path)
+
+    with TestClient(app) as client:
+        ip_a = {"CF-Connecting-IP": "198.51.100.10", "Origin": "http://localhost:5173"}
+        ip_b = {"X-Forwarded-For": "198.51.100.20, 10.0.0.1"}
+
+        # 1. Read/API bucket allows exactly 10 requests and emits X-RateLimit-* headers
+        for idx in range(10):
+            resp = client.get("/api/tiles/manifest.json", headers=ip_a)
+            assert resp.status_code == 200
+            assert resp.headers["x-ratelimit-limit"] == "10"
+            assert resp.headers["x-ratelimit-remaining"] == str(9 - idx)
+
+        # 11th request from ip_a -> HTTP 429 + Retry-After + CORS header preserved
+        blocked = client.get("/api/tiles/manifest.json", headers=ip_a)
+        assert blocked.status_code == 429
+        assert blocked.json() == {"detail": "Rate limit exceeded. Please try again shortly."}
+        assert int(blocked.headers["retry-after"]) >= 1
+        assert blocked.headers["x-ratelimit-limit"] == "10"
+        assert blocked.headers["x-ratelimit-remaining"] == "0"
+        assert blocked.headers.get("access-control-allow-origin") == "http://localhost:5173"
+
+        # Different IP (via X-Forwarded-For) still succeeds
+        other = client.get("/api/tiles/manifest.json", headers=ip_b)
+        assert other.status_code == 200
+        assert other.headers["x-ratelimit-remaining"] == "9"
+
+        # /api/health and OPTIONS preflight are NEVER rate-limited even for blocked ip_a
+        for _ in range(5):
+            assert client.get("/api/health", headers=ip_a).status_code == 200
+        opt = client.options(
+            "/api/tiles/manifest.json",
+            headers={
+                **ip_a,
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        assert opt.status_code == 200
+
+        # 2. Auth bucket (limit 3/min) enforces tighter limit on POST /api/auth/login
+        auth_ip = {"CF-Connecting-IP": "198.51.100.30"}
+        for idx in range(3):
+            r_auth = client.post("/api/auth/login", headers=auth_ip, json={})
+            # Validation fails with 422 (zero DB needed) while still consuming auth tokens
+            assert r_auth.status_code == 422
+            assert r_auth.headers["x-ratelimit-limit"] == "3"
+            assert r_auth.headers["x-ratelimit-remaining"] == str(2 - idx)
+
+        r_auth_blocked = client.post("/api/auth/login", headers=auth_ip, json={})
+        assert r_auth_blocked.status_code == 429
+        assert int(r_auth_blocked.headers["retry-after"]) >= 1
+        assert r_auth_blocked.headers["x-ratelimit-limit"] == "3"
+        assert r_auth_blocked.headers["x-ratelimit-remaining"] == "0"
+
+        # 3. reset_rate_limiter(app) restores capacity immediately
+        reset_rate_limiter(app)
+        after_reset = client.get("/api/tiles/manifest.json", headers=ip_a)
+        assert after_reset.status_code == 200
+        assert after_reset.headers["x-ratelimit-remaining"] == "9"
+
+        # 4. Usage telemetry captured tiles + auth requests, errors, bytes_out, and 429s
+        snap = get_live_usage_snapshot()
+        assert snap["by_route_group"]["tiles"]["request_count"] == 13
+        assert snap["by_route_group"]["tiles"]["rate_limited_count"] == 1
+        assert snap["by_route_group"]["tiles"]["error_count"] == 1
+        assert snap["by_route_group"]["tiles"]["bytes_out"] > 0
+        assert snap["by_route_group"]["auth"]["request_count"] == 4
+        assert snap["by_route_group"]["auth"]["rate_limited_count"] == 1
+        assert snap["by_route_group"]["auth"]["error_count"] == 4
+        assert snap["totals"]["rate_limited_count"] == 2
+        assert len(snap["pending_buckets"]) >= 2
+
+    app.dependency_overrides.clear()
+
+
+def test_rate_limit_disabled_allows_burst_and_upload_quota_helper(tmp_path: Path) -> None:
+    cfg = Settings(rate_limit_enabled=False, rate_limit_read_per_min=10)
+    app = _make_healthy_app(settings=cfg, tiles_dir=tmp_path)
+    with TestClient(app) as client:
+        for _ in range(15):
+            resp = client.get(
+                "/api/tiles/manifest.json",
+                headers={"CF-Connecting-IP": "198.51.100.99"},
+            )
+            assert resp.status_code == 200
+            assert "x-ratelimit-limit" not in resp.headers
+    app.dependency_overrides.clear()
+
+    # trust_proxy_headers=False ignores spoofed CF-Connecting-IP / X-Forwarded-For headers
+    untrusted_cfg = Settings(
+        rate_limit_enabled=True,
+        rate_limit_read_per_min=10,
+        trust_proxy_headers=False,
+    )
+    untrusted_app = _make_healthy_app(settings=untrusted_cfg, tiles_dir=tmp_path)
+    untrusted_app.state.enforce_rate_limit_in_tests = True
+    with TestClient(untrusted_app) as client:
+        for idx in range(10):
+            # Even with rotating spoofed proxy headers, all hit the same client.host bucket
+            resp = client.get(
+                "/api/tiles/manifest.json",
+                headers={"CF-Connecting-IP": f"198.51.100.{idx + 1}"},
+            )
+            assert resp.status_code == 200
+            assert resp.headers["x-ratelimit-remaining"] == str(9 - idx)
+        blocked = client.get(
+            "/api/tiles/manifest.json",
+            headers={"CF-Connecting-IP": "198.51.100.250"},
+        )
+        assert blocked.status_code == 429
+    untrusted_app.dependency_overrides.clear()
+
+    # Daily upload quota helper
+    reset_rate_limiter()
+    u1 = uuid.uuid4()
+    u2 = uuid.uuid4()
+    assert check_upload_quota(u1, limit_per_day=2).remaining == 1
+    assert check_upload_quota(u1, limit_per_day=2).remaining == 0
+    with pytest.raises(HTTPException) as exc_info:
+        check_upload_quota(u1, limit_per_day=2)
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.headers is not None
+    assert int(exc_info.value.headers["Retry-After"]) >= 1
+    # Distinct user still has full quota
+    assert check_upload_quota(u2, limit_per_day=2).remaining == 1
+    reset_rate_limiter()
+
+
+# -----------------------------------------------------------------------------
+# 3. Photo Upload Disk Quota Guard
+# -----------------------------------------------------------------------------
+
+
+def test_photo_storage_disk_quota_guard_and_507_handler(tmp_path: Path) -> None:
+    png_small = _make_valid_png_bytes(payload_pad=128)
+    assert get_directory_size_bytes(tmp_path) == 0
+
+    # Save first photo within quota
+    quota = len(png_small) * 2 + 10
+    saved1 = save_report_photo(png_small, uploads_dir=tmp_path, max_total_bytes=quota)
+    assert saved1.path.is_file()
+    assert get_directory_size_bytes(tmp_path) == len(png_small)
+
+    # Save second photo still within quota
+    saved2 = save_report_photo(png_small, uploads_dir=tmp_path, max_total_bytes=quota)
+    assert saved2.path.is_file()
+    assert get_directory_size_bytes(tmp_path) == len(png_small) * 2
+
+    # Symlinks inside uploads dir are ignored by size calculation
+    outside = tmp_path.parent / "outside_blob.bin"
+    outside.write_bytes(b"0" * 10_000)
+    (tmp_path / "ignore_link.bin").symlink_to(outside)
+    assert get_directory_size_bytes(tmp_path) == len(png_small) * 2
+
+    # Third photo exceeds quota -> raises PhotoStorageQuotaError with no orphan temp files
+    with pytest.raises(PhotoStorageQuotaError):
+        save_report_photo(png_small, uploads_dir=tmp_path, max_total_bytes=quota)
+    assert [p.name for p in tmp_path.glob("*.tmp")] == []
+
+    # Verify FastAPI exception handler maps PhotoStorageQuotaError -> HTTP 507
+    app = _make_healthy_app()
+
+    @app.get("/api/_test_photo_quota_507")
+    def _trigger_quota() -> dict[str, str]:
+        raise PhotoStorageQuotaError("Disk quota reached")
+
+    with TestClient(app) as client:
+        r_507 = client.get("/api/_test_photo_quota_507")
+        assert r_507.status_code == 507
+        assert "Disk quota reached" in r_507.json()["detail"]
+    app.dependency_overrides.clear()
+
+
+# -----------------------------------------------------------------------------
+# 4. Cloudflare R2 Tile Offload Manifest
+# -----------------------------------------------------------------------------
+
+
+def test_tiles_manifest_r2_cdn_offload_and_local_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Local mode (no TILES_PUBLIC_BASE_URL, empty tiles_dir)
+    monkeypatch.delenv("TILES_PUBLIC_BASE_URL", raising=False)
+    monkeypatch.delenv("TRAILFORGE_TILES_PUBLIC_BASE_URL", raising=False)
+    get_settings.cache_clear()
+
+    local_app = _make_healthy_app(tiles_dir=tmp_path)
+    with TestClient(local_app) as client:
+        r_local = client.get("/api/tiles/manifest.json")
+        assert r_local.status_code == 200
+        body = r_local.json()
+        assert body["cdn_offload"] is False
+        assert body["vector_url"] == "/api/tiles/trailforge_vector.pmtiles"
+        assert body["terrain_url"] == "/api/tiles/trailforge_terrain.pmtiles"
+        assert body["vector_available"] is False
+        assert body["terrain_available"] is False
+    local_app.dependency_overrides.clear()
+
+    # R2 CDN offload mode (trailing slash normalized; zero local PMTiles required!)
+    cdn_cfg = Settings(tiles_public_base_url="https://tiles.example.com/")
+    cdn_app = _make_healthy_app(settings=cdn_cfg, tiles_dir=tmp_path)
+    with TestClient(cdn_app) as client:
+        r_cdn = client.get("/api/tiles/manifest.json")
+        assert r_cdn.status_code == 200
+        body = r_cdn.json()
+        assert body["cdn_offload"] is True
+        assert body["vector_url"] == "https://tiles.example.com/trailforge_vector.pmtiles"
+        assert body["terrain_url"] == "https://tiles.example.com/trailforge_terrain.pmtiles"
+        assert body["vector_available"] is True
+        assert body["terrain_available"] is True
+    cdn_app.dependency_overrides.clear()
+
+
+# -----------------------------------------------------------------------------
+# 5. Pure-Python AWS SigV4 + Mocked-HTTP R2 Sync & CLI Dry-Run
+# -----------------------------------------------------------------------------
+
+
+def test_sigv4_signing_determinism_and_no_boto3() -> None:
+    assert "boto3" not in sys.modules
+    fixed_ts = datetime(2026, 11, 26, 7, 30, 0, tzinfo=UTC)
+    headers = r2_sync.sign_s3_v4_request(
+        method="PUT",
+        url="https://acct.r2.example.com/trailforge-tiles/trailforge_vector.pmtiles",
+        access_key_id="AKIAEXAMPLEKEY",
+        secret_access_key="SecretExampleKey123",
+        region="auto",
+        payload_hash=r2_sync.UNSIGNED_PAYLOAD,
+        extra_headers={
+            "Content-Type": "application/vnd.pmtiles",
+            "Cache-Control": "public, max-age=86400",
+            "Content-Length": "128",
+        },
+        now=fixed_ts,
+    )
+    assert headers["x-amz-date"] == "20261126T073000Z"
+    assert headers["x-amz-content-sha256"] == "UNSIGNED-PAYLOAD"
+    auth = headers["Authorization"]
+    assert auth.startswith(
+        "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLEKEY/20261126/auto/s3/aws4_request, "
+    )
+    assert (
+        "SignedHeaders=cache-control;content-length;content-type;host;"
+        "x-amz-content-sha256;x-amz-date"
+    ) in auth
+    sig = auth.rsplit("Signature=", 1)[1]
+    assert len(sig) == 64 and all(ch in "0123456789abcdef" for ch in sig)
+
+    # Identical inputs -> identical signature; altered secret -> different signature
+    headers_same = r2_sync.sign_s3_v4_request(
+        method="PUT",
+        url="https://acct.r2.example.com/trailforge-tiles/trailforge_vector.pmtiles",
+        access_key_id="AKIAEXAMPLEKEY",
+        secret_access_key="SecretExampleKey123",
+        region="auto",
+        payload_hash=r2_sync.UNSIGNED_PAYLOAD,
+        extra_headers={
+            "Content-Type": "application/vnd.pmtiles",
+            "Cache-Control": "public, max-age=86400",
+            "Content-Length": "128",
+        },
+        now=fixed_ts,
+    )
+    assert headers_same["Authorization"] == auth
+
+    headers_diff = r2_sync.sign_s3_v4_request(
+        method="PUT",
+        url="https://acct.r2.example.com/trailforge-tiles/trailforge_vector.pmtiles",
+        access_key_id="AKIAEXAMPLEKEY",
+        secret_access_key="DifferentSecretKey999",
+        region="auto",
+        payload_hash=r2_sync.UNSIGNED_PAYLOAD,
+        extra_headers={
+            "Content-Type": "application/vnd.pmtiles",
+            "Cache-Control": "public, max-age=86400",
+            "Content-Length": "128",
+        },
+        now=fixed_ts,
+    )
+    assert headers_diff["Authorization"] != auth
+
+
+def test_r2_sync_mock_http_streaming_etag_skip_and_cli_dry_run(tmp_path: Path) -> None:
+    tiles_dir = tmp_path / "tiles"
+    packs_dir = tmp_path / "packs"
+    alps_dir = packs_dir / "australian-alps"
+    staging_dir = packs_dir / ".australian-alps.staging-1234"
+    tiles_dir.mkdir()
+    alps_dir.mkdir(parents=True)
+    staging_dir.mkdir(parents=True)
+
+    # Populate synthetic tiles + pack artifacts (+ hidden staging dir that MUST be ignored)
+    tile_files = {
+        "trailforge_vector.pmtiles": b"PMTilesVEC" + b"\x01" * 1024,
+        "trailforge_terrain.pmtiles": b"PMTilesTER" + b"\x02" * 512,
+        "manifest.json": b'{"version":"1.1.0","bounds":[148.0,-36.7,148.2,-36.5]}\n',
+    }
+    for fname, blob in tile_files.items():
+        (tiles_dir / fname).write_bytes(blob)
+
+    pack_files = {
+        "manifest.json": b'{"region_id":"australian-alps","version":"2026.11.26"}\n',
+        "snapshot.json": b'{"tracks":[]}\n',
+        "vector.pmtiles": b"PMTilesPACKV" + b"\x03" * 256,
+        "terrain.pmtiles": b"PMTilesPACKT" + b"\x04" * 256,
+        "bundle.tar.gz": b"\x1f\x8b\x08\x00" + b"\x05" * 128,
+    }
+    for fname, blob in pack_files.items():
+        (alps_dir / fname).write_bytes(blob)
+    (staging_dir / "manifest.json").write_bytes(b'{"ignore":true}\n')
+
+    # In-memory mock R2 object store via httpx.MockTransport (zero network!)
+    stored_objects: dict[str, dict[str, Any]] = {}
+    recorded_calls: list[tuple[str, str]] = []
+
+    def _mock_r2_handler(request: httpx.Request) -> httpx.Response:
+        recorded_calls.append((request.method, request.url.path))
+        auth = request.headers.get("authorization", "")
+        assert auth.startswith("AWS4-HMAC-SHA256 ")
+        assert "x-amz-date" in request.headers
+        assert "x-amz-content-sha256" in request.headers
+
+        prefix = "/trailforge-bucket/"
+        assert request.url.path.startswith(prefix)
+        key = request.url.path[len(prefix) :]
+
+        if request.method == "HEAD":
+            obj = stored_objects.get(key)
+            if obj is None:
+                return httpx.Response(404)
+            return httpx.Response(
+                200,
+                headers={
+                    "Content-Length": str(len(obj["body"])),
+                    "ETag": f'"{obj["md5"]}"',
+                },
+            )
+        if request.method == "PUT":
+            body = request.read()
+            md5_hex = hashlib.md5(body, usedforsecurity=False).hexdigest()
+            stored_objects[key] = {
+                "body": body,
+                "md5": md5_hex,
+                "content_type": request.headers.get("content-type"),
+                "cache_control": request.headers.get("cache-control"),
+                "content_length": request.headers.get("content-length"),
+            }
+            return httpx.Response(200, headers={"ETag": f'"{md5_hex}"'})
+        return httpx.Response(405)
+
+    transport = httpx.MockTransport(_mock_r2_handler)
+    with httpx.Client(transport=transport) as mock_client:
+        # 1. First sync uploads all 8 artifacts with exact Content-Type & Cache-Control
+        res1 = r2_sync.sync_to_r2(
+            tiles_dir=tiles_dir,
+            packs_dir=packs_dir,
+            endpoint_url="https://acct.r2.example.com",
+            bucket="trailforge-bucket",
+            access_key_id="AKIA_TEST",
+            secret_access_key="SECRET_TEST",
+            client=mock_client,
+        )
+        assert res1["dry_run"] is False
+        assert res1["total_files"] == 8
+        assert res1["uploaded"] == 8
+        assert res1["skipped"] == 0
+
+        assert stored_objects["trailforge_vector.pmtiles"]["content_type"] == (
+            "application/vnd.pmtiles"
+        )
+        assert stored_objects["trailforge_vector.pmtiles"]["cache_control"] == (
+            "public, max-age=86400"
+        )
+        assert stored_objects["trailforge_vector.pmtiles"]["body"] == (
+            tile_files["trailforge_vector.pmtiles"]
+        )
+        assert stored_objects["manifest.json"]["content_type"] == "application/json"
+        assert stored_objects["manifest.json"]["cache_control"] == "public, max-age=300"
+        assert stored_objects["australian-alps/bundle.tar.gz"]["content_type"] == (
+            "application/gzip"
+        )
+        assert stored_objects["australian-alps/bundle.tar.gz"]["cache_control"] == (
+            "public, max-age=86400"
+        )
+        assert stored_objects["australian-alps/vector.pmtiles"]["content_type"] == (
+            "application/vnd.pmtiles"
+        )
+
+        # 2. Second sync skips all 8 unchanged files via HEAD ETag/size match
+        recorded_calls.clear()
+        res2 = r2_sync.sync_to_r2(
+            tiles_dir=tiles_dir,
+            packs_dir=packs_dir,
+            endpoint_url="https://acct.r2.example.com",
+            bucket="trailforge-bucket",
+            access_key_id="AKIA_TEST",
+            secret_access_key="SECRET_TEST",
+            client=mock_client,
+        )
+        assert res2["uploaded"] == 0
+        assert res2["skipped"] == 8
+        assert all(method == "HEAD" for method, _ in recorded_calls)
+
+        # 3. Same-length content mutation triggers single re-upload via MD5 ETag mismatch
+        updated_manifest = b'{"version":"1.1.1","bounds":[148.0,-36.7,148.2,-36.5]}\n'
+        assert len(updated_manifest) == len(tile_files["manifest.json"])
+        (tiles_dir / "manifest.json").write_bytes(updated_manifest)
+        res3 = r2_sync.sync_to_r2(
+            tiles_dir=tiles_dir,
+            packs_dir=packs_dir,
+            endpoint_url="https://acct.r2.example.com",
+            bucket="trailforge-bucket",
+            access_key_id="AKIA_TEST",
+            secret_access_key="SECRET_TEST",
+            client=mock_client,
+        )
+        assert res3["uploaded"] == 1
+        assert res3["skipped"] == 7
+        assert stored_objects["manifest.json"]["body"] == updated_manifest
+
+        # 4. --force skips HEAD checks and re-uploads selected region only
+        recorded_calls.clear()
+        res4 = r2_sync.sync_to_r2(
+            packs_dir=packs_dir,
+            region="australian-alps",
+            endpoint_url="https://acct.r2.example.com",
+            bucket="trailforge-bucket",
+            access_key_id="AKIA_TEST",
+            secret_access_key="SECRET_TEST",
+            force=True,
+            client=mock_client,
+        )
+        assert res4["total_files"] == 5
+        assert res4["uploaded"] == 5
+        assert all(method == "PUT" for method, _ in recorded_calls)
+
+    # 5. Subprocess CLI dry-run with -W error::RuntimeWarning (0 warnings, 0 network)
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-W",
+            "error::RuntimeWarning",
+            "-m",
+            "trailforge.packs.r2_sync",
+            "--tiles-dir",
+            str(tiles_dir),
+            "--packs-dir",
+            str(packs_dir),
+            "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent.parent / "src")},
+    )
+    assert proc.returncode == 0, f"stderr={proc.stderr}"
+    assert proc.stderr.strip() == ""
+    cli_summary = json.loads(proc.stdout)
+    assert cli_summary["dry_run"] is True
+    assert cli_summary["total_files"] == 8
+    assert cli_summary["planned"] == 8
+    keys = {item["object_key"] for item in cli_summary["items"]}
+    assert "trailforge_vector.pmtiles" in keys
+    assert "australian-alps/bundle.tar.gz" in keys
+
+
+# -----------------------------------------------------------------------------
+# 6. PostGIS Integration Tests (Usage DB Rollup + Trip Upload Daily Quota + Photo 507)
+# -----------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_usage_metrics_postgis_rollup_and_trip_upload_daily_cap(
+    postgis_engine: Engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reset_rate_limiter()
+    reset_usage_metrics()
+
+    # 1. Verify hourly rollup upsert to usage_metrics_hourly when migration 0004 is applied
+    with Session(postgis_engine) as session:
+        has_usage_table = session.execute(
+            text("SELECT to_regclass('public.usage_metrics_hourly')")
+        ).scalar_one_or_none()
+        if has_usage_table is not None:
+            session.execute(text("DELETE FROM usage_metrics_hourly"))
+            session.commit()
+
+            store = UsageMetricsStore()
+            fixed_hour = datetime(2026, 11, 26, 8, 15, 0, tzinfo=UTC)
+            store.record(route_group="tracks", status_code=200, bytes_out=1500, at=fixed_hour)
+            store.record(
+                route_group="tracks",
+                status_code=429,
+                bytes_out=80,
+                rate_limited=True,
+                at=fixed_hour,
+            )
+            flushed1 = flush_usage_metrics(session, store=store)
+            assert flushed1 == 1
+            assert store.get_snapshot()["pending_buckets"] == []
+
+            # Second flush adds onto same (bucket_hour, route_group) PK row
+            store.record(route_group="tracks", status_code=500, bytes_out=200, at=fixed_hour)
+            flushed2 = flush_usage_metrics(session, store=store)
+            assert flushed2 == 1
+
+            row = session.execute(
+                text(
+                    """
+                    SELECT request_count, error_count, bytes_out, rate_limited_count
+                    FROM usage_metrics_hourly
+                    WHERE route_group = 'tracks'
+                    """
+                )
+            ).one()
+            assert tuple(row) == (3, 2, 1780, 1)
+
+            session.execute(text("DELETE FROM usage_metrics_hourly"))
+            session.commit()
+
+    # 2. Verify daily per-member trip upload cap on POST /api/trips/upload & /mobile-sync
+    uploads_dir = tmp_path / "quota_uploads"
+    uploads_dir.mkdir()
+    monkeypatch.setenv("TRAILFORGE_UPLOADS_DIR", str(uploads_dir))
+    monkeypatch.setenv("TRAILFORGE_REGISTRATION_MODE", "open")
+    get_settings.cache_clear()
+
+    cfg = Settings(
+        registration_mode="open",
+        rate_limit_enabled=True,
+        rate_limit_upload_per_day=2,
+        uploads_dir=str(uploads_dir),
+    )
+
+    with postgis_engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                TRUNCATE TABLE
+                    condition_report_votes, condition_reports,
+                    telemetry_observations, unmapped_track_candidates,
+                    trips, vehicle_profiles, users
+                RESTART IDENTITY CASCADE
+                """
+            )
+        )
+
+    try:
+        with Session(postgis_engine) as session:
+            app = create_app(settings=cfg)
+
+            def _override_db() -> Generator[Session, None, None]:
+                yield session
+
+            app.dependency_overrides[get_db] = _override_db
+
+            with TestClient(app) as client:
+                reg = client.post(
+                    "/api/auth/register",
+                    json={
+                        "email": "quota.member@example.au",
+                        "display_name": "Quota Member",
+                        "password": "TrailForge4WD!",
+                    },
+                )
+                assert reg.status_code == 201, reg.text
+                token = reg.json()["access_token"]
+                headers = {"Authorization": f"Bearer {token}"}
+
+                trace_payload = {
+                    "name": "Short Quota Test",
+                    "visibility": "private",
+                    "points": [
+                        {
+                            "lon": 148.1200,
+                            "lat": -36.5660,
+                            "timestamp": "2026-11-26T01:00:00Z",
+                        },
+                        {
+                            "lon": 148.1205,
+                            "lat": -36.5662,
+                            "timestamp": "2026-11-26T01:01:00Z",
+                        },
+                    ],
+                }
+                r1 = client.post("/api/trips/upload", headers=headers, json=trace_payload)
+                assert r1.status_code == 201, r1.text
+
+                r2 = client.post("/api/trips/mobile-sync", headers=headers, json=trace_payload)
+                assert r2.status_code == 201, r2.text
+
+                # 3rd upload in 24h hits daily member cap -> HTTP 429 + Retry-After
+                r3 = client.post("/api/trips/upload", headers=headers, json=trace_payload)
+                assert r3.status_code == 429
+                assert int(r3.headers["retry-after"]) >= 1
+                assert r3.headers["x-ratelimit-limit"] == "2"
+
+                # Admin users bypass the daily member upload cap
+                has_role_col = session.execute(
+                    text(
+                        """
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'users' AND column_name = 'role'
+                        """
+                    )
+                ).scalar_one_or_none()
+                if has_role_col is not None:
+                    session.execute(
+                        text("UPDATE users SET role = 'admin' WHERE email = :email"),
+                        {"email": "quota.member@example.au"},
+                    )
+                    session.commit()
+                    r_admin = client.post("/api/trips/upload", headers=headers, json=trace_payload)
+                    assert r_admin.status_code == 201, r_admin.text
+
+                # 3. Verify POST /api/reports photo quota exceeded returns HTTP 507
+                monkeypatch.setenv("TRAILFORGE_UPLOADS_MAX_TOTAL_MB", "0.0001")
+                r_507 = client.post(
+                    "/api/reports",
+                    headers=headers,
+                    data={
+                        "report_type": "washout",
+                        "notes": "Testing photo quota exhaustion",
+                        "lon": "148.1200",
+                        "lat": "-36.5660",
+                    },
+                    files={
+                        "photo": (
+                            "quota.png",
+                            _make_valid_png_bytes(payload_pad=512),
+                            "image/png",
+                        )
+                    },
+                )
+                assert r_507.status_code == 507, r_507.text
+
+            app.dependency_overrides.clear()
+    finally:
+        reset_rate_limiter()
+        reset_usage_metrics()
+        get_settings.cache_clear()
+        with postgis_engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    TRUNCATE TABLE
+                        condition_report_votes, condition_reports,
+                        telemetry_observations, unmapped_track_candidates,
+                        trips, vehicle_profiles, users
+                    RESTART IDENTITY CASCADE
+                    """
+                )
+            )

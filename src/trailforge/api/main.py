@@ -7,14 +7,21 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from trailforge import SERVICE_NAME, __version__
+from trailforge.api.admin import router as admin_router
 from trailforge.api.auth import router as auth_router
 from trailforge.api.closures import router as closures_router
 from trailforge.api.grading import router as grading_router
 from trailforge.api.health import router as health_router
+from trailforge.api.middleware import (
+    SlidingWindowRateLimiter,
+    UsageAndRateLimitMiddleware,
+    flush_usage_metrics,
+)
 from trailforge.api.packs import router as packs_router
 from trailforge.api.reports import router as reports_router
 from trailforge.api.routes import router as routes_router
@@ -25,6 +32,7 @@ from trailforge.api.user_data import router as user_data_router
 from trailforge.api.vehicles import router as vehicles_router
 from trailforge.config import Settings, get_settings
 from trailforge.db.session import reset_engine
+from trailforge.reports.photos import PhotoStorageQuotaError
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +51,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
+            flush_usage_metrics()
             reset_engine()
             logger.info("Shutdown complete for %s", SERVICE_NAME)
 
@@ -57,6 +66,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
 
+    rate_limiter = SlidingWindowRateLimiter()
+    application.state.rate_limiter = rate_limiter
+    application.state.settings = cfg
+    if settings is not None:
+        application.state.custom_settings = settings
+
+    @application.exception_handler(PhotoStorageQuotaError)
+    async def _photo_quota_exception_handler(
+        _request: Request,
+        exc: PhotoStorageQuotaError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_507_INSUFFICIENT_STORAGE,
+            content={"detail": str(exc)},
+        )
+
+    # Register rate limiter inside CORSMiddleware so 429/507 responses retain CORS headers
+    application.add_middleware(
+        UsageAndRateLimitMiddleware,
+        settings=settings,
+        rate_limiter=rate_limiter,
+    )
     application.add_middleware(
         CORSMiddleware,
         allow_origins=cfg.cors_origins_list,
@@ -77,6 +108,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(vehicles_router)
     application.include_router(user_data_router)
     application.include_router(routes_router)
+    application.include_router(admin_router)
 
     @application.get("/", tags=["meta"])
     def root() -> dict[str, str]:

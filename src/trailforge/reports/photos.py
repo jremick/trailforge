@@ -38,6 +38,10 @@ class PhotoNotFoundError(FileNotFoundError):
     """Raised when a valid confined photo filename does not exist on disk."""
 
 
+class PhotoStorageQuotaError(OSError):
+    """Raised when saving a photo would exceed the global uploads_max_total_mb disk quota."""
+
+
 @dataclass(frozen=True, slots=True)
 class SavedPhoto:
     """Metadata returned after validating and persisting a report photo attachment."""
@@ -94,16 +98,75 @@ def validate_photo_bytes(data: bytes) -> tuple[str, str]:
     return detected
 
 
+def get_directory_size_bytes(path: Path | str) -> int:
+    """Return total byte size of regular files inside ``path`` (ignoring symlinks)."""
+    root = Path(path).expanduser()
+    if not root.is_dir():
+        return 0
+    total = 0
+    stack: list[Path] = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            total += int(entry.stat(follow_symlinks=False).st_size)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
+
+
+def get_uploads_max_total_bytes(override_mb: int | float | None = None) -> int:
+    """Resolve the global photo uploads disk quota in bytes."""
+    if override_mb is not None:
+        return max(0, int(float(override_mb) * 1024 * 1024))
+
+    env_val = os.environ.get("TRAILFORGE_UPLOADS_MAX_TOTAL_MB") or os.environ.get(
+        "UPLOADS_MAX_TOTAL_MB"
+    )
+    if env_val and env_val.strip():
+        try:
+            parsed_mb = float(env_val.strip())
+            if parsed_mb > 0:
+                return int(parsed_mb * 1024 * 1024)
+        except ValueError:
+            pass
+
+    settings_mb = getattr(get_settings(), "uploads_max_total_mb", 500)
+    return max(0, int(settings_mb) * 1024 * 1024)
+
+
 def save_report_photo(
     data: bytes,
     *,
     uploads_dir: Path | str | None = None,
+    max_total_bytes: int | None = None,
 ) -> SavedPhoto:
     """Validate and atomically save a photo attachment under the uploads directory."""
     ext, media_type = validate_photo_bytes(data)
     base_dir = get_uploads_dir(uploads_dir)
     base_dir.mkdir(parents=True, exist_ok=True)
     resolved_base = base_dir.resolve()
+
+    quota_bytes = (
+        max(0, int(max_total_bytes))
+        if max_total_bytes is not None
+        else get_uploads_max_total_bytes()
+    )
+    current_bytes = get_directory_size_bytes(resolved_base)
+    if current_bytes + len(data) > quota_bytes:
+        raise PhotoStorageQuotaError(
+            "Photo upload storage quota exceeded "
+            f"({current_bytes + len(data)} bytes would exceed {quota_bytes} byte limit)"
+        )
 
     filename = f"{uuid.uuid4().hex}.{ext}"
     final_path = (resolved_base / filename).resolve()

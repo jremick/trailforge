@@ -18,6 +18,7 @@ from shapely.geometry import LineString, Point
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
+from trailforge.api.middleware import check_upload_quota
 from trailforge.auth.dependencies import get_current_user
 from trailforge.config import get_settings
 from trailforge.db.models import (
@@ -762,6 +763,16 @@ async def _ingest_trip_trace(
     return resp, imu_summary, matcher_backend, discarded_imu_count
 
 
+def _enforce_trip_upload_quota(request: Request, current_user: User) -> None:
+    """Enforce daily per-member trip upload cap (skipping admins or when disabled)."""
+    cfg = getattr(getattr(request.app, "state", None), "custom_settings", None) or get_settings()
+    if not cfg.rate_limit_enabled:
+        return
+    if getattr(current_user, "role", "member") == "admin":
+        return
+    check_upload_quota(current_user.id, limit_per_day=cfg.rate_limit_upload_per_day)
+
+
 @router.post("/trips/upload", response_model=TripItemResponse, status_code=status.HTTP_201_CREATED)
 async def upload_trip(
     request: Request,
@@ -770,6 +781,7 @@ async def upload_trip(
     matcher: TrackMatcher = Depends(get_track_matcher),
 ) -> TripItemResponse:
     """Upload a GPX 1.1 file or Telemetry JSON trace with mandatory >=250 m privacy trimming."""
+    _enforce_trip_upload_quota(request, current_user)
     content_type = (request.headers.get("content-type") or "").lower()
 
     explicit_name: str | None = None
@@ -931,12 +943,14 @@ async def upload_trip(
     status_code=status.HTTP_201_CREATED,
 )
 async def mobile_sync_trip(
+    request: Request,
     payload: MobileSyncRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     matcher: TrackMatcher = Depends(get_track_matcher),
 ) -> MobileSyncResponse:
     """Sync a mobile/Capacitor background GPS + high-rate IMU recording session."""
+    _enforce_trip_upload_quota(request, current_user)
     try:
         parsed = parse_telemetry_json(
             {

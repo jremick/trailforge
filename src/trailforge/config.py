@@ -103,19 +103,169 @@ class Settings(BaseSettings):
     trailforge_data_dir: str = Field(default="/data")
     tiles_dir: str = Field(
         default="/data/tiles",
-        validation_alias=AliasChoices("TILES_DIR", "TRAILFORGE_TILES_DIR"),
+        validation_alias=AliasChoices("TILES_DIR", "TRAILFORGE_TILES_DIR", "tiles_dir"),
         description="Directory storing generated vector/terrain PMTiles and manifest.json.",
     )
     uploads_dir: str = Field(
         default="/data/uploads",
-        validation_alias=AliasChoices("TRAILFORGE_UPLOADS_DIR", "UPLOADS_DIR"),
+        validation_alias=AliasChoices("TRAILFORGE_UPLOADS_DIR", "UPLOADS_DIR", "uploads_dir"),
         description="Directory storing validated community condition report photo attachments.",
     )
     packs_dir: str = Field(
         default="/data/packs",
-        validation_alias=AliasChoices("PACKS_DIR", "TRAILFORGE_PACKS_DIR"),
+        validation_alias=AliasChoices("PACKS_DIR", "TRAILFORGE_PACKS_DIR", "packs_dir"),
         description="Directory storing built offline regional pack bundles and manifests.",
     )
+
+    # Public instance access control & demo UX (v1.1.0 Public Hardening)
+    registration_mode: Literal["open", "invite_only", "closed"] = Field(
+        default="open",
+        validation_alias=AliasChoices(
+            "TRAILFORGE_REGISTRATION_MODE",
+            "REGISTRATION_MODE",
+            "registration_mode",
+        ),
+        description="Account registration policy ('open', 'invite_only', or 'closed').",
+    )
+    admin_email: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "TRAILFORGE_ADMIN_EMAIL",
+            "ADMIN_EMAIL",
+            "admin_email",
+        ),
+        description="Optional bootstrap admin email promoted on first registration.",
+    )
+    demo_banner: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "TRAILFORGE_DEMO_BANNER",
+            "DEMO_BANNER",
+            "demo_banner",
+        ),
+        description="Optional public info banner text displayed in the web UI.",
+    )
+
+    # Edge rate limiting & storage quotas (zero Redis, bounded in-memory sliding windows)
+    rate_limit_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRAILFORGE_RATE_LIMIT_ENABLED",
+            "RATE_LIMIT_ENABLED",
+            "rate_limit_enabled",
+        ),
+        description="Enable in-process sliding-window rate limiting and upload quotas.",
+    )
+    rate_limit_read_per_min: int = Field(
+        default=180,
+        ge=10,
+        validation_alias=AliasChoices(
+            "TRAILFORGE_RATE_LIMIT_READ_PER_MIN",
+            "RATE_LIMIT_READ_PER_MIN",
+            "rate_limit_read_per_min",
+        ),
+        description="Per-IP requests per minute allowed on general /api/* routes.",
+    )
+    rate_limit_auth_per_min: int = Field(
+        default=12,
+        ge=3,
+        validation_alias=AliasChoices(
+            "TRAILFORGE_RATE_LIMIT_AUTH_PER_MIN",
+            "RATE_LIMIT_AUTH_PER_MIN",
+            "rate_limit_auth_per_min",
+        ),
+        description="Per-IP requests per minute allowed on /api/auth/login and /register.",
+    )
+    rate_limit_upload_per_day: int = Field(
+        default=25,
+        ge=1,
+        validation_alias=AliasChoices(
+            "TRAILFORGE_RATE_LIMIT_UPLOAD_PER_DAY",
+            "RATE_LIMIT_UPLOAD_PER_DAY",
+            "rate_limit_upload_per_day",
+        ),
+        description="Maximum trip uploads / mobile syncs per non-admin member per 24 hours.",
+    )
+    uploads_max_total_mb: int = Field(
+        default=500,
+        ge=10,
+        validation_alias=AliasChoices(
+            "TRAILFORGE_UPLOADS_MAX_TOTAL_MB",
+            "UPLOADS_MAX_TOTAL_MB",
+            "uploads_max_total_mb",
+        ),
+        description="Global disk quota in MiB for condition report photo attachments.",
+    )
+    trust_proxy_headers: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "TRAILFORGE_TRUST_PROXY_HEADERS",
+            "TRUST_PROXY_HEADERS",
+            "trust_proxy_headers",
+        ),
+        description="Trust CF-Connecting-IP and X-Forwarded-For proxy headers for client IP.",
+    )
+
+    # Cloudflare R2 / CDN static offload & pure-Python SigV4 sync
+    tiles_public_base_url: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "TILES_PUBLIC_BASE_URL",
+            "TRAILFORGE_TILES_PUBLIC_BASE_URL",
+            "tiles_public_base_url",
+        ),
+        description="Optional public CDN/R2 base URL serving PMTiles archives.",
+    )
+    packs_public_base_url: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "PACKS_PUBLIC_BASE_URL",
+            "TRAILFORGE_PACKS_PUBLIC_BASE_URL",
+            "packs_public_base_url",
+        ),
+        description="Optional public CDN/R2 base URL serving offline regional packs.",
+    )
+    r2_endpoint_url: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "TRAILFORGE_R2_ENDPOINT_URL",
+            "R2_ENDPOINT_URL",
+            "r2_endpoint_url",
+        ),
+        description="Cloudflare R2 S3-compatible endpoint URL (e.g. https://<acct>.r2.cloudflarestorage.com).",
+    )
+    r2_bucket: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "TRAILFORGE_R2_BUCKET",
+            "R2_BUCKET",
+            "r2_bucket",
+        ),
+        description="Cloudflare R2 target bucket name for tile/pack sync.",
+    )
+    r2_access_key_id: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "TRAILFORGE_R2_ACCESS_KEY_ID",
+            "R2_ACCESS_KEY_ID",
+            "r2_access_key_id",
+        ),
+        description="Cloudflare R2 S3 API access key ID.",
+    )
+    r2_secret_access_key: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "TRAILFORGE_R2_SECRET_ACCESS_KEY",
+            "R2_SECRET_ACCESS_KEY",
+            "r2_secret_access_key",
+        ),
+        description="Cloudflare R2 S3 API secret access key.",
+    )
+
+    @property
+    def uploads_max_total_bytes(self) -> int:
+        """Global photo uploads quota expressed in bytes."""
+        return self.uploads_max_total_mb * 1024 * 1024
 
     @property
     def trailforge_tiles_dir(self) -> str:

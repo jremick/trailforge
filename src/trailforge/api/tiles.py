@@ -152,22 +152,39 @@ def _stream_file_slice(file_path: Path, start: int, length: int) -> Iterator[byt
 
 @router.get("/manifest.json")
 def get_tiles_manifest(
+    request: Request,
     tiles_dir: Path = Depends(get_tiles_dir),
 ) -> JSONResponse:
     """Return active PMTiles archive availability, bounds, zooms, layers, and attributions."""
+    cfg = getattr(getattr(request.app, "state", None), "custom_settings", None) or get_settings()
+    public_base = cfg.tiles_public_base_url.strip().rstrip("/")
+    cdn_offload = bool(public_base)
+
     vector_path = tiles_dir / "trailforge_vector.pmtiles"
     terrain_path = tiles_dir / "trailforge_terrain.pmtiles"
     manifest_path = tiles_dir / "manifest.json"
+
+    default_vector_url = (
+        f"{public_base}/trailforge_vector.pmtiles"
+        if cdn_offload
+        else "/api/tiles/trailforge_vector.pmtiles"
+    )
+    default_terrain_url = (
+        f"{public_base}/trailforge_terrain.pmtiles"
+        if cdn_offload
+        else "/api/tiles/trailforge_terrain.pmtiles"
+    )
 
     payload: dict[str, Any] = {
         "generated_at": None,
         "bounds": list(DEFAULT_CORRIDOR_BOUNDS),
         "minzoom": 8,
         "maxzoom": 15,
-        "vector_url": "/api/tiles/trailforge_vector.pmtiles",
-        "terrain_url": "/api/tiles/trailforge_terrain.pmtiles",
-        "vector_available": vector_path.is_file(),
-        "terrain_available": terrain_path.is_file(),
+        "vector_url": default_vector_url,
+        "terrain_url": default_terrain_url,
+        "vector_available": vector_path.is_file() or cdn_offload,
+        "terrain_available": terrain_path.is_file() or cdn_offload,
+        "cdn_offload": cdn_offload,
         "layers": [],
         "snowline_bands_m": list(DEFAULT_SNOWLINE_BANDS_M),
         "attributions": list(DEFAULT_ATTRIBUTIONS),
@@ -181,11 +198,12 @@ def get_tiles_manifest(
         except (OSError, json.JSONDecodeError):
             pass
 
-    # Always reflect live disk availability & canonical API URLs
-    payload["vector_url"] = "/api/tiles/trailforge_vector.pmtiles"
-    payload["terrain_url"] = "/api/tiles/trailforge_terrain.pmtiles"
-    payload["vector_available"] = vector_path.is_file()
-    payload["terrain_available"] = terrain_path.is_file()
+    # Always reflect live disk/CDN availability & canonical URLs
+    payload["vector_url"] = default_vector_url
+    payload["terrain_url"] = default_terrain_url
+    payload["vector_available"] = vector_path.is_file() or cdn_offload
+    payload["terrain_available"] = terrain_path.is_file() or cdn_offload
+    payload["cdn_offload"] = cdn_offload
     if not payload.get("snowline_bands_m"):
         payload["snowline_bands_m"] = list(DEFAULT_SNOWLINE_BANDS_M)
     if not payload.get("attributions"):
