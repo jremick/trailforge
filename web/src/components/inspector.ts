@@ -32,7 +32,10 @@ import {
   getReportTypeColor,
   partitionTrackReports,
   resolveReportOsmLinks,
+  sanitizeReportPhotoUrl,
 } from "../reportsHelpers";
+
+export { sanitizeReportPhotoUrl };
 import type {
   BBoxTuple,
   ConditionReportCreateInput,
@@ -472,10 +475,10 @@ export class TrackInspectorDrawer {
                 r.last_confirmed_at ?? r.created_at
               );
               const links = resolveReportOsmLinks(r);
-              const photoHtml =
-                r.photo_url && r.photo_url.startsWith("/")
-                  ? `<a class="tf-report-photo-link" href="${escapeHtml(r.photo_url)}" target="_blank" rel="noopener noreferrer"><img class="tf-report-photo" src="${escapeHtml(r.photo_url)}" alt="${escapeHtml(typeLabel)} attachment" loading="lazy" /></a>`
-                  : "";
+              const safePhotoUrl = sanitizeReportPhotoUrl(r.photo_url);
+              const photoHtml = safePhotoUrl
+                ? `<a class="tf-report-photo-link" href="${escapeHtml(safePhotoUrl)}" target="_blank" rel="noopener noreferrer"><img class="tf-report-photo" src="${escapeHtml(safePhotoUrl)}" alt="${escapeHtml(typeLabel)} attachment" loading="lazy" /></a>`
+                : "";
               return `
                 <div class="tf-report-card" style="border-left-color:${color}">
                   <div class="tf-report-head">

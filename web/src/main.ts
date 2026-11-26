@@ -10,6 +10,7 @@ import {
   activateVehicle,
   addFavorite,
   buildRegionPack,
+  clearLegacyStoredAuthToken,
   createAdminInvite,
   createConditionReport,
   createPin,
@@ -2022,6 +2023,8 @@ class TrailForgeApp {
   }
 
   private bootstrap(): void {
+    clearLegacyStoredAuthToken();
+
     const initialHealth: HealthState = {
       kind: "connecting",
       data: null,
@@ -2068,6 +2071,7 @@ class TrailForgeApp {
   }
 
   private async hydrateAuthSession(): Promise<void> {
+    clearLegacyStoredAuthToken();
     try {
       const me = await fetchAuthMe();
       if (me.authenticated && me.user) {

@@ -187,6 +187,27 @@ function isSafeHttpsUrl(url: string | null | undefined): url is string {
   return Boolean(url && /^https:\/\//i.test(url.trim()));
 }
 
+const SAFE_REPORT_PHOTO_URL_RE = /^\/api\/reports\/photos\/[A-Za-z0-9._-]+$/;
+
+/**
+ * Strictly validate a condition-report photo URL against the canonical local
+ * API photo path (`/api/reports/photos/<filename>`), rejecting protocol-relative
+ * (`//evil.com/...`), external `http(s)://`, `javascript:`, `data:`, and path
+ * traversal (`..`) values.
+ */
+export function sanitizeReportPhotoUrl(
+  url: string | null | undefined
+): string | null {
+  if (typeof url !== "string") return null;
+  const trimmed = url.trim();
+  if (!SAFE_REPORT_PHOTO_URL_RE.test(trimmed)) return null;
+  const filename = trimmed.slice("/api/reports/photos/".length);
+  if (filename === "." || filename === ".." || filename.includes("..")) {
+    return null;
+  }
+  return trimmed;
+}
+
 export function resolveReportOsmLinks(report: ConditionReportItem): {
   osmNoteUrl: string;
   osmEditUrl: string;

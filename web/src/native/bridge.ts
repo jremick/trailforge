@@ -267,6 +267,14 @@ export function getRuntimeMode(env?: RuntimeBridgeEnv): RuntimeMode {
 }
 
 /**
+ * Return true strictly when TrailForge is executing inside a native Capacitor
+ * mobile container (iOS or Android), false in standard web browsers/PWAs.
+ */
+export function isNativeApp(env?: RuntimeBridgeEnv): boolean {
+  return getRuntimeMode(env) !== "pwa_browser";
+}
+
+/**
  * Map frontend `RuntimeMode` to backend `POST /api/trips/mobile-sync` `recording_source`.
  */
 export function runtimeModeToRecordingSource(

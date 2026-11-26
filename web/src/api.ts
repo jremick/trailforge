@@ -60,6 +60,7 @@ import type {
 } from "./types";
 
 export { getApiBaseUrl, resolveApiUrl };
+import { isNativeApp, type RuntimeBridgeEnv } from "./native/bridge";
 import {
   slugifyExportFilename,
   triggerClientFileDownload,
@@ -70,7 +71,14 @@ import {
   planRouteFromOfflineStore,
 } from "./routeHelpers";
 
-const AUTH_TOKEN_STORAGE_KEY = "trailforge.access_token";
+export const AUTH_TOKEN_STORAGE_KEY = "trailforge.access_token";
+
+export interface BearerStorageContext {
+  apiBaseUrl?: string;
+  nativeApp?: boolean;
+  windowObj?: RuntimeBridgeEnv["windowObj"];
+  navigatorObj?: RuntimeBridgeEnv["navigatorObj"];
+}
 
 export class ApiError extends Error {
   readonly status: number;
@@ -82,7 +90,56 @@ export class ApiError extends Error {
   }
 }
 
-export function getStoredAuthToken(): string | null {
+/**
+ * Return `true` ONLY when talking to a cross-origin API (`Boolean(VITE_API_BASE_URL)`)
+ * OR running inside a native Capacitor container (`isNativeApp()`).
+ *
+ * On same-origin browser web (Cloudflare Pages proxy / Docker Nginx), returns `false`
+ * so session authentication relies strictly on the `HttpOnly`, `SameSite=Lax` cookie
+ * (`credentials: "include"`) with zero bearer tokens written to or read from `localStorage`.
+ */
+export function shouldUseBearerStorage(
+  ctx?: BearerStorageContext
+): boolean {
+  const apiBase =
+    ctx?.apiBaseUrl !== undefined
+      ? getApiBaseUrl(ctx.apiBaseUrl)
+      : getApiBaseUrl();
+  if (Boolean(apiBase)) {
+    return true;
+  }
+  if (ctx?.nativeApp !== undefined) {
+    return ctx.nativeApp;
+  }
+  return isNativeApp(
+    ctx
+      ? { windowObj: ctx.windowObj, navigatorObj: ctx.navigatorObj }
+      : undefined
+  );
+}
+
+/**
+ * Purge any legacy `trailforge.access_token` entry left in `localStorage` from
+ * earlier versions when running on same-origin browser web.
+ */
+export function clearLegacyStoredAuthToken(
+  ctx?: BearerStorageContext
+): boolean {
+  if (shouldUseBearerStorage(ctx)) return false;
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return false;
+    window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    return true;
+  } catch (err) {
+    console.debug("Unable to clear legacy auth token from localStorage:", err);
+    return false;
+  }
+}
+
+export function getStoredAuthToken(ctx?: BearerStorageContext): string | null {
+  if (!shouldUseBearerStorage(ctx)) {
+    return null;
+  }
   try {
     if (typeof window === "undefined" || !window.localStorage) return null;
     const token = window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
@@ -92,9 +149,16 @@ export function getStoredAuthToken(): string | null {
   }
 }
 
-export function setStoredAuthToken(token: string | null): void {
+export function setStoredAuthToken(
+  token: string | null,
+  ctx?: BearerStorageContext
+): void {
   try {
     if (typeof window === "undefined" || !window.localStorage) return;
+    if (!shouldUseBearerStorage(ctx)) {
+      window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+      return;
+    }
     if (token && token.trim()) {
       window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token.trim());
     } else {
@@ -104,6 +168,9 @@ export function setStoredAuthToken(token: string | null): void {
     // Ignore storage quota/private-mode errors
   }
 }
+
+export const getAccessToken = getStoredAuthToken;
+export const setAccessToken = setStoredAuthToken;
 
 function buildHeaders(extra?: Record<string, string>): Record<string, string> {
   const headers: Record<string, string> = {
@@ -147,7 +214,7 @@ async function parseErrorDetail(res: Response): Promise<string> {
 }
 
 function fetchCredentialsMode(): RequestCredentials {
-  return getApiBaseUrl() ? "include" : "same-origin";
+  return "include";
 }
 
 async function requestJson<T>(
