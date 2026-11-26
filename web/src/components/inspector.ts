@@ -38,11 +38,13 @@ import {
 
 export { sanitizeReportPhotoUrl };
 import type {
+  BasemapId,
   BBoxTuple,
   ConditionReportCreateInput,
   ConditionReportType,
   PoiItem,
   ReportVoteKind,
+  TileManifestResponse,
   TrackInspectorDetail,
   VehicleCapabilityClass,
 } from "../types";
@@ -59,6 +61,9 @@ export interface TrackInspectorContext {
   isInRoute?: boolean;
   isAuthenticated: boolean;
   pickedReportCoords?: { lat: number; lon: number } | null;
+  activeBasemap?: BasemapId;
+  tileManifest?: TileManifestResponse | null;
+  isOfflinePack?: boolean;
 }
 
 export interface TrackInspectorCallbacks {
@@ -131,10 +136,12 @@ export class TrackInspectorDrawer {
     if (!this.currentDetail) return;
     const norm = normalizeTrackInspector(this.currentDetail);
     if (norm.profile.length >= 2) {
-      this.elevationModal.open(
-        this.currentDetail,
-        this.context.snowLineElevationM
-      );
+      this.elevationModal.open(this.currentDetail, {
+        snowLineElevationM: this.context.snowLineElevationM,
+        activeBasemap: this.context.activeBasemap,
+        tileManifest: this.context.tileManifest,
+        isOfflinePack: this.context.isOfflinePack,
+      });
     }
   }
 
@@ -1042,13 +1049,13 @@ export class TrackInspectorDrawer {
     this.root
       .querySelector<HTMLButtonElement>("[data-role='expand-elevation']")
       ?.addEventListener("click", () => {
-        this.elevationModal.open(detail, this.context.snowLineElevationM);
+        this.openElevationModal();
       });
 
     this.root
       .querySelector<HTMLElement>("[data-role='expand-elevation-chart']")
       ?.addEventListener("click", () => {
-        this.elevationModal.open(detail, this.context.snowLineElevationM);
+        this.openElevationModal();
       });
 
     this.root

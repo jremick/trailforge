@@ -30,6 +30,9 @@ export interface NormalizedTrackSummary {
   breakdown: BaselineBreakdown | null;
   profile: ElevationProfilePoint[];
   crossings: WaterwayCrossingItem[];
+  canonicalSegments: SegmentSummaryItem[];
+  courseVertices: TrackCourseVertex[];
+  courseBBox: [number, number, number, number] | null;
 }
 
 export interface FormattedBreakdownFactor {
@@ -108,12 +111,24 @@ export function normalizeTrackInspector(
     }
   }
 
+  // Build deduplicated, spatially chained canonical corridor when segment geometries exist.
+  // Eliminates multi-tile duplicate segments (e.g. `_2` overlapping tiles & parallel OSM/state
+  // double-lines) that otherwise inflate length and cause elevation/course cursor flickering.
+  const corridor = buildCanonicalTrackCorridor(
+    segments,
+    detail.elevation_profile ?? [],
+    detail.waterway_crossings ?? []
+  );
+
+  const canonicalSegments =
+    corridor.segments.length > 0 ? corridor.segments : segments;
+
   // Synthesize an elevation profile from ordered segments if explicit profile missing
-  let profile: ElevationProfilePoint[] = detail.elevation_profile ?? [];
-  if (profile.length === 0 && segments.length > 0) {
+  let profile: ElevationProfilePoint[] = corridor.profile;
+  if (profile.length === 0 && canonicalSegments.length > 0) {
     let cumDist = 0;
     const built: ElevationProfilePoint[] = [];
-    for (const seg of segments) {
+    for (const seg of canonicalSegments) {
       const elevMin = seg.elev_min_m;
       const elevMax = seg.elev_max_m;
       const len = seg.length_m ?? 75;
@@ -150,23 +165,25 @@ export function normalizeTrackInspector(
         ? [detail.primary_park]
         : [];
 
-  const crossings = detail.waterway_crossings ?? [];
+  const crossings = corridor.crossings;
 
   // Reconcile Track header stats with canonical segments & profile so multi-tile tracks
-  // never show stale single-tile sub-ranges (e.g. flat end segment min/max/slope/length).
+  // never show stale single-tile sub-ranges or double-counted tile overlap duplicates.
   const elevCandidatesMin: number[] = [];
   const elevCandidatesMax: number[] = [];
-  if (typeof detail.min_elev_m === "number") elevCandidatesMin.push(detail.min_elev_m);
-  else if (typeof detail.elev_min_m === "number") elevCandidatesMin.push(detail.elev_min_m);
-  if (typeof detail.max_elev_m === "number") elevCandidatesMax.push(detail.max_elev_m);
-  else if (typeof detail.elev_max_m === "number") elevCandidatesMax.push(detail.elev_max_m);
+  if (!corridor.rebuiltFromSegments) {
+    if (typeof detail.min_elev_m === "number") elevCandidatesMin.push(detail.min_elev_m);
+    else if (typeof detail.elev_min_m === "number") elevCandidatesMin.push(detail.elev_min_m);
+    if (typeof detail.max_elev_m === "number") elevCandidatesMax.push(detail.max_elev_m);
+    else if (typeof detail.elev_max_m === "number") elevCandidatesMax.push(detail.elev_max_m);
+  }
 
   let segLengthSumM = 0;
   let segGainSumM = 0;
   let segLossSumM = 0;
   let segMaxSlope: number | null = null;
 
-  for (const seg of segments) {
+  for (const seg of canonicalSegments) {
     if (typeof seg.length_m === "number" && Number.isFinite(seg.length_m)) {
       segLengthSumM += seg.length_m;
     }
@@ -207,33 +224,35 @@ export function normalizeTrackInspector(
     elevCandidatesMax.length > 0 ? Math.max(...elevCandidatesMax) : null;
 
   const is4wdOnly =
-    detail.is_4wd_only ?? segments.some((s) => Boolean(s.is_4wd_only));
+    detail.is_4wd_only ?? canonicalSegments.some((s) => Boolean(s.is_4wd_only));
   const hasGateBarrier =
-    detail.has_gate_barrier ?? segments.some((s) => Boolean(s.has_gate_barrier));
+    detail.has_gate_barrier ?? canonicalSegments.some((s) => Boolean(s.has_gate_barrier));
   const accessStatus =
     detail.access_status ??
-    segments.find(
+    canonicalSegments.find(
       (s) => s.access_status && s.access_status !== "public"
     )?.access_status ??
     "public";
 
-  const elevGainM =
-    segments.length > 0
+  const elevGainM = corridor.rebuiltFromSegments
+    ? segGainSumM
+    : canonicalSegments.length > 0
       ? Math.max(detail.elev_gain_m ?? 0, segGainSumM)
       : detail.elev_gain_m;
 
-  const elevLossM =
-    typeof detail.elev_loss_m === "number"
-      ? segments.length > 0
+  const elevLossM = corridor.rebuiltFromSegments
+    ? segLossSumM
+    : typeof detail.elev_loss_m === "number"
+      ? canonicalSegments.length > 0
         ? Math.max(detail.elev_loss_m, segLossSumM)
         : detail.elev_loss_m
-      : segments.length > 0
+      : canonicalSegments.length > 0
         ? segLossSumM
         : null;
 
   const sustainedSlopeDeg =
     detail.sustained_slope_deg ??
-    segments.reduce<number | null>((best, s) => {
+    canonicalSegments.reduce<number | null>((best, s) => {
       if (typeof s.sustained_slope_deg !== "number") return best;
       return best === null ? s.sustained_slope_deg : Math.max(best, s.sustained_slope_deg);
     }, null);
@@ -247,11 +266,9 @@ export function normalizeTrackInspector(
   const maxSlopeDeg =
     slopeCandidates.length > 0 ? Math.max(...slopeCandidates) : null;
 
-  const reconciledLengthM = Math.max(
-    detail.total_length_m || 0,
-    segLengthSumM,
-    profileMaxDistM
-  );
+  const reconciledLengthM = corridor.rebuiltFromSegments
+    ? Math.max(segLengthSumM, profileMaxDistM)
+    : Math.max(detail.total_length_m || 0, segLengthSumM, profileMaxDistM);
   const waterwayCrossingCount = Math.max(
     detail.waterway_crossing_count || 0,
     crossings.length
@@ -279,6 +296,9 @@ export function normalizeTrackInspector(
     breakdown,
     profile,
     crossings,
+    canonicalSegments,
+    courseVertices: corridor.vertices,
+    courseBBox: corridor.bbox,
   };
 }
 
@@ -909,10 +929,594 @@ function chooseNiceScaleBarMeters(targetM: number): { meters: number; label: str
   return { meters: chosen, label };
 }
 
+function polylineArcLength(coords: readonly [number, number][]): number {
+  let total = 0;
+  for (let i = 1; i < coords.length; i += 1) {
+    const a = coords[i - 1]!;
+    const b = coords[i]!;
+    total += haversineMeters(a[0], a[1], b[0], b[1]);
+  }
+  return total;
+}
+
+function polylineTrueMidpoint(coords: readonly [number, number][]): [number, number] {
+  if (coords.length === 0) return [0, 0];
+  if (coords.length === 1) return coords[0]!;
+  const total = polylineArcLength(coords);
+  if (total <= 1e-6) {
+    const a = coords[0]!;
+    const b = coords[coords.length - 1]!;
+    return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+  }
+  const half = total / 2;
+  let acc = 0;
+  for (let i = 1; i < coords.length; i += 1) {
+    const a = coords[i - 1]!;
+    const b = coords[i]!;
+    const step = haversineMeters(a[0], a[1], b[0], b[1]);
+    if (acc + step >= half && step > 1e-6) {
+      const t = (half - acc) / step;
+      return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+    }
+    acc += step;
+  }
+  return coords[coords.length - 1]!;
+}
+
+function parseSegmentElevProfile(
+  raw: unknown[] | undefined
+): Array<[number, number]> {
+  if (!Array.isArray(raw) || raw.length < 2) return [];
+  const out: Array<[number, number]> = [];
+  for (const pt of raw) {
+    if (
+      Array.isArray(pt) &&
+      pt.length >= 2 &&
+      typeof pt[0] === "number" &&
+      typeof pt[1] === "number" &&
+      Number.isFinite(pt[0]) &&
+      Number.isFinite(pt[1])
+    ) {
+      out.push([pt[0], pt[1]]);
+    }
+  }
+  return out.length >= 2 ? out : [];
+}
+
+interface CanonicalTrackCorridorResult {
+  segments: SegmentSummaryItem[];
+  profile: ElevationProfilePoint[];
+  crossings: WaterwayCrossingItem[];
+  vertices: TrackCourseVertex[];
+  bbox: [number, number, number, number] | null;
+  rebuiltFromSegments: boolean;
+}
+
+/**
+ * Deduplicate overlapping multi-tile / multi-source segments and extract a single continuous,
+ * spatially chained corridor (via graph-diameter Dijkstra on clustered endpoints). Guarantees a
+ * strict 1-to-1 monotonic mapping between cumulative elevation distance `dist_m` and geographic
+ * coordinates `(lon, lat)` with zero cursor flickering.
+ */
+export function buildCanonicalTrackCorridor(
+  segments: readonly SegmentSummaryItem[],
+  fallbackProfile: readonly ElevationProfilePoint[],
+  rawCrossings: readonly WaterwayCrossingItem[]
+): CanonicalTrackCorridorResult {
+  interface GeomSeg {
+    seg: SegmentSummaryItem;
+    coords: Array<[number, number]>;
+    start: [number, number];
+    mid: [number, number];
+    end: [number, number];
+    arcLenM: number;
+    elevPts: Array<[number, number]>;
+  }
+
+  const geomSegs: GeomSeg[] = [];
+  const seenSegIds = new Set<string>();
+  for (const seg of segments) {
+    if (seenSegIds.has(seg.segment_id)) continue;
+    seenSegIds.add(seg.segment_id);
+    const lines = extractSegmentCoordinateLines(seg.geometry);
+    if (lines.length === 0) continue;
+    // Use longest part for MultiLineString segments
+    let coords = lines[0]!;
+    for (let i = 1; i < lines.length; i += 1) {
+      if (lines[i]!.length > coords.length) coords = lines[i]!;
+    }
+    if (coords.length < 2) continue;
+    geomSegs.push({
+      seg,
+      coords,
+      start: coords[0]!,
+      mid: polylineTrueMidpoint(coords),
+      end: coords[coords.length - 1]!,
+      arcLenM: polylineArcLength(coords),
+      elevPts: parseSegmentElevProfile(seg.elevation_profile_m),
+    });
+  }
+
+  if (geomSegs.length === 0) {
+    return {
+      segments: [...segments],
+      profile: [...fallbackProfile],
+      crossings: [...rawCrossings],
+      vertices: [],
+      bbox: null,
+      rebuiltFromSegments: false,
+    };
+  }
+
+  // Step 1: Spatial deduplication — prefer segments with elevation profiles, without numeric
+  // multi-tile collision suffixes (`_2`, `_3`), and primary OSM geometry.
+  const segPriority = (g: GeomSeg): number => {
+    const hasProf = g.elevPts.length >= 2 ? 1000 : 0;
+    const noDupSuffix = /_\d+$/.test(g.seg.segment_id) ? 0 : 100;
+    const isOsm = g.seg.primary_source === "osm" ? 10 : 0;
+    return hasProf + noDupSuffix + isOsm + Math.min(5, g.arcLenM / 100);
+  };
+
+  const kept: GeomSeg[] = [];
+  const dupToKeptId = new Map<string, string>();
+  const sortedByPrio = [...geomSegs].sort((a, b) => segPriority(b) - segPriority(a));
+
+  for (const cand of sortedByPrio) {
+    let matchedKept: GeomSeg | null = null;
+    for (const k of kept) {
+      const midDist = haversineMeters(cand.mid[0], cand.mid[1], k.mid[0], k.mid[1]);
+      if (midDist < 25) {
+        const dFwd = Math.max(
+          haversineMeters(cand.start[0], cand.start[1], k.start[0], k.start[1]),
+          haversineMeters(cand.end[0], cand.end[1], k.end[0], k.end[1])
+        );
+        const dRev = Math.max(
+          haversineMeters(cand.start[0], cand.start[1], k.end[0], k.end[1]),
+          haversineMeters(cand.end[0], cand.end[1], k.start[0], k.start[1])
+        );
+        if (Math.min(dFwd, dRev) < 40 || midDist < 14) {
+          matchedKept = k;
+          break;
+        }
+      }
+    }
+    if (matchedKept) {
+      dupToKeptId.set(cand.seg.segment_id, matchedKept.seg.segment_id);
+    } else {
+      kept.push(cand);
+    }
+  }
+
+  // Step 2: Cluster endpoints within 28 m into topological graph nodes & extract clean corridor spine
+  const nodes: Array<[number, number]> = [];
+  const getNode = (pt: [number, number]): number => {
+    let bestIdx = -1;
+    let bestDist = 28;
+    for (let i = 0; i < nodes.length; i += 1) {
+      const n = nodes[i]!;
+      const d = haversineMeters(pt[0], pt[1], n[0], n[1]);
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx >= 0) return bestIdx;
+    nodes.push(pt);
+    return nodes.length - 1;
+  };
+
+  interface Edge {
+    to: number;
+    keptIdx: number;
+    reversed: boolean;
+    weight: number;
+  }
+  const adj = new Map<number, Edge[]>();
+  const addEdge = (u: number, edge: Edge): void => {
+    const list = adj.get(u);
+    if (list) list.push(edge);
+    else adj.set(u, [edge]);
+  };
+
+  const singletons: GeomSeg[] = [];
+  for (let idx = 0; idx < kept.length; idx += 1) {
+    const g = kept[idx]!;
+    const u = getNode(g.start);
+    const v = getNode(g.end);
+    if (u === v) {
+      singletons.push(g);
+      continue;
+    }
+    const baseLen = Math.max(
+      1,
+      typeof g.seg.length_m === "number" && g.seg.length_m > 0
+        ? g.seg.length_m
+        : g.arcLenM
+    );
+    const srcFactor = g.seg.primary_source === "osm" ? 1.0 : 1.04;
+    const profFactor = g.elevPts.length >= 2 ? 1.0 : 1.25;
+    const weight = baseLen * srcFactor * profFactor;
+    addEdge(u, { to: v, keptIdx: idx, reversed: false, weight });
+    addEdge(v, { to: u, keptIdx: idx, reversed: true, weight });
+  }
+
+  const dijkstra = (
+    src: number
+  ): {
+    dist: Map<number, number>;
+    prev: Map<number, { from: number; keptIdx: number; reversed: boolean }>;
+  } => {
+    const dist = new Map<number, number>([[src, 0]]);
+    const prev = new Map<number, { from: number; keptIdx: number; reversed: boolean }>();
+    const visitedNodes = new Set<number>();
+
+    while (true) {
+      let bestNode = -1;
+      let bestD = Infinity;
+      dist.forEach((d, nodeId) => {
+        if (!visitedNodes.has(nodeId) && d < bestD) {
+          bestD = d;
+          bestNode = nodeId;
+        }
+      });
+      if (bestNode < 0) break;
+      visitedNodes.add(bestNode);
+      const edges = adj.get(bestNode) ?? [];
+      for (const e of edges) {
+        const nd = bestD + e.weight;
+        if (nd < (dist.get(e.to) ?? Infinity)) {
+          dist.set(e.to, nd);
+          prev.set(e.to, { from: bestNode, keptIdx: e.keptIdx, reversed: e.reversed });
+        }
+      }
+    }
+    return { dist, prev };
+  };
+
+  interface OrderedStep {
+    g: GeomSeg;
+    reversed: boolean;
+  }
+
+  const visitedCompNodes = new Set<number>();
+  const componentSpines: Array<{ steps: OrderedStep[]; totalLenM: number }> = [];
+
+  adj.forEach((_edges, startNode) => {
+    if (visitedCompNodes.has(startNode)) return;
+    const d1 = dijkstra(startNode);
+    let endA = startNode;
+    let maxD1 = -1;
+    d1.dist.forEach((d, nid) => {
+      visitedCompNodes.add(nid);
+      if (d > maxD1) {
+        maxD1 = d;
+        endA = nid;
+      }
+    });
+
+    const d2 = dijkstra(endA);
+    let endB = endA;
+    let maxD2 = -1;
+    d2.dist.forEach((d, nid) => {
+      if (d > maxD2) {
+        maxD2 = d;
+        endB = nid;
+      }
+    });
+
+    const steps: OrderedStep[] = [];
+    let cur = endB;
+    while (cur !== endA) {
+      const p = d2.prev.get(cur);
+      if (!p) break;
+      steps.push({ g: kept[p.keptIdx]!, reversed: p.reversed });
+      cur = p.from;
+    }
+    steps.reverse();
+
+    if (steps.length > 0) {
+      const totalLenM = steps.reduce(
+        (acc, st) => acc + (st.g.seg.length_m ?? st.g.arcLenM),
+        0
+      );
+      componentSpines.push({ steps, totalLenM });
+    }
+  });
+
+  componentSpines.sort((a, b) => b.totalLenM - a.totalLenM);
+
+  const orderedSteps: OrderedStep[] = [];
+  if (componentSpines.length > 0) {
+    const primary = componentSpines[0]!;
+    orderedSteps.push(...primary.steps);
+
+    // Append genuine non-overlapping disconnected components (>= 200 m and > 80 m away from primary)
+    for (let ci = 1; ci < componentSpines.length; ci += 1) {
+      const comp = componentSpines[ci]!;
+      if (comp.totalLenM < 200) continue;
+      let nearPrimaryCount = 0;
+      for (const st of comp.steps) {
+        let minDist = Infinity;
+        for (const pst of primary.steps) {
+          const d = haversineMeters(
+            st.g.mid[0],
+            st.g.mid[1],
+            pst.g.mid[0],
+            pst.g.mid[1]
+          );
+          if (d < minDist) minDist = d;
+        }
+        if (minDist < 80) nearPrimaryCount += 1;
+      }
+      if (nearPrimaryCount / comp.steps.length >= 0.4) continue;
+
+      const tailStep = orderedSteps[orderedSteps.length - 1]!;
+      const tailExit = tailStep.reversed ? tailStep.g.start : tailStep.g.end;
+      const compStart = comp.steps[0]!.reversed
+        ? comp.steps[0]!.g.end
+        : comp.steps[0]!.g.start;
+      const compEnd = comp.steps[comp.steps.length - 1]!.reversed
+        ? comp.steps[comp.steps.length - 1]!.g.start
+        : comp.steps[comp.steps.length - 1]!.g.end;
+      if (
+        haversineMeters(tailExit[0], tailExit[1], compEnd[0], compEnd[1]) <
+        haversineMeters(tailExit[0], tailExit[1], compStart[0], compStart[1])
+      ) {
+        for (let si = comp.steps.length - 1; si >= 0; si -= 1) {
+          orderedSteps.push({
+            g: comp.steps[si]!.g,
+            reversed: !comp.steps[si]!.reversed,
+          });
+        }
+      } else {
+        orderedSteps.push(...comp.steps);
+      }
+    }
+  } else if (singletons.length > 0) {
+    for (const g of singletons) {
+      orderedSteps.push({ g, reversed: false });
+    }
+  }
+
+  // Orient consistently: start at the lower original `segment_seq` endpoint (or southernmost if tied)
+  if (orderedSteps.length >= 2) {
+    const first = orderedSteps[0]!;
+    const last = orderedSteps[orderedSteps.length - 1]!;
+    const firstSeq = first.g.seg.segment_seq;
+    const lastSeq = last.g.seg.segment_seq;
+    const firstCoord = first.reversed ? first.g.end : first.g.start;
+    const lastCoord = last.reversed ? last.g.start : last.g.end;
+    const shouldFlip =
+      typeof firstSeq === "number" &&
+      typeof lastSeq === "number" &&
+      firstSeq !== lastSeq
+        ? firstSeq > lastSeq
+        : firstCoord[1] > lastCoord[1];
+
+    if (shouldFlip) {
+      orderedSteps.reverse();
+      for (const st of orderedSteps) {
+        st.reversed = !st.reversed;
+      }
+    }
+  }
+
+  // Step 3: Build strictly monotonic, 1-to-1 aligned elevation profile & course vertices
+  const profCount = orderedSteps.filter((st) => st.g.elevPts.length >= 2).length;
+  const shouldRebuildProfile =
+    orderedSteps.length >= 2 && profCount / orderedSteps.length >= 0.6;
+
+  // Map fallback profile spans per segment_id for payloads without per-segment elevation_profile_m
+  const fallbackSpanMap = new Map<string, { start: number; end: number }>();
+  for (const pt of fallbackProfile) {
+    if (!pt.segment_id) continue;
+    const prev = fallbackSpanMap.get(pt.segment_id);
+    if (!prev) {
+      fallbackSpanMap.set(pt.segment_id, { start: pt.dist_m, end: pt.dist_m });
+    } else {
+      prev.start = Math.min(prev.start, pt.dist_m);
+      prev.end = Math.max(prev.end, pt.dist_m);
+    }
+  }
+
+  const rebuiltProfile: ElevationProfilePoint[] = [];
+  const vertices: TrackCourseVertex[] = [];
+  const newSegMidDist = new Map<string, number>();
+
+  let cumDist = 0;
+  let polylineId = 1;
+  let prevExitCoord: [number, number] | null = null;
+  let minLon = Infinity;
+  let maxLon = -Infinity;
+  let minLat = Infinity;
+  let maxLat = -Infinity;
+
+  for (let stepIdx = 0; stepIdx < orderedSteps.length; stepIdx += 1) {
+    const { g, reversed } = orderedSteps[stepIdx]!;
+    const coords = reversed ? [...g.coords].reverse() : g.coords;
+    const segLen =
+      typeof g.seg.length_m === "number" && g.seg.length_m > 0
+        ? g.seg.length_m
+        : Math.max(1, g.arcLenM);
+    const grade = extractSegmentGrade(g.seg) ?? "Easy";
+
+    // Start a fresh polylineId only on genuine spatial gaps (> 60 m)
+    if (prevExitCoord) {
+      const gap = haversineMeters(
+        prevExitCoord[0],
+        prevExitCoord[1],
+        coords[0]![0],
+        coords[0]![1]
+      );
+      if (gap > 60) polylineId += 1;
+    }
+
+    let segStartDist = cumDist;
+    let segEndDist = cumDist + segLen;
+
+    if (!shouldRebuildProfile) {
+      const span = fallbackSpanMap.get(g.seg.segment_id);
+      if (stepIdx === 0 && span) {
+        segStartDist = Math.min(cumDist, span.start);
+      }
+      if (span && span.end > segStartDist + 0.5) {
+        segEndDist = span.end;
+      }
+    }
+
+    newSegMidDist.set(g.seg.segment_id, (segStartDist + segEndDist) / 2);
+
+    // Emit elevation profile samples for this exact corridor segment
+    if (shouldRebuildProfile) {
+      const rawPts = g.elevPts;
+      const slopeDeg =
+        typeof g.seg.max_slope_deg === "number"
+          ? Math.round(g.seg.max_slope_deg * 100) / 100
+          : null;
+      if (rawPts.length >= 2) {
+        const span = Math.max(1e-6, rawPts[rawPts.length - 1]![0]);
+        const orderedPts: Array<[number, number]> = reversed
+          ? [...rawPts]
+              .reverse()
+              .map(([d, z]) => [Math.max(0, span - d), z] as [number, number])
+          : rawPts;
+        for (let pi = 0; pi < orderedPts.length; pi += 1) {
+          if (stepIdx > 0 && pi === 0 && rebuiltProfile.length > 0) continue;
+          const [localD, elevM] = orderedPts[pi]!;
+          const frac = Math.max(0, Math.min(1, localD / span));
+          rebuiltProfile.push({
+            dist_m: Math.round((segStartDist + frac * (segEndDist - segStartDist)) * 10) / 10,
+            elev_m: Math.round(elevM * 100) / 100,
+            slope_deg: slopeDeg,
+            segment_id: g.seg.segment_id,
+            grade,
+          });
+        }
+      } else if (typeof g.seg.elev_min_m === "number" || typeof g.seg.elev_max_m === "number") {
+        const z = g.seg.elev_min_m ?? g.seg.elev_max_m ?? 0;
+        if (stepIdx === 0) {
+          rebuiltProfile.push({
+            dist_m: Math.round(segStartDist * 10) / 10,
+            elev_m: z,
+            slope_deg: slopeDeg,
+            segment_id: g.seg.segment_id,
+            grade,
+          });
+        }
+        rebuiltProfile.push({
+          dist_m: Math.round(segEndDist * 10) / 10,
+          elev_m: z,
+          slope_deg: slopeDeg,
+          segment_id: g.seg.segment_id,
+          grade,
+        });
+      }
+    }
+
+    // Emit geographically aligned TrackCourseVertex entries along exact haversine arc fraction
+    const cumArc: number[] = [0];
+    let arcTotal = 0;
+    for (let i = 1; i < coords.length; i += 1) {
+      arcTotal += haversineMeters(
+        coords[i - 1]![0],
+        coords[i - 1]![1],
+        coords[i]![0],
+        coords[i]![1]
+      );
+      cumArc.push(arcTotal);
+    }
+
+    for (let i = 0; i < coords.length; i += 1) {
+      const [lon, lat] = coords[i]!;
+      if (lon < minLon) minLon = lon;
+      if (lon > maxLon) maxLon = lon;
+      if (lat < minLat) minLat = lat;
+      if (lat > maxLat) maxLat = lat;
+
+      const frac =
+        arcTotal > 1e-6 ? cumArc[i]! / arcTotal : i / Math.max(1, coords.length - 1);
+      vertices.push({
+        distM: segStartDist + frac * (segEndDist - segStartDist),
+        lon,
+        lat,
+        x: 0,
+        y: 0,
+        grade,
+        segmentId: g.seg.segment_id,
+        polylineId,
+      });
+    }
+
+    prevExitCoord = coords[coords.length - 1]!;
+    cumDist = segEndDist;
+  }
+
+  // Remap waterway crossing distances cleanly onto the deduplicated corridor when profile was rebuilt
+  let mappedCrossings: WaterwayCrossingItem[] = [...rawCrossings];
+  if (shouldRebuildProfile && rawCrossings.length > 0 && fallbackProfile.length >= 2) {
+    const oldMaxDist = Math.max(
+      1,
+      fallbackProfile[fallbackProfile.length - 1]!.dist_m
+    );
+    const newMaxDist = Math.max(
+      1,
+      rebuiltProfile.length > 0
+        ? rebuiltProfile[rebuiltProfile.length - 1]!.dist_m
+        : cumDist
+    );
+
+    mappedCrossings = rawCrossings.map((c) => {
+      if (typeof c.dist_m !== "number" || !Number.isFinite(c.dist_m)) return c;
+      // Locate segment in raw profile closest to old dist_m
+      let nearestSegId: string | null = null;
+      let bestDelta = Infinity;
+      for (const pt of fallbackProfile) {
+        if (!pt.segment_id) continue;
+        const delta = Math.abs(pt.dist_m - c.dist_m);
+        if (delta < bestDelta) {
+          bestDelta = delta;
+          nearestSegId = pt.segment_id;
+        }
+      }
+      if (nearestSegId) {
+        const direct = newSegMidDist.get(nearestSegId);
+        if (typeof direct === "number") {
+          return { ...c, dist_m: Math.round(direct * 10) / 10 };
+        }
+        const remappedId = dupToKeptId.get(nearestSegId);
+        if (remappedId) {
+          const remapped = newSegMidDist.get(remappedId);
+          if (typeof remapped === "number") {
+            return { ...c, dist_m: Math.round(remapped * 10) / 10 };
+          }
+        }
+      }
+      const scaled = Math.max(
+        0,
+        Math.min(newMaxDist, (c.dist_m / oldMaxDist) * newMaxDist)
+      );
+      return { ...c, dist_m: Math.round(scaled * 10) / 10 };
+    });
+  }
+
+  return {
+    segments: orderedSteps.map((st) => st.g.seg),
+    profile: shouldRebuildProfile ? rebuiltProfile : [...fallbackProfile],
+    crossings: mappedCrossings,
+    vertices,
+    bbox:
+      Number.isFinite(minLon) && Number.isFinite(minLat)
+        ? [minLon, minLat, maxLon, maxLat]
+        : null,
+    rebuiltFromSegments: shouldRebuildProfile,
+  };
+}
+
 /**
  * Build a true-aspect-ratio (North-up) interactive SVG plan view of a track's course
  * aligned 1-to-1 by cumulative distance with `elevation_profile`, enabling bidirectional
- * cursor synchronization between the elevation graph and track course.
+ * cursor synchronization between the elevation graph and track course (also serves as fallback
+ * when WebGL is unavailable for the live MapLibre mini-map).
  */
 export function buildTrackCourseSvg(
   segments: readonly SegmentSummaryItem[],
@@ -922,159 +1526,28 @@ export function buildTrackCourseSvg(
     height?: number;
     crossings?: readonly WaterwayCrossingItem[];
     steepZones?: readonly ElevationSteepZone[];
+    precomputedVertices?: readonly TrackCourseVertex[];
+    precomputedBBox?: [number, number, number, number] | null;
   }
 ): TrackCourseSvgResult {
-  const width = options?.width ?? 440;
+  const width = options?.width ?? 460;
   const height = options?.height ?? 340;
   const crossings = options?.crossings ?? [];
   const steepZones = options?.steepZones ?? [];
 
-  // Map each segment_id to its exact [startDistM, endDistM] span from the stitched profile
-  const segSpanMap = new Map<string, { start: number; end: number }>();
-  for (const pt of profile) {
-    if (!pt.segment_id) continue;
-    const prev = segSpanMap.get(pt.segment_id);
-    if (!prev) {
-      segSpanMap.set(pt.segment_id, { start: pt.dist_m, end: pt.dist_m });
-    } else {
-      prev.start = Math.min(prev.start, pt.dist_m);
-      prev.end = Math.max(prev.end, pt.dist_m);
-    }
+  let baseVertices: readonly TrackCourseVertex[];
+  let bbox: [number, number, number, number] | null;
+
+  if (options?.precomputedVertices && options.precomputedVertices.length >= 2) {
+    baseVertices = options.precomputedVertices;
+    bbox = options.precomputedBBox ?? null;
+  } else {
+    const corridor = buildCanonicalTrackCorridor(segments, profile, crossings);
+    baseVertices = corridor.vertices;
+    bbox = corridor.bbox;
   }
 
-  interface RawVertex {
-    distM: number;
-    lon: number;
-    lat: number;
-    grade: string;
-    segmentId: string;
-    polylineId: number;
-  }
-
-  const rawVertices: RawVertex[] = [];
-  let runningDistM = 0;
-  let polylineId = 0;
-
-  // Pre-parse coordinate lines so we can orient each segment continuously along the track chain
-  // matching backend `_stitch_elevation_profile` start/end continuity.
-  const parsedSegments = segments.map((seg) => ({
-    seg,
-    lines: extractSegmentCoordinateLines(seg.geometry),
-  }));
-
-  let prevExitCoord: [number, number] | null = null;
-
-  for (let segIdx = 0; segIdx < parsedSegments.length; segIdx += 1) {
-    const { seg, lines: origLines } = parsedSegments[segIdx]!;
-    const segLenFallback =
-      typeof seg.length_m === "number" && seg.length_m > 0 ? seg.length_m : 75;
-    const span = segSpanMap.get(seg.segment_id);
-    const segStartDist =
-      segIdx === 0 && span ? Math.min(runningDistM, span.start) : runningDistM;
-    const segEndDist =
-      span && span.end > segStartDist + 0.5
-        ? span.end
-        : segStartDist + segLenFallback;
-
-    if (origLines.length === 0) {
-      runningDistM = segEndDist;
-      continue;
-    }
-
-    // Orient single-part segments continuously with neighbor endpoints
-    const lines = origLines.map((l) => [...l]);
-    if (lines.length === 1) {
-      const line = lines[0]!;
-      const firstPt = line[0]!;
-      const lastPt = line[line.length - 1]!;
-      let shouldReverse = false;
-
-      if (segIdx === 0) {
-        const nextSeg = parsedSegments
-          .slice(1)
-          .find((item) => item.lines.length > 0);
-        if (nextSeg && nextSeg.lines[0]!.length >= 2) {
-          const nLine = nextSeg.lines[0]!;
-          const nStart = nLine[0]!;
-          const nEnd = nLine[nLine.length - 1]!;
-          const dEndToNext = Math.min(
-            haversineMeters(lastPt[0], lastPt[1], nStart[0], nStart[1]),
-            haversineMeters(lastPt[0], lastPt[1], nEnd[0], nEnd[1])
-          );
-          const dStartToNext = Math.min(
-            haversineMeters(firstPt[0], firstPt[1], nStart[0], nStart[1]),
-            haversineMeters(firstPt[0], firstPt[1], nEnd[0], nEnd[1])
-          );
-          if (dStartToNext + 2 < dEndToNext && dStartToNext < 60) {
-            shouldReverse = true;
-          }
-        }
-      } else if (prevExitCoord) {
-        const dStart = haversineMeters(
-          prevExitCoord[0],
-          prevExitCoord[1],
-          firstPt[0],
-          firstPt[1]
-        );
-        const dEnd = haversineMeters(
-          prevExitCoord[0],
-          prevExitCoord[1],
-          lastPt[0],
-          lastPt[1]
-        );
-        if (dEnd + 2 < dStart && dEnd < 60) {
-          shouldReverse = true;
-        }
-      }
-
-      if (shouldReverse) {
-        line.reverse();
-      }
-      prevExitCoord = line[line.length - 1]!;
-    } else {
-      const lastLine = lines[lines.length - 1]!;
-      prevExitCoord = lastLine[lastLine.length - 1]!;
-    }
-
-    const grade = extractSegmentGrade(seg) ?? "Easy";
-
-    // Total metric arc length across all parts of this segment
-    let segArcTotal = 0;
-    const lineArcs: number[][] = [];
-    for (const line of lines) {
-      const cum: number[] = [0];
-      for (let i = 1; i < line.length; i += 1) {
-        const prevPt = line[i - 1]!;
-        const currPt = line[i]!;
-        segArcTotal += haversineMeters(prevPt[0], prevPt[1], currPt[0], currPt[1]);
-        cum.push(segArcTotal);
-      }
-      lineArcs.push(cum);
-    }
-
-    for (let li = 0; li < lines.length; li += 1) {
-      const line = lines[li]!;
-      const cum = lineArcs[li]!;
-      polylineId += 1;
-      for (let i = 0; i < line.length; i += 1) {
-        const [lon, lat] = line[i]!;
-        const frac = segArcTotal > 0 ? cum[i]! / segArcTotal : i / Math.max(1, line.length - 1);
-        const distM = segStartDist + frac * (segEndDist - segStartDist);
-        rawVertices.push({
-          distM,
-          lon,
-          lat,
-          grade,
-          segmentId: seg.segment_id,
-          polylineId,
-        });
-      }
-    }
-
-    runningDistM = segEndDist;
-  }
-
-  if (rawVertices.length < 2) {
+  if (baseVertices.length < 2) {
     return {
       svgHtml: `<div class="tf-elev-empty">Track course geometry unavailable for plan view.</div>`,
       vertices: [],
@@ -1086,15 +1559,17 @@ export function buildTrackCourseSvg(
     };
   }
 
-  let minLon = Infinity;
-  let maxLon = -Infinity;
-  let minLat = Infinity;
-  let maxLat = -Infinity;
-  for (const v of rawVertices) {
-    if (v.lon < minLon) minLon = v.lon;
-    if (v.lon > maxLon) maxLon = v.lon;
-    if (v.lat < minLat) minLat = v.lat;
-    if (v.lat > maxLat) maxLat = v.lat;
+  let minLon = bbox ? bbox[0] : Infinity;
+  let minLat = bbox ? bbox[1] : Infinity;
+  let maxLon = bbox ? bbox[2] : -Infinity;
+  let maxLat = bbox ? bbox[3] : -Infinity;
+  if (!bbox) {
+    for (const v of baseVertices) {
+      if (v.lon < minLon) minLon = v.lon;
+      if (v.lon > maxLon) maxLon = v.lon;
+      if (v.lat < minLat) minLat = v.lat;
+      if (v.lat > maxLat) maxLat = v.lat;
+    }
   }
 
   const midLatRad = (((minLat + maxLat) / 2) * Math.PI) / 180;
@@ -1114,7 +1589,7 @@ export function buildTrackCourseSvg(
   const projectX = (lon: number): number => offX + (lon - minLon) * cosLat * scale;
   const projectY = (lat: number): number => offY + (maxLat - lat) * scale;
 
-  const vertices: TrackCourseVertex[] = rawVertices.map((v) => ({
+  const vertices: TrackCourseVertex[] = baseVertices.map((v) => ({
     ...v,
     x: projectX(v.lon),
     y: projectY(v.lat),
@@ -1139,18 +1614,22 @@ export function buildTrackCourseSvg(
     );
   }
 
-  // Group vertices by polylineId so multi-part / tile gaps render cleanly without stray chords
+  // Group vertices by polylineId & grade for clean SVG ribbons
   const polyGroups: TrackCourseVertex[][] = [];
   for (const v of vertices) {
     const last = polyGroups[polyGroups.length - 1];
-    if (last && last[0]!.polylineId === v.polylineId) {
+    if (last && last[0]!.polylineId === v.polylineId && last[0]!.grade === v.grade) {
       last.push(v);
+    } else if (last && last[0]!.polylineId === v.polylineId) {
+      last.push(v);
+      polyGroups.push([v]);
     } else {
       polyGroups.push([v]);
     }
   }
 
   const casingPolylinesHtml = polyGroups
+    .filter((pts) => pts.length >= 2)
     .map((pts) => {
       const coords = pts.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
       return `<polyline points="${coords}" fill="none" stroke="#070B10" stroke-width="8.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.92"/>`;
@@ -1158,6 +1637,7 @@ export function buildTrackCourseSvg(
     .join("");
 
   const gradePolylinesHtml = polyGroups
+    .filter((pts) => pts.length >= 2)
     .map((pts) => {
       const coords = pts.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
       const color = getGradeColor(pts[0]!.grade);
@@ -1165,7 +1645,6 @@ export function buildTrackCourseSvg(
     })
     .join("");
 
-  // Waterway crossing dots projected onto exact course coordinates
   const crossingDotsHtml = crossings
     .filter((c) => typeof c.dist_m === "number" && Number.isFinite(c.dist_m))
     .map((c) => {
@@ -1176,7 +1655,6 @@ export function buildTrackCourseSvg(
     })
     .join("");
 
-  // Subtle steep-zone ticks projected onto the course
   const steepDotsHtml = steepZones
     .map((z) => {
       const pt = sampleTrackCourseAtDistance(vertices, z.peakDistM);
@@ -1185,7 +1663,6 @@ export function buildTrackCourseSvg(
     })
     .join("");
 
-  // Start & End markers
   const startPt = sampleTrackCourseAtDistance(vertices, 0) ?? vertices[0]!;
   const endPt = sampleTrackCourseAtDistance(vertices, totalDistM) ?? vertices[vertices.length - 1]!;
   const endpointsHtml = `
@@ -1197,7 +1674,6 @@ export function buildTrackCourseSvg(
     </g>
   `;
 
-  // Metric scale bar (1 deg lat ≈ 111,132 m)
   const metersPerPx = 111132 / scale;
   const niceBar = chooseNiceScaleBarMeters(metersPerPx * 82);
   const barWidthPx = Math.max(28, Math.min(120, niceBar.meters / metersPerPx));
@@ -1367,6 +1843,71 @@ export function findNearestPointOnTrackCourse(
         lat: a.lat + (b.lat - a.lat) * t,
         x: px,
         y: py,
+        grade: t < 0.5 ? a.grade : b.grade,
+        segmentId: t < 0.5 ? a.segmentId : b.segmentId,
+      };
+    }
+  }
+
+  return bestPoint;
+}
+
+/**
+ * Given a geographic pointer coordinate `(lon, lat)` from the live MapLibre mini-map,
+ * project orthogonally onto the nearest segment of the deduplicated canonical track polyline
+ * and return its exact cumulative distance `distM` for lockstep elevation crosshair sync.
+ */
+export function findNearestPointOnTrackCourseGeo(
+  vertices: readonly TrackCourseVertex[],
+  lon: number,
+  lat: number
+): TrackCoursePoint | null {
+  if (vertices.length === 0) return null;
+  if (vertices.length === 1) {
+    const v = vertices[0]!;
+    return {
+      distM: v.distM,
+      lon: v.lon,
+      lat: v.lat,
+      x: v.x,
+      y: v.y,
+      grade: v.grade,
+      segmentId: v.segmentId,
+    };
+  }
+
+  const cosLat = Math.max(0.2, Math.cos((lat * Math.PI) / 180));
+  let bestDistSq = Infinity;
+  let bestPoint: TrackCoursePoint | null = null;
+
+  for (let i = 1; i < vertices.length; i += 1) {
+    const a = vertices[i - 1]!;
+    const b = vertices[i]!;
+    if (a.polylineId !== b.polylineId) continue;
+
+    const dx = (b.lon - a.lon) * cosLat;
+    const dy = b.lat - a.lat;
+    const lenSq = dx * dx + dy * dy;
+    const pxRel = (lon - a.lon) * cosLat;
+    const pyRel = lat - a.lat;
+    const t =
+      lenSq > 1e-12
+        ? Math.max(0, Math.min(1, (pxRel * dx + pyRel * dy) / lenSq))
+        : 0;
+    const projLon = a.lon + (b.lon - a.lon) * t;
+    const projLat = a.lat + (b.lat - a.lat) * t;
+    const dLon = (lon - projLon) * cosLat;
+    const dLat = lat - projLat;
+    const distSq = dLon * dLon + dLat * dLat;
+
+    if (distSq < bestDistSq) {
+      bestDistSq = distSq;
+      bestPoint = {
+        distM: a.distM + (b.distM - a.distM) * t,
+        lon: projLon,
+        lat: projLat,
+        x: a.x + (b.x - a.x) * t,
+        y: a.y + (b.y - a.y) * t,
         grade: t < 0.5 ? a.grade : b.grade,
         segmentId: t < 0.5 ? a.segmentId : b.segmentId,
       };

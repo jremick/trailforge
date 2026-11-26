@@ -915,6 +915,8 @@ export interface SegmentSummaryItem {
   is_4wd_only?: boolean;
   has_gate_barrier?: boolean;
   access_status?: string;
+  primary_source?: string;
+  elevation_profile_m?: unknown[];
   grade?:
     | string
     | {

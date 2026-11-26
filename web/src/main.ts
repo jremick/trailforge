@@ -155,6 +155,7 @@ import type {
   RouteWaypointInput,
   SavedRouteItem,
   SyncQueueItem,
+  TileManifestResponse,
   TrackInspectorDetail,
   TripItem,
   UnifiedSearchItem,
@@ -243,6 +244,7 @@ class TrailForgeApp {
   private activeSidebarWidthPx: number = SIDEBAR_DEFAULT_WIDTH_PX;
   private activePreset: RegionPreset = getDefaultPreset();
   private activeBasemap: BasemapId;
+  private currentTileManifest: TileManifestResponse | null = null;
   private layerState: LayerVisibilityState = createInitialLayerState();
   private healthAbort: AbortController | null = null;
   private inspectorAbort: AbortController | null = null;
@@ -1944,6 +1946,9 @@ class TrailForgeApp {
       ),
       isAuthenticated: Boolean(this.user),
       pickedReportCoords: this.pickedReportCoords,
+      activeBasemap: this.activeBasemap,
+      tileManifest: this.currentTileManifest,
+      isOfflinePack: Boolean(this.activeOfflinePackId) || !this.isOnline,
     });
     this.syncRoutePlannerUiState();
   }
@@ -2309,6 +2314,11 @@ class TrailForgeApp {
     this.sidebar.updateTileMode("loading");
     try {
       const manifest = await fetchTileManifest();
+      this.currentTileManifest = manifest;
+      this.inspector.updateContext({
+        tileManifest: manifest,
+        isOfflinePack: Boolean(this.activeOfflinePackId) || !this.isOnline,
+      });
       if (manifest.snowline_bands_m && manifest.snowline_bands_m.length > 0) {
         this.sidebar.setSnowLineBands(
           manifest.snowline_bands_m,
@@ -2413,6 +2423,9 @@ class TrailForgeApp {
         isInRoute: this.routeTrackIds.includes(trackId),
         isAuthenticated: Boolean(this.user),
         pickedReportCoords: this.pickedReportCoords,
+        activeBasemap: this.activeBasemap,
+        tileManifest: this.currentTileManifest,
+        isOfflinePack: Boolean(this.activeOfflinePackId) || !this.isOnline,
       });
 
       if (options?.autoZoomIfNoCoords && detail.bbox) {
@@ -2575,6 +2588,7 @@ class TrailForgeApp {
   private setActiveBasemap(basemap: BasemapId): void {
     this.activeBasemap = basemap;
     this.map.setBasemap(basemap);
+    this.inspector.updateContext({ activeBasemap: basemap });
     this.basemapButtons.forEach((b) =>
       b.classList.toggle("active", b.dataset.basemap === basemap)
     );

@@ -1,3 +1,4 @@
+import { CourseMiniMap } from "./courseMiniMap";
 import {
   buildElevationProfileSvg,
   buildTrackCourseSvg,
@@ -14,7 +15,13 @@ import {
   type TrackCourseSvgResult,
 } from "../inspectorHelpers";
 import { escapeHtml, getGradeColor } from "../presets";
-import type { BBoxTuple, SegmentSummaryItem, TrackInspectorDetail } from "../types";
+import type {
+  BasemapId,
+  BBoxTuple,
+  SegmentSummaryItem,
+  TileManifestResponse,
+  TrackInspectorDetail,
+} from "../types";
 
 export interface ElevationModalCallbacks {
   onZoomToTrack?: (bbox: BBoxTuple) => void;
@@ -23,16 +30,23 @@ export interface ElevationModalCallbacks {
   onOpenStateChange?: (isOpen: boolean) => void;
 }
 
+export interface ElevationModalOpenOptions {
+  snowLineElevationM: number;
+  activeBasemap?: BasemapId;
+  tileManifest?: TileManifestResponse | null;
+  isOfflinePack?: boolean;
+}
+
 /**
  * Large-scale interactive Terrain Elevation Profile & Synchronized Track Course Pop-Over Modal.
- * Features a linked North-up Track Course plan view alongside the Elevation Profile so scrubbing
- * either graph moves both position markers in lockstep, plus grade distribution, clickable steep
- * (>=14°) zones, waterway crossings, and surface/tenure context.
+ * Embeds a live MapLibre topographic/satellite mini-map alongside the Elevation Profile so
+ * scrubbing either graph moves both position markers in lockstep over the real map.
  */
 export class ElevationProfileModal {
   private readonly backdropEl: HTMLDivElement;
   private readonly callbacks: ElevationModalCallbacks;
   private isOpen = false;
+  private miniMap: CourseMiniMap | null = null;
   private readonly keydownHandler: (e: KeyboardEvent) => void;
 
   constructor(callbacks: ElevationModalCallbacks = {}) {
@@ -43,7 +57,7 @@ export class ElevationProfileModal {
     this.backdropEl.setAttribute("aria-modal", "true");
     this.backdropEl.setAttribute(
       "aria-label",
-      "Expanded terrain elevation profile and track course"
+      "Expanded terrain elevation profile and track map"
     );
     document.body.appendChild(this.backdropEl);
 
@@ -66,7 +80,18 @@ export class ElevationProfileModal {
     return this.isOpen;
   }
 
-  open(detail: TrackInspectorDetail, snowLineElevationM: number): void {
+  open(
+    detail: TrackInspectorDetail,
+    snowLineOrOptions: number | ElevationModalOpenOptions
+  ): void {
+    const opts: ElevationModalOpenOptions =
+      typeof snowLineOrOptions === "number"
+        ? { snowLineElevationM: snowLineOrOptions }
+        : snowLineOrOptions;
+    const snowLineElevationM = opts.snowLineElevationM;
+    const activeBasemap: BasemapId = opts.activeBasemap ?? "opentopo";
+
+    this.destroyMiniMap();
     const wasOpen = this.isOpen;
     const norm = normalizeTrackInspector(detail);
     const chart = buildElevationProfileSvg(norm.profile, {
@@ -78,9 +103,9 @@ export class ElevationProfileModal {
       gradientId: "tfElevGradModal",
     });
 
-    const segments = detail.segments ?? [];
+    const segments = norm.canonicalSegments;
     const segById = new Map<string, SegmentSummaryItem>();
-    for (const seg of segments) {
+    for (const seg of detail.segments ?? []) {
       segById.set(seg.segment_id, seg);
     }
 
@@ -89,8 +114,10 @@ export class ElevationProfileModal {
       height: 340,
       crossings: norm.crossings,
       steepZones: chart.steepZones,
+      precomputedVertices: norm.courseVertices,
+      precomputedBBox: norm.courseBBox,
     });
-    const hasCourse = course.vertices.length >= 2;
+    const hasCourse = course.vertices.length >= 2 && course.bbox !== null;
 
     const gradeColor = getGradeColor(norm.grade);
     const gradeDist = computeTrackGradeDistribution(segments, norm.profile);
@@ -221,6 +248,12 @@ export class ElevationProfileModal {
       )
       .join("");
 
+    const miniBasemaps: Array<{ id: BasemapId; label: string }> = [
+      { id: "opentopo", label: "Topo" },
+      { id: "satellite", label: "Sat" },
+      { id: "osm", label: "OSM" },
+    ];
+
     const visualStageHtml = hasCourse
       ? `
         <div class="tf-elev-visual-split">
@@ -235,11 +268,24 @@ export class ElevationProfileModal {
           </div>
           <div class="tf-elev-pane tf-elev-pane-course">
             <div class="tf-elev-pane-head">
-              <span class="tf-elev-pane-title">Track Course (Plan View)</span>
-              <span class="tf-elev-pane-meta mono">S → E · North-up</span>
+              <span class="tf-elev-pane-title">Track Map (North-Up)</span>
+              <div class="tf-mini-map-controls">
+                <div class="tf-mini-basemap-group" role="group" aria-label="Track map basemap">
+                  ${miniBasemaps
+                    .map(
+                      (b) =>
+                        `<button type="button" class="tf-mini-bm-btn ${activeBasemap === b.id ? "active" : ""}" data-mini-basemap="${b.id}">${b.label}</button>`
+                    )
+                    .join("")}
+                </div>
+                <button type="button" class="tf-mini-bm-btn" data-mini-action="fit" title="Refit full track">⌖</button>
+              </div>
             </div>
-            <div class="tf-elev-course-svg-wrap">
-              ${course.svgHtml}
+            <div class="tf-elev-course-map-wrap">
+              <div class="tf-elev-course-map" data-role="course-minimap" aria-label="Interactive topographic track map synchronized with elevation profile"></div>
+              <div class="tf-elev-course-svg-fallback hidden" data-role="course-svg-fallback">
+                ${course.svgHtml}
+              </div>
             </div>
           </div>
         </div>
@@ -254,7 +300,7 @@ export class ElevationProfileModal {
       <div class="tf-elev-modal">
         <div class="tf-elev-modal-head">
           <div class="tf-elev-modal-title-group">
-            <div class="tf-inspector-kicker">Terrain Elevation &amp; Synchronized Track Profile</div>
+            <div class="tf-inspector-kicker">Terrain Elevation &amp; Synchronized Track Map</div>
             <div class="tf-elev-modal-title-row">
               <h2 class="tf-elev-modal-title">${escapeHtml(norm.name)}</h2>
               <span class="tf-elev-grade-chip" style="border-color:${gradeColor};color:${gradeColor}">
@@ -314,7 +360,7 @@ export class ElevationProfileModal {
             <div class="tf-elev-scrub-hud" data-role="scrub-hud">
               <span class="tf-elev-scrub-hint">${
                 hasCourse
-                  ? "Move cursor or drag across the Elevation Profile or Track Course — both markers stay synced in real time."
+                  ? "Move cursor across the Elevation Profile or Track Map — both markers stay synced in real time."
                   : "Move cursor or drag across the profile to inspect exact elevation, slope, grade, and surface."
               }</span>
             </div>
@@ -401,12 +447,16 @@ export class ElevationProfileModal {
         chart.geometry,
         hasCourse ? course : null,
         snowLineElevationM,
-        segById
+        segById,
+        activeBasemap,
+        opts.tileManifest ?? null,
+        Boolean(opts.isOfflinePack)
       );
     }
   }
 
   close(): void {
+    this.destroyMiniMap();
     const wasOpen = this.isOpen;
     this.isOpen = false;
     this.backdropEl.classList.add("hidden");
@@ -417,8 +467,20 @@ export class ElevationProfileModal {
   }
 
   destroy(): void {
+    this.destroyMiniMap();
     document.removeEventListener("keydown", this.keydownHandler);
     this.backdropEl.remove();
+  }
+
+  private destroyMiniMap(): void {
+    if (this.miniMap) {
+      try {
+        this.miniMap.destroy();
+      } catch {
+        // Ignore teardown errors
+      }
+      this.miniMap = null;
+    }
   }
 
   private bindScrubbing(
@@ -426,7 +488,10 @@ export class ElevationProfileModal {
     geom: ElevationChartGeometry,
     course: TrackCourseSvgResult | null,
     snowLineElevationM: number,
-    segById: Map<string, SegmentSummaryItem>
+    segById: Map<string, SegmentSummaryItem>,
+    initialBasemap: BasemapId,
+    tileManifest: TileManifestResponse | null,
+    isOfflinePack: boolean
   ): void {
     const elevSvg = this.backdropEl.querySelector<SVGSVGElement>(".tf-elev-svg-lg");
     const elevHit = this.backdropEl.querySelector<SVGRectElement>(
@@ -446,6 +511,12 @@ export class ElevationProfileModal {
     );
     const hud = this.backdropEl.querySelector<HTMLElement>("[data-role='scrub-hud']");
 
+    const miniMapContainer = this.backdropEl.querySelector<HTMLElement>(
+      "[data-role='course-minimap']"
+    );
+    const svgFallbackWrap = this.backdropEl.querySelector<HTMLElement>(
+      "[data-role='course-svg-fallback']"
+    );
     const courseSvg = this.backdropEl.querySelector<SVGSVGElement>(".tf-course-svg");
     const courseHit = this.backdropEl.querySelector<SVGRectElement>(
       "[data-role='course-scrub-hit']"
@@ -490,22 +561,26 @@ export class ElevationProfileModal {
       crossDot.setAttribute("fill", color);
       crosshair.classList.remove("hidden");
 
-      // Synchronize the Track Course marker to the matching distance/coordinate
       const coursePt =
         explicitCoursePt ??
         (course ? sampleTrackCourseAtDistance(course.vertices, sample.distM) : null);
 
-      if (coursePt && courseCursor && courseGlow && courseRing && courseDot) {
-        const cx = coursePt.x.toFixed(1);
-        const cy = coursePt.y.toFixed(1);
-        courseGlow.setAttribute("cx", cx);
-        courseGlow.setAttribute("cy", cy);
-        courseRing.setAttribute("cx", cx);
-        courseRing.setAttribute("cy", cy);
-        courseDot.setAttribute("cx", cx);
-        courseDot.setAttribute("cy", cy);
-        courseDot.setAttribute("fill", color);
-        courseCursor.classList.remove("hidden");
+      if (coursePt) {
+        if (this.miniMap) {
+          this.miniMap.setCursor(coursePt, color);
+        }
+        if (courseCursor && courseGlow && courseRing && courseDot) {
+          const cx = coursePt.x.toFixed(1);
+          const cy = coursePt.y.toFixed(1);
+          courseGlow.setAttribute("cx", cx);
+          courseGlow.setAttribute("cy", cy);
+          courseRing.setAttribute("cx", cx);
+          courseRing.setAttribute("cy", cy);
+          courseDot.setAttribute("cx", cx);
+          courseDot.setAttribute("cy", cy);
+          courseDot.setAttribute("fill", color);
+          courseCursor.classList.remove("hidden");
+        }
       }
 
       const seg = sample.segmentId ? segById.get(sample.segmentId) : undefined;
@@ -538,6 +613,44 @@ export class ElevationProfileModal {
         ${nearCrossing ? `<span class="tf-mini-tag cyan">≈ ${escapeHtml(nearCrossing.name || "Waterway crossing")}</span>` : ""}
       `;
     };
+
+    // Mount real interactive MapLibre mini-map with underlying topographic/satellite map
+    if (course && course.bbox && miniMapContainer) {
+      try {
+        this.miniMap = new CourseMiniMap(miniMapContainer, {
+          vertices: course.vertices,
+          bbox: course.bbox,
+          totalDistM: course.totalDistM,
+          crossings: norm.crossings,
+          initialBasemap,
+          tileManifest,
+          isOfflinePack,
+          onHoverPoint: (pt) => syncAtDistance(pt.distM, pt),
+        });
+
+        // Wire mini-map basemap switcher (Topo / Sat / OSM) & Fit button
+        const bmButtons = this.backdropEl.querySelectorAll<HTMLButtonElement>(
+          "[data-mini-basemap]"
+        );
+        bmButtons.forEach((btn) => {
+          btn.addEventListener("click", () => {
+            const bm = btn.dataset.miniBasemap as BasemapId;
+            this.miniMap?.setBasemap(bm);
+            bmButtons.forEach((b) => b.classList.toggle("active", b === btn));
+          });
+        });
+
+        this.backdropEl
+          .querySelector<HTMLButtonElement>("[data-mini-action='fit']")
+          ?.addEventListener("click", () => {
+            this.miniMap?.fitTrack();
+          });
+      } catch {
+        // Fallback gracefully to SVG plan view if WebGL is unavailable
+        miniMapContainer.classList.add("hidden");
+        svgFallbackWrap?.classList.remove("hidden");
+      }
+    }
 
     const handleElevPointer = (clientX: number): void => {
       const rect = elevSvg.getBoundingClientRect();

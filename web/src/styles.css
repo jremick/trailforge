@@ -1716,12 +1716,107 @@ button {
   padding: 8px 10px 4px;
 }
 
-.tf-elev-course-svg-wrap {
+.tf-elev-course-map-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 280px;
+  background: #0a1016;
+  overflow: hidden;
+}
+
+.tf-elev-course-map {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.tf-elev-course-map .maplibregl-canvas-container {
+  cursor: crosshair;
+}
+
+.tf-elev-course-map .maplibregl-ctrl-scale {
+  background: rgba(11, 17, 23, 0.82);
+  border-color: rgba(148, 163, 184, 0.65);
+  color: #cbd5e1;
+  font-size: 9.5px;
+  font-family: var(--font-mono);
+  padding: 0 5px;
+  margin: 0 0 6px 6px;
+}
+
+.tf-elev-course-svg-fallback {
   padding: 8px 10px 4px;
   display: flex;
   align-items: center;
   justify-content: center;
-  flex: 1;
+  height: 100%;
+}
+
+.tf-mini-map-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.tf-mini-basemap-group {
+  display: inline-flex;
+  align-items: center;
+  background: rgba(7, 11, 16, 0.72);
+  border: 1px solid var(--border-subtle);
+  border-radius: 5px;
+  padding: 1px;
+  gap: 1px;
+}
+
+.tf-mini-bm-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  line-height: 1.2;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.tf-mini-bm-btn:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.tf-mini-bm-btn.active {
+  background: rgba(56, 189, 248, 0.22);
+  color: var(--accent-cyan);
+}
+
+.tf-mini-endpoint {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+  pointer-events: none;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.7);
+}
+
+.tf-mini-endpoint.start {
+  background: #22c55e;
+  color: #052e16;
+  border: 2px solid #070b10;
+}
+
+.tf-mini-endpoint.end {
+  background: #f8fafc;
+  color: #0b1117;
+  border: 2px solid #070b10;
 }
 
 .tf-elev-svg-lg,

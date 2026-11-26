@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildCanonicalTrackCorridor,
   buildElevationProfileSvg,
   buildTrackCourseSvg,
   computeTrackGradeDistribution,
   findNearestPointOnTrackCourse,
+  findNearestPointOnTrackCourseGeo,
   formatBreakdownFactors,
   formatOverrideLabel,
   normalizeTrackInspector,
@@ -358,5 +360,138 @@ describe("Track Inspector explainable helpers", () => {
     const startPt = sampleTrackCourseAtDistance(course.vertices, 0);
     const endPt = sampleTrackCourseAtDistance(course.vertices, 2000);
     expect(endPt!.y).toBeLessThan(startPt!.y);
+
+    // Geographic nearest-point lookup (for live MapLibre mini-map hover)
+    const geoNearest = findNearestPointOnTrackCourseGeo(
+      course.vertices,
+      147.095,
+      -37.225
+    );
+    expect(geoNearest).not.toBeNull();
+    expect(geoNearest!.distM).toBeCloseTo(1500, 1);
+  });
+
+  it("deduplicates overlapping multi-tile `_2` segments and chains monotonically with zero cursor flickering", () => {
+    // Simulates Billy Goat Bluff multi-tile overlap: interleaved `_2` spatial duplicates without
+    // elevation_profile_m + an out-of-order `seq=1` segment that geometrically belongs at the end.
+    const segs = [
+      {
+        segment_id: "tfseg_b_2",
+        segment_seq: 0,
+        primary_source: "osm",
+        length_m: 1000,
+        grade: "Extreme",
+        elev_min_m: 900,
+        elev_max_m: 1100,
+        elevation_profile_m: [],
+        geometry: {
+          type: "LineString",
+          coordinates: [
+            [147.04, -37.44],
+            [147.05, -37.43],
+          ],
+        },
+      },
+      {
+        segment_id: "tfseg_a",
+        segment_seq: 0,
+        primary_source: "osm",
+        length_m: 1000,
+        grade: "Medium",
+        elev_min_m: 1100,
+        elev_max_m: 1300,
+        max_slope_deg: 10.0,
+        elevation_profile_m: [
+          [0, 1300],
+          [500, 1200],
+          [1000, 1100],
+        ],
+        geometry: {
+          type: "LineString",
+          coordinates: [
+            [147.03, -37.45],
+            [147.04, -37.44],
+          ],
+        },
+      },
+      // Out-of-order segment geometrically at the far northern end (should NOT create a drop spike in middle)
+      {
+        segment_id: "tfseg_c",
+        segment_seq: 1,
+        primary_source: "osm",
+        length_m: 1000,
+        grade: "Medium",
+        elev_min_m: 500,
+        elev_max_m: 900,
+        max_slope_deg: 8.0,
+        elevation_profile_m: [
+          [0, 900],
+          [500, 700],
+          [1000, 500],
+        ],
+        geometry: {
+          type: "LineString",
+          coordinates: [
+            [147.05, -37.43],
+            [147.06, -37.42],
+          ],
+        },
+      },
+      {
+        segment_id: "tfseg_b",
+        segment_seq: 2,
+        primary_source: "osm",
+        length_m: 1000,
+        grade: "Extreme",
+        elev_min_m: 900,
+        elev_max_m: 1100,
+        max_slope_deg: 22.0,
+        elevation_profile_m: [
+          [0, 1100],
+          [500, 1000],
+          [1000, 900],
+        ],
+        geometry: {
+          type: "LineString",
+          coordinates: [
+            [147.04, -37.44],
+            [147.05, -37.43],
+          ],
+        },
+      },
+    ];
+
+    const corridor = buildCanonicalTrackCorridor(segs, [], []);
+    // Duplicate `tfseg_b_2` dropped; remaining 3 chained geometrically a -> b -> c!
+    expect(corridor.rebuiltFromSegments).toBe(true);
+    expect(corridor.segments.map((s) => s.segment_id)).toEqual([
+      "tfseg_a",
+      "tfseg_b",
+      "tfseg_c",
+    ]);
+
+    // Elevation profile descends smoothly 1300 -> 500 with zero drop spike
+    expect(corridor.profile[0]!.elev_m).toBe(1300);
+    expect(corridor.profile[corridor.profile.length - 1]!.elev_m).toBe(500);
+    for (let i = 1; i < corridor.profile.length; i += 1) {
+      expect(corridor.profile[i]!.dist_m).toBeGreaterThanOrEqual(
+        corridor.profile[i - 1]!.dist_m
+      );
+      expect(corridor.profile[i]!.elev_m).toBeLessThanOrEqual(
+        corridor.profile[i - 1]!.elev_m
+      );
+    }
+
+    // Scrubbing monotonically along distM moves strictly monotonically North-East (zero two-point flicker!)
+    let prevLat = -90;
+    let prevLon = -180;
+    for (let d = 0; d <= 3000; d += 250) {
+      const pt = sampleTrackCourseAtDistance(corridor.vertices, d);
+      expect(pt).not.toBeNull();
+      expect(pt!.lat).toBeGreaterThanOrEqual(prevLat - 1e-6);
+      expect(pt!.lon).toBeGreaterThanOrEqual(prevLon - 1e-6);
+      prevLat = pt!.lat;
+      prevLon = pt!.lon;
+    }
   });
 });
