@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -36,8 +36,17 @@ class Settings(BaseSettings):
 
     # Local storage directories (streaming pack/tile outputs)
     trailforge_data_dir: str = Field(default="/data")
-    trailforge_tiles_dir: str = Field(default="/data/tiles")
+    tiles_dir: str = Field(
+        default="/data/tiles",
+        validation_alias=AliasChoices("TILES_DIR", "TRAILFORGE_TILES_DIR"),
+        description="Directory storing generated vector/terrain PMTiles and manifest.json.",
+    )
     trailforge_packs_dir: str = Field(default="/data/packs")
+
+    @property
+    def trailforge_tiles_dir(self) -> str:
+        """Backward-compatible alias for `tiles_dir`."""
+        return self.tiles_dir
 
     @property
     def cors_origins_list(self) -> list[str]:

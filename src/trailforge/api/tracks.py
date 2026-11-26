@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -10,13 +11,38 @@ from pydantic import BaseModel, Field
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
-from trailforge.db.models import POI, CAPADPark, Track, TrackSegment, TrackSegmentGrade
+from trailforge.db.models import (
+    POI,
+    CAPADPark,
+    SourceWaterway,
+    Track,
+    TrackSegment,
+    TrackSegmentGrade,
+)
 from trailforge.db.session import get_db
+from trailforge.grading.baseline import SegmentGradeInput, compute_baseline_grade
 
 router = APIRouter(prefix="/api", tags=["tracks"])
 
 _GRADE_RANK = {"Easy": 1, "Medium": 2, "Hard": 3, "Extreme": 4}
 _RANK_GRADE = {v: k for k, v in _GRADE_RANK.items()}
+_SURFACE_RANK = {
+    "unknown": 0,
+    "sealed": 1,
+    "gravel_compacted": 2,
+    "dirt_unsealed": 3,
+    "rough_rock_mud_sand": 4,
+}
+_TRACKTYPE_RANK = {"grade1": 1, "grade2": 2, "grade3": 3, "grade4": 4, "grade5": 5}
+_ACCESS_STRICTNESS = {
+    "public": 0,
+    "seasonal": 1,
+    "permit": 2,
+    "private": 3,
+    "restricted": 4,
+    "closed": 5,
+}
+_NEARBY_POI_RADIUS_M = 1500.0
 
 
 def _parse_bbox(bbox: str | None) -> tuple[float, float, float, float] | None:
@@ -43,6 +69,19 @@ def _parse_bbox(bbox: str | None) -> tuple[float, float, float, float] | None:
     return (min_lon, min_lat, max_lon, max_lat)
 
 
+def _bbox_list(
+    xmin: float | None, ymin: float | None, xmax: float | None, ymax: float | None
+) -> list[float] | None:
+    if xmin is None or ymin is None or xmax is None or ymax is None:
+        return None
+    return [
+        round(float(xmin), 6),
+        round(float(ymin), 6),
+        round(float(xmax), 6),
+        round(float(ymax), 6),
+    ]
+
+
 class ParkSummary(BaseModel):
     id: int
     capad_external_id: str
@@ -67,6 +106,22 @@ class SegmentGradePayload(BaseModel):
     sample_count: int
     wet_risk_level: str
     rainfall_context: dict[str, Any] | None = None
+
+
+class ElevationProfilePoint(BaseModel):
+    dist_m: float
+    elev_m: float
+    slope_deg: float
+    segment_id: str
+    grade: str | None = None
+
+
+class WaterwayCrossingItem(BaseModel):
+    name: str
+    waterway_type: str
+    perennial: bool
+    bridged: bool
+    dist_m: float
 
 
 class SegmentDetailResponse(BaseModel):
@@ -127,6 +182,9 @@ class TrackSummaryResponse(BaseModel):
     waterway_crossing_count: int
     primary_park_name: str | None = None
     effective_grade: str | None = None
+    grade: str | None = None
+    score: float | None = None
+    bbox: list[float] | None = None
     segment_count: int = 0
     is_active: bool
 
@@ -145,10 +203,25 @@ class PoiResponse(BaseModel):
     source_license: str
     lon: float
     lat: float
+    distance_m: float | None = None
 
 
 class TrackDetailResponse(TrackSummaryResponse):
+    """Full Track Inspector payload per Slice 03 contract."""
+
+    source_refs: list[dict[str, Any]] = Field(default_factory=list)
+    min_elev_m: float | None = None
+    max_elev_m: float | None = None
+    elev_loss_m: float = 0.0
+    sustained_slope_deg: float | None = None
+    is_4wd_only: bool = False
+    has_gate_barrier: bool = False
+    access_status: str = "public"
+    baseline_breakdown: dict[str, Any] | None = None
+    elevation_profile: list[ElevationProfilePoint] = Field(default_factory=list)
+    waterway_crossings: list[WaterwayCrossingItem] = Field(default_factory=list)
     primary_park: ParkSummary | None = None
+    capad_parks: list[ParkSummary] = Field(default_factory=list)
     segments: list[SegmentDetailResponse] = Field(default_factory=list)
     nearby_pois: list[PoiResponse] = Field(default_factory=list)
 
@@ -159,8 +232,11 @@ class SearchResultItem(BaseModel):
     name: str
     state: str
     subtitle: str | None = None
+    category: str | None = None
+    grade: str | None = None
     lon: float | None = None
     lat: float | None = None
+    bbox: list[float] | None = None
 
 
 class SearchResponse(BaseModel):
@@ -251,6 +327,82 @@ def _segment_to_detail(
     )
 
 
+def _stitch_elevation_profile(
+    seg_rows: list[tuple[TrackSegment, str, TrackSegmentGrade | None, CAPADPark | None]],
+) -> tuple[list[ElevationProfilePoint], dict[str, float]]:
+    """Build a continuous, direction-consistent elevation profile across ordered track segments.
+
+    Returns ``(profile_points, segment_mid_dist_map)``.
+    """
+    profile: list[ElevationProfilePoint] = []
+    seg_mid_dist: dict[str, float] = {}
+    if not seg_rows:
+        return profile, seg_mid_dist
+
+    cum_dist = 0.0
+    curr_exit_node: str | None = None
+
+    for idx, (seg, _geom_json, grd, _park) in enumerate(seg_rows):
+        reverse_seg = False
+        if idx == 0:
+            if len(seg_rows) >= 2:
+                nxt = seg_rows[1][0]
+                nxt_nodes = {nxt.start_node_key, nxt.end_node_key}
+                if seg.end_node_key in nxt_nodes:
+                    reverse_seg = False
+                    curr_exit_node = seg.end_node_key
+                elif seg.start_node_key in nxt_nodes:
+                    reverse_seg = True
+                    curr_exit_node = seg.start_node_key
+                else:
+                    curr_exit_node = seg.end_node_key
+            else:
+                curr_exit_node = seg.end_node_key
+        else:
+            if seg.start_node_key == curr_exit_node:
+                reverse_seg = False
+                curr_exit_node = seg.end_node_key
+            elif seg.end_node_key == curr_exit_node:
+                reverse_seg = True
+                curr_exit_node = seg.start_node_key
+            else:
+                reverse_seg = False
+                curr_exit_node = seg.end_node_key
+
+        seg_mid_dist[seg.segment_id] = round(cum_dist + (seg.length_m * 0.5), 1)
+        raw_pts = seg.elevation_profile_m or []
+        eff_grade = grd.effective_grade if grd else None
+        seg_slope = round(float(seg.max_slope_deg or 0.0), 2)
+
+        if raw_pts:
+            parsed: list[tuple[float, float]] = [
+                (float(p[0]), float(p[1]))
+                for p in raw_pts
+                if isinstance(p, (list, tuple)) and len(p) >= 2
+            ]
+            if parsed:
+                span = parsed[-1][0]
+                if reverse_seg:
+                    ordered_pts = [(max(0.0, span - d), z) for d, z in reversed(parsed)]
+                else:
+                    ordered_pts = parsed
+                for pt_idx, (local_d, elev_m) in enumerate(ordered_pts):
+                    if idx > 0 and pt_idx == 0 and profile:
+                        continue
+                    profile.append(
+                        ElevationProfilePoint(
+                            dist_m=round(cum_dist + local_d, 1),
+                            elev_m=round(elev_m, 2),
+                            slope_deg=seg_slope,
+                            segment_id=seg.segment_id,
+                            grade=eff_grade,
+                        )
+                    )
+        cum_dist += float(seg.length_m)
+
+    return profile, seg_mid_dist
+
+
 @router.get("/tracks", response_model=list[TrackSummaryResponse])
 def list_tracks(
     state: str | None = Query(default=None),
@@ -263,7 +415,7 @@ def list_tracks(
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ) -> list[TrackSummaryResponse]:
-    """List canonical tracks with optional spatial bbox, state, grade, and name filters."""
+    """List canonical tracks with optional spatial bbox, state, grade, and name/alias filters."""
     parsed_bbox = _parse_bbox(bbox)
 
     grade_rank_expr = case(
@@ -278,6 +430,7 @@ def list_tracks(
             TrackSegment.track_id.label("track_id"),
             func.count(TrackSegment.segment_id).label("segment_count"),
             func.max(grade_rank_expr).label("worst_rank"),
+            func.max(TrackSegmentGrade.baseline_score).label("max_score"),
         )
         .outerjoin(TrackSegmentGrade, TrackSegment.segment_id == TrackSegmentGrade.segment_id)
         .where(TrackSegment.is_active.is_(True))
@@ -291,6 +444,11 @@ def list_tracks(
             CAPADPark.name.label("park_name"),
             func.coalesce(seg_agg.c.segment_count, 0).label("segment_count"),
             func.coalesce(seg_agg.c.worst_rank, 0).label("worst_rank"),
+            seg_agg.c.max_score.label("max_score"),
+            func.ST_XMin(Track.bbox_geom).label("xmin"),
+            func.ST_YMin(Track.bbox_geom).label("ymin"),
+            func.ST_XMax(Track.bbox_geom).label("xmax"),
+            func.ST_YMax(Track.bbox_geom).label("ymax"),
         )
         .outerjoin(CAPADPark, Track.primary_park_id == CAPADPark.id)
         .outerjoin(seg_agg, Track.track_id == seg_agg.c.track_id)
@@ -322,29 +480,35 @@ def list_tracks(
     stmt = stmt.order_by(Track.name.asc()).offset(offset).limit(limit)
     rows = db.execute(stmt).all()
 
-    return [
-        TrackSummaryResponse(
-            track_id=trk.track_id,
-            name=trk.name,
-            alt_names=list(trk.alt_names or []),
-            state=trk.state,
-            primary_source=trk.primary_source,
-            has_osm_source=trk.has_osm_source,
-            trail_class=trk.trail_class,
-            is_vehicular=trk.is_vehicular,
-            total_length_m=trk.total_length_m,
-            elev_min_m=trk.elev_min_m,
-            elev_max_m=trk.elev_max_m,
-            elev_gain_m=trk.elev_gain_m,
-            max_slope_deg=trk.max_slope_deg,
-            waterway_crossing_count=trk.waterway_crossing_count,
-            primary_park_name=park_name,
-            effective_grade=_RANK_GRADE.get(int(worst_rank)) if worst_rank else None,
-            segment_count=int(segment_count),
-            is_active=trk.is_active,
+    results: list[TrackSummaryResponse] = []
+    for trk, park_name, segment_count, worst_rank, max_score, xmin, ymin, xmax, ymax in rows:
+        eff_grade = _RANK_GRADE.get(int(worst_rank)) if worst_rank else None
+        results.append(
+            TrackSummaryResponse(
+                track_id=trk.track_id,
+                name=trk.name,
+                alt_names=list(trk.alt_names or []),
+                state=trk.state,
+                primary_source=trk.primary_source,
+                has_osm_source=trk.has_osm_source,
+                trail_class=trk.trail_class,
+                is_vehicular=trk.is_vehicular,
+                total_length_m=trk.total_length_m,
+                elev_min_m=trk.elev_min_m,
+                elev_max_m=trk.elev_max_m,
+                elev_gain_m=trk.elev_gain_m,
+                max_slope_deg=trk.max_slope_deg,
+                waterway_crossing_count=trk.waterway_crossing_count,
+                primary_park_name=park_name,
+                effective_grade=eff_grade,
+                grade=eff_grade,
+                score=round(float(max_score), 1) if max_score is not None else None,
+                bbox=_bbox_list(xmin, ymin, xmax, ymax),
+                segment_count=int(segment_count),
+                is_active=trk.is_active,
+            )
         )
-        for trk, park_name, segment_count, worst_rank in rows
-    ]
+    return results
 
 
 @router.get("/tracks/geojson")
@@ -388,6 +552,7 @@ def get_corridor_tracks_geojson(
                 "properties": {
                     "segment_id": seg.segment_id,
                     "track_id": seg.track_id,
+                    "track_name": seg.name,
                     "segment_seq": seg.segment_seq,
                     "name": seg.name,
                     "state": seg.state,
@@ -395,6 +560,8 @@ def get_corridor_tracks_geojson(
                     "surface_class": seg.surface_class,
                     "tracktype": seg.tracktype,
                     "length_m": seg.length_m,
+                    "min_elev_m": seg.elev_min_m,
+                    "max_elev_m": seg.elev_max_m,
                     "elev_min_m": seg.elev_min_m,
                     "elev_max_m": seg.elev_max_m,
                     "max_slope_deg": seg.max_slope_deg,
@@ -403,10 +570,13 @@ def get_corridor_tracks_geojson(
                     "is_above_snowline": seg.is_above_snowline,
                     "waterway_crossing_count": seg.waterway_crossing_count,
                     "has_perennial_crossing": seg.has_perennial_crossing,
+                    "is_4wd_only": seg.is_4wd_only,
                     "access_status": seg.access_status,
                     "has_gate_barrier": seg.has_gate_barrier,
                     "primary_source": seg.primary_source,
                     "has_osm_source": seg.has_osm_source,
+                    "grade": grd.effective_grade if grd else None,
+                    "score": grd.baseline_score if grd else None,
                     "baseline_grade": grd.baseline_grade if grd else None,
                     "baseline_score": grd.baseline_score if grd else None,
                     "effective_grade": grd.effective_grade if grd else None,
@@ -421,18 +591,25 @@ def get_track_detail(
     track_id: str,
     db: Session = Depends(get_db),
 ) -> TrackDetailResponse:
-    """Return full track metadata, ordered graded segments, CAPAD tenure, and nearby POIs."""
+    """Return full Track Inspector payload: profile, breakdown, crossings, POIs, & CAPAD tenure."""
     row = db.execute(
-        select(Track, CAPADPark)
+        select(
+            Track,
+            CAPADPark,
+            func.ST_XMin(Track.bbox_geom).label("xmin"),
+            func.ST_YMin(Track.bbox_geom).label("ymin"),
+            func.ST_XMax(Track.bbox_geom).label("xmax"),
+            func.ST_YMax(Track.bbox_geom).label("ymax"),
+        )
         .outerjoin(CAPADPark, Track.primary_park_id == CAPADPark.id)
         .where(Track.track_id == track_id)
     ).first()
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found")
 
-    trk, primary_park = row
+    trk, primary_park, xmin, ymin, xmax, ymax = row
 
-    seg_rows = db.execute(
+    raw_seg_rows = db.execute(
         select(
             TrackSegment,
             func.ST_AsGeoJSON(TrackSegment.geom).label("geom_json"),
@@ -444,47 +621,263 @@ def get_track_detail(
         .where(TrackSegment.track_id == track_id, TrackSegment.is_active.is_(True))
         .order_by(TrackSegment.segment_seq.asc().nullslast(), TrackSegment.segment_id.asc())
     ).all()
+    seg_rows: list[tuple[TrackSegment, str, TrackSegmentGrade | None, CAPADPark | None]] = [
+        (r[0], r[1], r[2], r[3]) for r in raw_seg_rows
+    ]
 
     segments: list[SegmentDetailResponse] = []
-    seg_ids: list[str] = []
-    worst = 0
-    for seg, geom_json, grd, park in seg_rows:
-        seg_ids.append(seg.segment_id)
-        if grd and grd.effective_grade in _GRADE_RANK:
-            worst = max(worst, _GRADE_RANK[grd.effective_grade])
-        segments.append(_segment_to_detail(seg, geom_json, grd, park))
+    merged_refs: list[dict[str, Any]] = []
+    seen_ref_keys: set[tuple[str, str]] = set()
+    grade_dist: Counter[str] = Counter()
+    worst_rank = 0
+    rep_seg: TrackSegment | None = None
+    rep_grade: TrackSegmentGrade | None = None
+    rep_sort_key: tuple[float, float, int, str] | None = None
+    elev_loss_total = 0.0
+    max_seg_gain = 0.0
+    max_seg_loss = 0.0
+    max_slope_val: float | None = None
+    max_sustained_slope: float | None = None
+    worst_surface = "unknown"
+    worst_tracktype: str | None = None
+    is_4wd_only = False
+    is_4wd_recommended = False
+    has_gate_barrier = False
+    any_unbridged_perennial = False
+    dem_tier_val: str | None = None
+    access_status = "public"
+    steep_count = 0
+    snowline_count = 0
+    parks_by_id: dict[int, CAPADPark] = {}
 
-    nearby_pois: list[PoiResponse] = []
-    if seg_ids:
+    if primary_park is not None:
+        parks_by_id[primary_park.id] = primary_park
+
+    for seg, geom_json, grd, park in seg_rows:
+        segments.append(_segment_to_detail(seg, geom_json, grd, park))
+        elev_loss_total += float(seg.elev_loss_m or 0.0)
+        max_seg_gain = max(max_seg_gain, float(seg.elev_gain_m or 0.0))
+        max_seg_loss = max(max_seg_loss, float(seg.elev_loss_m or 0.0))
+        if seg.max_slope_deg is not None and (
+            max_slope_val is None or seg.max_slope_deg > max_slope_val
+        ):
+            max_slope_val = float(seg.max_slope_deg)
+        if seg.sustained_slope_deg is not None and (
+            max_sustained_slope is None or seg.sustained_slope_deg > max_sustained_slope
+        ):
+            max_sustained_slope = float(seg.sustained_slope_deg)
+        if _SURFACE_RANK.get(seg.surface_class, 0) > _SURFACE_RANK.get(worst_surface, 0):
+            worst_surface = seg.surface_class
+        if seg.tracktype and _TRACKTYPE_RANK.get(seg.tracktype, 0) > _TRACKTYPE_RANK.get(
+            worst_tracktype or "", 0
+        ):
+            worst_tracktype = seg.tracktype
+        is_4wd_only = is_4wd_only or bool(seg.is_4wd_only)
+        is_4wd_recommended = is_4wd_recommended or bool(seg.is_4wd_recommended)
+        has_gate_barrier = has_gate_barrier or bool(seg.has_gate_barrier)
+        any_unbridged_perennial = any_unbridged_perennial or bool(seg.has_perennial_crossing)
+        if dem_tier_val is None and seg.dem_tier:
+            dem_tier_val = seg.dem_tier
+        if _ACCESS_STRICTNESS.get(seg.access_status, 0) > _ACCESS_STRICTNESS.get(access_status, 0):
+            access_status = seg.access_status
+        if seg.is_steep_highlight:
+            steep_count += 1
+        if seg.is_above_snowline:
+            snowline_count += 1
+        if park is not None:
+            parks_by_id.setdefault(park.id, park)
+        for ref in seg.source_refs or []:
+            if isinstance(ref, dict):
+                rkey = (str(ref.get("source", "")), str(ref.get("source_id", "")))
+                if rkey not in seen_ref_keys:
+                    seen_ref_keys.add(rkey)
+                    merged_refs.append(dict(ref))
+        if grd is not None:
+            grade_dist[grd.effective_grade] += 1
+            rank = _GRADE_RANK.get(grd.effective_grade, 0)
+            if rank > worst_rank:
+                worst_rank = rank
+            # Deterministic hardest-segment tie-break: score DESC, max_slope DESC, crossings DESC,
+            # segment_id ASC (compare on negated segment_id via explicit branch).
+            cand_metrics = (
+                float(grd.baseline_score),
+                float(seg.max_slope_deg or 0.0),
+                int(seg.waterway_crossing_count or 0),
+            )
+            if rep_sort_key is None or cand_metrics > rep_sort_key[:3] or (
+                cand_metrics == rep_sort_key[:3] and seg.segment_id < rep_sort_key[3]
+            ):
+                rep_sort_key = (*cand_metrics, seg.segment_id)
+                rep_grade = grd
+                rep_seg = seg
+
+    # Continuous stitched elevation profile + distance index per segment
+    elevation_profile, seg_mid_dist = _stitch_elevation_profile(seg_rows)
+
+    # Waterway crossings along track segments (PostGIS intersection against SourceWaterway)
+    waterway_crossings: list[WaterwayCrossingItem] = []
+    has_major_perennial = False
+    if seg_rows:
+        ww_rows = db.execute(
+            select(
+                SourceWaterway.source_feature_id,
+                SourceWaterway.name,
+                SourceWaterway.feature_type,
+                SourceWaterway.perenniality,
+                SourceWaterway.hierarchy,
+                TrackSegment.segment_id,
+                TrackSegment.is_bridged,
+            )
+            .join(
+                TrackSegment,
+                func.ST_DWithin(
+                    func.ST_Transform(TrackSegment.geom, 3577),
+                    func.ST_Transform(SourceWaterway.geom, 3577),
+                    1.0,
+                ),
+            )
+            .where(
+                TrackSegment.track_id == track_id,
+                TrackSegment.is_active.is_(True),
+                func.lower(SourceWaterway.feature_type) != "connector",
+            )
+        ).all()
+        seen_crossings: dict[tuple[str, bool], WaterwayCrossingItem] = {}
+        for ww_fid, ww_name, ww_type, perenn, hierarchy, seg_id, seg_bridged in ww_rows:
+            dist_m = seg_mid_dist.get(seg_id, 0.0)
+            is_perennial = str(perenn).strip().lower() == "perennial"
+            if is_perennial and not seg_bridged and str(hierarchy or "").strip().lower() == "major":
+                has_major_perennial = True
+            key = (ww_fid, bool(seg_bridged))
+            if key not in seen_crossings or dist_m < seen_crossings[key].dist_m:
+                seen_crossings[key] = WaterwayCrossingItem(
+                    name=ww_name or "Unnamed watercourse",
+                    waterway_type=ww_type,
+                    perennial=is_perennial,
+                    bridged=bool(seg_bridged),
+                    dist_m=dist_m,
+                )
+        waterway_crossings = sorted(seen_crossings.values(), key=lambda c: (c.dist_m, c.name))
+
+    # Track-level explainable baseline_breakdown consistent with track header stats
+    baseline_breakdown: dict[str, Any] | None = None
+    track_grade_result = None
+    if seg_rows:
+        unbridged_items = [c for c in waterway_crossings if not c.bridged]
+        unbridged_names = list(dict.fromkeys(c.name for c in unbridged_items if c.name))
+        unbridged_count = max(int(trk.waterway_crossing_count or 0), len(unbridged_items))
+        all_bridged = all(s.is_bridged for s, _, _, _ in seg_rows) and unbridged_count == 0
+        track_grade_result = compute_baseline_grade(
+            SegmentGradeInput(
+                surface_class=worst_surface,  # type: ignore[arg-type]
+                tracktype=worst_tracktype,  # type: ignore[arg-type]
+                trail_class=trk.trail_class,  # type: ignore[arg-type]
+                max_slope_deg=max_slope_val if max_slope_val is not None else trk.max_slope_deg,
+                sustained_slope_deg=max_sustained_slope,
+                elev_gain_m=max_seg_gain,
+                elev_loss_m=max_seg_loss,
+                unbridged_crossing_count=unbridged_count,
+                has_perennial_crossing=any_unbridged_perennial
+                or any(c.perennial for c in unbridged_items),
+                has_major_perennial_crossing=has_major_perennial,
+                waterway_names=unbridged_names,
+                is_bridged=all_bridged,
+                is_ford=any(c.perennial for c in unbridged_items),
+                is_4wd_only=is_4wd_only,
+                is_4wd_recommended=is_4wd_recommended,
+                access_status=access_status,  # type: ignore[arg-type]
+                has_gate_barrier=has_gate_barrier,
+                dem_tier=dem_tier_val,  # type: ignore[arg-type]
+            )
+        )
+        baseline_breakdown = dict(track_grade_result.baseline_breakdown)
+        baseline_breakdown["track_summary"] = {
+            "hardest_segment_id": rep_seg.segment_id if rep_seg else None,
+            "representative_segment_id": rep_seg.segment_id if rep_seg else None,
+            "hardest_segment_score": round(float(rep_grade.baseline_score), 1)
+            if rep_grade is not None
+            else None,
+            "segment_count": len(segments),
+            "steep_segment_count": steep_count,
+            "snowline_segment_count": snowline_count,
+            "grade_distribution": dict(grade_dist),
+        }
+
+    # Intersecting CAPAD parks via PostGIS (covers border-crossing tracks cleanly)
+    if seg_rows:
+        track_union_sq = (
+            select(func.ST_Union(TrackSegment.geom).label("geom"))
+            .where(TrackSegment.track_id == track_id, TrackSegment.is_active.is_(True))
+            .subquery("track_union")
+        )
+        park_rows = db.execute(
+            select(CAPADPark)
+            .join(track_union_sq, func.ST_Intersects(CAPADPark.geom, track_union_sq.c.geom))
+            .order_by(CAPADPark.name.asc())
+        ).scalars().all()
+        for pk in park_rows:
+            parks_by_id.setdefault(pk.id, pk)
+
+        # Nearby POIs within 1,500 m sorted by metric distance in EPSG:3577
+        dist_expr = func.ST_Distance(
+            func.ST_Transform(POI.geom, 3577),
+            func.ST_Transform(track_union_sq.c.geom, 3577),
+        ).label("distance_m")
         poi_rows = db.execute(
             select(
                 POI,
                 func.ST_X(POI.geom).label("lon"),
                 func.ST_Y(POI.geom).label("lat"),
                 CAPADPark.name.label("park_name"),
+                dist_expr,
+            )
+            .join(
+                track_union_sq,
+                func.ST_DWithin(
+                    func.ST_Transform(POI.geom, 3577),
+                    func.ST_Transform(track_union_sq.c.geom, 3577),
+                    _NEARBY_POI_RADIUS_M,
+                ),
             )
             .outerjoin(CAPADPark, POI.capad_park_id == CAPADPark.id)
-            .where(POI.nearest_segment_id.in_(seg_ids))
-            .order_by(POI.name.asc())
+            .order_by(dist_expr.asc(), POI.name.asc())
+            .limit(25)
         ).all()
-        for poi, lon, lat, park_name in poi_rows:
-            nearby_pois.append(
-                PoiResponse(
-                    id=poi.id,
-                    poi_key=poi.poi_key,
-                    name=poi.name,
-                    poi_type=poi.poi_type,
-                    state=poi.state,
-                    elev_m=poi.elev_m,
-                    access_note=poi.access_note,
-                    nearest_segment_id=poi.nearest_segment_id,
-                    capad_park_name=park_name,
-                    primary_source=poi.primary_source,
-                    source_license=poi.source_license,
-                    lon=float(lon),
-                    lat=float(lat),
-                )
+        nearby_pois = [
+            PoiResponse(
+                id=poi.id,
+                poi_key=poi.poi_key,
+                name=poi.name,
+                poi_type=poi.poi_type,
+                state=poi.state,
+                elev_m=poi.elev_m,
+                access_note=poi.access_note,
+                nearest_segment_id=poi.nearest_segment_id,
+                capad_park_name=park_name,
+                primary_source=poi.primary_source,
+                source_license=poi.source_license,
+                lon=float(lon),
+                lat=float(lat),
+                distance_m=round(float(dist_m), 1),
             )
+            for poi, lon, lat, park_name, dist_m in poi_rows
+        ]
+    else:
+        nearby_pois = []
+
+    if track_grade_result is not None:
+        eff_grade = _RANK_GRADE.get(
+            max(worst_rank, _GRADE_RANK.get(track_grade_result.grade, 0))
+        )
+        peak_score = round(float(track_grade_result.score), 1)
+    else:
+        eff_grade = _RANK_GRADE.get(worst_rank) if worst_rank else None
+        peak_score = round(float(rep_grade.baseline_score), 1) if rep_grade is not None else None
+    capad_parks_list = [
+        summary
+        for pk in sorted(parks_by_id.values(), key=lambda p: p.name)
+        if (summary := _park_to_summary(pk)) is not None
+    ]
 
     return TrackDetailResponse(
         track_id=trk.track_id,
@@ -498,14 +891,31 @@ def get_track_detail(
         total_length_m=trk.total_length_m,
         elev_min_m=trk.elev_min_m,
         elev_max_m=trk.elev_max_m,
+        min_elev_m=trk.elev_min_m,
+        max_elev_m=trk.elev_max_m,
         elev_gain_m=trk.elev_gain_m,
+        elev_loss_m=round(elev_loss_total, 2),
         max_slope_deg=trk.max_slope_deg,
+        sustained_slope_deg=(
+            round(max_sustained_slope, 2) if max_sustained_slope is not None else None
+        ),
         waterway_crossing_count=trk.waterway_crossing_count,
+        is_4wd_only=is_4wd_only,
+        has_gate_barrier=has_gate_barrier,
+        access_status=access_status,
         primary_park_name=primary_park.name if primary_park else None,
-        effective_grade=_RANK_GRADE.get(worst) if worst else None,
+        effective_grade=eff_grade,
+        grade=eff_grade,
+        score=peak_score,
+        bbox=_bbox_list(xmin, ymin, xmax, ymax),
+        source_refs=merged_refs,
+        baseline_breakdown=baseline_breakdown,
+        elevation_profile=elevation_profile,
+        waterway_crossings=waterway_crossings,
         segment_count=len(segments),
         is_active=trk.is_active,
         primary_park=_park_to_summary(primary_park),
+        capad_parks=capad_parks_list,
         segments=segments,
         nearby_pois=nearby_pois,
     )
@@ -628,10 +1038,28 @@ def search_network(
     limit: int = Query(default=20, ge=1, le=100),
     db: Session = Depends(get_db),
 ) -> SearchResponse:
-    """Search canonical tracks (name & aliases), POIs, and CAPAD parks."""
+    """Search canonical tracks (name & aliases), POIs, and CAPAD parks with coordinates/bbox."""
     term = q.strip()
     pattern = f"%{term}%"
     items: list[SearchResultItem] = []
+
+    grade_rank_expr = case(
+        (TrackSegmentGrade.effective_grade == "Easy", 1),
+        (TrackSegmentGrade.effective_grade == "Medium", 2),
+        (TrackSegmentGrade.effective_grade == "Hard", 3),
+        (TrackSegmentGrade.effective_grade == "Extreme", 4),
+        else_=0,
+    )
+    seg_agg = (
+        select(
+            TrackSegment.track_id.label("track_id"),
+            func.max(grade_rank_expr).label("worst_rank"),
+        )
+        .outerjoin(TrackSegmentGrade, TrackSegment.segment_id == TrackSegmentGrade.segment_id)
+        .where(TrackSegment.is_active.is_(True))
+        .group_by(TrackSegment.track_id)
+        .subquery("search_seg_agg")
+    )
 
     track_rows = db.execute(
         select(
@@ -639,9 +1067,15 @@ def search_network(
             Track.name,
             Track.state,
             Track.trail_class,
+            func.coalesce(seg_agg.c.worst_rank, 0).label("worst_rank"),
             func.ST_X(func.ST_Centroid(Track.bbox_geom)).label("lon"),
             func.ST_Y(func.ST_Centroid(Track.bbox_geom)).label("lat"),
+            func.ST_XMin(Track.bbox_geom).label("xmin"),
+            func.ST_YMin(Track.bbox_geom).label("ymin"),
+            func.ST_XMax(Track.bbox_geom).label("xmax"),
+            func.ST_YMax(Track.bbox_geom).label("ymax"),
         )
+        .outerjoin(seg_agg, Track.track_id == seg_agg.c.track_id)
         .where(
             Track.is_active.is_(True),
             or_(
@@ -652,7 +1086,8 @@ def search_network(
         .order_by(Track.name.asc())
         .limit(limit)
     ).all()
-    for tid, name, state, trail_class, lon, lat in track_rows:
+    for tid, name, state, trail_class, worst_rank, lon, lat, xmin, ymin, xmax, ymax in track_rows:
+        eff_grade = _RANK_GRADE.get(int(worst_rank)) if worst_rank else None
         items.append(
             SearchResultItem(
                 kind="track",
@@ -660,8 +1095,11 @@ def search_network(
                 name=name,
                 state=state,
                 subtitle=trail_class.replace("_", " "),
-                lon=float(lon) if lon is not None else None,
-                lat=float(lat) if lat is not None else None,
+                category=trail_class,
+                grade=eff_grade,
+                lon=round(float(lon), 6) if lon is not None else None,
+                lat=round(float(lat), 6) if lat is not None else None,
+                bbox=_bbox_list(xmin, ymin, xmax, ymax),
             )
         )
 
@@ -686,8 +1124,11 @@ def search_network(
                 name=name,
                 state=state,
                 subtitle=poi_type,
-                lon=float(lon),
-                lat=float(lat),
+                category=poi_type,
+                grade=None,
+                lon=round(float(lon), 6),
+                lat=round(float(lat), 6),
+                bbox=None,
             )
         )
 
@@ -699,12 +1140,16 @@ def search_network(
             CAPADPark.park_type,
             func.ST_X(func.ST_PointOnSurface(CAPADPark.geom)).label("lon"),
             func.ST_Y(func.ST_PointOnSurface(CAPADPark.geom)).label("lat"),
+            func.ST_XMin(CAPADPark.geom).label("xmin"),
+            func.ST_YMin(CAPADPark.geom).label("ymin"),
+            func.ST_XMax(CAPADPark.geom).label("xmax"),
+            func.ST_YMax(CAPADPark.geom).label("ymax"),
         )
         .where(CAPADPark.name.ilike(pattern))
         .order_by(CAPADPark.name.asc())
         .limit(limit)
     ).all()
-    for pk_id, name, state, park_type, lon, lat in park_rows:
+    for pk_id, name, state, park_type, lon, lat, xmin, ymin, xmax, ymax in park_rows:
         items.append(
             SearchResultItem(
                 kind="park",
@@ -712,8 +1157,11 @@ def search_network(
                 name=name,
                 state=state,
                 subtitle=park_type,
-                lon=float(lon),
-                lat=float(lat),
+                category=park_type,
+                grade=None,
+                lon=round(float(lon), 6),
+                lat=round(float(lat), 6),
+                bbox=_bbox_list(xmin, ymin, xmax, ymax),
             )
         )
 

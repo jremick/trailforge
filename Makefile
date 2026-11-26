@@ -1,4 +1,4 @@
-.PHONY: help up down logs ps stats lint test test-unit test-integration migrate web-check fixtures
+.PHONY: help up down logs ps stats lint test test-unit test-integration migrate seed-corridor web-check fixtures
 
 help:
 	@echo "TrailForge developer commands:"
@@ -11,6 +11,7 @@ help:
 	@echo "  make test-integration - Run offline PostGIS integration tests inside API container"
 	@echo "  make test             - Run lint + unit tests + integration tests"
 	@echo "  make migrate          - Run Alembic migrations inside API container"
+	@echo "  make seed-corridor    - Ingest synthetic Alps corridor & build PMTiles in /data/tiles"
 	@echo "  make web-check        - Run web typecheck, build, and Vitest suite"
 	@echo "  make fixtures         - Regenerate deterministic synthetic VIC/NSW fixtures"
 
@@ -42,6 +43,10 @@ test: lint test-unit test-integration
 
 migrate:
 	docker compose exec -T api alembic upgrade head
+
+seed-corridor:
+	docker compose exec -T api python -m trailforge.ingestion.pipeline --fixtures tests/fixtures
+	docker compose exec -T api python -m trailforge.tiles.cli --output-dir /data/tiles --dem tests/fixtures/dem_alps_corridor.tif
 
 web-check:
 	cd web && npm run typecheck && npm run build && npm test

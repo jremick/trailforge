@@ -45,12 +45,14 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
       PRIVACY_TRIM_METERS: ${PRIVACY_TRIM_METERS:-250}
       SNOW_LINE_DEFAULT_M: ${SNOW_LINE_DEFAULT_M:-1000}
+      TILES_DIR: ${TILES_DIR:-/data/tiles}
       GDAL_CACHEMAX: ${GDAL_CACHEMAX:-192}
       OMP_THREAD_LIMIT: ${OMP_THREAD_LIMIT:-1}
     ports:
       - "${API_PORT:-8000}:8000"
     volumes:
       - trailforge-data:/data
+      - trailforge_tiles:/data/tiles
     depends_on:
       db:
         condition: service_healthy
@@ -74,10 +76,12 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-30}
       PRIVACY_TRIM_METERS: ${PRIVACY_TRIM_METERS:-250}
+      TILES_DIR: ${TILES_DIR:-/data/tiles}
       GDAL_CACHEMAX: ${GDAL_CACHEMAX:-192}
       OMP_THREAD_LIMIT: ${OMP_THREAD_LIMIT:-1}
     volumes:
       - trailforge-data:/data
+      - trailforge_tiles:/data/tiles
     depends_on:
       db:
         condition: service_healthy
@@ -118,3 +122,4 @@ services:
 volumes:
   trailforge-pgdata:
   trailforge-data:
+  trailforge_tiles:
