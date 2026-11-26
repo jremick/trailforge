@@ -17,12 +17,14 @@ from sqlalchemy import Engine, delete, select, text
 from sqlalchemy.orm import Session
 
 from trailforge.api.grading import router as grading_router
+from trailforge.auth.security import create_access_token, hash_password
 from trailforge.db.models import (
     RainfallSnapshot,
     TelemetryObservation,
     Track,
     TrackSegment,
     TrackSegmentGrade,
+    User,
 )
 from trailforge.db.session import get_db
 from trailforge.grading.cli import build_parser
@@ -545,6 +547,27 @@ def test_postgis_live_grading_rainfall_hotspots_outage_and_api(
             assert fallback.rain_72h_mm == pytest.approx(42.0)
 
             # 6. Verify FastAPI /api/grading/* endpoints via TestClient
+            admin_email = "grading-admin@example.test"
+            admin_user = session.execute(
+                select(User).where(User.email == admin_email).limit(1)
+            ).scalar_one_or_none()
+            if admin_user is None:
+                admin_user = User(
+                    email=admin_email,
+                    display_name="Grading Admin",
+                    password_hash=hash_password("AdminPass123!"),
+                    role="admin",
+                    is_active=True,
+                )
+                session.add(admin_user)
+                session.commit()
+                session.refresh(admin_user)
+            admin_headers = {
+                "Authorization": (
+                    f"Bearer {create_access_token(str(admin_user.id), admin_user.email)}"
+                )
+            }
+
             app = FastAPI()
             app.include_router(grading_router)
 
@@ -553,8 +576,16 @@ def test_postgis_live_grading_rainfall_hotspots_outage_and_api(
 
             app.dependency_overrides[get_db] = _override_db
             with TestClient(app) as client:
+                assert (
+                    client.post(
+                        "/api/grading/recompute",
+                        json={"rain_72h_mm": 18.5, "rain_24h_mm": 6.0},
+                    ).status_code
+                    == 401
+                )
                 r_recomp = client.post(
                     "/api/grading/recompute",
+                    headers=admin_headers,
                     json={"rain_72h_mm": 18.5, "rain_24h_mm": 6.0},
                 )
                 assert r_recomp.status_code == 200
@@ -578,6 +609,7 @@ def test_postgis_live_grading_rainfall_hotspots_outage_and_api(
                     TelemetryObservation.contribution_hash.like(f"{test_contrib_prefix}%")
                 )
             )
+            session.execute(delete(User).where(User.email == "grading-admin@example.test"))
             session.commit()
 
 

@@ -13,7 +13,8 @@ from sqlalchemy import Engine, delete, select
 from sqlalchemy.orm import Session
 
 from trailforge.api.closures import router as closures_router
-from trailforge.db.models import ClosureAlert, FeedSyncStatus, SegmentClosureLink, Track
+from trailforge.auth.security import create_access_token, hash_password
+from trailforge.db.models import ClosureAlert, FeedSyncStatus, SegmentClosureLink, Track, User
 from trailforge.db.session import get_db
 from trailforge.feeds import (
     FEED_REGISTRY,
@@ -334,7 +335,28 @@ def test_closures_sync_propagation_capad_join_and_outage_resilience(
         assert stale_health["overall_status"] in ("degraded", "stale")
         assert all(f["is_stale"] for f in stale_health["feeds"])
 
-        # 8. Test Closures FastAPI router endpoints end-to-end (including POST /sync recovery)
+        # 8. Test Closures FastAPI router endpoints end-to-end (including admin POST /sync)
+        admin_email = "closures-sync-admin@example.test"
+        existing_admin = session.execute(
+            select(User).where(User.email == admin_email).limit(1)
+        ).scalar_one_or_none()
+        if existing_admin is None:
+            admin_user = User(
+                email=admin_email,
+                display_name="Closures Admin",
+                password_hash=hash_password("AdminPass123!"),
+                role="admin",
+                is_active=True,
+            )
+            session.add(admin_user)
+            session.commit()
+            session.refresh(admin_user)
+        else:
+            admin_user = existing_admin
+        admin_headers = {
+            "Authorization": f"Bearer {create_access_token(str(admin_user.id), admin_user.email)}"
+        }
+
         app = FastAPI()
         app.include_router(closures_router)
 
@@ -343,43 +365,53 @@ def test_closures_sync_propagation_capad_join_and_outage_resilience(
                 yield db_sess
 
         app.dependency_overrides[get_db] = _override_db
-        with TestClient(app) as api_client:
-            r_list = api_client.get("/api/closures?active_only=true&state=VIC")
-            assert r_list.status_code == 200
-            payload = r_list.json()
-            assert len(payload["items"]) >= 3
-            assert len(payload["feeds"]) == 5
+        try:
+            with TestClient(app) as api_client:
+                r_list = api_client.get("/api/closures?active_only=true&state=VIC")
+                assert r_list.status_code == 200
+                payload = r_list.json()
+                assert len(payload["items"]) >= 3
+                assert len(payload["feeds"]) == 5
 
-            r_geo = api_client.get("/api/closures/geojson")
-            assert r_geo.status_code == 200
-            assert r_geo.json()["type"] == "FeatureCollection"
-            assert len(r_geo.json()["features"]) > 0
+                r_geo = api_client.get("/api/closures/geojson")
+                assert r_geo.status_code == 200
+                assert r_geo.json()["type"] == "FeatureCollection"
+                assert len(r_geo.json()["features"]) > 0
 
-            r_status = api_client.get("/api/closures/status")
-            assert r_status.status_code == 200
-            assert r_status.json()["overall_status"] == "degraded"
+                r_status = api_client.get("/api/closures/status")
+                assert r_status.status_code == 200
+                assert r_status.json()["overall_status"] == "degraded"
 
-            # Re-sync from fixtures recovers vic_emergency back to healthy
-            r_sync = api_client.post(
-                "/api/closures/sync",
-                json={
-                    "use_fixtures": True,
-                    "fixtures_path": str(fixtures_dir / "closures_sample.json"),
-                },
-            )
-            assert r_sync.status_code == 200
-            assert r_sync.json()["overall_ok"] is True
+                # Anonymous POST /sync must be rejected with 401
+                r_anon = api_client.post("/api/closures/sync", json={"use_fixtures": True})
+                assert r_anon.status_code == 401
 
-            r_status_ok = api_client.get("/api/closures/status")
-            assert r_status_ok.json()["overall_status"] == "healthy"
-
-            # Path-traversal / arbitrary-file-read confinement regression checks (#40)
-            for bad_path in ("/etc/passwd", "../../pyproject.toml", "/tmp/outside.json"):
-                r_bad = api_client.post(
+                # Re-sync from fixtures recovers vic_emergency back to healthy (admin required)
+                r_sync = api_client.post(
                     "/api/closures/sync",
-                    json={"use_fixtures": True, "fixtures_path": bad_path},
+                    headers=admin_headers,
+                    json={
+                        "use_fixtures": True,
+                        "fixtures_path": str(fixtures_dir / "closures_sample.json"),
+                    },
                 )
-                assert r_bad.status_code == 422, f"Expected 422 for {bad_path}"
+                assert r_sync.status_code == 200
+                assert r_sync.json()["overall_ok"] is True
+
+                r_status_ok = api_client.get("/api/closures/status")
+                assert r_status_ok.json()["overall_status"] == "healthy"
+
+                # Path-traversal / arbitrary-file-read confinement regression checks (#40)
+                for bad_path in ("/etc/passwd", "../../pyproject.toml", "/tmp/outside.json"):
+                    r_bad = api_client.post(
+                        "/api/closures/sync",
+                        headers=admin_headers,
+                        json={"use_fixtures": True, "fixtures_path": bad_path},
+                    )
+                    assert r_bad.status_code == 422, f"Expected 422 for {bad_path}"
+        finally:
+            session.execute(delete(User).where(User.email == admin_email))
+            session.commit()
 
         # 9. Verify worker periodic sync respects sync_interval_s and runs offline cleanly
         res_not_due = run_due_closure_syncs(

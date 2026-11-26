@@ -1,4 +1,4 @@
-"""FastAPI authentication dependencies supporting anonymous read-only & signed-in access."""
+"""FastAPI authentication & role-based access dependencies."""
 
 from __future__ import annotations
 
@@ -28,11 +28,8 @@ def extract_token(request: Request) -> str | None:
     return None
 
 
-def get_optional_current_user(
-    request: Request,
-    db: Session = Depends(get_db),
-) -> User | None:
-    """Return authenticated active User when valid credentials exist, else None (never 401)."""
+def resolve_token_user(request: Request, db: Session) -> User | None:
+    """Resolve a User row from a valid Bearer/cookie token without filtering ``is_active``."""
     token = extract_token(request)
     if not token:
         return None
@@ -43,20 +40,50 @@ def get_optional_current_user(
         user_uuid = uuid.UUID(str(payload["sub"]))
     except (KeyError, ValueError):
         return None
-    user = db.get(User, user_uuid)
+    return db.get(User, user_uuid)
+
+
+def get_optional_current_user(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> User | None:
+    """Return authenticated active User when valid credentials exist, else None (never 401)."""
+    user = resolve_token_user(request, db)
     if user is None or not user.is_active:
         return None
     return user
 
 
 def get_current_user(
-    user: User | None = Depends(get_optional_current_user),
+    request: Request,
+    db: Session = Depends(get_db),
 ) -> User:
-    """Require an authenticated active user; raises 401 Unauthorized otherwise."""
+    """Require an authenticated active user (401 anonymous, 403 suspended)."""
+    user = resolve_token_user(request, db)
     if user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication required",
             headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is suspended",
+        )
+    return user
+
+
+require_user = get_current_user
+
+
+def require_admin(
+    user: User = Depends(get_current_user),
+) -> User:
+    """Require an authenticated active admin user (401 anonymous, 403 member/suspended)."""
+    if user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin privileges required",
         )
     return user

@@ -1,9 +1,9 @@
-"""SQLAlchemy 2 + GeoAlchemy2 spatial models for TrailForge (Slices 01-09 + Phase B Pan-AU).
+"""SQLAlchemy 2 + GeoAlchemy2 spatial models for TrailForge (Slices 01-09 + v1.1.0).
 
-Implements all 28 PostGIS tables across three strict OSM ODbL separation tiers:
+Implements all 30 PostGIS tables across three strict OSM ODbL separation tiers:
   - Tier A (7 tables): Dedicated upstream source staging tables (incl. Pan-AU state tracks)
   - Tier B (5 tables): Canonical conflated network & reference tables
-  - Tier C (16 tables): Independent TrailForge grading, live feeds, telemetry & community tables
+  - Tier C (18 tables): Independent TrailForge grading, feeds, telemetry & access-control tables
 """
 
 from __future__ import annotations
@@ -613,7 +613,7 @@ class POI(Base):
 
 
 # =============================================================================
-# Tier C — Independent TrailForge Intelligence, Community & Live Tables (15 Tables)
+# Tier C — Independent TrailForge Intelligence, Community & Live Tables (18 Tables)
 # Strictly zero raw OSM geometries and zero OSM tag blobs.
 # =============================================================================
 
@@ -809,7 +809,7 @@ class User(Base):
 
     __tablename__ = "users"
     __table_args__ = (
-        CheckConstraint("role IN ('user','moderator','admin')", name="role_valid"),
+        CheckConstraint("role IN ('admin','member')", name="role_valid"),
         Index("ix_users_lower_email", text("lower(email)")),
     )
 
@@ -819,13 +819,61 @@ class User(Base):
     email: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     display_name: Mapped[str] = mapped_column(Text, nullable=False)
     password_hash: Mapped[str] = mapped_column(Text, nullable=False)
-    role: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'user'"))
+    role: Mapped[str] = mapped_column(String(16), nullable=False, server_default=text("'member'"))
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    invited_by_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class InviteCode(Base):
+    """Invite-only registration codes for public instances (Tier C — zero OSM data)."""
+
+    __tablename__ = "invite_codes"
+    __table_args__ = (
+        CheckConstraint("role IN ('admin','member')", name="role_valid"),
+        CheckConstraint("max_uses >= 1", name="max_uses_min"),
+        CheckConstraint("use_count >= 0", name="use_count_nonneg"),
+        UniqueConstraint("code", name="uq_invite_codes_code"),
+        Index("ix_invite_codes_code", "code"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    code: Mapped[str] = mapped_column(String(64), nullable=False)
+    label: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    role: Mapped[str] = mapped_column(String(16), nullable=False, server_default=text("'member'"))
+    max_uses: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    use_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class UsageMetricHourly(Base):
+    """Hourly aggregated API request, error, egress, and rate-limit metrics (Tier C)."""
+
+    __tablename__ = "usage_metrics_hourly"
+    __table_args__ = (Index("ix_usage_metrics_hourly_bucket_hour", "bucket_hour"),)
+
+    bucket_hour: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    route_group: Mapped[str] = mapped_column(String(48), primary_key=True)
+    request_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    error_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    bytes_out: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    rate_limited_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
     )
 
 
@@ -1346,6 +1394,7 @@ __all__ = [
     "ConditionReport",
     "ConditionReportVote",
     "FeedSyncStatus",
+    "InviteCode",
     "OfflinePack",
     "POI",
     "PlannedRoute",
@@ -1365,6 +1414,7 @@ __all__ = [
     "TrackSegmentGrade",
     "Trip",
     "UnmappedTrackCandidate",
+    "UsageMetricHourly",
     "User",
     "UserFavorite",
     "UserPin",

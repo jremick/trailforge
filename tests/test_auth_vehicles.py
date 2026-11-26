@@ -18,6 +18,7 @@ from trailforge.auth.security import (
     verify_access_token,
     verify_password,
 )
+from trailforge.db.models import User
 from trailforge.db.session import get_db
 from trailforge.ingestion.connectors.fixtures import load_corridor_fixtures
 from trailforge.ingestion.pipeline import ingest_corridor_dataset
@@ -170,7 +171,8 @@ def _truncate_all(engine: Engine) -> None:
                     telemetry_observations, unmapped_track_candidates,
                     segment_closure_links, closures_alerts, feed_sync_status,
                     segment_reconciliation_log, track_segment_grades,
-                    user_favorites, user_pins, vehicle_profiles, users,
+                    user_favorites, user_pins, vehicle_profiles, invite_codes,
+                    usage_metrics_hourly, users,
                     pois, track_segments, tracks, capad_parks,
                     source_tracks_osm, source_tracks_vic, source_tracks_nsw,
                     source_waterways, source_pois, source_capad_parks
@@ -380,9 +382,25 @@ def test_auth_vehicle_profiles_and_track_suitability_end_to_end(
                 assert remaining[0]["id"] == v1["id"]
                 assert remaining[0]["is_active"] is True
 
-                # 7. Slice 04 + 05 cross-integration: sync offline closures & verify on tracks
+                # 7. Slice 04 + 05 cross-integration: sync offline closures (admin) & verify tracks
+                sync_admin = User(
+                    email="sync.admin@highcountry.au",
+                    display_name="Sync Admin",
+                    password_hash=hash_password("AdminPassword123!"),
+                    role="admin",
+                    is_active=True,
+                )
+                session.add(sync_admin)
+                session.commit()
+                session.refresh(sync_admin)
+                admin_headers = {
+                    "Authorization": (
+                        f"Bearer {create_access_token(str(sync_admin.id), sync_admin.email)}"
+                    )
+                }
                 r_sync = client.post(
                     "/api/closures/sync",
+                    headers=admin_headers,
                     json={
                         "use_fixtures": True,
                         "fixtures_path": str(fixtures_dir / "closures_sample.json"),

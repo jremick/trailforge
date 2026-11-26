@@ -29,6 +29,8 @@ from sqlalchemy import Engine, text
 from sqlalchemy.orm import Session
 
 from trailforge.api.main import create_app
+from trailforge.auth.security import create_access_token, hash_password
+from trailforge.db.models import User
 from trailforge.db.session import get_db
 from trailforge.export.formats import EXPORT_ATTRIBUTIONS, GPX_NS
 from trailforge.ingestion.connectors.fixtures import load_corridor_fixtures
@@ -56,7 +58,8 @@ def _truncate_all(engine: Engine) -> None:
                     telemetry_observations, unmapped_track_candidates, trips,
                     segment_closure_links, closures_alerts, feed_sync_status,
                     segment_reconciliation_log, track_segment_grades,
-                    user_favorites, user_pins, vehicle_profiles, users,
+                    user_favorites, user_pins, vehicle_profiles, invite_codes,
+                    usage_metrics_hourly, users,
                     pois, track_segments, tracks, capad_parks,
                     source_tracks_osm, source_tracks_vic, source_tracks_nsw,
                     source_tracks_au_state,
@@ -136,6 +139,22 @@ def test_checkpoint_c_full_v1_pipeline_end_to_end(
             assert seed_summary["passes_seeded"] == 5
             assert seed_summary["observations_inserted"] > 500
 
+            admin_user = User(
+                email="checkpoint_admin@trailforge.local",
+                display_name="Checkpoint Admin",
+                password_hash=hash_password("AdminPassword123!"),
+                role="admin",
+                is_active=True,
+            )
+            session.add(admin_user)
+            session.commit()
+            session.refresh(admin_user)
+            admin_headers = {
+                "Authorization": (
+                    f"Bearer {create_access_token(str(admin_user.id), admin_user.email)}"
+                )
+            }
+
             app = create_app()
 
             def _override_db() -> Generator[Session, None, None]:
@@ -143,9 +162,10 @@ def test_checkpoint_c_full_v1_pipeline_end_to_end(
 
             app.dependency_overrides[get_db] = _override_db
             with TestClient(app) as client:
-                # 3. Sync official VIC/NSW closures + OSM access flags
+                # 3. Sync official VIC/NSW closures + OSM access flags (admin required)
                 r_sync = client.post(
                     "/api/closures/sync",
+                    headers=admin_headers,
                     json={
                         "use_fixtures": True,
                         "fixtures_path": str(fixtures_dir / "closures_sample.json"),
@@ -191,9 +211,10 @@ def test_checkpoint_c_full_v1_pipeline_end_to_end(
                 assert r_trip.status_code == 201, r_trip.text
                 assert r_trip.json()["observations_published"] > 100
 
-                # 5. Recompute explainable live grades + 72h rainfall wet-risk (22.5 mm -> wet)
+                # 5. Recompute explainable live grades + 72h rainfall wet-risk (admin required)
                 r_grade = client.post(
                     "/api/grading/recompute",
+                    headers=admin_headers,
                     json={"rain_72h_mm": 22.5, "rain_24h_mm": 8.0},
                 )
                 assert r_grade.status_code == 200, r_grade.text
@@ -258,6 +279,7 @@ def test_checkpoint_c_full_v1_pipeline_end_to_end(
                 # 8. Build `australian-alps` offline regional pack & verify checksums + snapshot
                 r_build = client.post(
                     "/api/packs/australian-alps/build",
+                    headers=admin_headers,
                     json={
                         "dem_path": str(fixtures_dir / "dem_alps_corridor.tif"),
                         "skip_tiles": True,

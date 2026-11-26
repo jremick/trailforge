@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tarfile
 import tracemalloc
+import uuid
 from collections.abc import Generator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,7 +24,9 @@ from sqlalchemy.orm import Session
 from trailforge.api.main import create_app
 from trailforge.api.packs import get_packs_dir_dep
 from trailforge.api.packs import router as packs_router
-from trailforge.db.models import OfflinePack, TrackSegment, TrackSegmentGrade
+from trailforge.auth.dependencies import require_admin
+from trailforge.auth.security import create_access_token, hash_password
+from trailforge.db.models import OfflinePack, TrackSegment, TrackSegmentGrade, User
 from trailforge.db.session import get_db
 from trailforge.feeds.sync import sync_from_fixtures
 from trailforge.ingestion.connectors.fixtures import load_corridor_fixtures
@@ -187,6 +190,15 @@ def test_packs_api_range_206_and_strict_traversal_rejection(tmp_path: Path) -> N
 
     app = _build_test_app()
     app.dependency_overrides[get_packs_dir_dep] = lambda: packs_dir
+    stub_admin = User(
+        id=uuid.uuid4(),
+        email="unit-admin@example.test",
+        display_name="Unit Admin",
+        password_hash="scrypt$stub",
+        role="admin",
+        is_active=True,
+    )
+    app.dependency_overrides[require_admin] = lambda: stub_admin
     try:
         with TestClient(app) as client:
             # HEAD full archive
@@ -290,7 +302,8 @@ def _truncate_all(engine: Engine) -> None:
                     telemetry_observations, unmapped_track_candidates,
                     segment_closure_links, closures_alerts, feed_sync_status,
                     segment_reconciliation_log, track_segment_grades,
-                    user_favorites, user_pins, vehicle_profiles, users,
+                    user_favorites, user_pins, vehicle_profiles, invite_codes,
+                    usage_metrics_hourly, users,
                     pois, track_segments, tracks, capad_parks,
                     source_tracks_osm, source_tracks_vic, source_tracks_nsw,
                     source_tracks_au_state,
@@ -414,14 +427,42 @@ def test_all_four_regional_packs_build_checksums_tarball_snapshot_range_and_memo
                     isinstance(r["states"], list) and len(r["states"]) >= 1 for r in before_regions
                 )
 
+                # Create an admin user for POST /api/packs/{region_id}/build
+                pack_admin = User(
+                    email="pack.admin@highcountry.au",
+                    display_name="Pack Admin",
+                    password_hash=hash_password("AdminPack4WD!"),
+                    role="admin",
+                    is_active=True,
+                )
+                session.add(pack_admin)
+                session.commit()
+                session.refresh(pack_admin)
+                admin_headers = {
+                    "Authorization": (
+                        f"Bearer {create_access_token(str(pack_admin.id), pack_admin.email)}"
+                    )
+                }
+
+                # Regular member cannot build packs -> 403
+                assert (
+                    client.post(
+                        "/api/packs/australian-alps/build",
+                        headers=headers,
+                        json={"dem_path": str(fixtures_dir / "dem_alps_corridor.tif")},
+                    ).status_code
+                    == 403
+                )
+
                 # 2. Build the 4 core VIC/NSW regions while tracking peak Python RAM (< 300 MB)
                 built_rids = ("australian-alps", "blue-mountains", "vic", "nsw")
                 dem_fixture = fixtures_dir / "dem_alps_corridor.tif"
                 tracemalloc.start()
                 try:
-                    # Build australian-alps via HTTP endpoint
+                    # Build australian-alps via HTTP endpoint (admin authenticated)
                     r_build_alps = client.post(
                         "/api/packs/australian-alps/build",
+                        headers=admin_headers,
                         json={"dem_path": str(dem_fixture)},
                     )
                     assert r_build_alps.status_code == 200, r_build_alps.text

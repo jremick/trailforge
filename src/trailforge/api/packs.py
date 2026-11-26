@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Iterator
 from datetime import UTC
@@ -15,7 +16,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from trailforge.db.models import OfflinePack
+from trailforge.auth.dependencies import require_admin
+from trailforge.config import get_settings
+from trailforge.db.models import OfflinePack, User
 from trailforge.db.session import get_db
 from trailforge.packs.builder import (
     BUNDLE_FILENAME,
@@ -232,6 +235,19 @@ def _stream_file_slice(file_path: Path, start: int, length: int) -> Iterator[byt
             yield chunk
 
 
+def _get_packs_public_base_url() -> str:
+    """Safely read optional public R2/CDN base URL for offline pack downloads."""
+    cfg = get_settings()
+    val = getattr(cfg, "packs_public_base_url", None)
+    if val is not None:
+        raw = str(val)
+    else:
+        raw = os.environ.get("PACKS_PUBLIC_BASE_URL") or os.environ.get(
+            "TRAILFORGE_PACKS_PUBLIC_BASE_URL", ""
+        )
+    return raw.strip().rstrip("/")
+
+
 def _build_region_summary(
     region: PackRegionSpec,
     packs_dir: Path,
@@ -243,6 +259,7 @@ def _build_region_summary(
     bundle_path = region_dir / BUNDLE_FILENAME
     vector_path = region_dir / VECTOR_TILE_FILENAME
     terrain_path = region_dir / TERRAIN_TILE_FILENAME
+    public_base = _get_packs_public_base_url()
 
     if manifest is not None:
         pack_status = "ready"
@@ -259,6 +276,25 @@ def _build_region_summary(
         terrain_available = terrain_path.is_file()
         bounds = manifest.bounds
         attributions = manifest.attributions
+    elif public_base and db_row is not None and db_row.status == "ready":
+        pack_status = "ready"
+        version = db_row.version
+        generated_at = (
+            db_row.built_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            if db_row.built_at is not None
+            else None
+        )
+        total_size_bytes = int(db_row.size_bytes or 0)
+        bundle_size_bytes = 0
+        track_count = 0
+        segment_count = 0
+        poi_count = 0
+        vector_available = bool(db_row.vector_pmtiles_path)
+        terrain_available = bool(db_row.terrain_pmtiles_path)
+        bounds = list(region.bbox)
+        attributions = (
+            list(db_row.attributions) if db_row.attributions else list(region.attributions)
+        )
     else:
         if db_row is not None and db_row.status in ("building", "failed"):
             pack_status = db_row.status
@@ -279,6 +315,19 @@ def _build_region_summary(
         terrain_available = False
         bounds = list(region.bbox)
         attributions = list(region.attributions)
+
+    if public_base:
+        manifest_url = f"{public_base}/{rid}/{MANIFEST_FILENAME}"
+        snapshot_url = f"{public_base}/{rid}/{SNAPSHOT_FILENAME}"
+        bundle_url = f"{public_base}/{rid}/{BUNDLE_FILENAME}"
+        vector_pmtiles_url = f"{public_base}/{rid}/{VECTOR_TILE_FILENAME}"
+        terrain_pmtiles_url = f"{public_base}/{rid}/{TERRAIN_TILE_FILENAME}"
+    else:
+        manifest_url = f"/api/packs/{rid}/{MANIFEST_FILENAME}"
+        snapshot_url = f"/api/packs/{rid}/{SNAPSHOT_FILENAME}"
+        bundle_url = f"/api/packs/{rid}/{BUNDLE_FILENAME}"
+        vector_pmtiles_url = f"/api/packs/{rid}/tiles/{VECTOR_TILE_FILENAME}"
+        terrain_pmtiles_url = f"/api/packs/{rid}/tiles/{TERRAIN_TILE_FILENAME}"
 
     return {
         "region_id": rid,
@@ -301,11 +350,11 @@ def _build_region_summary(
         "poi_count": poi_count,
         "vector_available": vector_available,
         "terrain_available": terrain_available,
-        "manifest_url": f"/api/packs/{rid}/{MANIFEST_FILENAME}",
-        "snapshot_url": f"/api/packs/{rid}/{SNAPSHOT_FILENAME}",
-        "bundle_url": f"/api/packs/{rid}/{BUNDLE_FILENAME}",
-        "vector_pmtiles_url": f"/api/packs/{rid}/tiles/{VECTOR_TILE_FILENAME}",
-        "terrain_pmtiles_url": f"/api/packs/{rid}/tiles/{TERRAIN_TILE_FILENAME}",
+        "manifest_url": manifest_url,
+        "snapshot_url": snapshot_url,
+        "bundle_url": bundle_url,
+        "vector_pmtiles_url": vector_pmtiles_url,
+        "terrain_pmtiles_url": terrain_pmtiles_url,
         "attributions": attributions,
     }
 
@@ -330,6 +379,7 @@ def list_packs(
 def build_pack_endpoint(
     region_id: str,
     body: PackBuildRequest | None = None,
+    _admin: User = Depends(require_admin),
     packs_dir: Path = Depends(get_packs_dir_dep),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:

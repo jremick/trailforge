@@ -1,15 +1,23 @@
-"""Self-hostable user registration, login, logout, and optional session inspection API."""
+"""Self-hostable user registration, login, logout, config, and session inspection API."""
 
 from __future__ import annotations
 
-from typing import Annotated
+from datetime import UTC, datetime
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field, StringConstraints
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from trailforge.auth.dependencies import get_optional_current_user
+from trailforge.auth.dependencies import resolve_token_user
+from trailforge.auth.invites import (
+    get_admin_email,
+    get_demo_banner,
+    get_registration_mode,
+    normalize_invite_code,
+)
 from trailforge.auth.security import (
     create_access_token,
     hash_password,
@@ -17,7 +25,7 @@ from trailforge.auth.security import (
     verify_password,
 )
 from trailforge.config import get_settings
-from trailforge.db.models import User, VehicleProfile
+from trailforge.db.models import InviteCode, User, VehicleProfile
 from trailforge.db.session import get_db
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -29,6 +37,7 @@ class RegisterRequest(BaseModel):
         str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)
     ]
     password: str = Field(..., min_length=8, max_length=128)
+    invite_code: str | None = Field(default=None, max_length=64)
 
 
 class LoginRequest(BaseModel):
@@ -40,6 +49,8 @@ class UserPublic(BaseModel):
     id: str
     email: str
     display_name: str
+    role: Literal["admin", "member"] = "member"
+    is_active: bool = True
     active_vehicle_profile_id: str | None = None
 
 
@@ -54,6 +65,12 @@ class AuthMeResponse(BaseModel):
     user: UserPublic | None = None
 
 
+class AuthConfigResponse(BaseModel):
+    registration_mode: Literal["open", "invite_only", "closed"]
+    demo_banner: str
+    allow_anonymous_browsing: bool = True
+
+
 def _get_active_vehicle_id(db: Session, user: User) -> str | None:
     vid = db.execute(
         select(VehicleProfile.id)
@@ -64,10 +81,13 @@ def _get_active_vehicle_id(db: Session, user: User) -> str | None:
 
 
 def _to_user_public(db: Session, user: User) -> UserPublic:
+    role: Literal["admin", "member"] = "admin" if user.role == "admin" else "member"
     return UserPublic(
         id=str(user.id),
         email=user.email,
         display_name=user.display_name,
+        role=role,
+        is_active=bool(user.is_active),
         active_vehicle_profile_id=_get_active_vehicle_id(db, user),
     )
 
@@ -85,13 +105,23 @@ def _set_session_cookie(response: Response, token: str) -> None:
     )
 
 
+@router.get("/config", response_model=AuthConfigResponse)
+def get_auth_config() -> AuthConfigResponse:
+    """Return public registration mode and optional demo banner for frontend boot."""
+    return AuthConfigResponse(
+        registration_mode=get_registration_mode(),
+        demo_banner=get_demo_banner(),
+        allow_anonymous_browsing=True,
+    )
+
+
 @router.post("/register", response_model=AuthTokenResponse, status_code=status.HTTP_201_CREATED)
 def register_user(
     payload: RegisterRequest,
     response: Response,
     db: Session = Depends(get_db),
 ) -> AuthTokenResponse:
-    """Create a self-hosted user account and issue a signed Bearer token + HttpOnly cookie."""
+    """Create a user account respecting registration_mode, invites, and admin bootstrap."""
     try:
         email = normalize_email(payload.email)
         pw_hash = hash_password(payload.password)
@@ -100,6 +130,13 @@ def register_user(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
         ) from exc
+
+    mode = get_registration_mode()
+    if mode == "closed":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Registration is closed",
+        )
 
     existing = db.execute(
         select(User).where(func.lower(User.email) == email).limit(1)
@@ -110,13 +147,94 @@ def register_user(
             detail="An account with this email already exists",
         )
 
+    bootstrap_email = get_admin_email()
+    is_admin_bootstrap = False
+    if bootstrap_email and email == bootstrap_email:
+        has_existing_admin = (
+            db.execute(select(User.id).where(User.role == "admin").limit(1)).scalar_one_or_none()
+            is not None
+        )
+        is_admin_bootstrap = not has_existing_admin
+
+    assigned_role = "member"
+    used_invite_code: str | None = None
+    raw_code = normalize_invite_code(payload.invite_code) if payload.invite_code else ""
+
+    if is_admin_bootstrap:
+        assigned_role = "admin"
+    elif mode == "invite_only" and not raw_code:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="An invite code is required to register",
+        )
+    elif raw_code:
+        now = datetime.now(UTC)
+        invite = db.execute(
+            select(InviteCode)
+            .where(func.upper(InviteCode.code) == raw_code)
+            .with_for_update()
+        ).scalar_one_or_none()
+        if invite is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Invalid invite code",
+            )
+        if invite.revoked_at is not None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Invite code has been revoked",
+            )
+        if invite.expires_at is not None:
+            exp = (
+                invite.expires_at.astimezone(UTC)
+                if invite.expires_at.tzinfo
+                else invite.expires_at.replace(tzinfo=UTC)
+            )
+            if exp <= now:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Invite code has expired",
+                )
+        if invite.use_count >= invite.max_uses:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Invite code has reached its maximum uses",
+            )
+
+        updated = db.execute(
+            update(InviteCode)
+            .where(
+                InviteCode.id == invite.id,
+                InviteCode.revoked_at.is_(None),
+                InviteCode.use_count < InviteCode.max_uses,
+            )
+            .values(use_count=InviteCode.use_count + 1)
+            .returning(InviteCode.code, InviteCode.role)
+        ).one_or_none()
+        if updated is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Invite code has reached its maximum uses",
+            )
+        used_invite_code, assigned_role = updated
+
     user = User(
         email=email,
         display_name=payload.display_name.strip(),
         password_hash=pw_hash,
+        role=assigned_role,
+        is_active=True,
+        invited_by_code=used_invite_code,
     )
     db.add(user)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An account with this email already exists",
+        ) from exc
     db.refresh(user)
 
     token = create_access_token(str(user.id), user.email)
@@ -142,14 +260,15 @@ def login_user(
     user = db.execute(
         select(User).where(func.lower(User.email) == email).limit(1)
     ).scalar_one_or_none()
-    if (
-        user is None
-        or not user.is_active
-        or not verify_password(payload.password, user.password_hash)
-    ):
+    if user is None or not verify_password(payload.password, user.password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",
+        )
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is suspended",
         )
 
     token = create_access_token(str(user.id), user.email)
@@ -167,10 +286,16 @@ def logout_user(response: Response) -> dict[str, bool]:
 
 @router.get("/me", response_model=AuthMeResponse)
 def get_me(
-    user: User | None = Depends(get_optional_current_user),
+    request: Request,
     db: Session = Depends(get_db),
 ) -> AuthMeResponse:
-    """Return active session state; returns `authenticated: false` cleanly when anonymous."""
+    """Return active session state; anonymous gets `authenticated: false`, suspended gets `403`."""
+    user = resolve_token_user(request, db)
     if user is None:
         return AuthMeResponse(authenticated=False, user=None)
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is suspended",
+        )
     return AuthMeResponse(authenticated=True, user=_to_user_public(db, user))

@@ -10,6 +10,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from trailforge.auth.dependencies import require_admin
+from trailforge.db.models import User
 from trailforge.db.session import get_db
 from trailforge.feeds.adapters import build_default_adapters
 from trailforge.feeds.queries import (
@@ -145,6 +147,7 @@ def get_closures_status(
 @router.post("/sync", response_model=SyncRunSummary)
 def trigger_closures_sync(
     body: ClosureSyncRequest | None = None,
+    _admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> SyncRunSummary:
     """Trigger an on-demand sync of closure feeds (defaults to offline fixtures when available)."""

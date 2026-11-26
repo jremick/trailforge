@@ -8,6 +8,8 @@ from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from trailforge.auth.dependencies import require_admin
+from trailforge.db.models import User
 from trailforge.db.session import get_db
 from trailforge.grading.live import (
     LiveGradingRecomputeSummary,
@@ -43,6 +45,7 @@ class RecomputeGradingRequest(BaseModel):
 @router.post("/recompute", response_model=LiveGradingRecomputeSummary)
 def trigger_live_grading_recompute(
     body: RecomputeGradingRequest | None = None,
+    _admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> LiveGradingRecomputeSummary:
     """Recompute live crowdsourced difficulty grades, obstacle hotspots, and 72h rainfall."""
