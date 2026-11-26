@@ -1,3 +1,4 @@
+import { ElevationProfileModal } from "./elevationModal";
 import {
   formatClosureDateRange,
   formatClosureTypeLabel,
@@ -85,6 +86,7 @@ export interface TrackInspectorCallbacks {
 export class TrackInspectorDrawer {
   private readonly root: HTMLElement;
   private readonly callbacks: TrackInspectorCallbacks;
+  private readonly elevationModal: ElevationProfileModal;
   private currentDetail: TrackInspectorDetail | null = null;
   private showReportForm = false;
   private reportSubmitting = false;
@@ -102,6 +104,11 @@ export class TrackInspectorDrawer {
   constructor(container: HTMLElement, callbacks: TrackInspectorCallbacks) {
     this.root = container;
     this.callbacks = callbacks;
+    this.elevationModal = new ElevationProfileModal({
+      onZoomToTrack: (bbox) => this.callbacks.onZoomToTrack(bbox),
+      onExportTrack: (trackId, format) =>
+        this.callbacks.onExportTrack(trackId, format),
+    });
     this.root.className = "tf-inspector";
     this.root.setAttribute("aria-label", "Track Inspector");
     this.root.setAttribute("aria-hidden", "true");
@@ -188,6 +195,7 @@ export class TrackInspectorDrawer {
     this.currentDetail = null;
     this.showReportForm = false;
     this.reportError = null;
+    this.elevationModal.close();
     this.root.setAttribute("aria-hidden", "true");
   }
 
@@ -934,13 +942,20 @@ export class TrackInspectorDrawer {
         <section class="tf-insp-section">
           <div class="tf-insp-sec-head">
             <h3>Elevation Profile</h3>
-            <span class="mono tf-insp-meta">${
-              chart.steepZoneCount > 0
-                ? `${chart.steepZoneCount} steep ≥14° ${chart.steepZoneCount === 1 ? "zone" : "zones"}`
-                : "DEM AHD"
-            }</span>
+            <div class="tf-elev-head-right">
+              <span class="mono tf-insp-meta">${
+                chart.steepZoneCount > 0
+                  ? `${chart.steepZoneCount} steep ≥14° ${chart.steepZoneCount === 1 ? "zone" : "zones"}`
+                  : "DEM AHD"
+              }</span>
+              ${
+                norm.profile.length >= 2
+                  ? `<button type="button" class="tf-mini-btn tf-elev-expand-btn" data-role="expand-elevation" title="Open large interactive elevation & track profile window">⤢ Expand</button>`
+                  : ""
+              }
+            </div>
           </div>
-          <div class="tf-elev-chart-wrap">
+          <div class="tf-elev-chart-wrap ${norm.profile.length >= 2 ? "expandable" : ""}" ${norm.profile.length >= 2 ? 'data-role="expand-elevation-chart" title="Click to open large interactive elevation profile"' : ""}>
             ${chart.svgHtml}
           </div>
         </section>
@@ -999,6 +1014,18 @@ export class TrackInspectorDrawer {
     `;
 
     this.bindClose();
+
+    this.root
+      .querySelector<HTMLButtonElement>("[data-role='expand-elevation']")
+      ?.addEventListener("click", () => {
+        this.elevationModal.open(detail, this.context.snowLineElevationM);
+      });
+
+    this.root
+      .querySelector<HTMLElement>("[data-role='expand-elevation-chart']")
+      ?.addEventListener("click", () => {
+        this.elevationModal.open(detail, this.context.snowLineElevationM);
+      });
 
     this.root
       .querySelector<HTMLButtonElement>("[data-role='change-rig']")

@@ -1492,11 +1492,370 @@ button {
   color: var(--accent-cyan);
 }
 
+.tf-elev-head-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tf-elev-expand-btn {
+  padding: 2px 7px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  border-color: rgba(148, 163, 184, 0.3);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.tf-elev-expand-btn:hover {
+  border-color: var(--accent-cyan);
+  color: var(--accent-cyan);
+  background: rgba(56, 189, 248, 0.1);
+}
+
 .tf-elev-chart-wrap {
   background: var(--bg-panel);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   padding: 6px 4px 2px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.tf-elev-chart-wrap.expandable {
+  cursor: pointer;
+}
+
+.tf-elev-chart-wrap.expandable:hover {
+  border-color: rgba(56, 189, 248, 0.45);
+  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.1);
+}
+
+/* ---------- Large-Scale Terrain Elevation Profile Pop-Over Modal ---------- */
+
+.tf-elev-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  background: rgba(5, 10, 15, 0.78);
+  backdrop-filter: blur(8px);
+  display: grid;
+  place-items: center;
+  padding: 18px;
+}
+
+.tf-elev-modal {
+  width: min(1100px, 95vw);
+  max-height: min(90vh, 880px);
+  display: flex;
+  flex-direction: column;
+  background: #0d151c;
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  box-shadow: 0 28px 68px rgba(0, 0, 0, 0.68);
+  overflow: hidden;
+}
+
+.tf-elev-modal-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 14px 18px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: rgba(17, 26, 34, 0.94);
+  flex-shrink: 0;
+}
+
+.tf-elev-modal-title-group {
+  min-width: 0;
+  flex: 1;
+}
+
+.tf-elev-modal-title-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 3px;
+}
+
+.tf-elev-modal-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+
+.tf-elev-grade-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: rgba(11, 17, 23, 0.8);
+  font-size: 11.5px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.tf-elev-grade-chip.sm {
+  padding: 1px 7px;
+  font-size: 10.5px;
+}
+
+.tf-elev-grade-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.tf-elev-modal-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex-shrink: 0;
+}
+
+.tf-elev-modal-body {
+  padding: 14px 18px 18px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.tf-elev-kpi-strip {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.tf-elev-stage {
+  background: #0a1016;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.tf-elev-scrub-hud {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  min-height: 36px;
+  padding: 7px 14px;
+  background: rgba(17, 26, 34, 0.86);
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.tf-elev-scrub-hint {
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.tf-elev-hud-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+}
+
+.tf-elev-hud-k {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+
+.tf-elev-stage-svg {
+  padding: 10px 10px 4px;
+}
+
+.tf-elev-svg-lg {
+  cursor: crosshair;
+  touch-action: none;
+}
+
+.tf-elev-detail-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  gap: 12px;
+}
+
+.tf-elev-panel {
+  background: rgba(17, 26, 34, 0.65);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.tf-elev-subhead {
+  margin-top: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.tf-elev-grade-bar {
+  display: flex;
+  height: 10px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.06);
+  gap: 1px;
+}
+
+.tf-elev-grade-seg {
+  height: 100%;
+  min-width: 3px;
+}
+
+.tf-elev-grade-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.tf-elev-grade-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
+.tf-elev-grade-pill strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.tf-elev-meta-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tf-elev-factors-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+}
+
+.tf-elev-factor-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.tf-elev-factor-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.tf-elev-factor-detail {
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.tf-elev-jump-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-height: 175px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.tf-elev-jump-row {
+  width: 100%;
+  border: 1px solid var(--border-subtle);
+  background: rgba(11, 17, 23, 0.72);
+  border-radius: 7px;
+  padding: 6px 9px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.14s ease, background 0.14s ease;
+}
+
+.tf-elev-jump-row:hover:not(:disabled) {
+  border-color: rgba(253, 224, 71, 0.55);
+  background: rgba(253, 224, 71, 0.06);
+}
+
+.tf-elev-jump-row:disabled {
+  opacity: 0.65;
+  cursor: default;
+}
+
+.tf-elev-jump-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.tf-elev-jump-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+.tf-elev-jump-title {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tf-elev-jump-sub {
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.tf-elev-jump-val {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-primary);
+  flex-shrink: 0;
+}
+
+@media (max-width: 920px) {
+  .tf-elev-kpi-strip {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .tf-elev-detail-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 600px) {
+  .tf-elev-modal-backdrop {
+    padding: 8px;
+  }
+
+  .tf-elev-kpi-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .tf-elev-factors-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .tf-elev-svg {

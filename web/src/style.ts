@@ -61,6 +61,35 @@ export function buildSnowlineFilter(
   return ["==", ["get", "elev_min_m"], snapped];
 }
 
+export const SELECTED_TRACK_LAYER_IDS = [
+  "tf-tracks-selected-glow",
+  "tf-tracks-selected",
+  "tf-tracks-selected-inner-casing",
+  "tf-tracks-selected-core",
+] as const;
+
+export const SELECTED_TRACK_STEEP_LAYER_ID = "tf-tracks-selected-steep";
+
+export interface TrackSelectionOpacities {
+  casing: number;
+  line: number;
+  accessWarn: number;
+  steep: number;
+}
+
+/**
+ * Spotlight opacity curve: when a track is actively selected, surrounding
+ * unselected tracks recede calmly into context so the selected track pops
+ * immediately without losing grade readability.
+ */
+export function getTrackSelectionOpacities(
+  hasSelection: boolean
+): TrackSelectionOpacities {
+  return hasSelection
+    ? { casing: 0.36, line: 0.44, accessWarn: 0.32, steep: 0.28 }
+    : { casing: 0.92, line: 0.98, accessWarn: 0.92, steep: 0.9 };
+}
+
 /**
  * Build the MapLibre filter expression for highlighting a selected canonical track.
  */
@@ -612,6 +641,8 @@ export function buildTrailForgeStyle(
     });
   }
 
+  const trackOpacities = getTrackSelectionOpacities(Boolean(selectedTrackId));
+
   if (useVectorPmtiles) {
     // 1. CAPAD 2025 Protected Areas
     styleLayers.push(
@@ -623,7 +654,7 @@ export function buildTrailForgeStyle(
         layout: { visibility: vis(layers.parksWaterways) },
         paint: {
           "fill-color": "#10B981",
-          "fill-opacity": 0.1,
+          "fill-opacity": 0.08,
         },
       },
       {
@@ -634,9 +665,9 @@ export function buildTrailForgeStyle(
         layout: { visibility: vis(layers.parksWaterways) },
         paint: {
           "line-color": "#34D399",
-          "line-width": 1.6,
+          "line-width": 1.4,
           "line-dasharray": [4, 2],
-          "line-opacity": 0.72,
+          "line-opacity": 0.56,
         },
       }
     );
@@ -671,7 +702,7 @@ export function buildTrailForgeStyle(
       }
     );
 
-    // 3. Topographic Contours (20 m minor + 100 m index + offline canvas badge labels)
+    // 3. Topographic Contours (subtle terrain context so foreground tracks pop cleanly)
     styleLayers.push(
       {
         id: "tf-contours-hillshade",
@@ -683,8 +714,8 @@ export function buildTrailForgeStyle(
         layout: { visibility: vis(layers.contoursHillshade) },
         paint: {
           "line-color": "#7A91A8",
-          "line-width": 0.75,
-          "line-opacity": 0.42,
+          "line-width": 0.65,
+          "line-opacity": 0.28,
         },
       },
       {
@@ -696,9 +727,9 @@ export function buildTrailForgeStyle(
         minzoom: 9,
         layout: { visibility: vis(layers.contoursHillshade) },
         paint: {
-          "line-color": "#A3B8CC",
-          "line-width": 1.45,
-          "line-opacity": 0.72,
+          "line-color": "#9BB1C5",
+          "line-width": 1.25,
+          "line-opacity": 0.52,
         },
       },
       {
@@ -728,7 +759,7 @@ export function buildTrailForgeStyle(
       }
     );
 
-    // 4. GA / OSM Waterways
+    // 4. GA / OSM Waterways (muted hydro slate-blue so creeks never compete with Medium tracks)
     styleLayers.push(
       {
         id: "tf-waterways-perennial",
@@ -742,9 +773,9 @@ export function buildTrailForgeStyle(
           "line-join": "round",
         },
         paint: {
-          "line-color": "#38BDF8",
-          "line-width": ["interpolate", ["linear"], ["zoom"], 9, 1.4, 14, 3.0],
-          "line-opacity": 0.85,
+          "line-color": "#3B82A6",
+          "line-width": ["interpolate", ["linear"], ["zoom"], 9, 1.0, 14, 2.2],
+          "line-opacity": 0.58,
         },
       },
       {
@@ -753,38 +784,22 @@ export function buildTrailForgeStyle(
         source: "tf-vector",
         "source-layer": "waterways",
         filter: ["!=", ["get", "perennial"], true],
+        minzoom: 12,
         layout: {
           visibility: vis(layers.parksWaterways),
           "line-cap": "round",
         },
         paint: {
-          "line-color": "#0EA5E9",
-          "line-width": 1.25,
-          "line-dasharray": [3, 2],
-          "line-opacity": 0.68,
+          "line-color": "#4E89AB",
+          "line-width": ["interpolate", ["linear"], ["zoom"], 12, 0.75, 15, 1.25],
+          "line-dasharray": [3, 3],
+          "line-opacity": 0.38,
         },
       }
     );
 
-    // 5. Color-coded Canonical Graded 4WD Tracks
+    // 5. Color-coded Canonical Graded 4WD Tracks (crisp dark-cased foreground ribbons)
     styleLayers.push(
-      {
-        id: "tf-tracks-selected",
-        type: "line",
-        source: "tf-vector",
-        "source-layer": "track_segments",
-        filter: selectedFilter,
-        layout: {
-          visibility: vis(layers.tracks),
-          "line-cap": "round",
-          "line-join": "round",
-        },
-        paint: {
-          "line-color": "#FFFFFF",
-          "line-width": ["interpolate", ["linear"], ["zoom"], 9, 7.5, 14, 11.5],
-          "line-opacity": 0.72,
-        },
-      },
       {
         id: "tf-tracks-casing",
         type: "line",
@@ -796,9 +811,9 @@ export function buildTrailForgeStyle(
           "line-join": "round",
         },
         paint: {
-          "line-color": "#090F14",
-          "line-width": ["interpolate", ["linear"], ["zoom"], 9, 4.4, 14, 7.2],
-          "line-opacity": 0.88,
+          "line-color": "#070B10",
+          "line-width": ["interpolate", ["linear"], ["zoom"], 9, 4.8, 14, 7.8],
+          "line-opacity": trackOpacities.casing,
         },
       },
       {
@@ -813,8 +828,8 @@ export function buildTrailForgeStyle(
         },
         paint: {
           "line-color": gradeColor,
-          "line-width": ["interpolate", ["linear"], ["zoom"], 9, 2.4, 14, 4.4],
-          "line-opacity": 0.96,
+          "line-width": ["interpolate", ["linear"], ["zoom"], 9, 2.6, 14, 4.6],
+          "line-opacity": trackOpacities.line,
         },
       },
       {
@@ -837,14 +852,14 @@ export function buildTrailForgeStyle(
         },
         paint: {
           "line-color": "#FDE047",
-          "line-width": 2.4,
+          "line-width": 2.2,
           "line-dasharray": [2, 2],
-          "line-opacity": 0.92,
+          "line-opacity": trackOpacities.accessWarn,
         },
       }
     );
 
-    // 6. Highlighted Steep Sections (>=14°)
+    // 6. Highlighted Steep Sections (>=14° — crisp inner dash that preserves track grade color)
     styleLayers.push({
       id: "tf-steep-highlights",
       type: "line",
@@ -856,11 +871,101 @@ export function buildTrailForgeStyle(
       },
       paint: {
         "line-color": "#FB7185",
-        "line-width": ["interpolate", ["linear"], ["zoom"], 10, 4.0, 14, 6.4],
-        "line-dasharray": [1.5, 2],
-        "line-opacity": 0.96,
+        "line-width": ["interpolate", ["linear"], ["zoom"], 10, 1.8, 14, 2.6],
+        "line-dasharray": [1.3, 2.1],
+        "line-opacity": trackOpacities.steep,
       },
     });
+
+    // 7. Selected Track Spotlight Stack (rendered strictly ABOVE all unselected tracks)
+    styleLayers.push(
+      {
+        id: "tf-tracks-selected-glow",
+        type: "line",
+        source: "tf-vector",
+        "source-layer": "track_segments",
+        filter: selectedFilter,
+        layout: {
+          visibility: vis(layers.tracks),
+          "line-cap": "round",
+          "line-join": "round",
+        },
+        paint: {
+          "line-color": "#FDE047",
+          "line-width": ["interpolate", ["linear"], ["zoom"], 9, 16, 14, 24],
+          "line-blur": 5,
+          "line-opacity": 0.62,
+        },
+      },
+      {
+        id: "tf-tracks-selected",
+        type: "line",
+        source: "tf-vector",
+        "source-layer": "track_segments",
+        filter: selectedFilter,
+        layout: {
+          visibility: vis(layers.tracks),
+          "line-cap": "round",
+          "line-join": "round",
+        },
+        paint: {
+          "line-color": "#FFFFFF",
+          "line-width": ["interpolate", ["linear"], ["zoom"], 9, 10.5, 14, 15.5],
+          "line-opacity": 0.98,
+        },
+      },
+      {
+        id: "tf-tracks-selected-inner-casing",
+        type: "line",
+        source: "tf-vector",
+        "source-layer": "track_segments",
+        filter: selectedFilter,
+        layout: {
+          visibility: vis(layers.tracks),
+          "line-cap": "round",
+          "line-join": "round",
+        },
+        paint: {
+          "line-color": "#070B10",
+          "line-width": ["interpolate", ["linear"], ["zoom"], 9, 7.0, 14, 10.6],
+          "line-opacity": 0.96,
+        },
+      },
+      {
+        id: "tf-tracks-selected-core",
+        type: "line",
+        source: "tf-vector",
+        "source-layer": "track_segments",
+        filter: selectedFilter,
+        layout: {
+          visibility: vis(layers.tracks),
+          "line-cap": "round",
+          "line-join": "round",
+        },
+        paint: {
+          "line-color": gradeColor,
+          "line-width": ["interpolate", ["linear"], ["zoom"], 9, 4.4, 14, 6.8],
+          "line-opacity": 1.0,
+        },
+      },
+      {
+        id: SELECTED_TRACK_STEEP_LAYER_ID,
+        type: "line",
+        source: "tf-vector",
+        "source-layer": "steep_sections",
+        filter: selectedFilter,
+        layout: {
+          visibility: vis(layers.tracks && layers.steepHighlights),
+          "line-cap": "round",
+        },
+        paint: {
+          "line-color": "#FFE4E6",
+          "line-width": ["interpolate", ["linear"], ["zoom"], 10, 2.0, 14, 2.8],
+          "line-dasharray": [1.3, 2.1],
+          "line-opacity": 0.94,
+        },
+      }
+    );
   } else {
     // GeoJSON fallback layers (used automatically when PMTiles are unavailable)
     styleLayers.push(
@@ -871,8 +976,8 @@ export function buildTrailForgeStyle(
         layout: { visibility: vis(layers.contoursHillshade) },
         paint: {
           "line-color": "#64748B",
-          "line-width": 0.85,
-          "line-opacity": 0.55,
+          "line-width": 0.75,
+          "line-opacity": 0.35,
         },
       },
       {
@@ -898,22 +1003,6 @@ export function buildTrailForgeStyle(
         },
       },
       {
-        id: "tf-tracks-selected",
-        type: "line",
-        source: "tf-tracks",
-        filter: selectedFilter,
-        layout: {
-          visibility: vis(layers.tracks),
-          "line-cap": "round",
-          "line-join": "round",
-        },
-        paint: {
-          "line-color": "#FFFFFF",
-          "line-width": 9.5,
-          "line-opacity": 0.72,
-        },
-      },
-      {
         id: "tf-tracks-casing",
         type: "line",
         source: "tf-tracks",
@@ -923,9 +1012,9 @@ export function buildTrailForgeStyle(
           "line-join": "round",
         },
         paint: {
-          "line-color": "#0B1117",
-          "line-width": 5.8,
-          "line-opacity": 0.86,
+          "line-color": "#070B10",
+          "line-width": 6.4,
+          "line-opacity": trackOpacities.casing,
         },
       },
       {
@@ -939,8 +1028,8 @@ export function buildTrailForgeStyle(
         },
         paint: {
           "line-color": gradeColor,
-          "line-width": 3.4,
-          "line-opacity": 0.96,
+          "line-width": 3.8,
+          "line-opacity": trackOpacities.line,
         },
       },
       {
@@ -953,9 +1042,90 @@ export function buildTrailForgeStyle(
         },
         paint: {
           "line-color": "#FB7185",
-          "line-width": 4.8,
-          "line-dasharray": [1.5, 2],
-          "line-opacity": 0.95,
+          "line-width": 2.2,
+          "line-dasharray": [1.3, 2.1],
+          "line-opacity": trackOpacities.steep,
+        },
+      },
+      {
+        id: "tf-tracks-selected-glow",
+        type: "line",
+        source: "tf-tracks",
+        filter: selectedFilter,
+        layout: {
+          visibility: vis(layers.tracks),
+          "line-cap": "round",
+          "line-join": "round",
+        },
+        paint: {
+          "line-color": "#FDE047",
+          "line-width": 20,
+          "line-blur": 5,
+          "line-opacity": 0.62,
+        },
+      },
+      {
+        id: "tf-tracks-selected",
+        type: "line",
+        source: "tf-tracks",
+        filter: selectedFilter,
+        layout: {
+          visibility: vis(layers.tracks),
+          "line-cap": "round",
+          "line-join": "round",
+        },
+        paint: {
+          "line-color": "#FFFFFF",
+          "line-width": 13.5,
+          "line-opacity": 0.98,
+        },
+      },
+      {
+        id: "tf-tracks-selected-inner-casing",
+        type: "line",
+        source: "tf-tracks",
+        filter: selectedFilter,
+        layout: {
+          visibility: vis(layers.tracks),
+          "line-cap": "round",
+          "line-join": "round",
+        },
+        paint: {
+          "line-color": "#070B10",
+          "line-width": 9.2,
+          "line-opacity": 0.96,
+        },
+      },
+      {
+        id: "tf-tracks-selected-core",
+        type: "line",
+        source: "tf-tracks",
+        filter: selectedFilter,
+        layout: {
+          visibility: vis(layers.tracks),
+          "line-cap": "round",
+          "line-join": "round",
+        },
+        paint: {
+          "line-color": gradeColor,
+          "line-width": 5.8,
+          "line-opacity": 1.0,
+        },
+      },
+      {
+        id: SELECTED_TRACK_STEEP_LAYER_ID,
+        type: "line",
+        source: "tf-steep",
+        filter: selectedFilter,
+        layout: {
+          visibility: vis(layers.tracks && layers.steepHighlights),
+          "line-cap": "round",
+        },
+        paint: {
+          "line-color": "#FFE4E6",
+          "line-width": 2.4,
+          "line-dasharray": [1.3, 2.1],
+          "line-opacity": 0.94,
         },
       }
     );

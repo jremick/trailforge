@@ -8,10 +8,13 @@ import {
   snapSnowlineBand,
 } from "./presets";
 import {
+  SELECTED_TRACK_LAYER_IDS,
+  SELECTED_TRACK_STEEP_LAYER_ID,
   buildOfflineGraticuleGeoJson,
   buildRegionalBoundsGeoJson,
   buildSnowlineFilter,
   buildTrailForgeStyle,
+  getTrackSelectionOpacities,
   poisToGeoJson,
   toPmtilesUrl,
   userPinsToGeoJson,
@@ -216,6 +219,32 @@ describe("MapLibre 5 PMTiles & offline fallback style builder", () => {
     expect(layerIdx("tf-planned-route-pins-badge")).toBeGreaterThan(maxLineIdx);
     expect(layerIdx("tf-user-pins-dot")).toBeGreaterThan(maxLineIdx);
     expect(layerIdx("tf-search-pin-dot")).toBeGreaterThan(maxLineIdx);
+
+    // Regression: selected track spotlight renders ABOVE unselected tracks & steep ticks
+    // while receding unselected tracks and keeping waterways visually distinct from Medium tracks
+    const baseTracksMaxIdx = Math.max(
+      layerIdx("tf-tracks-casing"),
+      layerIdx("tf-tracks-line"),
+      layerIdx("tf-steep-highlights")
+    );
+    for (const selId of [...SELECTED_TRACK_LAYER_IDS, SELECTED_TRACK_STEEP_LAYER_ID]) {
+      expect(layerIdx(selId)).toBeGreaterThan(baseTracksMaxIdx);
+      expect(layerIdx(selId)).toBeLessThan(layerIdx("tf-pois-layer"));
+    }
+    const dimmed = getTrackSelectionOpacities(true);
+    const normal = getTrackSelectionOpacities(false);
+    expect(dimmed.line).toBeLessThan(normal.line);
+    expect(dimmed.casing).toBeLessThan(normal.casing);
+    expect((byId.get("tf-tracks-line")?.paint as Record<string, unknown>)["line-opacity"]).toBe(
+      dimmed.line
+    );
+    expect(
+      (byId.get("tf-tracks-selected-core")?.paint as Record<string, unknown>)["line-opacity"]
+    ).toBe(1.0);
+    expect(
+      (byId.get("tf-waterways-perennial")?.paint as Record<string, unknown>)["line-color"]
+    ).not.toBe("#38BDF8");
+    expect((byId.get("tf-waterways-intermittent") as { minzoom?: number })?.minzoom).toBeGreaterThanOrEqual(12);
   });
 
   it("converts Slice 05 personal user pins into category-colored GeoJSON", () => {

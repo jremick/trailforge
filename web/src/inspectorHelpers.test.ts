@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   buildElevationProfileSvg,
+  computeTrackGradeDistribution,
   formatBreakdownFactors,
   formatOverrideLabel,
   normalizeTrackInspector,
+  sampleElevationAtDistance,
 } from "./inspectorHelpers";
 import type { BaselineBreakdown, TrackInspectorDetail } from "./types";
 
@@ -193,5 +195,83 @@ describe("Track Inspector explainable helpers", () => {
     );
     expect(res.hasSnowLineIntersection).toBe(false);
     expect(res.svgHtml).not.toContain("Snow-line 1400m");
+  });
+
+  it("reconciles multi-tile track stats from segments/profile and builds interactive modal telemetry", () => {
+    const detail: TrackInspectorDetail = {
+      track_id: "tftrk_bgb",
+      name: "Billy Goat Bluff Track",
+      state: "VIC",
+      grade: "Extreme",
+      score: 98,
+      // Stale flat-end single-tile header stats
+      total_length_m: 7270,
+      min_elev_m: 275,
+      max_elev_m: 283,
+      elev_gain_m: 1,
+      elev_loss_m: 1044,
+      max_slope_deg: 6.0,
+      sustained_slope_deg: 21.9,
+      waterway_crossing_count: 0,
+      segments: [
+        {
+          segment_id: "s1",
+          length_m: 9000,
+          elev_min_m: 800,
+          elev_max_m: 1450,
+          elev_gain_m: 120,
+          elev_loss_m: 650,
+          max_slope_deg: 24.0,
+          sustained_slope_deg: 21.9,
+          grade: "Extreme",
+        },
+        {
+          segment_id: "s2",
+          length_m: 8800,
+          elev_min_m: 230,
+          elev_max_m: 800,
+          elev_gain_m: 40,
+          elev_loss_m: 570,
+          max_slope_deg: 16.5,
+          sustained_slope_deg: 11.2,
+          grade: "Medium",
+        },
+      ],
+      elevation_profile: [
+        { dist_m: 0, elev_m: 1450, slope_deg: 24.0, grade: "Extreme", segment_id: "s1" },
+        { dist_m: 9000, elev_m: 800, slope_deg: 16.5, grade: "Extreme", segment_id: "s1" },
+        { dist_m: 17800, elev_m: 230, slope_deg: 6.0, grade: "Medium", segment_id: "s2" },
+      ],
+      waterway_crossings: [
+        { name: "Wonnangatta River", waterway_type: "river", perennial: true, bridged: false, dist_m: 17400 },
+      ],
+    };
+
+    const norm = normalizeTrackInspector(detail);
+    expect(norm.totalLengthKm).toBeCloseTo(17.8, 1);
+    expect(norm.minElevM).toBe(230);
+    expect(norm.maxElevM).toBe(1450);
+    expect(norm.maxSlopeDeg).toBe(24.0);
+    expect(norm.waterwayCrossingCount).toBe(1);
+
+    const modalChart = buildElevationProfileSvg(norm.profile, {
+      detailed: true,
+      snowLineElevationM: 1000,
+      crossings: norm.crossings,
+    });
+    expect(modalChart.geometry).not.toBeNull();
+    expect(modalChart.steepZones.length).toBeGreaterThanOrEqual(1);
+    expect(modalChart.svgHtml).toContain('data-role="elev-scrub-hit"');
+    expect(modalChart.svgHtml).toContain("tfElevGradModal");
+
+    const mid = sampleElevationAtDistance(norm.profile, 4500);
+    expect(mid).not.toBeNull();
+    expect(mid?.elevM).toBeCloseTo(1125, 0);
+    expect(mid?.grade).toBe("Extreme");
+    expect(mid?.slopePct).toBeGreaterThan(25);
+
+    const dist = computeTrackGradeDistribution(detail.segments ?? [], norm.profile);
+    expect(dist.map((d) => d.grade)).toEqual(["Medium", "Extreme"]);
+    expect(dist.reduce((acc, d) => acc + d.pct, 0)).toBeCloseTo(100, 0);
   });
 });

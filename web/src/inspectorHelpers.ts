@@ -150,8 +150,61 @@ export function normalizeTrackInspector(
         ? [detail.primary_park]
         : [];
 
-  const minElevM = detail.min_elev_m ?? detail.elev_min_m ?? null;
-  const maxElevM = detail.max_elev_m ?? detail.elev_max_m ?? null;
+  const crossings = detail.waterway_crossings ?? [];
+
+  // Reconcile Track header stats with canonical segments & profile so multi-tile tracks
+  // never show stale single-tile sub-ranges (e.g. flat end segment min/max/slope/length).
+  const elevCandidatesMin: number[] = [];
+  const elevCandidatesMax: number[] = [];
+  if (typeof detail.min_elev_m === "number") elevCandidatesMin.push(detail.min_elev_m);
+  else if (typeof detail.elev_min_m === "number") elevCandidatesMin.push(detail.elev_min_m);
+  if (typeof detail.max_elev_m === "number") elevCandidatesMax.push(detail.max_elev_m);
+  else if (typeof detail.elev_max_m === "number") elevCandidatesMax.push(detail.elev_max_m);
+
+  let segLengthSumM = 0;
+  let segGainSumM = 0;
+  let segLossSumM = 0;
+  let segMaxSlope: number | null = null;
+
+  for (const seg of segments) {
+    if (typeof seg.length_m === "number" && Number.isFinite(seg.length_m)) {
+      segLengthSumM += seg.length_m;
+    }
+    if (typeof seg.elev_min_m === "number" && Number.isFinite(seg.elev_min_m)) {
+      elevCandidatesMin.push(seg.elev_min_m);
+    }
+    if (typeof seg.elev_max_m === "number" && Number.isFinite(seg.elev_max_m)) {
+      elevCandidatesMax.push(seg.elev_max_m);
+    }
+    if (typeof seg.elev_gain_m === "number" && Number.isFinite(seg.elev_gain_m)) {
+      segGainSumM += seg.elev_gain_m;
+    }
+    if (typeof seg.elev_loss_m === "number" && Number.isFinite(seg.elev_loss_m)) {
+      segLossSumM += seg.elev_loss_m;
+    }
+    if (typeof seg.max_slope_deg === "number" && Number.isFinite(seg.max_slope_deg)) {
+      segMaxSlope = segMaxSlope === null ? seg.max_slope_deg : Math.max(segMaxSlope, seg.max_slope_deg);
+    }
+  }
+
+  let profileMaxDistM = 0;
+  for (const pt of profile) {
+    if (typeof pt.elev_m === "number" && Number.isFinite(pt.elev_m)) {
+      elevCandidatesMin.push(pt.elev_m);
+      elevCandidatesMax.push(pt.elev_m);
+    }
+    if (typeof pt.dist_m === "number" && Number.isFinite(pt.dist_m)) {
+      profileMaxDistM = Math.max(profileMaxDistM, pt.dist_m);
+    }
+    if (typeof pt.slope_deg === "number" && Number.isFinite(pt.slope_deg)) {
+      segMaxSlope = segMaxSlope === null ? pt.slope_deg : Math.max(segMaxSlope, pt.slope_deg);
+    }
+  }
+
+  const minElevM =
+    elevCandidatesMin.length > 0 ? Math.min(...elevCandidatesMin) : null;
+  const maxElevM =
+    elevCandidatesMax.length > 0 ? Math.max(...elevCandidatesMax) : null;
 
   const is4wdOnly =
     detail.is_4wd_only ?? segments.some((s) => Boolean(s.is_4wd_only));
@@ -164,11 +217,18 @@ export function normalizeTrackInspector(
     )?.access_status ??
     "public";
 
+  const elevGainM =
+    segments.length > 0
+      ? Math.max(detail.elev_gain_m ?? 0, segGainSumM)
+      : detail.elev_gain_m;
+
   const elevLossM =
     typeof detail.elev_loss_m === "number"
-      ? detail.elev_loss_m
+      ? segments.length > 0
+        ? Math.max(detail.elev_loss_m, segLossSumM)
+        : detail.elev_loss_m
       : segments.length > 0
-        ? segments.reduce((acc, s) => acc + (s.elev_loss_m ?? 0), 0)
+        ? segLossSumM
         : null;
 
   const sustainedSlopeDeg =
@@ -178,6 +238,25 @@ export function normalizeTrackInspector(
       return best === null ? s.sustained_slope_deg : Math.max(best, s.sustained_slope_deg);
     }, null);
 
+  const slopeCandidates = [
+    detail.max_slope_deg,
+    segMaxSlope,
+    sustainedSlopeDeg,
+    breakdown?.factors?.max_slope?.max_slope_deg,
+  ].filter((v): v is number => typeof v === "number" && Number.isFinite(v));
+  const maxSlopeDeg =
+    slopeCandidates.length > 0 ? Math.max(...slopeCandidates) : null;
+
+  const reconciledLengthM = Math.max(
+    detail.total_length_m || 0,
+    segLengthSumM,
+    profileMaxDistM
+  );
+  const waterwayCrossingCount = Math.max(
+    detail.waterway_crossing_count || 0,
+    crossings.length
+  );
+
   return {
     trackId: detail.track_id,
     name: detail.name,
@@ -185,21 +264,21 @@ export function normalizeTrackInspector(
     state: detail.state,
     grade,
     score: typeof score === "number" ? score : null,
-    totalLengthKm: detail.total_length_m / 1000,
+    totalLengthKm: reconciledLengthM / 1000,
     minElevM,
     maxElevM,
-    elevGainM: detail.elev_gain_m,
+    elevGainM,
     elevLossM,
-    maxSlopeDeg: detail.max_slope_deg ?? null,
+    maxSlopeDeg,
     sustainedSlopeDeg,
-    waterwayCrossingCount: detail.waterway_crossing_count,
+    waterwayCrossingCount,
     is4wdOnly,
     hasGateBarrier,
     accessStatus,
     parks,
     breakdown,
     profile,
-    crossings: detail.waterway_crossings ?? [],
+    crossings,
   };
 }
 
@@ -303,6 +382,32 @@ export interface ElevationChartOptions {
   snowLineElevationM?: number;
   crossings?: readonly WaterwayCrossingItem[];
   steepThresholdDeg?: number;
+  detailed?: boolean;
+  gradientId?: string;
+}
+
+export interface ElevationSteepZone {
+  index: number;
+  startDistM: number;
+  endDistM: number;
+  peakDistM: number;
+  peakElevM: number;
+  peakSlopeDeg: number;
+  grade: string;
+}
+
+export interface ElevationChartGeometry {
+  width: number;
+  height: number;
+  padL: number;
+  padR: number;
+  padT: number;
+  padB: number;
+  plotW: number;
+  plotH: number;
+  yMin: number;
+  yMax: number;
+  totalDistM: number;
 }
 
 export interface ElevationChartResult {
@@ -313,24 +418,154 @@ export interface ElevationChartResult {
   hasSnowLineIntersection: boolean;
   steepPointCount: number;
   steepZoneCount: number;
+  steepZones: ElevationSteepZone[];
+  geometry: ElevationChartGeometry | null;
+}
+
+export interface ElevationSampleReadout {
+  distM: number;
+  elevM: number;
+  slopeDeg: number | null;
+  slopePct: number | null;
+  grade: string;
+  segmentId: string | null;
+}
+
+export interface GradeDistributionItem {
+  grade: string;
+  color: string;
+  lengthM: number;
+  pct: number;
+  segmentCount: number;
 }
 
 /**
- * Pure SVG elevation profile generator for the Track Inspector Drawer.
- * Renders elevation area, crisp color-coded grade polylines (Easy/Medium/Hard/Extreme),
- * subtle shaded steep zones (>=14°) with one peak marker per steep run (avoiding
- * overlapping marker occlusion on dense elevation samples), snow-line reference,
- * and waterway crossing ticks.
+ * Sample elevation, slope, and grade at an arbitrary distance along the profile
+ * via binary search + linear elevation interpolation (for interactive chart scrubbing).
+ */
+export function sampleElevationAtDistance(
+  points: readonly ElevationProfilePoint[],
+  targetDistM: number
+): ElevationSampleReadout | null {
+  if (points.length === 0) return null;
+  const clamped = Math.max(
+    points[0]!.dist_m,
+    Math.min(points[points.length - 1]!.dist_m, targetDistM)
+  );
+  if (points.length === 1) {
+    const p = points[0]!;
+    const deg = typeof p.slope_deg === "number" ? p.slope_deg : null;
+    return {
+      distM: p.dist_m,
+      elevM: p.elev_m,
+      slopeDeg: deg,
+      slopePct: deg !== null ? Math.tan((deg * Math.PI) / 180) * 100 : null,
+      grade: p.grade ?? "Easy",
+      segmentId: p.segment_id ?? null,
+    };
+  }
+
+  let lo = 0;
+  let hi = points.length - 1;
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >> 1;
+    if (points[mid]!.dist_m <= clamped) lo = mid;
+    else hi = mid;
+  }
+
+  const a = points[lo]!;
+  const b = points[hi]!;
+  const span = Math.max(1e-6, b.dist_m - a.dist_m);
+  const t = Math.max(0, Math.min(1, (clamped - a.dist_m) / span));
+  const elevM = a.elev_m + (b.elev_m - a.elev_m) * t;
+  const nearer = t < 0.5 ? a : b;
+  const slopeDeg =
+    typeof nearer.slope_deg === "number"
+      ? nearer.slope_deg
+      : typeof a.slope_deg === "number"
+        ? a.slope_deg
+        : typeof b.slope_deg === "number"
+          ? b.slope_deg
+          : null;
+  const slopePct =
+    slopeDeg !== null ? Math.tan((slopeDeg * Math.PI) / 180) * 100 : null;
+
+  return {
+    distM: clamped,
+    elevM,
+    slopeDeg,
+    slopePct,
+    grade: nearer.grade ?? a.grade ?? b.grade ?? "Easy",
+    segmentId: nearer.segment_id ?? a.segment_id ?? b.segment_id ?? null,
+  };
+}
+
+/**
+ * Compute distance-weighted grade distribution across Easy / Medium / Hard / Extreme.
+ */
+export function computeTrackGradeDistribution(
+  segments: readonly SegmentSummaryItem[],
+  profile: readonly ElevationProfilePoint[]
+): GradeDistributionItem[] {
+  const order = ["Easy", "Medium", "Hard", "Extreme"] as const;
+  const lengths: Record<string, number> = { Easy: 0, Medium: 0, Hard: 0, Extreme: 0 };
+  const counts: Record<string, number> = { Easy: 0, Medium: 0, Hard: 0, Extreme: 0 };
+
+  const normalizeGrade = (raw: string | null | undefined): string => {
+    const low = String(raw ?? "Easy").trim().toLowerCase();
+    if (low === "extreme") return "Extreme";
+    if (low === "hard") return "Hard";
+    if (low === "medium") return "Medium";
+    return "Easy";
+  };
+
+  if (segments.length > 0) {
+    for (const seg of segments) {
+      const g = normalizeGrade(extractSegmentGrade(seg));
+      const len = typeof seg.length_m === "number" && seg.length_m > 0 ? seg.length_m : 75;
+      lengths[g] = (lengths[g] ?? 0) + len;
+      counts[g] = (counts[g] ?? 0) + 1;
+    }
+  } else if (profile.length >= 2) {
+    for (let i = 1; i < profile.length; i += 1) {
+      const prev = profile[i - 1]!;
+      const curr = profile[i]!;
+      const g = normalizeGrade(curr.grade ?? prev.grade);
+      const len = Math.max(0, curr.dist_m - prev.dist_m);
+      lengths[g] = (lengths[g] ?? 0) + len;
+      counts[g] = (counts[g] ?? 0) + 1;
+    }
+  }
+
+  const totalM = Object.values(lengths).reduce((a, b) => a + b, 0);
+  if (totalM <= 0) return [];
+
+  return order
+    .filter((g) => (lengths[g] ?? 0) > 0)
+    .map((g) => ({
+      grade: g,
+      color: getGradeColor(g),
+      lengthM: lengths[g] ?? 0,
+      pct: Math.round(((lengths[g] ?? 0) / totalM) * 1000) / 10,
+      segmentCount: counts[g] ?? 0,
+    }));
+}
+
+/**
+ * Pure SVG elevation profile generator for the Track Inspector Drawer and
+ * Large-Scale Elevation Profile Pop-Over Modal.
  */
 export function buildElevationProfileSvg(
   points: readonly ElevationProfilePoint[],
   options?: ElevationChartOptions
 ): ElevationChartResult {
-  const width = options?.width ?? 340;
-  const height = options?.height ?? 138;
+  const detailed = Boolean(options?.detailed);
+  const width = options?.width ?? (detailed ? 920 : 340);
+  const height = options?.height ?? (detailed ? 290 : 138);
   const snowLineM = options?.snowLineElevationM ?? 1000;
   const steepThreshold = options?.steepThresholdDeg ?? 14.0;
   const crossings = options?.crossings ?? [];
+  const gradId = options?.gradientId ?? (detailed ? "tfElevGradModal" : "tfElevGrad");
 
   if (points.length < 2) {
     return {
@@ -341,13 +576,15 @@ export function buildElevationProfileSvg(
       hasSnowLineIntersection: false,
       steepPointCount: 0,
       steepZoneCount: 0,
+      steepZones: [],
+      geometry: null,
     };
   }
 
-  const padL = 38;
-  const padR = 10;
-  const padT = 12;
-  const padB = 22;
+  const padL = detailed ? 54 : 38;
+  const padR = detailed ? 18 : 10;
+  const padT = detailed ? 18 : 12;
+  const padB = detailed ? 30 : 22;
   const plotW = width - padL - padR;
   const plotH = height - padT - padB;
 
@@ -371,8 +608,6 @@ export function buildElevationProfileSvg(
   const baseY = (padT + plotH).toFixed(1);
   const areaPath = `M ${firstX},${baseY} L ${polylinePts.replace(/ /g, " L ")} L ${lastX},${baseY} Z`;
 
-  // Group contiguous segments sharing the same grade color into clean polylines
-  // so dense profiles (500+ points) render crisp and brightly colored without stroke artifacts.
   const gradeRuns: { color: string; coords: string[] }[] = [];
   for (let i = 1; i < points.length; i += 1) {
     const prev = points[i - 1]!;
@@ -388,25 +623,24 @@ export function buildElevationProfileSvg(
     }
   }
 
+  const strokeW = detailed ? "3.2" : "2.6";
   const segLinesHtml = gradeRuns
     .map(
       (run) =>
-        `<polyline points="${run.coords.join(" ")}" fill="none" stroke="${run.color}" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>`
+        `<polyline points="${run.coords.join(" ")}" fill="none" stroke="${run.color}" stroke-width="${strokeW}" stroke-linecap="round" stroke-linejoin="round"/>`
     )
     .join("");
 
-  // Identify contiguous steep zones (slope >= 14°) and keep 1 peak marker per zone
-  // so dense steep sections highlight cleanly without overlapping black strokes hiding the curve.
   const steepPoints = points.filter(
     (p) => typeof p.slope_deg === "number" && p.slope_deg >= steepThreshold
   );
-  interface SteepZone {
+  interface RawSteepZone {
     startDistM: number;
     endDistM: number;
     peak: ElevationProfilePoint;
   }
-  const steepZones: SteepZone[] = [];
-  let activeZone: SteepZone | null = null;
+  const rawZones: RawSteepZone[] = [];
+  let activeZone: RawSteepZone | null = null;
 
   for (const p of points) {
     const isSteep =
@@ -421,55 +655,89 @@ export function buildElevationProfileSvg(
         }
       }
     } else if (activeZone) {
-      steepZones.push(activeZone);
+      rawZones.push(activeZone);
       activeZone = null;
     }
   }
   if (activeZone) {
-    steepZones.push(activeZone);
+    rawZones.push(activeZone);
   }
 
-  const steepBandsHtml = steepZones
+  const steepZones: ElevationSteepZone[] = rawZones.map((z, idx) => ({
+    index: idx,
+    startDistM: z.startDistM,
+    endDistM: z.endDistM,
+    peakDistM: z.peak.dist_m,
+    peakElevM: z.peak.elev_m,
+    peakSlopeDeg: z.peak.slope_deg ?? steepThreshold,
+    grade: z.peak.grade ?? "Extreme",
+  }));
+
+  const steepBandsHtml = rawZones
     .map((z) => {
       const x1 = toX(z.startDistM);
-      const x2 = Math.max(x1 + 2.5, toX(z.endDistM));
-      return `<rect x="${x1.toFixed(1)}" y="${padT}" width="${(x2 - x1).toFixed(1)}" height="${plotH}" fill="rgba(239, 68, 68, 0.12)"/>`;
+      const x2 = Math.max(x1 + (detailed ? 4 : 2.5), toX(z.endDistM));
+      return `<rect x="${x1.toFixed(1)}" y="${padT}" width="${(x2 - x1).toFixed(1)}" height="${plotH}" fill="rgba(239, 68, 68, ${detailed ? "0.14" : "0.12"})"/>`;
     })
     .join("");
 
-  const steepMarkersHtml = steepZones
-    .map((z) => {
+  const markerR = detailed ? "4.6" : "3.4";
+  const steepMarkersHtml = rawZones
+    .map((z, idx) => {
       const p = z.peak;
       const cx = toX(p.dist_m).toFixed(1);
       const cy = toY(p.elev_m).toFixed(1);
       const markerColor = getGradeColor(p.grade);
-      return `<circle cx="${cx}" cy="${cy}" r="3.4" fill="${markerColor}" stroke="#F8FAFC" stroke-width="1.2"><title>Peak steep ${p.slope_deg?.toFixed(1)}° at ${(p.dist_m / 1000).toFixed(2)} km (${Math.round(p.elev_m)} m)</title></circle>`;
+      return `<circle cx="${cx}" cy="${cy}" r="${markerR}" fill="${markerColor}" stroke="#F8FAFC" stroke-width="${detailed ? "1.6" : "1.2"}" data-steep-idx="${idx}"><title>Peak steep ${p.slope_deg?.toFixed(1)}° at ${(p.dist_m / 1000).toFixed(2)} km (${Math.round(p.elev_m)} m)</title></circle>`;
     })
     .join("");
 
-  // Horizontal grid lines (min, mid, max)
-  const yMid = Math.round((yMin + yMax) / 2);
-  const yTicks = [yMin, yMid, yMax];
+  // Horizontal elevation gridlines (5 ticks for detailed modal, 3 ticks for compact drawer)
+  const yTickCount = detailed ? 5 : 3;
+  const yTicks: number[] = [];
+  for (let i = 0; i < yTickCount; i += 1) {
+    yTicks.push(Math.round(yMin + ((yMax - yMin) * i) / (yTickCount - 1)));
+  }
+  const axisFontSize = detailed ? "11" : "9.5";
   const gridHtml = yTicks
     .map((e) => {
       const y = toY(e).toFixed(1);
       return `
         <line x1="${padL}" y1="${y}" x2="${width - padR}" y2="${y}" stroke="#233240" stroke-width="1" stroke-dasharray="2 2"/>
-        <text x="${padL - 4}" y="${Number(y) + 3}" text-anchor="end" fill="#6E8396" font-size="9.5" font-family="ui-monospace, monospace">${Math.round(e)}m</text>
+        <text x="${padL - 6}" y="${Number(y) + 3.5}" text-anchor="end" fill="#7F95AA" font-size="${axisFontSize}" font-family="ui-monospace, monospace">${Math.round(e)}m</text>
       `;
     })
     .join("");
+
+  // Vertical distance gridlines & x-axis ticks
+  const xTickCount = detailed ? 6 : 3;
+  const xTicksHtml: string[] = [];
+  for (let i = 0; i < xTickCount; i += 1) {
+    const frac = i / (xTickCount - 1);
+    const distM = totalDistM * frac;
+    const x = toX(distM);
+    const anchor = i === 0 ? "start" : i === xTickCount - 1 ? "end" : "middle";
+    const label = i === 0 ? "0 km" : `${(distM / 1000).toFixed(1)} km`;
+    if (detailed && i > 0 && i < xTickCount - 1) {
+      xTicksHtml.push(
+        `<line x1="${x.toFixed(1)}" y1="${padT}" x2="${x.toFixed(1)}" y2="${baseY}" stroke="#1C2A36" stroke-width="1" stroke-dasharray="2 3"/>`
+      );
+    }
+    xTicksHtml.push(
+      `<text x="${x.toFixed(1)}" y="${height - (detailed ? 8 : 5)}" text-anchor="${anchor}" fill="#7F95AA" font-size="${axisFontSize}" font-family="ui-monospace, monospace">${label}</text>`
+    );
+  }
 
   // Snow-line horizontal reference line when inside chart range
   const hasSnowLineIntersection = snowLineM >= yMin && snowLineM <= yMax;
   let snowLineHtml = "";
   if (hasSnowLineIntersection) {
     const sy = toY(snowLineM);
-    const labelY = Math.max(padT + 9, sy - 3);
+    const labelY = Math.max(padT + (detailed ? 12 : 9), sy - 4);
     snowLineHtml = `
       <rect x="${padL}" y="${padT}" width="${plotW}" height="${Math.max(0, sy - padT).toFixed(1)}" fill="rgba(186, 230, 253, 0.09)"/>
-      <line x1="${padL}" y1="${sy.toFixed(1)}" x2="${width - padR}" y2="${sy.toFixed(1)}" stroke="#7DD3FC" stroke-width="1.3" stroke-dasharray="4 3"/>
-      <text x="${width - padR - 2}" y="${labelY.toFixed(1)}" text-anchor="end" fill="#7DD3FC" font-size="9" font-family="ui-monospace, monospace">Snow-line ${snowLineM}m</text>
+      <line x1="${padL}" y1="${sy.toFixed(1)}" x2="${width - padR}" y2="${sy.toFixed(1)}" stroke="#7DD3FC" stroke-width="${detailed ? "1.5" : "1.3"}" stroke-dasharray="5 3"/>
+      <text x="${width - padR - 4}" y="${labelY.toFixed(1)}" text-anchor="end" fill="#7DD3FC" font-size="${detailed ? "10.5" : "9"}" font-family="ui-monospace, monospace">Snow-line ${snowLineM}m</text>
     `;
   }
 
@@ -480,19 +748,30 @@ export function buildElevationProfileSvg(
       const cx = toX(c.dist_m!).toFixed(1);
       const label = escapeHtml(c.name ?? "Water crossing");
       return `
-        <line x1="${cx}" y1="${padT}" x2="${cx}" y2="${baseY}" stroke="rgba(56, 189, 248, 0.35)" stroke-width="1" stroke-dasharray="2 2"/>
-        <circle cx="${cx}" cy="${baseY}" r="3.2" fill="#38BDF8" stroke="#0B1117" stroke-width="1"><title>${label} (${(c.dist_m! / 1000).toFixed(2)} km)</title></circle>
+        <line x1="${cx}" y1="${padT}" x2="${cx}" y2="${baseY}" stroke="rgba(56, 189, 248, ${detailed ? "0.42" : "0.35"})" stroke-width="1" stroke-dasharray="2 2"/>
+        <circle cx="${cx}" cy="${baseY}" r="${detailed ? "4.4" : "3.2"}" fill="#38BDF8" stroke="#0B1117" stroke-width="1.2"><title>${label} (${(c.dist_m! / 1000).toFixed(2)} km)</title></circle>
       `;
     })
     .join("");
 
-  const midDistKm = (totalDistM / 2000).toFixed(1);
+  // Interactive scrub crosshair elements for the detailed pop-over chart
+  const scrubOverlayHtml = detailed
+    ? `
+      <g class="tf-elev-crosshair hidden" data-role="elev-crosshair" pointer-events="none">
+        <line data-role="crosshair-line" x1="${padL}" y1="${padT}" x2="${padL}" y2="${baseY}" stroke="#FDE047" stroke-width="1.5" stroke-dasharray="3 2"/>
+        <circle data-role="crosshair-halo" cx="${padL}" cy="${baseY}" r="9" fill="rgba(253, 224, 71, 0.28)"/>
+        <circle data-role="crosshair-dot" cx="${padL}" cy="${baseY}" r="4.8" fill="#FDE047" stroke="#070B10" stroke-width="2"/>
+      </g>
+      <rect class="tf-elev-scrub-hit" data-role="elev-scrub-hit" x="${padL}" y="${padT}" width="${plotW}" height="${plotH}" fill="transparent"/>
+    `
+    : "";
+
   const totalDistKm = (totalDistM / 1000).toFixed(1);
 
   const svgHtml = `
-    <svg class="tf-elev-svg" viewBox="0 0 ${width} ${height}" width="100%" height="${height}" role="img" aria-label="Track elevation profile from ${Math.round(rawMinE)} m to ${Math.round(rawMaxE)} m over ${totalDistKm} km">
+    <svg class="tf-elev-svg ${detailed ? "tf-elev-svg-lg" : ""}" viewBox="0 0 ${width} ${height}" width="100%" height="${height}" role="img" aria-label="Track elevation profile from ${Math.round(rawMinE)} m to ${Math.round(rawMaxE)} m over ${totalDistKm} km">
       <defs>
-        <linearGradient id="tfElevGrad" x1="0" y1="0" x2="0" y2="1">
+        <linearGradient id="${gradId}" x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.28"/>
           <stop offset="100%" stop-color="#0E151B" stop-opacity="0.02"/>
         </linearGradient>
@@ -500,14 +779,13 @@ export function buildElevationProfileSvg(
       ${gridHtml}
       ${steepBandsHtml}
       ${snowLineHtml}
-      <path d="${areaPath}" fill="url(#tfElevGrad)"/>
+      <path d="${areaPath}" fill="url(#${gradId})"/>
       ${segLinesHtml}
       ${crossingMarkersHtml}
       ${steepMarkersHtml}
       <line x1="${padL}" y1="${baseY}" x2="${width - padR}" y2="${baseY}" stroke="#324659" stroke-width="1"/>
-      <text x="${padL}" y="${height - 5}" text-anchor="start" fill="#6E8396" font-size="9.5" font-family="ui-monospace, monospace">0 km</text>
-      <text x="${(padL + plotW / 2).toFixed(1)}" y="${height - 5}" text-anchor="middle" fill="#6E8396" font-size="9.5" font-family="ui-monospace, monospace">${midDistKm} km</text>
-      <text x="${width - padR}" y="${height - 5}" text-anchor="end" fill="#6E8396" font-size="9.5" font-family="ui-monospace, monospace">${totalDistKm} km</text>
+      ${xTicksHtml.join("")}
+      ${scrubOverlayHtml}
     </svg>
   `;
 
@@ -519,5 +797,19 @@ export function buildElevationProfileSvg(
     hasSnowLineIntersection,
     steepPointCount: steepPoints.length,
     steepZoneCount: steepZones.length,
+    steepZones,
+    geometry: {
+      width,
+      height,
+      padL,
+      padR,
+      padT,
+      padB,
+      plotW,
+      plotH,
+      yMin,
+      yMax,
+      totalDistM,
+    },
   };
 }

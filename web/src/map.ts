@@ -14,10 +14,13 @@ import {
 } from "./presets";
 import {
   EMPTY_FEATURE_COLLECTION,
+  SELECTED_TRACK_LAYER_IDS,
+  SELECTED_TRACK_STEEP_LAYER_ID,
   buildSearchPinGeoJson,
   buildSelectedTrackFilter,
   buildSnowlineFilter,
   buildTrailForgeStyle,
+  getTrackSelectionOpacities,
   poisToGeoJson,
   userPinsToGeoJson,
 } from "./style";
@@ -263,6 +266,8 @@ export class TrailForgeMap {
         "tf-closures-points",
         "tf-closures-line",
         "tf-planned-route-line",
+        SELECTED_TRACK_STEEP_LAYER_ID,
+        "tf-tracks-selected-core",
         "tf-steep-highlights",
         "tf-tracks-line",
       ].filter((id) => Boolean(this.map.getLayer(id)));
@@ -501,11 +506,30 @@ export class TrailForgeMap {
 
   setSelectedTrackId(trackId: string | null): void {
     this.selectedTrackId = trackId;
-    if (this.isLoaded && this.map.getLayer("tf-tracks-selected")) {
-      this.map.setFilter(
-        "tf-tracks-selected",
-        buildSelectedTrackFilter(trackId)
-      );
+    if (this.isLoaded) {
+      this.applySelectedTrackHighlight();
+    }
+  }
+
+  private applySelectedTrackHighlight(): void {
+    const filter = buildSelectedTrackFilter(this.selectedTrackId);
+    for (const id of [...SELECTED_TRACK_LAYER_IDS, SELECTED_TRACK_STEEP_LAYER_ID]) {
+      if (this.map.getLayer(id)) {
+        this.map.setFilter(id, filter);
+      }
+    }
+
+    const opacities = getTrackSelectionOpacities(Boolean(this.selectedTrackId));
+    const paintUpdates: Array<[string, number]> = [
+      ["tf-tracks-casing", opacities.casing],
+      ["tf-tracks-line", opacities.line],
+      ["tf-tracks-access-warn", opacities.accessWarn],
+      ["tf-steep-highlights", opacities.steep],
+    ];
+    for (const [id, opacity] of paintUpdates) {
+      if (this.map.getLayer(id)) {
+        this.map.setPaintProperty(id, "line-opacity", opacity);
+      }
     }
   }
 
@@ -603,12 +627,7 @@ export class TrailForgeMap {
     this.preloadContourBadges();
     void this.preloadOutdoorIcons();
 
-    if (this.selectedTrackId && this.map.getLayer("tf-tracks-selected")) {
-      this.map.setFilter(
-        "tf-tracks-selected",
-        buildSelectedTrackFilter(this.selectedTrackId)
-      );
-    }
+    this.applySelectedTrackHighlight();
 
     if (this.pendingPin) {
       this.applySearchPin(
@@ -707,6 +726,8 @@ export class TrailForgeMap {
       "tf-pois-icons",
       "tf-pois-layer",
       "tf-planned-route-line",
+      SELECTED_TRACK_STEEP_LAYER_ID,
+      "tf-tracks-selected-core",
       "tf-steep-highlights",
       "tf-tracks-line",
       "tf-unmapped-line",
@@ -987,7 +1008,13 @@ export class TrailForgeMap {
   }
 
   private applyLayerVisibility(): void {
-    this.setLayerVis("tf-tracks-selected", this.currentLayers.tracks);
+    for (const id of SELECTED_TRACK_LAYER_IDS) {
+      this.setLayerVis(id, this.currentLayers.tracks);
+    }
+    this.setLayerVis(
+      SELECTED_TRACK_STEEP_LAYER_ID,
+      this.currentLayers.tracks && this.currentLayers.steepHighlights
+    );
     this.setLayerVis("tf-tracks-casing", this.currentLayers.tracks);
     this.setLayerVis("tf-tracks-line", this.currentLayers.tracks);
     this.setLayerVis("tf-tracks-access-warn", this.currentLayers.tracks);
