@@ -9,7 +9,7 @@ from typing import Any, Final
 import numpy as np
 from pydantic import BaseModel, Field
 from pyproj import Transformer
-from shapely import STRtree
+from shapely import GEOSException, STRtree, make_valid
 from shapely import transform as shapely_transform_coords
 from shapely.geometry import Point, shape
 from shapely.geometry.base import BaseGeometry
@@ -132,9 +132,12 @@ class WaterwaySpatialIndex:
             ww = self._features[idx]
             ww_m = self._geoms_m[idx]
 
-            inter = seg_m.intersection(ww_m)
-            if inter.is_empty:
-                inter = seg_test_m.intersection(ww_m)
+            try:
+                inter = seg_m.intersection(ww_m)
+                if inter.is_empty:
+                    inter = seg_test_m.intersection(ww_m)
+            except GEOSException:
+                inter = Point()
 
             pt_wgs84: tuple[float, float] | None = None
             if not inter.is_empty:
@@ -194,6 +197,10 @@ class CapadSpatialIndex:
             pgeom = park.to_shapely()
             if pgeom.is_empty:
                 continue
+            if not pgeom.is_valid:
+                pgeom = make_valid(pgeom)
+            if pgeom.is_empty:
+                continue
             self._parks.append(park)
             self._geoms_wgs84.append(pgeom)
             self._prepared.append(prep(pgeom))
@@ -204,6 +211,8 @@ class CapadSpatialIndex:
         cached = self._geoms_m_cache.get(idx)
         if cached is None:
             cached = _project_geom(self._geoms_wgs84[idx], self._to_metric)
+            if not cached.is_valid:
+                cached = make_valid(cached)
             self._geoms_m_cache[idx] = cached
         return cached
 
@@ -226,8 +235,11 @@ class CapadSpatialIndex:
         # Fast path: midpoint strictly inside a candidate CAPAD polygon
         for raw_idx in self._tree.query(midpoint):
             idx = int(raw_idx)
-            if self._prepared[idx].contains(midpoint):
-                return _park_to_dict(self._parks[idx])
+            try:
+                if self._prepared[idx].contains(midpoint):
+                    return _park_to_dict(self._parks[idx])
+            except GEOSException:
+                continue
 
         # Border-seam / polygon fallback: choose park with largest metric intersection
         candidates = self._tree.query(shp)
@@ -239,10 +251,16 @@ class CapadSpatialIndex:
         best_overlap = 0.0
         for raw_idx in candidates:
             idx = int(raw_idx)
-            if not self._prepared[idx].intersects(shp):
+            try:
+                if not self._prepared[idx].intersects(shp):
+                    continue
+                pgeom_m = self._get_metric_geom(idx)
+                inter = shp_m.intersection(pgeom_m)
+            except GEOSException:
+                # Defensive fallback if upstream simplified CAPAD polygon still hits GEOS error
+                if best_park is None:
+                    best_park = self._parks[idx]
                 continue
-            pgeom_m = self._get_metric_geom(idx)
-            inter = shp_m.intersection(pgeom_m)
             measure = float(inter.length) if inter.length > 0.0 else float(inter.area)
             if measure > best_overlap or (best_park is None and not inter.is_empty):
                 best_overlap = measure
