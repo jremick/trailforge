@@ -1,0 +1,107 @@
+# Google Cloud Build CI pipeline for TrailForge (cached Docker builds + full offline tests)
+# Manual run: gcloud builds submit --region=australia-southeast2 --config=cloudbuild.yaml .
+
+substitutions:
+  _REGION: australia-southeast2
+  _AR_REPO: forge-ci
+
+options:
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+  # 1. Build & inline-cache backend GIS image (tippecanoe + GDAL + osmium + pmtiles + Python 3.12)
+  - id: build-backend
+    name: gcr.io/cloud-builders/docker
+    waitFor: ['-']
+    env:
+      - DOCKER_BUILDKIT=1
+    entrypoint: bash
+    args:
+      - -euxc
+      - |
+        CACHE_IMG="${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/trailforge-backend:cache"
+        docker pull "$${CACHE_IMG}" || true
+        docker build \
+          --build-arg BUILDKIT_INLINE_CACHE=1 \
+          --cache-from "$${CACHE_IMG}" \
+          -t "trailforge-backend:ci-${BUILD_ID}" \
+          -t "$${CACHE_IMG}" \
+          .
+
+  # 2. Build & inline-cache web PWA image in parallel
+  - id: build-web
+    name: gcr.io/cloud-builders/docker
+    waitFor: ['-']
+    env:
+      - DOCKER_BUILDKIT=1
+    entrypoint: bash
+    args:
+      - -euxc
+      - |
+        CACHE_IMG="${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/trailforge-web:cache"
+        docker pull "$${CACHE_IMG}" || true
+        docker build \
+          --build-arg BUILDKIT_INLINE_CACHE=1 \
+          --cache-from "$${CACHE_IMG}" \
+          -t "trailforge-web:ci-${BUILD_ID}" \
+          -t "$${CACHE_IMG}" \
+          ./web
+
+  # 3. Run web PWA typecheck and Vitest offline unit suite in parallel
+  - id: test-web
+    name: node:22-alpine
+    waitFor: ['-']
+    dir: web
+    entrypoint: sh
+    args:
+      - -euxc
+      - |
+        npm ci
+        npm run typecheck
+        npm test
+
+  # 4. Run ruff lint, Alembic migrations, and offline unit + PostGIS integration tests
+  #    inside the freshly built backend image (exercises full GDAL/tippecanoe/pmtiles stack).
+  - id: test-backend
+    name: gcr.io/cloud-builders/docker
+    waitFor: ['build-backend']
+    entrypoint: bash
+    args:
+      - -euxc
+      - |
+        cleanup() {
+          docker rm -f db >/dev/null 2>&1 || true
+        }
+        trap cleanup EXIT
+
+        docker run -d --name db --network cloudbuild \
+          -e POSTGRES_DB=trailforge \
+          -e POSTGRES_USER=trailforge \
+          -e POSTGRES_PASSWORD=trailforge \
+          imresamu/postgis:16-3.4
+
+        for i in $$(seq 1 30); do
+          if docker exec db pg_isready -U trailforge -d trailforge >/dev/null 2>&1; then
+            break
+          fi
+          sleep 2
+        done
+        docker exec db pg_isready -U trailforge -d trailforge
+
+        docker run --rm --network cloudbuild \
+          -e DATABASE_URL="postgresql+psycopg://trailforge:trailforge@db:5432/trailforge" \
+          -e TEST_DATABASE_URL="postgresql+psycopg://trailforge:trailforge@db:5432/trailforge" \
+          "trailforge-backend:ci-${BUILD_ID}" \
+          bash -euxc 'ruff check src tests migrations && alembic upgrade head && pytest -m "not live" -v'
+
+  # 5. Push updated Docker layer caches only after all checks pass
+  - id: push-cache
+    name: gcr.io/cloud-builders/docker
+    waitFor: ['test-backend', 'test-web', 'build-web']
+    entrypoint: bash
+    args:
+      - -euxc
+      - |
+        docker push "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/trailforge-backend:cache"
+        docker push "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_AR_REPO}/trailforge-web:cache"
