@@ -5,6 +5,33 @@ All notable changes to **TrailForge** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — Phase A (Path to `v1.0.0-beta.1` / `v1.0.0` GA)
+
+### Added
+
+#### Pillar 1 — Real-Data Regional Bake Pipeline & 10k-Segment Scale Benchmark
+- Streaming `< 300 MB` RAM OSM PBF extractor (`src/trailforge/ingestion/pbf.py`) chaining `osmium extract --strategy=complete_ways` -> `osmium tags-filter` -> `osmium export -f geojsonseq` line-by-line into vehicular 4WD tracks, waterways, and outdoor POIs with shared-vertex gate propagation and ODbL provenance.
+- Tiled regional & statewide open-data bake orchestrator and CLI (`src/trailforge/ingestion/live_bake.py`, `src/trailforge/ingestion/bake_cli.py`, plus `make bake-alps` and `make bake-blue-mountains`) supporting resumable tile manifests (`0.25°` default tiles), `GDAL_STREAMING_ENV`, live OSM PBF/Overpass + VIC DataVic WFS + NSW Spatial ArcGIS + GA Hydrology + CAPAD 2025 + GA 5 m LiDAR / DEA SRTM 1s DEM ingestion, closures, 72 h rainfall, PMTiles, and offline packs, plus `--fixtures` & `--dry-run` CI modes.
+- 10,000+ segment synthetic scale benchmark and PostGIS `EXPLAIN (ANALYZE, FORMAT JSON)` GIST index auditor (`src/trailforge/ingestion/benchmark.py`, `tests/test_scale_bake.py`) plus a `@pytest.mark.live` real Australian corridor bake test.
+
+#### Pillar 2 — Multi-Arch GHCR Release, Production HTTPS Deploy Kit & Isolated Test DB
+- Multi-arch (`linux/amd64`, `linux/arm64`) GitHub Container Registry release workflow (`.github/workflows/release-images.yml`) publishing `trailforge-backend` (`INSTALL_DEV=false`) and `trailforge-web` with `GPL-3.0-or-later` OCI annotations, scoped GHA build caches, and a semver pre-release guard so tags like `v1.0.0-beta.1` never overwrite `:latest` or `:vMAJOR.MINOR`.
+- Zero-build production/homelab Compose file (`docker-compose.ghcr.yml`) pulling prebuilt GHCR images + `imresamu/postgis:16-3.4`, binding `127.0.0.1:${WEB_PORT:-5173}:80` safely by default with full secrets/volumes/memory-cap parity (`db` 512m, `api` 512m, `worker` 512m, `web` 128m).
+- Production HTTPS deployment kit (`deploy/README.md`, `deploy/Caddyfile.example`, `deploy/traefik-compose.override.yml`, `deploy/tailscale-serve.md`) preserving HTTP `Range` / `206 Partial Content` for PMTiles, enforcing `15 MB` GPX/photo upload caps, documenting why HTTPS is mandatory for in-cab PWA Service Workers / Geolocation / Screen Wake Lock / `AUTH_COOKIE_SECURE=true`, and covering PostGIS + `/data/uploads` + `/data/packs` backups and low-downtime upgrades.
+- Isolated `trailforge_test` PostGIS integration test database in `Makefile` (`make test-integration`) and `tests/conftest.py` (auto-creating `trailforge_test` + PostGIS + Alembic migrations while syncing `DATABASE_URL` & `TEST_DATABASE_URL`) so tests never race `worker-1` or mutate seeded dev corridor data, backed by offline parity tests (`tests/test_deploy_config.py`).
+
+#### Pillar 3 — Interactive Multi-Track Route Planner & GridForge 300 DPI Strip Atlas Handoff
+- Tier C ODbL-separated `planned_routes` ORM model and Alembic migration (`migrations/versions/0002_planned_routes.py`, 27 base tables total; zero OSM geometries/tags — links strictly by canonical `track_ids` JSONB).
+- Route planning engine & REST API (`src/trailforge/routes/planner.py`, `src/trailforge/api/routes.py`, `tests/test_route_planner.py`): `POST /api/routes/plan` with 2-state DP automatic leg orientation, `> 100 m` leg gap detection, combined distance/duration/elevation/slope/grade/rig-suitability/closures/gates/wet-risk/crossings/POIs summary, `POST /api/routes/plan/export?format=gpx|geojson` (GDAL-verified GPX 1.1 & RFC 7946 GeoJSON), authenticated saved-routes CRUD (`/api/routes`) with strict owner isolation, and pre-formatted `gridforge_cli` strip-atlas command.
+- Interactive web **Route Planner** drawer, top-bar `Route` pill, `+ Route` Track Inspector button, stitched MapLibre route overlay (`#14b8a6` line + numbered `S` / `2..N` / `F` / `W` pins), combined 4-grade SVG elevation profile, offline pack fallback planner, one-click `Copy CLI` GridForge card, and drawer `overflow: clip` / `visibility` layout hardening (`web/src/components/routePlanner.ts`, `web/src/routeHelpers.ts`, `web/src/routeHelpers.test.ts`).
+
+### Verification Metrics (Phase A)
+- **Offline CI Tests:** `207+` offline automated tests passing (`121` isolated Docker PostGIS Python tests + `86` Vitest web tests across 12 files + `4` host deploy-manifest parity tests; zero `worker-1` races and live dev corridor intact).
+- **10k+ Segment Scale & GIST Benchmark:** `11,179` canonical segments (`150` tracks), **`13.65 MiB`** peak Python heap (`< 300 MB` budget), **`0.18–0.63 ms`** PostGIS GIST index scans (`0` Seq Scans on `track_segments`).
+- **Live Real-Data AU Verification (`@pytest.mark.live`):** `4/4` passing across all 8 AU upstream agencies + real corridor bakes (Blue Mountains Narrow Neck & Australian Alps Tom Groggin: `592` real segments, `2.3 MiB` vector + `300 KiB` terrain PMTiles).
+
+---
+
 ## [1.0.0-alpha.1] - 2026-11-26
 
 First public alpha release of **TrailForge** — an open-source (`GPL-3.0-or-later`), self-hostable 4WD & off-road mapping, live track-grading, and trail-intelligence platform launching first for **Victoria & New South Wales (including ACT)**.
