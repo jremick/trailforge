@@ -1,0 +1,164 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "source_provider": "ga_hydro",
+        "source_license": "CC-BY-4.0",
+        "source_feature_id": "GA-HYD-101",
+        "name": "Murray River",
+        "featuretype": "Watercourse",
+        "perenniality": "Perennial",
+        "hierarchy": "Major"
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            148.055,
+            -36.564205
+          ],
+          [
+            148.065,
+            -36.562741
+          ],
+          [
+            148.075,
+            -36.561634
+          ],
+          [
+            148.085,
+            -36.561058
+          ],
+          [
+            148.095,
+            -36.561105
+          ],
+          [
+            148.105,
+            -36.561766
+          ],
+          [
+            148.115,
+            -36.562938
+          ],
+          [
+            148.125,
+            -36.564436
+          ],
+          [
+            148.135,
+            -36.566022
+          ],
+          [
+            148.145,
+            -36.567447
+          ],
+          [
+            148.155,
+            -36.568486
+          ],
+          [
+            148.165,
+            -36.568975
+          ],
+          [
+            148.175,
+            -36.568836
+          ],
+          [
+            148.185,
+            -36.568091
+          ],
+          [
+            148.195,
+            -36.566858
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "source_provider": "ga_hydro",
+        "source_license": "CC-BY-4.0",
+        "source_feature_id": "GA-HYD-102",
+        "name": "Limestone Creek",
+        "featuretype": "Watercourse",
+        "perenniality": "Intermittent",
+        "hierarchy": "Minor"
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            148.07,
+            -36.635
+          ],
+          [
+            148.081667,
+            -36.631667
+          ],
+          [
+            148.093333,
+            -36.628333
+          ],
+          [
+            148.105,
+            -36.625
+          ],
+          [
+            148.116667,
+            -36.620667
+          ],
+          [
+            148.128333,
+            -36.616333
+          ],
+          [
+            148.14,
+            -36.612
+          ],
+          [
+            148.151667,
+            -36.606333
+          ],
+          [
+            148.163333,
+            -36.600667
+          ],
+          [
+            148.175,
+            -36.595
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "source_provider": "ga_hydro",
+        "source_license": "CC-BY-4.0",
+        "source_feature_id": "GA-HYD-999",
+        "name": null,
+        "featuretype": "Connector",
+        "perenniality": "Unknown",
+        "hierarchy": "Minor"
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            148.11,
+            -36.566
+          ],
+          [
+            148.115,
+            -36.565
+          ]
+        ]
+      }
+    }
+  ]
+}

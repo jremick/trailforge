@@ -1,0 +1,120 @@
+services:
+  db:
+    image: ${POSTGIS_IMAGE:-imresamu/postgis:16-3.4}
+    command:
+      - postgres
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - effective_cache_size=256MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - max_connections=50
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-trailforge}
+      POSTGRES_USER: ${POSTGRES_USER:-trailforge}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trailforge}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - trailforge-pgdata:/var/lib/postgresql/data
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trailforge} -d ${POSTGRES_DB:-trailforge}"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: trailforge-backend:dev
+    command:
+      - sh
+      - -c
+      - alembic upgrade head && exec uvicorn trailforge.api.main:app --host 0.0.0.0 --port 8000
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://trailforge:trailforge@db:5432/trailforge}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+      PRIVACY_TRIM_METERS: ${PRIVACY_TRIM_METERS:-250}
+      SNOW_LINE_DEFAULT_M: ${SNOW_LINE_DEFAULT_M:-1000}
+      GDAL_CACHEMAX: ${GDAL_CACHEMAX:-192}
+      OMP_THREAD_LIMIT: ${OMP_THREAD_LIMIT:-1}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - trailforge-data:/data
+    depends_on:
+      db:
+        condition: service_healthy
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: trailforge-backend:dev
+    command: ["python", "-m", "trailforge.worker.main"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://trailforge:trailforge@db:5432/trailforge}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-30}
+      PRIVACY_TRIM_METERS: ${PRIVACY_TRIM_METERS:-250}
+      GDAL_CACHEMAX: ${GDAL_CACHEMAX:-192}
+      OMP_THREAD_LIMIT: ${OMP_THREAD_LIMIT:-1}
+    volumes:
+      - trailforge-data:/data
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    mem_limit: 512m
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os, time, sys; p='/tmp/worker-healthy'; sys.exit(0 if os.path.exists(p) and (time.time()-os.path.getmtime(p)) < 90 else 1)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    image: trailforge-web:dev
+    ports:
+      - "${WEB_PORT:-5173}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    mem_limit: 128m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:80/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  trailforge-pgdata:
+  trailforge-data:

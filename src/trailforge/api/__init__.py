@@ -1,0 +1,1 @@
+"""TrailForge FastAPI application package."""

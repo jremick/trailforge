@@ -1,0 +1,231 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "source_layer": "tr_road",
+        "pfi": "VIC-TR-2001",
+        "ezi_road_name_label": "DAVIES PLAIN TRACK",
+        "class_code": 7,
+        "road_seal": "3",
+        "feature_type_code": "road",
+        "trail_class": "4wd_track",
+        "is_vehicular": true
+      },
+      "geometry": {
+        "type": "MultiLineString",
+        "coordinates": [
+          [
+            [
+              148.12007,
+              -36.55998
+            ],
+            [
+              148.12007,
+              -36.56298
+            ],
+            [
+              148.12007,
+              -36.56598
+            ],
+            [
+              148.12007,
+              -36.56898
+            ],
+            [
+              148.12007,
+              -36.57198
+            ],
+            [
+              148.12007,
+              -36.57498
+            ],
+            [
+              148.12027,
+              -36.57938
+            ],
+            [
+              148.12047,
+              -36.58378
+            ],
+            [
+              148.12067,
+              -36.58818
+            ],
+            [
+              148.12087,
+              -36.59258
+            ],
+            [
+              148.12107,
+              -36.59698
+            ],
+            [
+              148.12147,
+              -36.60118
+            ],
+            [
+              148.12187,
+              -36.60538
+            ],
+            [
+              148.12227,
+              -36.60958
+            ],
+            [
+              148.12267,
+              -36.61378
+            ],
+            [
+              148.12307,
+              -36.61798
+            ],
+            [
+              148.12357,
+              -36.62348
+            ],
+            [
+              148.12407,
+              -36.62898
+            ],
+            [
+              148.12457,
+              -36.63448
+            ],
+            [
+              148.12507,
+              -36.63998
+            ],
+            [
+              148.12532,
+              -36.64548
+            ],
+            [
+              148.12557,
+              -36.65098
+            ],
+            [
+              148.12582,
+              -36.65648
+            ],
+            [
+              148.12607,
+              -36.66198
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "source_layer": "tr_road",
+        "pfi": "VIC-TR-2002",
+        "ezi_road_name_label": "BUCKY RIDGE FIRE TRAIL",
+        "class_code": 6,
+        "road_seal": "2",
+        "feature_type_code": "fire_trail",
+        "trail_class": "fire_trail",
+        "is_vehicular": true
+      },
+      "geometry": {
+        "type": "MultiLineString",
+        "coordinates": [
+          [
+            [
+              148.144,
+              -36.609
+            ],
+            [
+              148.147667,
+              -36.612667
+            ],
+            [
+              148.151333,
+              -36.616333
+            ],
+            [
+              148.155,
+              -36.62
+            ],
+            [
+              148.158667,
+              -36.625
+            ],
+            [
+              148.162333,
+              -36.63
+            ],
+            [
+              148.166,
+              -36.635
+            ],
+            [
+              148.168,
+              -36.640667
+            ],
+            [
+              148.17,
+              -36.646333
+            ],
+            [
+              148.172,
+              -36.652
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "source_layer": "recweb_tracks",
+        "pfi": "VIC-RW-3001",
+        "ezi_road_name_label": "ALPINE WALKING TRACK",
+        "class_code": 8,
+        "road_seal": "3",
+        "feature_type_code": "trail",
+        "access_dsc": "Walking Track",
+        "trk_class": "Walking",
+        "trail_class": "walking_track",
+        "is_vehicular": false
+      },
+      "geometry": {
+        "type": "MultiLineString",
+        "coordinates": [
+          [
+            [
+              148.08,
+              -36.645
+            ],
+            [
+              148.085,
+              -36.648333
+            ],
+            [
+              148.09,
+              -36.651667
+            ],
+            [
+              148.095,
+              -36.655
+            ],
+            [
+              148.1,
+              -36.658
+            ],
+            [
+              148.105,
+              -36.661
+            ],
+            [
+              148.11,
+              -36.664
+            ]
+          ]
+        ]
+      }
+    }
+  ]
+}

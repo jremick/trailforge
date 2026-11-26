@@ -1,0 +1,113 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "source_layer": "nsw_fire_trails_l9",
+        "objectid": 9001,
+        "classsubtype": 5,
+        "roadnamebase": "POPLARS",
+        "roadnametype": "FIRE TRAIL",
+        "brimsid": "FT-401",
+        "surface": "2",
+        "operationalstatus": "O",
+        "trail_class": "fire_trail",
+        "is_vehicular": true
+      },
+      "geometry": {
+        "type": "MultiLineString",
+        "coordinates": [
+          [
+            [
+              148.12005,
+              -36.56005
+            ],
+            [
+              148.12505,
+              -36.5593
+            ],
+            [
+              148.13005,
+              -36.55855
+            ],
+            [
+              148.13505,
+              -36.5578
+            ],
+            [
+              148.14005,
+              -36.55705
+            ],
+            [
+              148.14555,
+              -36.55605
+            ],
+            [
+              148.15105,
+              -36.55505
+            ],
+            [
+              148.15655,
+              -36.55405
+            ],
+            [
+              148.16205,
+              -36.55305
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "source_layer": "nsw_fire_trails_l9",
+        "objectid": 9002,
+        "classsubtype": 5,
+        "roadnamebase": "PINCH RIVER",
+        "roadnametype": "FIRE TRAIL",
+        "brimsid": "FT-409",
+        "surface": "2",
+        "operationalstatus": "O",
+        "trail_class": "fire_trail",
+        "is_vehicular": true
+      },
+      "geometry": {
+        "type": "MultiLineString",
+        "coordinates": [
+          [
+            [
+              148.162,
+              -36.553
+            ],
+            [
+              148.166667,
+              -36.553667
+            ],
+            [
+              148.171333,
+              -36.554333
+            ],
+            [
+              148.176,
+              -36.555
+            ],
+            [
+              148.180667,
+              -36.556
+            ],
+            [
+              148.185333,
+              -36.557
+            ],
+            [
+              148.19,
+              -36.558
+            ]
+          ]
+        ]
+      }
+    }
+  ]
+}

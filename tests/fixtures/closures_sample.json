@@ -1,0 +1,93 @@
+{
+  "generated_at": "2026-11-26T00:00:00Z",
+  "feeds": {
+    "vic_mapshare_seasonal": [
+      {
+        "external_id": "VIC-SEASONAL-DAVIES-2026",
+        "title": "Davies Plain Track \u2014 Winter Seasonal Closure",
+        "alert_type": "seasonal_closure",
+        "severity": "closed",
+        "status": "scheduled",
+        "state": "VIC",
+        "description": "Closed annually from Queen's Birthday weekend (June) to late October to protect alpine soils and track surfaces.",
+        "source_url": "https://mapshare.vic.gov.au/mapsharevic/",
+        "effective_from": "2026-06-08T00:00:00Z",
+        "effective_to": "2026-10-31T23:59:59Z",
+        "geometry": {
+          "type": "LineString",
+          "coordinates": [
+            [
+              148.12,
+              -36.57
+            ],
+            [
+              148.123,
+              -36.618
+            ],
+            [
+              148.126,
+              -36.662
+            ]
+          ]
+        }
+      }
+    ],
+    "nsw_npws": [
+      {
+        "external_id": "NPWS-KOSCI-2026-01",
+        "title": "Kosciuszko National Park \u2014 Alpine Track Wet Conditions Advisory",
+        "alert_type": "hazard_warning",
+        "severity": "advisory",
+        "status": "active",
+        "state": "NSW",
+        "park_name": "Kosciuszko National Park",
+        "description": "High river levels possible at Tom Groggin crossing after alpine rain.",
+        "source_url": "https://www.nationalparks.nsw.gov.au/alerts",
+        "effective_from": "2026-11-20T00:00:00Z",
+        "effective_to": null,
+        "geometry": null
+      }
+    ],
+    "vic_emergency": [
+      {
+        "external_id": "VICEM-2026-9941",
+        "title": "Bucky Ridge \u2014 Planned Fuel Reduction Burn Watch & Act",
+        "alert_type": "bushfire",
+        "severity": "watch_and_act",
+        "status": "active",
+        "state": "VIC",
+        "description": "Smoke and active fire appliances along Bucky Ridge Fire Trail.",
+        "source_url": "https://emergency.vic.gov.au/respond/",
+        "effective_from": "2026-11-25T22:00:00Z",
+        "effective_to": "2026-11-27T12:00:00Z",
+        "geometry": {
+          "type": "Polygon",
+          "coordinates": [
+            [
+              [
+                148.15,
+                -36.618
+              ],
+              [
+                148.175,
+                -36.618
+              ],
+              [
+                148.175,
+                -36.645
+              ],
+              [
+                148.15,
+                -36.645
+              ],
+              [
+                148.15,
+                -36.618
+              ]
+            ]
+          ]
+        }
+      }
+    ]
+  }
+}

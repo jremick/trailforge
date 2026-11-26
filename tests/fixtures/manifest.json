@@ -1,0 +1,87 @@
+{
+  "corridor": "Davies Plain / Tom Groggin / Murray River (VIC-NSW Australian Alps)",
+  "seed": 42,
+  "bbox": [
+    148.05,
+    -36.68,
+    148.2,
+    -36.55
+  ],
+  "crs": {
+    "storage": "EPSG:4326",
+    "metric": "EPSG:3577",
+    "utm": "EPSG:32755",
+    "mgrs_zone": "55H FV"
+  },
+  "dem": {
+    "filename": "dem_alps_corridor.tif",
+    "cols": 300,
+    "rows": 260,
+    "dx_deg": 0.0005,
+    "dy_deg": 0.0005,
+    "dtype": "Float32",
+    "compression": "DEFLATE",
+    "nodata": -9999.0,
+    "elev_min_m": 600.0,
+    "elev_max_m": 1633.51
+  },
+  "expected_counts": {
+    "osm_tracks": 7,
+    "osm_tracks_v2_jittered": 8,
+    "vic_tracks": 3,
+    "nsw_tracks": 2,
+    "waterways": 3,
+    "capad_parks": 2,
+    "pois": 6,
+    "closures_feeds": 3,
+    "gpx_davies_plain_points": 120,
+    "gpx_unmapped_spur_points": 45
+  },
+  "total_data_bytes": 161671,
+  "files": {
+    "osm_tracks.geojson": {
+      "size_bytes": 8225,
+      "sha256": "e255786c128b9cd6c59d93f247bfe1eb12fae0809ad0fe4c2507ef6b3f202a70"
+    },
+    "osm_tracks_v2_jittered.geojson": {
+      "size_bytes": 8929,
+      "sha256": "37c68dcc767166393c8fd2cd1a60651ceb88788c53efeff49bfabeb8e6759418"
+    },
+    "vic_tracks.geojson": {
+      "size_bytes": 4685,
+      "sha256": "f11fc115164f17e1399e8c8530c7a66276780fdc6df61b5c29c0294bdd519c19"
+    },
+    "nsw_tracks.geojson": {
+      "size_bytes": 2323,
+      "sha256": "ff64c5e6eb97ddc0991cf34622913a34c0d26e696860164307650234f4829970"
+    },
+    "dem_alps_corridor.tif": {
+      "size_bytes": 107128,
+      "sha256": "234458810fba66eb1f11a161ebf1642408421c87888cd2f587ce80f33a43556d"
+    },
+    "waterways.geojson": {
+      "size_bytes": 3160,
+      "sha256": "46d65e1d4707c739176aba3540968bd8de078961c823409fa5bf4d023be1f0a8"
+    },
+    "capad_parks.geojson": {
+      "size_bytes": 3186,
+      "sha256": "985efdff163bc2f2d87a186a4b9a9a4c72779de648a99bf0581484404e299467"
+    },
+    "pois.geojson": {
+      "size_bytes": 2986,
+      "sha256": "9beff423e3f9714f18a2694e79790e849433848c5957fb75c8bb1d5ff1c438b5"
+    },
+    "closures_sample.json": {
+      "size_bytes": 2681,
+      "sha256": "2014044a4396efb6bef48dcf68ec5241c751c4b399add7af5d64be3dbeebb429"
+    },
+    "sample_trace_davies_plain.gpx": {
+      "size_bytes": 13212,
+      "sha256": "21650b5e87fd6ba605b4a5b8c76d71d0c547ff5f65fd9647780a3ed94303c02f"
+    },
+    "sample_trace_unmapped_spur.gpx": {
+      "size_bytes": 5156,
+      "sha256": "b5c759dac6b36ab87d9d3855a4942ac1c1d132865ed705cf786384cbdb9298e6"
+    }
+  }
+}

@@ -1,0 +1,452 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "osm_way_id": 1001,
+        "osm_version": 2,
+        "name": "Tom Groggin Access Rd",
+        "highway": "unclassified",
+        "surface": "asphalt",
+        "tracktype": "grade1",
+        "smoothness": "good",
+        "4wd_only": "no",
+        "access": "public",
+        "motor_vehicle": "yes",
+        "bridge": null,
+        "ford": null,
+        "has_gate_barrier": false
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            148.065,
+            -36.556
+          ],
+          [
+            148.0725,
+            -36.5565
+          ],
+          [
+            148.08,
+            -36.557
+          ],
+          [
+            148.0875,
+            -36.5575
+          ],
+          [
+            148.095,
+            -36.558
+          ],
+          [
+            148.10125,
+            -36.5585
+          ],
+          [
+            148.1075,
+            -36.559
+          ],
+          [
+            148.11375,
+            -36.5595
+          ],
+          [
+            148.12,
+            -36.56
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "osm_way_id": 1002,
+        "osm_version": 2,
+        "name": "Davies Plain Track Lower",
+        "highway": "track",
+        "surface": "rock",
+        "tracktype": "grade4",
+        "smoothness": "very_bad",
+        "4wd_only": "yes",
+        "access": "public",
+        "motor_vehicle": "yes",
+        "bridge": null,
+        "ford": "yes",
+        "has_gate_barrier": false
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            148.123015,
+            -36.618028
+          ],
+          [
+            148.122612,
+            -36.613787
+          ],
+          [
+            148.122186,
+            -36.609598
+          ],
+          [
+            148.121824,
+            -36.605415
+          ],
+          [
+            148.121434,
+            -36.601164
+          ],
+          [
+            148.120983,
+            -36.596983
+          ],
+          [
+            148.120792,
+            -36.592563
+          ],
+          [
+            148.12061,
+            -36.588193
+          ],
+          [
+            148.120401,
+            -36.583776
+          ],
+          [
+            148.120175,
+            -36.57942
+          ],
+          [
+            148.120043,
+            -36.574992
+          ],
+          [
+            148.119966,
+            -36.572027
+          ],
+          [
+            148.119968,
+            -36.569
+          ],
+          [
+            148.119982,
+            -36.56601
+          ],
+          [
+            148.120026,
+            -36.562984
+          ],
+          [
+            148.119983,
+            -36.55999
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "osm_way_id": 1003,
+        "osm_version": 1,
+        "name": "Davies Plain Ridge",
+        "highway": "track",
+        "surface": "dirt",
+        "tracktype": "grade3",
+        "smoothness": "bad",
+        "4wd_only": "recommended",
+        "access": "public",
+        "motor_vehicle": "yes",
+        "bridge": null,
+        "ford": null,
+        "has_gate_barrier": false
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            148.123,
+            -36.618
+          ],
+          [
+            148.1235,
+            -36.6235
+          ],
+          [
+            148.124,
+            -36.629
+          ],
+          [
+            148.1245,
+            -36.6345
+          ],
+          [
+            148.125,
+            -36.64
+          ],
+          [
+            148.12525,
+            -36.6455
+          ],
+          [
+            148.1255,
+            -36.651
+          ],
+          [
+            148.12575,
+            -36.6565
+          ],
+          [
+            148.126,
+            -36.662
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "osm_way_id": 100401,
+        "osm_version": 2,
+        "name": "Poplars Fire Trail",
+        "highway": "track",
+        "surface": "gravel",
+        "tracktype": "grade3",
+        "smoothness": "intermediate",
+        "4wd_only": "recommended",
+        "access": "public",
+        "motor_vehicle": "yes",
+        "bridge": null,
+        "ford": null,
+        "has_gate_barrier": false
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            148.12,
+            -36.56
+          ],
+          [
+            148.125,
+            -36.55925
+          ],
+          [
+            148.13,
+            -36.5585
+          ],
+          [
+            148.135,
+            -36.55775
+          ],
+          [
+            148.14,
+            -36.557
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "osm_way_id": 100402,
+        "osm_version": 2,
+        "name": "Poplars Fire Trail",
+        "highway": "track",
+        "surface": "gravel",
+        "tracktype": "grade3",
+        "smoothness": "intermediate",
+        "4wd_only": "recommended",
+        "access": "public",
+        "motor_vehicle": "yes",
+        "bridge": null,
+        "ford": null,
+        "has_gate_barrier": false
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            148.14,
+            -36.557
+          ],
+          [
+            148.1455,
+            -36.556
+          ],
+          [
+            148.151,
+            -36.555
+          ],
+          [
+            148.1565,
+            -36.554
+          ],
+          [
+            148.162,
+            -36.553
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "osm_way_id": 1005,
+        "osm_version": 1,
+        "name": "Station Creek Private Spur",
+        "highway": "track",
+        "surface": "dirt",
+        "tracktype": "grade3",
+        "smoothness": "bad",
+        "4wd_only": "yes",
+        "access": "private",
+        "motor_vehicle": "private",
+        "barrier": "gate",
+        "locked": "yes",
+        "bridge": null,
+        "ford": null,
+        "has_gate_barrier": true
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            148.123,
+            -36.618
+          ],
+          [
+            148.117,
+            -36.616667
+          ],
+          [
+            148.111,
+            -36.615333
+          ],
+          [
+            148.105,
+            -36.614
+          ],
+          [
+            148.1,
+            -36.612667
+          ],
+          [
+            148.095,
+            -36.611333
+          ],
+          [
+            148.09,
+            -36.61
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "osm_way_id": 1006,
+        "osm_version": 1,
+        "name": "Limestone Creek Bridged Link",
+        "highway": "track",
+        "surface": "gravel",
+        "tracktype": "grade2",
+        "smoothness": "intermediate",
+        "4wd_only": "no",
+        "access": "public",
+        "motor_vehicle": "yes",
+        "bridge": "yes",
+        "ford": null,
+        "has_gate_barrier": false
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            148.123,
+            -36.618
+          ],
+          [
+            148.126,
+            -36.617
+          ],
+          [
+            148.129,
+            -36.616
+          ],
+          [
+            148.132,
+            -36.615
+          ],
+          [
+            148.136,
+            -36.613
+          ],
+          [
+            148.14,
+            -36.611
+          ],
+          [
+            148.144,
+            -36.609
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "osm_way_id": 1007,
+        "osm_version": 1,
+        "name": "Main Range Footpad",
+        "highway": "path",
+        "surface": "ground",
+        "tracktype": null,
+        "smoothness": "bad",
+        "4wd_only": null,
+        "access": "public",
+        "motor_vehicle": "no",
+        "foot": "yes",
+        "bridge": null,
+        "ford": null,
+        "has_gate_barrier": false
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [
+            148.126,
+            -36.662
+          ],
+          [
+            148.13,
+            -36.663333
+          ],
+          [
+            148.134,
+            -36.664667
+          ],
+          [
+            148.138,
+            -36.666
+          ],
+          [
+            148.142667,
+            -36.667
+          ],
+          [
+            148.147333,
+            -36.668
+          ],
+          [
+            148.152,
+            -36.669
+          ]
+        ]
+      }
+    }
+  ]
+}

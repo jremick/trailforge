@@ -55,3 +55,5 @@ web/.vite/
 # Keep synthetic unit/integration test fixtures tracked
 !tests/fixtures/
 !tests/fixtures/**
+tests/fixtures/__pycache__/
+tests/fixtures/**/*.py[cod]

@@ -1,0 +1,125 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "source_provider": "nsw_poi",
+        "source_license": "CC-BY-4.0",
+        "source_feature_id": "NSW-POI-101",
+        "name": "Tom Groggin Campground",
+        "poi_type": "campground",
+        "state": "NSW",
+        "elev_m": 612.0,
+        "access_note": "2WD/AWD accessible in dry conditions"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          148.1195,
+          -36.5602
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "source_provider": "vic_recweb_hut",
+        "source_license": "CC-BY-4.0",
+        "source_feature_id": "VIC-HUT-201",
+        "name": "Davies Plain Hut",
+        "poi_type": "hut",
+        "state": "VIC",
+        "elev_m": 1615.0,
+        "access_note": "Emergency shelter only; alpine snow zone"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          148.126,
+          -36.662
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "source_provider": "osm",
+        "source_license": "ODbL",
+        "source_feature_id": "node/88001",
+        "name": "Davies Plain Hut",
+        "poi_type": "hut",
+        "state": "VIC",
+        "elev_m": 1614.0,
+        "access_note": "Duplicate OSM node ~35 m away for dedupe testing"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          148.12635,
+          -36.66215
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "source_provider": "vic_geomark",
+        "source_license": "CC-BY-4.0",
+        "source_feature_id": "TS-4812",
+        "name": "Davies Trig (TS 4812)",
+        "poi_type": "trig",
+        "state": "VIC",
+        "elev_m": 1648.0,
+        "access_note": null
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          148.1285,
+          -36.6645
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "source_provider": "vic_foi",
+        "source_license": "CC-BY-4.0",
+        "source_feature_id": "VIC-FOI-305",
+        "name": "Murray Lookout",
+        "poi_type": "lookout",
+        "state": "VIC",
+        "elev_m": 1290.0,
+        "access_note": null
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          148.1225,
+          -36.615
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "source_provider": "osm",
+        "source_license": "ODbL",
+        "source_feature_id": "node/88002",
+        "name": "Station Creek Locked Gate",
+        "poi_type": "gate",
+        "state": "VIC",
+        "elev_m": 1180.0,
+        "access_note": "access=private; locked gate across Station Creek Spur"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          148.118,
+          -36.6168
+        ]
+      }
+    }
+  ]
+}

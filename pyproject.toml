@@ -1,0 +1,87 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "trailforge"
+version = "0.1.0"
+description = "Open-source, self-hostable 4WD & off-road mapping, live track-grading, and trail-intelligence platform for Victoria & New South Wales"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.12"
+authors = [
+    { name = "TrailForge Contributors" },
+]
+keywords = ["gis", "4wd", "offroad", "postgis", "pmtiles", "maplibre", "victoria", "nsw", "tracks"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Web Environment",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.32,<1.0",
+    "pydantic>=2.9,<3.0",
+    "pydantic-settings>=2.6,<3.0",
+    "sqlalchemy>=2.0.36,<3.0",
+    "psycopg[binary]>=3.2,<4.0",
+    "geoalchemy2>=0.15,<1.0",
+    "alembic>=1.14,<2.0",
+    "shapely>=2.0,<3.0",
+    "pyproj>=3.7,<4.0",
+    "httpx>=0.27,<1.0",
+    "python-multipart>=0.0.12,<1.0",
+]
+
+[project.optional-dependencies]
+gis = [
+    "rasterio>=1.4,<2.0",
+    "rio-rgbify>=0.2.0",
+    "pmtiles>=3.4,<4.0",
+    "numpy>=1.26,<3.0",
+]
+dev = [
+    "pytest>=8.3,<9.0",
+    "pytest-asyncio>=0.24,<1.0",
+    "ruff>=0.7,<1.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9.0",
+    "pytest-asyncio>=0.24,<1.0",
+    "ruff>=0.7,<1.0",
+]
+
+[project.scripts]
+trailforge-api = "trailforge.api.main:run"
+trailforge-worker = "trailforge.worker.main:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/trailforge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-m 'not live'"
+markers = [
+    "live: marks tests requiring live external network access (excluded from offline CI)",
+    "integration: marks tests requiring a running PostGIS database",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests", "migrations"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"migrations/versions/*.py" = ["E501"]
