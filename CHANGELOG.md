@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### Public Instance Access Control, Friend Invites & Admin API
+- Tier C reversible Alembic migration (`migrations/versions/0004_public_access_control.py`, bringing the schema to **30 base tables and 21 GIST indexes** with zero OSM ODbL impact) adding `role` (`'admin'`/`'member'`), `is_active`, `disabled_at`, and `invited_by_code` to `users`, plus new `invite_codes` and `usage_metrics_hourly` tables (`src/trailforge/db/models.py`, `tests/test_schema_postgis.py`).
+- Public registration policies (`TRAILFORGE_REGISTRATION_MODE=open|invite_only|closed`), `TRAILFORGE_ADMIN_EMAIL` first-admin auto-bootstrap (allowed even in `invite_only` mode), `GET /api/auth/config` (`registration_mode`, `demo_banner`, `allow_anonymous_browsing`), immediate `403` enforcement for suspended accounts across Bearer/cookie sessions and login, and `require_admin` dependency (`src/trailforge/auth/dependencies.py`, `src/trailforge/auth/invites.py`, `src/trailforge/api/auth.py`).
+- Admin-only gating (`Depends(require_admin)`) on expensive compute endpoints (`POST /api/packs/{region_id}/build`, `POST /api/closures/sync`, `POST /api/grading/recompute`) while keeping all read/browse `GET` routes open to anonymous visitors, plus `PACKS_PUBLIC_BASE_URL` Cloudflare R2 pack URL emission in `src/trailforge/api/packs.py`.
+- Admin management & telemetry API (`src/trailforge/api/admin.py`: `GET /api/admin/stats`, `GET/PATCH /api/admin/users`, `GET/POST/DELETE /api/admin/invites` with last-admin demotion/suspension `400` guard) and CLI (`python -m trailforge.auth.cli create-admin|promote|create-invite|list-invites`), verified by `tests/test_access_control.py`.
+
+#### Zero-Redis Rate Limiting, Upload Disk Quotas & Cloudflare R2 Sync
+- Zero-Redis in-process `UsageAndRateLimitMiddleware` (`src/trailforge/api/middleware.py`, wired in `src/trailforge/api/main.py`) extracting real client IPs from `CF-Connecting-IP` / `X-Forwarded-For` (`TRAILFORGE_TRUST_PROXY_HEADERS=true`), enforcing configurable read (`TRAILFORGE_RATE_LIMIT_READ_PER_MIN`) and auth (`TRAILFORGE_RATE_LIMIT_AUTH_PER_MIN`) sliding-window limits with `X-RateLimit-Limit` / `X-RateLimit-Remaining` and HTTP `429` + `Retry-After` (leaving `/api/health` unthrottled), and tracking rolling per-hour route-group telemetry flushed to `usage_metrics_hourly`.
+- Storage & upload protections: global `/data/uploads` disk quota (`TRAILFORGE_UPLOADS_MAX_TOTAL_MB`, returning HTTP `507 Insufficient Storage` before writing photos in `src/trailforge/reports/photos.py`) and per-user daily trip upload quotas (`TRAILFORGE_RATE_LIMIT_UPLOAD_PER_DAY` on `POST /api/trips/upload` & `POST /api/trips/mobile-sync` in `src/trailforge/api/trips.py`).
+- Zero-egress Cloudflare R2 offload (`TILES_PUBLIC_BASE_URL` in `src/trailforge/api/tiles.py`) and pure-Python AWS Signature Version 4 + `httpx` sync CLI (`python -m trailforge.packs.r2_sync`, zero `boto3` dependency, ETag/size skip checks, `--dry-run`), verified by `tests/test_edge_guard_r2.py`.
+
+#### Railway + Cloudflare Cloud Deploy Kit & Compose Parity
+- Railway Config-as-Code (`railway.toml`: Dockerfile build, `alembic upgrade head && exec uvicorn trailforge.api.main:app --host 0.0.0.0 --port ${PORT:-8000}`, `/api/health` healthcheck, `ON_FAILURE` restart policy) and complete ~$5–$10/mo hard-capped Railway + Cloudflare production playbook (`deploy/railway/README.md`, `deploy/railway/env.railway.example`) covering PostGIS (`imresamu/postgis:16-3.4`), `api`, `worker`, hard monthly billing limits, R2 sync, and admin/invite bootstrap.
+- Cloudflare Pages + R2 + WAF kit (`deploy/cloudflare/r2-cors.json` for HTTP `206` PMTiles CORS, `deploy/cloudflare/pages-proxy-worker.js` unbuffered `/api/*` Pages Function forwarding `CF-Connecting-IP`/`Range`/`Cookie`/`Authorization` with multi-`Set-Cookie` preservation and safe 5xx error sanitization, and `deploy/cloudflare/waf-rules.md` covering Free-tier rate limits, Bot Fight Mode, Managed Challenge, R2 cache rules, and cookie-free Cloudflare Web Analytics).
+- Full public-hardening and R2 offload environment variable parity across `.env.example`, `docker-compose.yml`, and `docker-compose.ghcr.yml` (safe `open` local dev defaults with `invite_only` documented for public hosts), verified by `tests/test_cloud_deploy.py`.
+
+#### Public Web UI, Absolute R2 PMTiles URLs & Admin Console
+- Configurable `VITE_API_BASE_URL` and absolute `http://`/`https://` Cloudflare R2 `PMTiles` & offline pack URL support across `web/src/style.ts`, `web/src/map.ts`, `web/src/offline/packStore.ts`, `web/src/components/packsPanel.ts`, and `web/public/sw.js` (keeping relative `/api/tiles/...` paths 100% compatible).
+- Startup `GET /api/auth/config` hydration, slim dismissible `TRAILFORGE_DEMO_BANNER` strip, `invite_only` (`TF-XXXX-XXXX` invite code input) and `closed` registration UX, friendly `429`/`403`/`507` error handling, and admin-only visibility for pack build/rebuild controls (`web/src/components/topbar.ts`, `accountPanel.ts`, `packsPanel.ts`).
+- Slide-over **Admin Console** drawer (`web/src/components/adminPanel.ts`, `web/src/adminHelpers.ts`) exposing 24h/7d traffic & error/`429` stats, route breakdown, storage quota usage bar, one-click Closure Sync & Live Grade Recompute triggers, friend invite creation/copy/revocation, and user suspend/re-enable/role controls (`web/src/adminHelpers.test.ts`, `web/src/style.test.ts` — `111/111` Vitest tests passing).
+
+### Verification Metrics (`Unreleased`)
+- **Offline CI Tests:** `276+` automated offline tests passing (`165` isolated Docker PostGIS tests + `111` Vitest web tests across 14 files + `141` host unit/deploy parity checks; `0` failures, `0` privacy hits).
+- **Schema:** Alembic `0004_public_access_control` roundtrip & `alembic check` clean (**30 base tables, 21 GIST indexes**).
+
 ---
 
 ## [1.0.1] - 2026-11-26
