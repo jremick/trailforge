@@ -418,6 +418,24 @@ def test_nginx_conf_mcp_and_oauth_unbuffered_proxy_blocks() -> None:
     assert "proxy_set_header MCP-Protocol-Version $http_mcp_protocol_version;" in mcp_block
     assert "proxy_set_header Last-Event-ID $http_last_event_id;" in mcp_block
 
+    # Dedicated /api/oauth/authorize block preserves FastAPI's dynamic CSP
+    # (`form-action 'self' <redirect-origin>; frame-ancestors 'none'`) without
+    # inheriting the static server-level CSP header, while keeping other security headers.
+    authorize_block = _extract_nginx_location_block(conf, "location = /api/oauth/authorize")
+    assert "http://api:8000" in authorize_block
+    assert "proxy_http_version 1.1;" in authorize_block
+    assert "proxy_hide_header Content-Security-Policy" not in authorize_block
+    assert "add_header Content-Security-Policy" not in authorize_block
+    assert 'add_header X-Content-Type-Options "nosniff" always;' in authorize_block
+    assert 'add_header X-Frame-Options "DENY" always;' in authorize_block
+    assert 'add_header Referrer-Policy "strict-origin-when-cross-origin" always;' in authorize_block
+    assert (
+        'add_header Permissions-Policy "camera=(), microphone=(), geolocation=(self)" always;'
+        in authorize_block
+    )
+    assert "proxy_set_header X-Forwarded-Host $host;" in authorize_block
+    assert "proxy_set_header X-Forwarded-Proto $scheme;" in authorize_block
+
     # Existing blocks preserved intact
     for existing in (
         "location /api/tiles/",
