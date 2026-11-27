@@ -174,6 +174,7 @@ import type {
   LayerKey,
   LayerVisibilityState,
   MapClosureClickPayload,
+  MapPlaceClickPayload,
   OfflinePackRegionItem,
   PlannedRouteAnalysis,
   PublicUiConfigResponse,
@@ -929,6 +930,9 @@ class TrailForgeApp {
         },
         onClosureClick: (payload: MapClosureClickPayload) => {
           void this.openClosureInspector(payload.primary, payload.overlapping);
+        },
+        onPlaceClick: (payload: MapPlaceClickPayload) => {
+          this.handlePlaceClick(payload);
         },
         onPinDropClick: (lat, lon) => {
           this.pendingPinCoords = { lat, lon };
@@ -3067,6 +3071,29 @@ class TrailForgeApp {
     }
 
     this.showToast("Export failed — track geometry unavailable offline", "error");
+  }
+
+  private handlePlaceClick(payload: MapPlaceClickPayload): void {
+    const currentView = this.map.getView();
+    const targetZoom = Math.max(currentView.zoom, payload.zoom_target);
+    if (payload.bbox) {
+      this.map.fitBBox(payload.bbox, this.getMapLeftPadding(24), 48);
+    } else {
+      this.map.flyToLocation(payload.lat, payload.lon, targetZoom);
+    }
+    this.updateCursorReadout(payload.lat, payload.lon);
+    this.syncUrlState(
+      {
+        lat: payload.lat,
+        lon: payload.lon,
+        zoom: payload.bbox ? payload.zoom_target : targetZoom,
+      },
+      "push"
+    );
+    const label = payload.state
+      ? `${payload.name}, ${payload.state}`
+      : payload.name;
+    this.showToast(`Focused on ${label}`, "info");
   }
 
   private handleSearchSelect(item: UnifiedSearchItem): void {

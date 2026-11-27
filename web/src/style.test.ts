@@ -8,6 +8,9 @@ import {
   snapSnowlineBand,
 } from "./presets";
 import {
+  HIGHWAY_LABEL_LAYER_ID,
+  HIGHWAY_LINE_LAYER_IDS,
+  PLACES_REGIONS_LAYER_IDS,
   SELECTED_CLOSURE_OUTLINE_LAYER_ID,
   SELECTED_TRACK_LAYER_IDS,
   SELECTED_TRACK_STEEP_LAYER_ID,
@@ -16,8 +19,13 @@ import {
   buildSelectedClosureFilter,
   buildSnowlineFilter,
   buildTrailForgeStyle,
+  extractPlaceClickPayload,
+  formatPlaceClassLabel,
   getTrackSelectionOpacities,
+  parseFeatureBBox,
   poisToGeoJson,
+  resolveGlyphsUrl,
+  resolveStaticAssetUrl,
   toPmtilesUrl,
   userPinsToGeoJson,
 } from "./style";
@@ -285,12 +293,24 @@ describe("MapLibre 5 PMTiles & offline fallback style builder", () => {
       layers,
     });
 
+    expect(style.glyphs).toBe("/fonts/{fontstack}/{range}.pbf");
+    expect(style.sources["tf-places"]).toEqual({
+      type: "geojson",
+      data: "/data/au_places.geojson",
+    });
+    expect(style.sources["tf-highways"]).toEqual({
+      type: "geojson",
+      data: "/data/au_highways.geojson",
+    });
     expect(style.sources["tf-vector"]).toBeUndefined();
     expect(style.sources["tf-terrain-dem"]).toBeUndefined();
     expect(style.sources["tf-tracks"]).toBeDefined();
     expect(style.sources["tf-pois"]).toBeDefined();
 
     const byId = new Map(style.layers.map((l) => [l.id, l]));
+    expect(byId.get("tf-park-labels")).toBeUndefined();
+    expect(byId.get("tf-highways-line")).toBeDefined();
+    expect(byId.get("tf-places-major")).toBeDefined();
     expect(byId.get("bg-dark-outdoors")?.type).toBe("background");
     expect(byId.get("basemap-osm-underlay")?.layout).toEqual({
       visibility: "none",
@@ -338,6 +358,215 @@ describe("MapLibre 5 PMTiles & offline fallback style builder", () => {
     expect(fc.features).toHaveLength(2);
     expect(fc.features[0]?.properties?.icon).toBe("hut");
     expect(fc.features[1]?.properties?.icon).toBe("campground");
+  });
+
+  it("configures self-hosted SDF glyphs, Pan-AU places/regions/park labels & major highways with collision hierarchy", () => {
+    expect(resolveGlyphsUrl("http://localhost:5173/")).toBe(
+      "http://localhost:5173/fonts/{fontstack}/{range}.pbf"
+    );
+    expect(resolveGlyphsUrl()).toBe("/fonts/{fontstack}/{range}.pbf");
+    expect(
+      resolveStaticAssetUrl("/data/au_places.geojson", "https://app.example.com/")
+    ).toBe("https://app.example.com/data/au_places.geojson");
+    expect(resolveStaticAssetUrl("/data/au_highways.geojson")).toBe(
+      "/data/au_highways.geojson"
+    );
+
+    const style = buildTrailForgeStyle({
+      initialBasemap: "opentopo",
+      layers: createInitialLayerState(),
+      tileManifest: SAMPLE_MANIFEST,
+      origin: "https://api.example.com",
+      assetsOrigin: "https://app.example.com",
+    });
+
+    expect(style.glyphs).toBe(
+      "https://app.example.com/fonts/{fontstack}/{range}.pbf"
+    );
+    expect(style.sources["tf-places"]).toEqual({
+      type: "geojson",
+      data: "https://app.example.com/data/au_places.geojson",
+    });
+    expect(style.sources["tf-highways"]).toEqual({
+      type: "geojson",
+      data: "https://app.example.com/data/au_highways.geojson",
+    });
+    expect(style.sources["tf-vector"]).toEqual({
+      type: "vector",
+      url: "pmtiles://https://api.example.com/api/tiles/trailforge_vector.pmtiles",
+    });
+
+    const byId = new Map(style.layers.map((l) => [l.id, l]));
+    const layerIdx = (id: string) => style.layers.findIndex((l) => l.id === id);
+    const maxLineIdx = style.layers.reduce(
+      (max, l, idx) => (l.type === "line" ? Math.max(max, idx) : max),
+      -1
+    );
+
+    // Major highway lines render BELOW graded 4WD tracks so 4WD tracks remain foreground hero
+    expect(layerIdx("tf-highways-casing")).toBeGreaterThan(-1);
+    expect(layerIdx("tf-highways-line")).toBeGreaterThan(
+      layerIdx("tf-highways-casing")
+    );
+    expect(layerIdx("tf-highways-line")).toBeLessThan(
+      layerIdx("tf-tracks-casing")
+    );
+
+    // Top-of-stack label band sits strictly ABOVE all line layers (hillshade, parks, contours, waterways, highways, tracks)
+    const symbolLabelIds = [
+      HIGHWAY_LABEL_LAYER_ID,
+      "tf-places-locality",
+      "tf-park-labels",
+      "tf-places-town",
+      "tf-places-region",
+      "tf-places-state",
+      "tf-places-major",
+    ];
+    const allowedFonts = new Set([
+      "Noto Sans Regular",
+      "Noto Sans Medium",
+      "Noto Sans Bold",
+      "Noto Sans Italic",
+    ]);
+
+    for (const id of symbolLabelIds) {
+      const layer = byId.get(id);
+      expect(layer, `Missing symbol label layer ${id}`).toBeDefined();
+      expect(layer?.type).toBe("symbol");
+      expect(layerIdx(id)).toBeGreaterThan(maxLineIdx);
+      const layout = (layer?.layout ?? {}) as Record<string, unknown>;
+      const paint = (layer?.paint ?? {}) as Record<string, unknown>;
+      expect(layout.visibility).toBe("visible");
+      expect(layout["text-allow-overlap"]).toBe(false);
+      expect(layout["symbol-sort-key"]).toBeDefined();
+      expect(paint["text-halo-color"]).toBe("rgba(9, 14, 20, 0.92)");
+      expect(paint["text-halo-width"]).toBe(1.8);
+      const fonts = layout["text-font"] as string[];
+      expect(Array.isArray(fonts) && fonts.length > 0).toBe(true);
+      for (const f of fonts) {
+        expect(allowedFonts.has(f), `Unexpected font ${f} on ${id}`).toBe(true);
+      }
+    }
+
+    // Zoom hierarchy checks
+    expect((byId.get("tf-places-state") as { minzoom?: number; maxzoom?: number })).toMatchObject({
+      minzoom: 3,
+      maxzoom: 7.7,
+    });
+    expect((byId.get("tf-places-region") as { minzoom?: number; maxzoom?: number })).toMatchObject({
+      minzoom: 5,
+      maxzoom: 11,
+    });
+    expect(byId.get("tf-park-labels")).toMatchObject({
+      source: "tf-vector",
+      "source-layer": "park_labels",
+      minzoom: 7.5,
+    });
+    expect((byId.get("tf-places-town") as { minzoom?: number })?.minzoom).toBe(7);
+    expect((byId.get("tf-places-locality") as { minzoom?: number })?.minzoom).toBe(9.8);
+    expect(byId.get("tf-places-cities-dots")).toMatchObject({
+      type: "circle",
+      source: "tf-places",
+      minzoom: 4,
+    });
+    expect(byId.get(HIGHWAY_LABEL_LAYER_ID)?.layout).toMatchObject({
+      "symbol-placement": "line",
+      "symbol-spacing": 360,
+    });
+
+    // Major cities/capitals win collision priority over towns/localities/highways (placed later in stack)
+    expect(layerIdx("tf-places-major")).toBeGreaterThan(layerIdx("tf-places-town"));
+    expect(layerIdx("tf-places-town")).toBeGreaterThan(layerIdx("tf-places-locality"));
+    expect(layerIdx("tf-places-locality")).toBeGreaterThan(
+      layerIdx(HIGHWAY_LABEL_LAYER_ID)
+    );
+
+    // Layer visibility toggles hide placesRegions and highways cleanly
+    const hiddenStyle = buildTrailForgeStyle({
+      initialBasemap: "offline-topo",
+      layers: {
+        ...createInitialLayerState(),
+        placesRegions: false,
+        highways: false,
+      },
+      tileManifest: SAMPLE_MANIFEST,
+      origin: "http://localhost:5173",
+    });
+    const hiddenById = new Map(hiddenStyle.layers.map((l) => [l.id, l]));
+    for (const id of PLACES_REGIONS_LAYER_IDS) {
+      expect(
+        (hiddenById.get(id)?.layout as { visibility?: string })?.visibility,
+        `Expected ${id} hidden when placesRegions=false`
+      ).toBe("none");
+    }
+    for (const id of [...HIGHWAY_LINE_LAYER_IDS, HIGHWAY_LABEL_LAYER_ID]) {
+      expect(
+        (hiddenById.get(id)?.layout as { visibility?: string })?.visibility,
+        `Expected ${id} hidden when highways=false`
+      ).toBe("none");
+    }
+  });
+
+  it("parses MapLibre place/region/park click payloads safely including JSON-stringified bbox", () => {
+    expect(parseFeatureBBox([147.0, -37.5, 149.0, -35.8])).toEqual([
+      147.0, -37.5, 149.0, -35.8,
+    ]);
+    expect(parseFeatureBBox("[147.0,-37.5,149.0,-35.8]")).toEqual([
+      147.0, -37.5, 149.0, -35.8,
+    ]);
+    expect(parseFeatureBBox("null")).toBeNull();
+    expect(parseFeatureBBox("not-json")).toBeNull();
+    expect(parseFeatureBBox([150, -36, 149, -35])).toBeNull();
+
+    const regionPayload = extractPlaceClickPayload(
+      "tf-places-region",
+      {
+        id: "au-region-high-country",
+        name: "High Country",
+        place_class: "region",
+        state: "VIC",
+        zoom_target: 9.2,
+        bbox: "[146.5,-37.6,148.6,-36.0]",
+        region_hint: "Victorian Alpine 4WD tracks",
+      },
+      { type: "Point", coordinates: [147.3, -36.8] },
+      -36.0,
+      147.0
+    );
+    expect(regionPayload).toEqual({
+      id: "au-region-high-country",
+      name: "High Country",
+      place_class: "region",
+      state: "VIC",
+      lat: -36.8,
+      lon: 147.3,
+      bbox: [146.5, -37.6, 148.6, -36.0],
+      zoom_target: 9.2,
+      region_hint: "Victorian Alpine 4WD tracks",
+    });
+
+    const parkPayload = extractPlaceClickPayload(
+      "tf-park-labels",
+      {
+        name: "Alpine National Park",
+        park_type: "National Park",
+        state: "VIC",
+        area_ha: 646000,
+      },
+      { type: "Point", coordinates: [147.4, -36.9] },
+      -36.9,
+      147.4
+    );
+    expect(parkPayload).toMatchObject({
+      name: "Alpine National Park",
+      place_class: "park",
+      state: "VIC",
+      zoom_target: 10.2,
+      region_hint: "National Park",
+      bbox: null,
+    });
+    expect(formatPlaceClassLabel("regional_hub")).toBe("Regional Hub");
+    expect(formatPlaceClassLabel("park", "State Forest")).toBe("State Forest");
   });
 
   it("generates non-empty offline graticule and corridor GeoJSON", () => {

@@ -612,7 +612,7 @@ export class AdminConsolePanel {
                   draggable="true"
                 >
                   <span class="tf-layer-drag-handle" title="Drag to reorder" aria-hidden="true">⋮⋮</span>
-                  <label class="tf-admin-layer-toggle">
+                  <label class="tf-admin-layer-toggle" title="${escapeHtml(def.hint)}">
                     <input
                       type="checkbox"
                       class="tf-checkbox"

@@ -7,6 +7,8 @@ export type TrackDifficulty = "easy" | "medium" | "hard" | "extreme";
 export type CanonicalGrade = "Easy" | "Medium" | "Hard" | "Extreme";
 
 export type LayerKey =
+  | "placesRegions"
+  | "highways"
   | "contoursHillshade"
   | "parksWaterways"
   | "pois"
@@ -21,6 +23,8 @@ export type LayerKey =
 export type LayerVisibilityMap = Record<LayerKey, boolean>;
 
 export interface LayerVisibilityState {
+  placesRegions: boolean;
+  highways: boolean;
   tracks: boolean;
   steepHighlights: boolean;
   hotspots: boolean;
@@ -273,6 +277,30 @@ export interface MapClosureClickPayload {
   overlapping: ClosureDetailResponse[];
   clickLat: number;
   clickLon: number;
+}
+
+export type PlaceClass =
+  | "state"
+  | "region"
+  | "capital"
+  | "city"
+  | "regional_hub"
+  | "town"
+  | "village"
+  | "locality"
+  | "park"
+  | string;
+
+export interface MapPlaceClickPayload {
+  id: string;
+  name: string;
+  place_class: PlaceClass;
+  state: string | null;
+  lat: number;
+  lon: number;
+  bbox: BBoxTuple | null;
+  zoom_target: number;
+  region_hint: string | null;
 }
 
 /* ---------- Slice 05 Auth, Vehicle Profiles, Favorites & Pins ---------- */

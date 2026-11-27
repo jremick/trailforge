@@ -15,6 +15,10 @@ import {
 } from "./presets";
 import {
   EMPTY_FEATURE_COLLECTION,
+  HIGHWAY_LABEL_LAYER_ID,
+  HIGHWAY_LINE_LAYER_IDS,
+  PLACES_REGIONS_LAYER_IDS,
+  PLACE_INTERACTIVE_LAYER_IDS,
   SELECTED_CLOSURE_OUTLINE_LAYER_ID,
   SELECTED_TRACK_LAYER_IDS,
   SELECTED_TRACK_STEEP_LAYER_ID,
@@ -23,6 +27,8 @@ import {
   buildSelectedTrackFilter,
   buildSnowlineFilter,
   buildTrailForgeStyle,
+  extractPlaceClickPayload,
+  formatPlaceClassLabel,
   getTrackSelectionOpacities,
   poisToGeoJson,
   userPinsToGeoJson,
@@ -41,6 +47,7 @@ import type {
   ClosureDetailResponse,
   LayerVisibilityState,
   MapClosureClickPayload,
+  MapPlaceClickPayload,
   PoiItem,
   RecordedBreadcrumbPoint,
   RegionPreset,
@@ -171,12 +178,20 @@ function renderRoutePinBadgeImage(pinKey: string): {
   return { width: size, height: size, data: new Uint8Array(img.data.buffer) };
 }
 
+export {
+  defaultZoomForPlaceClass,
+  extractPlaceClickPayload,
+  formatPlaceClassLabel,
+  parseFeatureBBox,
+} from "./style";
+
 export interface TrailForgeMapCallbacks {
   onCursorMove?: (lat: number, lon: number) => void;
   onMapMoveEnd?: (lat: number, lon: number, zoom: number) => void;
   onBasemapTileError?: () => void;
   onTrackClick?: (trackId: string, segmentId?: string) => void;
   onClosureClick?: (payload: MapClosureClickPayload) => void;
+  onPlaceClick?: (payload: MapPlaceClickPayload) => void;
   onPinDropClick?: (lat: number, lon: number) => void;
   onReportPickClick?: (lat: number, lon: number) => void;
 }
@@ -242,6 +257,7 @@ export class TrailForgeMap {
         initialBasemap: this.currentBasemap,
         layers: this.currentLayers,
         origin: window.location.origin,
+        assetsOrigin: window.location.origin,
       }),
       center,
       zoom,
@@ -310,17 +326,45 @@ export class TrailForgeMap {
         "tf-closures-polygon-outline",
         "tf-closures-polygon-fill",
       ].filter((id) => Boolean(this.map.getLayer(id)));
-      if (hitLayers.length === 0) return;
-
       const bbox: [maplibregl.PointLike, maplibregl.PointLike] = [
         [e.point.x - 6, e.point.y - 6],
         [e.point.x + 6, e.point.y + 6],
       ];
-      const features = this.map.queryRenderedFeatures(bbox, {
-        layers: hitLayers,
-      });
+      const features =
+        hitLayers.length > 0
+          ? this.map.queryRenderedFeatures(bbox, {
+              layers: hitLayers,
+            })
+          : [];
       const first = features[0];
-      if (!first) return;
+      if (!first) {
+        // Secondary hit test: clickable place, region, state & park labels
+        // ONLY when no track, closure, hotspot, report, or route was clicked
+        const placeHitLayers = PLACE_INTERACTIVE_LAYER_IDS.filter((id) =>
+          Boolean(this.map.getLayer(id))
+        );
+        if (placeHitLayers.length === 0) return;
+        const placeBbox: [maplibregl.PointLike, maplibregl.PointLike] = [
+          [e.point.x - 8, e.point.y - 8],
+          [e.point.x + 8, e.point.y + 8],
+        ];
+        const placeFeatures = this.map.queryRenderedFeatures(placeBbox, {
+          layers: placeHitLayers,
+        });
+        const placeHit = placeFeatures[0];
+        if (!placeHit) return;
+        const payload = extractPlaceClickPayload(
+          placeHit.layer.id,
+          (placeHit.properties ?? {}) as Record<string, unknown>,
+          placeHit.geometry,
+          e.lngLat.lat,
+          e.lngLat.lng
+        );
+        if (payload) {
+          callbacks.onPlaceClick?.(payload);
+        }
+        return;
+      }
       const firstLayerId = first.layer.id;
       const props = (first.properties ?? {}) as Record<string, unknown>;
       const trackId =
@@ -454,6 +498,7 @@ export class TrailForgeMap {
         layers: this.currentLayers,
         tileManifest: manifest,
         origin: fallbackOrigin,
+        assetsOrigin: window.location.origin,
         selectedTrackId: this.selectedTrackId,
         selectedClosureId: this.selectedClosureId,
       })
@@ -689,6 +734,19 @@ export class TrailForgeMap {
     });
   }
 
+  /**
+   * Smoothly fly to a geographic coordinate and zoom level without placing a search pin
+   * (used when clicking map place/town/region/park labels).
+   */
+  flyToLocation(lat: number, lon: number, zoom: number): void {
+    this.map.flyTo({
+      center: [lon, lat],
+      zoom,
+      duration: 650,
+      essential: true,
+    });
+  }
+
   clearSearchPin(): void {
     this.pendingPin = null;
     if (!this.isLoaded) return;
@@ -858,18 +916,73 @@ export class TrailForgeMap {
       "tf-closures-polygon-fill",
     ].filter((id) => Boolean(this.map.getLayer(id)));
 
-    if (queryLayers.length === 0) return;
-
     const bbox: [maplibregl.PointLike, maplibregl.PointLike] = [
       [e.point.x - 5, e.point.y - 5],
       [e.point.x + 5, e.point.y + 5],
     ];
-    const features = this.map.queryRenderedFeatures(bbox, {
-      layers: queryLayers,
-    });
+    const features =
+      queryLayers.length > 0
+        ? this.map.queryRenderedFeatures(bbox, {
+            layers: queryLayers,
+          })
+        : [];
     const hit = features[0];
 
     if (!hit) {
+      // Secondary hover check: clickable town, city, region, state & park labels
+      const placeLayers = PLACE_INTERACTIVE_LAYER_IDS.filter((id) =>
+        Boolean(this.map.getLayer(id))
+      );
+      if (placeLayers.length > 0) {
+        const placeBbox: [maplibregl.PointLike, maplibregl.PointLike] = [
+          [e.point.x - 6, e.point.y - 6],
+          [e.point.x + 6, e.point.y + 6],
+        ];
+        const placeFeatures = this.map.queryRenderedFeatures(placeBbox, {
+          layers: placeLayers,
+        });
+        const placeHit = placeFeatures[0];
+        if (placeHit) {
+          const placeProps = (placeHit.properties ?? {}) as Record<
+            string,
+            unknown
+          >;
+          const payload = extractPlaceClickPayload(
+            placeHit.layer.id,
+            placeProps,
+            placeHit.geometry,
+            e.lngLat.lat,
+            e.lngLat.lng
+          );
+          if (payload) {
+            this.map.getCanvas().style.cursor = "pointer";
+            const parkType =
+              typeof placeProps.park_type === "string"
+                ? placeProps.park_type
+                : null;
+            const kindLabel = formatPlaceClassLabel(
+              payload.place_class,
+              parkType
+            );
+            const metaParts = [kindLabel, payload.state].filter(Boolean);
+            const showRegionNote =
+              payload.place_class !== "park" && Boolean(payload.region_hint);
+            this.hoverPopup
+              .setLngLat(e.lngLat)
+              .setHTML(
+                `<div class="tf-popup-title">${escapeHtml(payload.name)}</div>
+                 <div class="tf-popup-meta">
+                   <span>${escapeHtml(metaParts.join(" · "))}</span>
+                   <span class="tf-popup-hint">Click to zoom</span>
+                 </div>
+                 ${showRegionNote && payload.region_hint ? `<div class="tf-popup-note">${escapeHtml(payload.region_hint)}</div>` : ""}`
+              )
+              .addTo(this.map);
+            return;
+          }
+        }
+      }
+
       this.map.getCanvas().style.cursor = "";
       if (this.lastHoverKey !== null) {
         this.lastHoverKey = null;
@@ -1187,6 +1300,13 @@ export class TrailForgeMap {
     );
     this.setLayerVis("tf-pois-layer", this.currentLayers.pois);
     this.setLayerVis("tf-pois-icons", this.currentLayers.pois);
+    for (const id of HIGHWAY_LINE_LAYER_IDS) {
+      this.setLayerVis(id, this.currentLayers.highways);
+    }
+    this.setLayerVis(HIGHWAY_LABEL_LAYER_ID, this.currentLayers.highways);
+    for (const id of PLACES_REGIONS_LAYER_IDS) {
+      this.setLayerVis(id, this.currentLayers.placesRegions);
+    }
   }
 
   private applySnowLineFilter(): void {

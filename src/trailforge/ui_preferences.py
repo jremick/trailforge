@@ -15,6 +15,8 @@ from trailforge.db.models import InstanceUiSettings, User
 
 # Canonical default sidebar layer order (maps 1:1 with frontend `LayerKey` values).
 CANONICAL_LAYER_KEYS: Final[tuple[str, ...]] = (
+    "placesRegions",
+    "highways",
     "contoursHillshade",
     "parksWaterways",
     "pois",
@@ -30,6 +32,8 @@ CANONICAL_LAYER_KEYS: Final[tuple[str, ...]] = (
 CANONICAL_LAYER_KEY_SET: Final[frozenset[str]] = frozenset(CANONICAL_LAYER_KEYS)
 
 DEFAULT_LAYER_VISIBILITY: Final[dict[str, bool]] = {
+    "placesRegions": True,
+    "highways": True,
     "contoursHillshade": True,
     "parksWaterways": True,
     "pois": True,
@@ -101,7 +105,7 @@ def normalize_layer_order(
     *,
     fallback: Sequence[str] = CANONICAL_LAYER_KEYS,
 ) -> list[str]:
-    """Leniently normalize a stored layer order, always returning all 10 canonical keys."""
+    """Leniently normalize a stored layer order, always returning all canonical keys."""
     ordered: list[str] = []
     seen: set[str] = set()
     if isinstance(raw, (list, tuple)):

@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  CANONICAL_LAYER_DEFINITIONS,
   CANONICAL_LAYER_ORDER,
   DEFAULT_LAYER_VISIBILITY,
   DEFAULT_PUBLIC_UI_CONFIG,
   USER_LAYER_PREFS_STORAGE_KEY,
   clearStoredUserLayerPrefs,
+  extractLayerVisibilityMap,
   loadStoredUserLayerPrefs,
   moveLayerInOrder,
   normalizeLayerOrder,
@@ -16,6 +18,7 @@ import {
   shouldShowStackTelemetrySection,
   type StorageWithRemove,
 } from "./layerPrefsHelpers";
+import { createInitialLayerState } from "./presets";
 
 function createMemoryStorage(
   initial?: Record<string, string>
@@ -34,8 +37,10 @@ function createMemoryStorage(
 }
 
 describe("layerPrefsHelpers — default ordering & reordering", () => {
-  it("matches the requested default Map Layers sidebar order", () => {
+  it("matches the requested default Map Layers sidebar order including Places & Regions and Major Highways", () => {
     expect(CANONICAL_LAYER_ORDER).toEqual([
+      "placesRegions",
+      "highways",
       "contoursHillshade",
       "parksWaterways",
       "pois",
@@ -47,9 +52,17 @@ describe("layerPrefsHelpers — default ordering & reordering", () => {
       "unmapped",
       "snowLine",
     ]);
+    expect(CANONICAL_LAYER_DEFINITIONS.map((d) => d.key)).toEqual(
+      CANONICAL_LAYER_ORDER
+    );
+    expect(DEFAULT_LAYER_VISIBILITY.placesRegions).toBe(true);
+    expect(DEFAULT_LAYER_VISIBILITY.highways).toBe(true);
+    expect(extractLayerVisibilityMap(createInitialLayerState())).toEqual(
+      DEFAULT_LAYER_VISIBILITY
+    );
   });
 
-  it("normalizes partial, duplicate, or invalid layer orders safely", () => {
+  it("normalizes partial, legacy 10-key, duplicate, or invalid layer orders safely", () => {
     const normalized = normalizeLayerOrder([
       "snowLine",
       "bogus_key",
@@ -59,18 +72,35 @@ describe("layerPrefsHelpers — default ordering & reordering", () => {
     expect(normalized.slice(0, 2)).toEqual(["snowLine", "tracks"]);
     expect(normalized).toHaveLength(CANONICAL_LAYER_ORDER.length);
     expect(new Set(normalized).size).toBe(CANONICAL_LAYER_ORDER.length);
+    expect(normalized).toContain("placesRegions");
+    expect(normalized).toContain("highways");
+
+    const legacy = normalizeLayerOrder([
+      "contoursHillshade",
+      "parksWaterways",
+      "pois",
+      "tracks",
+      "steepHighlights",
+      "hotspots",
+      "closures",
+      "reports",
+      "unmapped",
+      "snowLine",
+    ]);
+    expect(legacy).toHaveLength(CANONICAL_LAYER_ORDER.length);
+    expect(legacy.slice(-2)).toEqual(["placesRegions", "highways"]);
   });
 
   it("moves layers up/down and supports drag-and-drop reordering", () => {
-    const movedUp = moveLayerInOrder(CANONICAL_LAYER_ORDER, "parksWaterways", "up");
+    const movedUp = moveLayerInOrder(CANONICAL_LAYER_ORDER, "highways", "up");
     expect(movedUp.slice(0, 3)).toEqual([
-      "parksWaterways",
+      "highways",
+      "placesRegions",
       "contoursHillshade",
-      "pois",
     ]);
 
     // Boundary moves are no-ops
-    expect(moveLayerInOrder(CANONICAL_LAYER_ORDER, "contoursHillshade", "up")).toEqual(
+    expect(moveLayerInOrder(CANONICAL_LAYER_ORDER, "placesRegions", "up")).toEqual(
       CANONICAL_LAYER_ORDER
     );
     expect(moveLayerInOrder(CANONICAL_LAYER_ORDER, "snowLine", "down")).toEqual(
@@ -78,7 +108,9 @@ describe("layerPrefsHelpers — default ordering & reordering", () => {
     );
 
     const dragged = reorderLayerKeys(CANONICAL_LAYER_ORDER, "snowLine", "pois");
-    expect(dragged.slice(0, 4)).toEqual([
+    expect(dragged.slice(0, 6)).toEqual([
+      "placesRegions",
+      "highways",
       "contoursHillshade",
       "parksWaterways",
       "snowLine",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import uuid
 from collections.abc import Generator
 from pathlib import Path
@@ -50,6 +51,8 @@ MIGRATION_0006_PATH = (
 
 def test_canonical_layer_order_matches_requested_defaults() -> None:
     assert CANONICAL_LAYER_KEYS == (
+        "placesRegions",
+        "highways",
         "contoursHillshade",
         "parksWaterways",
         "pois",
@@ -62,9 +65,38 @@ def test_canonical_layer_order_matches_requested_defaults() -> None:
         "snowLine",
     )
     assert set(DEFAULT_LAYER_VISIBILITY.keys()) == set(CANONICAL_LAYER_KEYS)
+    assert DEFAULT_LAYER_VISIBILITY["placesRegions"] is True
+    assert DEFAULT_LAYER_VISIBILITY["highways"] is True
     assert DEFAULT_LAYER_VISIBILITY["unmapped"] is False
     assert DEFAULT_LAYER_VISIBILITY["snowLine"] is False
     assert DEFAULT_LAYER_VISIBILITY["tracks"] is True
+
+
+def test_canonical_layer_parity_between_backend_and_frontend() -> None:
+    """Guarantee 1:1 canonical layer key order and default visibility parity with web UI."""
+    ts_path = REPO_ROOT / "web" / "src" / "layerPrefsHelpers.ts"
+    ts_src = ts_path.read_text(encoding="utf-8")
+
+    order_match = re.search(
+        r"export const CANONICAL_LAYER_ORDER:\s*readonly LayerKey\[\]\s*=\s*\[(.*?)\]\s*as const;",
+        ts_src,
+        re.DOTALL,
+    )
+    assert order_match is not None, "Could not locate CANONICAL_LAYER_ORDER in layerPrefsHelpers.ts"
+    frontend_order = tuple(re.findall(r'"([A-Za-z0-9_]+)"', order_match.group(1)))
+    assert frontend_order == CANONICAL_LAYER_KEYS
+
+    vis_match = re.search(
+        r"export const DEFAULT_LAYER_VISIBILITY:\s*Readonly<LayerVisibilityMap>\s*=\s*\{(.*?)\};",
+        ts_src,
+        re.DOTALL,
+    )
+    assert vis_match is not None, "Could not locate DEFAULT_LAYER_VISIBILITY in layerPrefsHelpers.ts"
+    frontend_vis = {
+        k: (v == "true")
+        for k, v in re.findall(r"([A-Za-z0-9_]+)\s*:\s*(true|false)", vis_match.group(1))
+    }
+    assert frontend_vis == DEFAULT_LAYER_VISIBILITY
 
 
 def test_validate_and_normalize_layer_preferences() -> None:
@@ -83,8 +115,15 @@ def test_validate_and_normalize_layer_preferences() -> None:
     with pytest.raises(ValueError, match="at least one"):
         validate_layer_order([])
 
-    vis = validate_layer_visibility({"snowLine": True, "tracks": False})
-    assert vis == {"snowLine": True, "tracks": False}
+    vis = validate_layer_visibility(
+        {"snowLine": True, "tracks": False, "placesRegions": False, "highways": True}
+    )
+    assert vis == {
+        "snowLine": True,
+        "tracks": False,
+        "placesRegions": False,
+        "highways": True,
+    }
 
     with pytest.raises(ValueError, match="Unknown map layer key"):
         validate_layer_visibility({"bogus": True})
@@ -238,6 +277,8 @@ def test_ui_config_admin_settings_and_user_preferences_api_offline_sqlite(
             # Admin updates defaults
             new_order = [
                 "tracks",
+                "placesRegions",
+                "highways",
                 "contoursHillshade",
                 "parksWaterways",
                 "pois",
@@ -253,7 +294,11 @@ def test_ui_config_admin_settings_and_user_preferences_api_offline_sqlite(
                 headers=admin_headers,
                 json={
                     "default_layer_order": new_order,
-                    "default_layer_visibility": {"snowLine": True, "tracks": False},
+                    "default_layer_visibility": {
+                        "snowLine": True,
+                        "tracks": False,
+                        "highways": False,
+                    },
                     "show_stack_telemetry_public": True,
                 },
             )
@@ -261,6 +306,8 @@ def test_ui_config_admin_settings_and_user_preferences_api_offline_sqlite(
             assert put_admin.json()["default_layer_order"] == new_order
             assert put_admin.json()["default_layer_visibility"]["snowLine"] is True
             assert put_admin.json()["default_layer_visibility"]["tracks"] is False
+            assert put_admin.json()["default_layer_visibility"]["highways"] is False
+            assert put_admin.json()["default_layer_visibility"]["placesRegions"] is True
             assert put_admin.json()["show_stack_telemetry_public"] is True
 
             # Public config reflects admin update
@@ -408,6 +455,8 @@ def test_admin_ui_settings_and_user_preferences_lifecycle(
             custom_order = [
                 "tracks",
                 "closures",
+                "placesRegions",
+                "highways",
                 "contoursHillshade",
                 "parksWaterways",
                 "pois",

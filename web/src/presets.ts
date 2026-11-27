@@ -493,6 +493,8 @@ export function getGradeColor(grade: string | null | undefined): string {
 
 export function createInitialLayerState(): LayerVisibilityState {
   return {
+    placesRegions: true,
+    highways: true,
     tracks: true,
     steepHighlights: true,
     hotspots: true,

@@ -19,6 +19,8 @@ export interface LayerDefinition {
  * Canonical default ordering for the left sidebar Map Layers list.
  */
 export const CANONICAL_LAYER_ORDER: readonly LayerKey[] = [
+  "placesRegions",
+  "highways",
   "contoursHillshade",
   "parksWaterways",
   "pois",
@@ -32,6 +34,18 @@ export const CANONICAL_LAYER_ORDER: readonly LayerKey[] = [
 ] as const;
 
 export const CANONICAL_LAYER_DEFINITIONS: readonly LayerDefinition[] = [
+  {
+    key: "placesRegions",
+    label: "Places & Regions",
+    shortLabel: "Places & Regions",
+    hint: "States, 4WD regions, cities, towns, localities & national park names",
+  },
+  {
+    key: "highways",
+    label: "Major Highways",
+    shortLabel: "Major Highways",
+    hint: "Australian national highways, arterial corridors & route shields",
+  },
   {
     key: "contoursHillshade",
     label: "Contours & Hillshade",
@@ -102,6 +116,8 @@ export const LAYER_DEFINITION_MAP: Readonly<Record<LayerKey, LayerDefinition>> =
 const CANONICAL_KEY_SET: ReadonlySet<string> = new Set(CANONICAL_LAYER_ORDER);
 
 export const DEFAULT_LAYER_VISIBILITY: Readonly<LayerVisibilityMap> = {
+  placesRegions: true,
+  highways: true,
   contoursHillshade: true,
   parksWaterways: true,
   pois: true,
@@ -147,7 +163,7 @@ export function isCanonicalLayerKey(value: unknown): value is LayerKey {
 }
 
 /**
- * Normalize an arbitrary layer-order list so it contains all 10 canonical keys
+ * Normalize an arbitrary layer-order list so it contains all canonical keys
  * with no duplicates and no unknown keys.
  */
 export function normalizeLayerOrder(
@@ -310,12 +326,14 @@ export function reorderLayerKeys(
 }
 
 /**
- * Extract only the 10 boolean layer keys from a full `LayerVisibilityState`.
+ * Extract only the canonical boolean layer keys from a full `LayerVisibilityState`.
  */
 export function extractLayerVisibilityMap(
   state: LayerVisibilityState
 ): LayerVisibilityMap {
   return {
+    placesRegions: Boolean(state.placesRegions),
+    highways: Boolean(state.highways),
     contoursHillshade: Boolean(state.contoursHillshade),
     parksWaterways: Boolean(state.parksWaterways),
     pois: Boolean(state.pois),
