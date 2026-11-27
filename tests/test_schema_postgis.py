@@ -79,6 +79,7 @@ EXPECTED_GIST_INDEXES = frozenset(
         "ix_track_segments_geom_active",
         "ix_pois_geom",
         "ix_closures_alerts_geom",
+        "ix_closures_alerts_regional_geom",
         "ix_user_pins_geom",
         "ix_trips_raw_geom",
         "ix_trips_trimmed_geom",
@@ -128,7 +129,7 @@ def test_fastapi_health_against_live_postgis(postgis_engine: Engine) -> None:
 @pytest.mark.integration
 def test_required_tables_and_gist_indexes_exist(postgis_engine: Engine) -> None:
     assert len(EXPECTED_TABLES) == 36
-    assert len(EXPECTED_GIST_INDEXES) == 21
+    assert len(EXPECTED_GIST_INDEXES) == 22
     inspector = inspect(postgis_engine)
     tables = set(inspector.get_table_names(schema="public"))
     missing_tables = EXPECTED_TABLES - tables
