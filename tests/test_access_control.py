@@ -199,6 +199,64 @@ def test_auth_cli_help_zero_runtime_warnings() -> None:
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("mode", ["open", "invite_only"])
+def test_registration_roles_ignore_legacy_admin_email(
+    postgis_engine: Engine, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    _truncate_all(postgis_engine)
+    legacy_email = "unverified@example.test"
+    monkeypatch.setenv("TRAILFORGE_ADMIN_EMAIL", legacy_email)
+    monkeypatch.setenv("TRAILFORGE_REGISTRATION_MODE", mode)
+    monkeypatch.setenv("AUTH_SECRET_KEY", "a" * 64)
+    monkeypatch.setenv("TRAILFORGE_PRIVACY_SECRET", "p" * 64)
+    monkeypatch.setenv("TRAILFORGE_ENABLE_MCP", "false")
+    get_settings.cache_clear()
+
+    try:
+        with Session(postgis_engine) as session:
+            member_invite = InviteCode(code="TF-MEMB-2345", role="member", max_uses=1)
+            admin_invite = InviteCode(code="TF-ADMN-2345", role="admin", max_uses=1)
+            session.add_all([member_invite, admin_invite])
+            session.commit()
+
+            app = create_app()
+
+            def _override_db() -> Generator[Session, None, None]:
+                yield session
+
+            app.dependency_overrides[get_db] = _override_db
+            with TestClient(app) as client:
+                registration = {
+                    "email": legacy_email,
+                    "display_name": "Trail Driver",
+                    "password": "TrailDriverPassword",
+                }
+                if mode == "invite_only":
+                    assert client.post("/api/auth/register", json=registration).status_code == 403
+                    registration["invite_code"] = member_invite.code
+                member = client.post("/api/auth/register", json=registration)
+                assert member.status_code == 201, member.text
+                assert member.json()["user"]["role"] == "member"
+                assert client.get("/api/admin/invites").status_code == 403
+
+                client.cookies.clear()
+                admin = client.post(
+                    "/api/auth/register",
+                    json={
+                        **registration,
+                        "email": "operator@example.test",
+                        "invite_code": admin_invite.code,
+                    },
+                )
+                assert admin.status_code == 201, admin.text
+                assert admin.json()["user"]["role"] == "admin"
+                assert client.get("/api/admin/invites").status_code == 200
+    finally:
+        _truncate_all(postgis_engine)
+        get_settings.cache_clear()
+
+
+@pytest.mark.integration
 def test_registration_modes_invites_suspension_last_admin_and_admin_gating(
     postgis_engine: Engine,
     fixtures_dir: Path,
@@ -335,11 +393,11 @@ def test_registration_modes_invites_suspension_last_admin_and_admin_gating(
                 )
                 assert r_bypass.status_code == 403
 
-                # With a bootstrap invite code (or CLI create-admin), first admin is promoted
+                # An operator-issued admin invite can provision the first administrator.
                 boot_inv = InviteCode(
                     code="TF-BOOT-2345",
                     label="Initial Admin Bootstrap",
-                    role="member",
+                    role="admin",
                     max_uses=1,
                     use_count=0,
                 )

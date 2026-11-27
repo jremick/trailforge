@@ -104,6 +104,7 @@ class McpAuthContext:
 - **Scopes:**
   - `trailforge:read` — read user's Vehicle Profiles, saved routes, favorites, personal pins, and private trip summaries.
   - `trailforge:write` — create/update user's saved routes, personal pins, and favorites (implies `trailforge:read`).
+  - REST routes explicitly opt in to delegated reads or saved-item writes. Detailed trip data, exports of private data, deletions, telemetry uploads, condition report writes, account state, and administrative operations require a full session. Existing PATs and OAuth grants follow these limits without reissuing them.
   - Existing user session tokens (`create_access_token`) carry full session privileges (`trailforge:read`, `trailforge:write`) and remain the only credential allowed to manage PATs (`/api/auth/tokens`) or OAuth grants (`/api/auth/oauth-grants`) so a leaked AI token cannot mint persistent replacement tokens.
 - **Token Prefixes & Hashing:**
   - Personal Access Token: `tf_pat_<43-char-urlsafe-secret>` (256-bit entropy via `secrets.token_urlsafe(32)`).
@@ -176,7 +177,7 @@ Revises `0005_user_token_version`. Adds four Tier C tables:
      - Rejects `javascript:`, `data:`, non-loopback `http://`, wildcards, and credentials in URI.
    - Authorize & Token endpoints require **exact byte-for-byte match** against a registered `redirect_uri`.
 3. **Consent Page Hardening (`/api/oauth/authorize`):**
-   - Renders clean server-side HTML (auto-escaped) showing the `client_name`, requested scopes (`Read your rigs, saved routes & trip summaries` / `Save routes, pins & favorites`), and user email; if not signed in, displays a built-in email/password sign-in step on the same origin before consent.
+   - Renders server-side HTML with the escaped `client_name`, requested scopes, and user email. The read scope lists rigs, saved routes, pins, favorites, and trip summaries. The write scope lists saving routes, pins, and favorites. Signed-out visitors see a same-origin email and password form before consent.
    - Enforces `X-Frame-Options: DENY`, `Content-Security-Policy: frame-ancestors 'none'`, and an HMAC-signed short-lived CSRF nonce bound to the user session on `POST /api/oauth/authorize`.
 4. **Refresh Token Rotation & Reuse Detection:**
    - Exchanging a `refresh_token` atomically revokes the old `oauth_tokens` row and mints a new row sharing `token_family_id`.

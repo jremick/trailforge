@@ -11,9 +11,8 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from trailforge.auth.dependencies import resolve_request_auth_context
+from trailforge.auth.dependencies import require_expected_account, resolve_request_auth_context
 from trailforge.auth.invites import (
-    get_admin_email,
     get_demo_banner,
     get_registration_mode,
     normalize_invite_code,
@@ -24,7 +23,6 @@ from trailforge.auth.security import (
     normalize_email,
     verify_password,
 )
-from trailforge.auth.tokens import SCOPE_READ
 from trailforge.config import get_settings
 from trailforge.db.models import InviteCode, User, VehicleProfile
 from trailforge.db.session import get_db
@@ -130,7 +128,7 @@ def register_user(
     response: Response,
     db: Session = Depends(get_db),
 ) -> AuthTokenResponse:
-    """Create a user account respecting registration_mode, invites, and admin bootstrap."""
+    """Create a member account or grant the role assigned to a valid invite."""
     try:
         email = normalize_email(payload.email)
         if len(payload.password) < 8:
@@ -147,18 +145,6 @@ def register_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Registration is closed",
         )
-
-    # First-admin bootstrap may only auto-promote without an invite in open mode (SEC-M3).
-    # In invite_only mode, create the first admin via CLI (`trailforge-auth create-admin`)
-    # or redeem a valid invite code; never bypass invite_only based solely on email address.
-    bootstrap_email = get_admin_email()
-    is_admin_bootstrap = False
-    if bootstrap_email and email == bootstrap_email:
-        has_existing_admin = (
-            db.execute(select(User.id).where(User.role == "admin").limit(1)).scalar_one_or_none()
-            is not None
-        )
-        is_admin_bootstrap = not has_existing_admin
 
     assigned_role = "member"
     used_invite_code: str | None = None
@@ -204,9 +190,6 @@ def register_user(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Invite code has reached its maximum uses",
             )
-    elif is_admin_bootstrap and mode == "open":
-        assigned_role = "admin"
-
     existing = db.execute(
         select(User).where(func.lower(User.email) == email).limit(1)
     ).scalar_one_or_none()
@@ -233,8 +216,6 @@ def register_user(
                 detail="Invite code has reached its maximum uses",
             )
         used_invite_code, assigned_role = updated
-        if is_admin_bootstrap:
-            assigned_role = "admin"
 
     # Run expensive scrypt KDF strictly after all cheap access, invite, and duplicate checks
     pw_hash = hash_password(payload.password)
@@ -333,6 +314,7 @@ def logout_user(
                 "cannot log out user sessions"
             ),
         )
+    require_expected_account(request, ctx.user)
     if ctx.auth_method == "session" and ctx.user is not None:
         ctx.user.token_version = int(getattr(ctx.user, "token_version", 1) or 1) + 1
         ctx.user.updated_at = datetime.now(UTC)
@@ -354,15 +336,13 @@ def get_me(
     db: Session = Depends(get_db),
 ) -> AuthMeResponse:
     """Return active session state; anonymous gets `authenticated: false`, suspended gets `403`."""
-    ctx = resolve_request_auth_context(request, db)
+    ctx = resolve_request_auth_context(request, db, touch_last_used=False)
     user = ctx.user
-    if user is None:
+    if user is None or ctx.auth_method != "session":
         return AuthMeResponse(authenticated=False, user=None)
     if not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account is suspended",
         )
-    if ctx.auth_method in ("pat", "oauth") and not ctx.has_scope(SCOPE_READ):
-        return AuthMeResponse(authenticated=False, user=None)
     return AuthMeResponse(authenticated=True, user=_to_user_public(db, user))

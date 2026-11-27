@@ -635,7 +635,7 @@ def test_m6_invite_checked_before_email_409_and_login_dummy_scrypt(
                     InviteCode(
                         code="TF-BOSS-2345",
                         label="Operator Bootstrap",
-                        role="member",
+                        role="admin",
                         max_uses=1,
                         use_count=0,
                     )

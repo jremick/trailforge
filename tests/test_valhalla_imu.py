@@ -654,7 +654,7 @@ def test_imu_privacy_trim_strictly_discards_start_and_end_250m_buffer(
 
 
 @requires_repo_checkout
-def test_valhalla_compose_override_file_and_docker_config() -> None:
+def test_valhalla_compose_override_file_and_docker_config(monkeypatch: pytest.MonkeyPatch) -> None:
     override_path = REPO_ROOT / "deploy" / "valhalla-compose.override.yml"
     docs_path = REPO_ROOT / "deploy" / "valhalla.md"
     base_compose = REPO_ROOT / "docker-compose.yml"
@@ -675,6 +675,7 @@ def test_valhalla_compose_override_file_and_docker_config() -> None:
 
     docker_bin = shutil.which("docker")
     if docker_bin is not None:
+        monkeypatch.setenv("AUTH_SECRET_KEY", "synthetic-valhalla-compose-fixture")
         for base_file in (base_compose, ghcr_compose):
             proc = subprocess.run(
                 [

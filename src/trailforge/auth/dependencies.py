@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import uuid
-from typing import Final
 
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
@@ -19,7 +18,6 @@ from trailforge.auth.tokens import (
     McpAuthContext,
     extract_bearer_token,
     extract_session_cookie,
-    resolve_session_only_user,
     verify_oauth_access_token,
     verify_pat,
 )
@@ -27,27 +25,12 @@ from trailforge.config import Settings, get_settings
 from trailforge.db.models import User
 from trailforge.db.session import get_db
 
-_SAFE_READ_METHODS: Final[frozenset[str]] = frozenset({"GET", "HEAD", "OPTIONS"})
-_SESSION_ONLY_PATH_PREFIXES: Final[tuple[str, ...]] = (
-    "/api/auth/logout",
-    "/api/auth/tokens",
-    "/api/auth/oauth-grants",
-)
-
 
 def _request_settings(request: Request) -> Settings:
     custom = getattr(getattr(request.app, "state", None), "custom_settings", None)
     if isinstance(custom, Settings):
         return custom
     return get_settings()
-
-
-def _is_session_only_path(path: str) -> bool:
-    normalized = path.rstrip("/") or "/"
-    for prefix in _SESSION_ONLY_PATH_PREFIXES:
-        if normalized == prefix or normalized.startswith(f"{prefix}/"):
-            return True
-    return False
 
 
 def _resolve_raw_session_user(
@@ -150,21 +133,27 @@ def get_optional_current_user(
     request: Request,
     db: Session = Depends(get_db),
 ) -> User | None:
-    """Return authenticated active User when valid readable credentials exist, else None."""
-    ctx = resolve_request_auth_context(request, db)
-    if ctx.user is None or not ctx.user.is_active:
-        return None
-    if ctx.auth_method in ("pat", "oauth") and not ctx.has_scope(SCOPE_READ):
-        return None
-    return ctx.user
+    """Return an active session user when personalizing an otherwise public endpoint."""
+    ctx = resolve_request_auth_context(request, db, touch_last_used=False)
+    user = ctx.user
+    if ctx.auth_method != "session" or user is None or not user.is_active:
+        user = None
+    require_expected_account(request, user)
+    return user
 
 
-def get_current_user(
-    request: Request,
-    db: Session = Depends(get_db),
-) -> User:
-    """Require an authenticated active user, enforcing PAT/OAuth scopes & token-mgmt isolation."""
-    ctx = resolve_request_auth_context(request, db)
+def require_expected_account(request: Request, user: User | None) -> None:
+    """Reject stale UI requests when another tab has changed the session cookie."""
+    expected = request.headers.get("x-trailforge-account")
+    if expected is not None and (user is None or expected != str(user.id)):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The signed-in account has changed",
+        )
+
+
+def _require_route_user(request: Request, db: Session, delegated_scope: str | None) -> User:
+    ctx = resolve_request_auth_context(request, db, touch_last_used=delegated_scope is not None)
     user = ctx.user
     if user is None:
         raise HTTPException(
@@ -177,34 +166,38 @@ def get_current_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account is suspended",
         )
-    if ctx.auth_method in ("pat", "oauth"):
-        if _is_session_only_path(request.url.path):
+    if ctx.auth_method != "session":
+        if delegated_scope is None:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=(
-                    "Session authentication required; Personal Access Tokens and OAuth "
-                    "tokens cannot manage tokens or grants"
-                ),
+                detail="Full session authentication required",
             )
-        method = request.method.upper()
-        required_scope = SCOPE_READ if method in _SAFE_READ_METHODS else SCOPE_WRITE
-        if not ctx.has_scope(required_scope):
+        if not ctx.has_scope(delegated_scope):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Missing required scope: {required_scope}",
+                detail=f"Missing required scope: {delegated_scope}",
             )
+    require_expected_account(request, user)
     return user
 
 
+def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
+    """Require an active session unless a route explicitly allows delegated access."""
+    return _require_route_user(request, db, delegated_scope=None)
+
+
+def get_scoped_read_user(request: Request, db: Session = Depends(get_db)) -> User:
+    """Allow a session or delegated access to one of the consented read operations."""
+    return _require_route_user(request, db, delegated_scope=SCOPE_READ)
+
+
+def get_scoped_write_user(request: Request, db: Session = Depends(get_db)) -> User:
+    """Allow a session or delegated access to a consented saved-item write operation."""
+    return _require_route_user(request, db, delegated_scope=SCOPE_WRITE)
+
+
 require_user = get_current_user
-
-
-def require_session_user(
-    request: Request,
-    db: Session = Depends(get_db),
-) -> User:
-    """Require full session credentials (cookie or session Bearer); block PAT/OAuth tokens."""
-    return resolve_session_only_user(request, db, settings=_request_settings(request))
+require_session_user = get_current_user
 
 
 def require_admin(
@@ -230,6 +223,7 @@ def require_admin(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin endpoints require full session authentication",
         )
+    require_expected_account(request, user)
     if user.role != "admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

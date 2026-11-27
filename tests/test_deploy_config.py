@@ -106,6 +106,8 @@ def test_ghcr_compose_parity_with_dev_compose() -> None:
         "TRAILFORGE_VECTOR_BASEMAP_URL",
     ):
         assert required_secret in api_env
+    auth_key = ghcr["services"]["api"]["environment"]["AUTH_SECRET_KEY"]
+    assert auth_key.startswith("${AUTH_SECRET_KEY:?")
 
     assert "TRAILFORGE_VECTOR_BASEMAP_URL=" in (REPO_ROOT / ".env.example").read_text(
         encoding="utf-8"

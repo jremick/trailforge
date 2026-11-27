@@ -23,6 +23,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from trailforge.api.middleware import extract_client_ip
+from trailforge.auth.dependencies import get_current_user
 from trailforge.auth.oauth import (
     OAuthError,
     build_authorization_server_metadata,
@@ -60,7 +61,6 @@ from trailforge.auth.tokens import (
     create_personal_access_token,
     list_personal_access_tokens,
     resolve_session_cookie_or_bearer_user,
-    resolve_session_only_user,
     revoke_personal_access_token,
 )
 from trailforge.config import Settings, get_settings
@@ -824,10 +824,6 @@ class OAuthGrantRevokeResponse(BaseModel):
     revoked_tokens: int
 
 
-def _require_session_user(request: Request, db: Session = Depends(get_db)) -> User:
-    return resolve_session_only_user(request, db, settings=_request_settings(request))
-
-
 def _pat_to_item(pat: PersonalAccessToken, *, now: datetime) -> PatItemResponse:
     expired = pat.expires_at is not None and as_utc(pat.expires_at) <= now
     return PatItemResponse(
@@ -846,7 +842,7 @@ def _pat_to_item(pat: PersonalAccessToken, *, now: datetime) -> PatItemResponse:
 @tokens_router.get("/tokens", response_model=PatListResponse)
 def list_auth_tokens(
     include_revoked: bool = Query(default=False),
-    user: User = Depends(_require_session_user),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> PatListResponse:
     """List the authenticated user's Personal Access Tokens (never exposes token hashes/secrets)."""
@@ -866,7 +862,7 @@ def list_auth_tokens(
 def create_auth_token(
     payload: PatCreateRequest,
     response: Response,
-    user: User = Depends(_require_session_user),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> PatCreatedResponse:
     """Mint a new scoped Personal Access Token (`tf_pat_...`); plaintext returned once only."""
@@ -905,7 +901,7 @@ def create_auth_token(
 @tokens_router.delete("/tokens/{token_id}", response_model=PatRevokeResponse)
 def delete_auth_token(
     token_id: str,
-    user: User = Depends(_require_session_user),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> PatRevokeResponse:
     """Revoke an owned Personal Access Token immediately."""
@@ -928,7 +924,7 @@ def delete_auth_token(
 
 @tokens_router.get("/oauth-grants", response_model=OAuthGrantListResponse)
 def get_oauth_grants(
-    user: User = Depends(_require_session_user),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> OAuthGrantListResponse:
     """List connected OAuth AI applications with active grants for the current user."""
@@ -941,7 +937,7 @@ def get_oauth_grants(
 @tokens_router.delete("/oauth-grants/{client_id}", response_model=OAuthGrantRevokeResponse)
 def delete_oauth_grant(
     client_id: str,
-    user: User = Depends(_require_session_user),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> OAuthGrantRevokeResponse:
     """Revoke all active OAuth tokens for a connected AI application."""

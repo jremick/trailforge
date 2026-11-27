@@ -51,16 +51,25 @@ services:
     image: ghcr.io/jremick/trailforge-backend:${TRAILFORGE_IMAGE_TAG:-latest}
     command:
       - sh
-      - -c
-      - alembic upgrade head && exec uvicorn trailforge.api.main:app --host 0.0.0.0 --port 8000
+      - -ec
+      - |
+        python - <<'PY'
+        import os
+
+        key = os.environ["AUTH_SECRET_KEY"].strip()
+        if len(key) < 32 or key == "trailforge-dev-secret-change-in-production":
+            raise SystemExit("Set AUTH_SECRET_KEY to a unique random value of at least 32 characters")
+        PY
+        alembic upgrade head
+        exec uvicorn trailforge.api.main:app --host 0.0.0.0 --port 8000
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://trailforge:trailforge@db:5432/trailforge}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
       PRIVACY_TRIM_METERS: ${PRIVACY_TRIM_METERS:-250}
       SNOW_LINE_DEFAULT_M: ${SNOW_LINE_DEFAULT_M:-1000}
-      # CHANGE IN PRODUCTION! Generate strong secrets with: openssl rand -hex 32
-      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:-trailforge-dev-secret-change-in-production}
+      # Generate a unique signing key with: openssl rand -hex 32
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?Set AUTH_SECRET_KEY to a unique random value}
       TRAILFORGE_PRIVACY_SECRET: ${TRAILFORGE_PRIVACY_SECRET:-trailforge-dev-privacy-secret-change-in-production}
       # Set AUTH_COOKIE_SECURE=true when serving TrailForge behind HTTPS/TLS
       AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
@@ -69,7 +78,6 @@ services:
       # Public instance hardening: keep 'open' for private homelabs, or set 'invite_only' / 'closed'
       # when exposing TrailForge to the public internet.
       TRAILFORGE_REGISTRATION_MODE: ${TRAILFORGE_REGISTRATION_MODE:-open}
-      TRAILFORGE_ADMIN_EMAIL: ${TRAILFORGE_ADMIN_EMAIL:-}
       TRAILFORGE_DEMO_BANNER: ${TRAILFORGE_DEMO_BANNER:-}
       TRAILFORGE_SHOW_STACK_TELEMETRY_PUBLIC: ${TRAILFORGE_SHOW_STACK_TELEMETRY_PUBLIC:-false}
       TRAILFORGE_TRUST_PROXY_HEADERS: ${TRAILFORGE_TRUST_PROXY_HEADERS:-true}

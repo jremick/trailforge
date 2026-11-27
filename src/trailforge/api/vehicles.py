@@ -11,7 +11,7 @@ from pydantic import AliasChoices, BaseModel, Field, StringConstraints
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from trailforge.auth.dependencies import get_current_user
+from trailforge.auth.dependencies import get_current_user, get_scoped_read_user
 from trailforge.db.models import User, VehicleProfile
 from trailforge.db.session import get_db
 from trailforge.vehicles.classifier import (
@@ -170,7 +170,7 @@ def list_vehicle_classes() -> list[VehicleClassReference]:
 
 @router.get("", response_model=list[VehicleProfileResponse])
 def list_vehicles(
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_scoped_read_user),
     db: Session = Depends(get_db),
 ) -> list[VehicleProfileResponse]:
     """List the signed-in user's Vehicle Profiles (active profile first)."""

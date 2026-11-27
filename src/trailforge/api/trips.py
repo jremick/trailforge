@@ -20,7 +20,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from trailforge.api.middleware import check_upload_quota
-from trailforge.auth.dependencies import get_current_user
+from trailforge.auth.dependencies import get_current_user, get_scoped_read_user
 from trailforge.config import get_settings
 from trailforge.db.models import (
     TelemetryObservation,
@@ -1010,7 +1010,7 @@ async def mobile_sync_trip(
 
 @router.get("/trips", response_model=list[TripItemResponse])
 def list_trips(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_scoped_read_user),
     db: Session = Depends(get_db),
 ) -> list[TripItemResponse]:
     """List the signed-in user's trips newest-first with live contribution counts."""

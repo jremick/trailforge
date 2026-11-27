@@ -111,7 +111,6 @@ def test_hardening_and_r2_settings_defaults_aliases_and_bounds(
 ) -> None:
     defaults = Settings()
     assert defaults.registration_mode == "open"
-    assert defaults.admin_email == ""
     assert defaults.demo_banner == ""
     assert defaults.rate_limit_enabled is True
     assert defaults.rate_limit_read_per_min == 180
@@ -130,7 +129,6 @@ def test_hardening_and_r2_settings_defaults_aliases_and_bounds(
     assert defaults.r2_secret_access_key == ""
 
     monkeypatch.setenv("TRAILFORGE_REGISTRATION_MODE", "invite_only")
-    monkeypatch.setenv("TRAILFORGE_ADMIN_EMAIL", "admin@example.com")
     monkeypatch.setenv("TRAILFORGE_DEMO_BANNER", "Public demo instance")
     monkeypatch.setenv("TRAILFORGE_RATE_LIMIT_ENABLED", "false")
     monkeypatch.setenv("TRAILFORGE_RATE_LIMIT_READ_PER_MIN", "90")
@@ -147,7 +145,6 @@ def test_hardening_and_r2_settings_defaults_aliases_and_bounds(
 
     cfg = Settings()
     assert cfg.registration_mode == "invite_only"
-    assert cfg.admin_email == "admin@example.com"
     assert cfg.demo_banner == "Public demo instance"
     assert cfg.rate_limit_enabled is False
     assert cfg.rate_limit_read_per_min == 90

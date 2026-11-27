@@ -37,17 +37,6 @@ def get_registration_mode() -> RegistrationMode:
     return "open"
 
 
-def get_admin_email() -> str:
-    """Safely read bootstrap admin email from Settings (or env fallback)."""
-    cfg = get_settings()
-    val = getattr(cfg, "admin_email", None)
-    if val is not None:
-        raw = str(val)
-    else:
-        raw = os.environ.get("TRAILFORGE_ADMIN_EMAIL") or os.environ.get("ADMIN_EMAIL", "")
-    return raw.strip().lower()
-
-
 def get_demo_banner() -> str:
     """Safely read optional public demo banner text from Settings (or env fallback)."""
     cfg = get_settings()

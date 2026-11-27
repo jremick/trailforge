@@ -24,11 +24,7 @@ export function isAbsoluteHttpUrl(value: string | null | undefined): boolean {
  * Cloudflare Pages Functions proxy). Strips any trailing slashes cleanly.
  */
 export function getApiBaseUrl(override?: string): string {
-  const raw =
-    override !== undefined
-      ? override
-      : ((import.meta as { env?: Record<string, unknown> }).env
-          ?.VITE_API_BASE_URL ?? "");
+  const raw = override ?? import.meta.env.VITE_API_BASE_URL ?? "";
   return String(raw).trim().replace(/\/+$/, "");
 }
 
