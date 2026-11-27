@@ -154,7 +154,7 @@ def test_release_images_workflow_multiarch_oci_and_prerelease_guard() -> None:
 
     perms = wf.get("permissions", {})
     assert perms.get("contents") == "read"
-    assert perms.get("packages") == "write"
+    assert "packages" not in perms
 
     jobs = wf["jobs"]
     assert {"resolve-tag", "build-backend", "build-web"}.issubset(jobs.keys())
@@ -177,7 +177,11 @@ def test_release_images_workflow_multiarch_oci_and_prerelease_guard() -> None:
         "build-web": "ghcr.io/${{ github.repository_owner }}/trailforge-web",
     }
     for job_name, expected_image in expected_jobs.items():
+        assert jobs[job_name]["permissions"] == {"contents": "read", "packages": "write"}
         steps = jobs[job_name]["steps"]
+        for step in steps:
+            if "uses" in step:
+                assert re.fullmatch(r"[a-zA-Z0-9_./-]+@[a-f0-9]{40}", step["uses"])
         uses_list = [str(s.get("uses", "")) for s in steps]
         for action in (
             "docker/setup-qemu-action",
