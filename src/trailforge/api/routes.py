@@ -10,6 +10,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field, StringConstraints, field_validator
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from trailforge.auth.dependencies import (
@@ -22,9 +23,11 @@ from trailforge.db.models import PlannedRoute, User, VehicleProfile
 from trailforge.db.session import get_db
 from trailforge.routes.export import build_route_geojson, build_route_gpx
 from trailforge.routes.planner import (
+    MAX_ROUTE_EXPORT_BYTES,
     MAX_ROUTE_TRACKS,
     PlannedRouteAnalysis,
     RouteWaypoint,
+    RouteWorkBudgetExceeded,
     TrackNotFoundError,
     build_gridforge_cli,
     plan_route_with_geometry,
@@ -208,6 +211,12 @@ def _run_plan_or_http_error(
         )
     except TrackNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except DBAPIError as exc:
+        if getattr(exc.orig, "sqlstate", None) != "57014":
+            raise
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(RouteWorkBudgetExceeded())
+        ) from exc
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
@@ -248,17 +257,20 @@ def _export_response(
 ) -> Response:
     slug = slugify_route_name(analysis.name)
     if fmt == "gpx":
-        gpx_xml = build_route_gpx(analysis, leg_tracks=leg_tracks, notes=notes)
-        return Response(
-            content=gpx_xml,
-            media_type="application/gpx+xml",
-            headers={"Content-Disposition": f'attachment; filename="{slug}.gpx"'},
+        content = build_route_gpx(analysis, leg_tracks=leg_tracks, notes=notes).encode("utf-8")
+        media_type = "application/gpx+xml"
+    else:
+        geojson = build_route_geojson(analysis, leg_tracks=leg_tracks, notes=notes)
+        content = json.dumps(geojson, separators=(",", ":")).encode("utf-8")
+        media_type = "application/geo+json"
+    if len(content) > MAX_ROUTE_EXPORT_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(RouteWorkBudgetExceeded())
         )
-    gj = build_route_geojson(analysis, leg_tracks=leg_tracks, notes=notes)
     return Response(
-        content=json.dumps(gj, separators=(",", ":")),
-        media_type="application/geo+json",
-        headers={"Content-Disposition": f'attachment; filename="{slug}.geojson"'},
+        content=content,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{slug}.{fmt}"'},
     )
 
 

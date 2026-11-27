@@ -49,7 +49,7 @@ services:
       - "traefik.http.middlewares.trailforge-security.headers.referrerPolicy=strict-origin-when-cross-origin"
       - "traefik.http.middlewares.trailforge-security.headers.customRequestHeaders.X-Forwarded-Proto=https"
       - "traefik.http.middlewares.trailforge-security.headers.customRequestHeaders.CF-Connecting-IP="
-      # Allow up to 17 MB multipart GPX trace & condition report photo uploads (matches web/nginx.conf)
+      # Outer ceiling. The web service applies smaller request limits by route.
       - "traefik.http.middlewares.trailforge-upload-limit.buffering.maxRequestBodyBytes=17825792"
       - "traefik.http.middlewares.trailforge-upload-limit.buffering.memRequestBodyBytes=2097152"
 

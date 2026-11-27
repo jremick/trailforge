@@ -12,6 +12,8 @@ import math
 import os
 import shutil
 import subprocess
+import tempfile
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Final, Literal
 
@@ -19,13 +21,16 @@ import httpx
 import numpy as np
 from pydantic import BaseModel
 
+from trailforge.ingestion.connectors._cog_ranges import cog_range_path
 from trailforge.ingestion.connectors.base import (
     ATTRIBUTION_GA_DEM,
     GDAL_STREAMING_ENV,
-    USER_AGENT,
+    IDENTITY_HTTP_HEADERS,
     BBox,
     DemTierLiteral,
     is_in_australia_coverage,
+    iter_bounded_response,
+    stream_upstream,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,6 +50,9 @@ GA_SRTM_1S_WCS_URL: Final[str] = (
     "https://services.ga.gov.au/gis/services/"
     "DEM_SRTM_1Second_Hydro_Enforced_2024/MapServer/WCSServer"
 )
+_MAX_WCS_GEOTIFF_BYTES: Final[int] = 128 * 1024 * 1024
+_MAX_DEM_PIXELS: Final[int] = 32_000_000
+_SRTM_PIXEL_DEG: Final[float] = 1.0 / 3600
 
 
 class RasterCoverageStats(BaseModel):
@@ -161,7 +169,9 @@ def inspect_raster_coverage(
     """Inspect a GeoTIFF DEM and apply the coastal-water vs. missing-LiDAR cliff guard."""
     from trailforge.ingestion.terrain import DemSampler
 
-    with DemSampler(tif_path) as sampler:
+    if tif_path.stat().st_size > _MAX_WCS_GEOTIFF_BYTES:
+        raise ValueError("DEM raster exceeds the file size limit")
+    with DemSampler(tif_path, max_pixels=_MAX_DEM_PIXELS) as sampler:
         arr, nodata = sampler.read_array()
     return evaluate_raster_coverage_array(
         arr,
@@ -177,6 +187,11 @@ def wcs_resolution_for_bbox(bbox: BBox) -> tuple[float, float, str]:
     if bbox.width <= 0.35 and bbox.height <= 0.35:
         return (0.000055, 0.000052, "5m")
     return (0.000110, 0.000104, "10m")
+
+
+def _clip_dimensions(bbox: BBox, resx: float, resy: float) -> tuple[int, int]:
+    # Include a pixel of rounding slack at each edge.
+    return (math.ceil(bbox.width / resx) + 2, math.ceil(bbox.height / resy) + 2)
 
 
 class AUElvisDEMConnector:
@@ -209,6 +224,18 @@ class AUElvisDEMConnector:
         env = os.environ.copy()
         for k, v in GDAL_STREAMING_ENV.items():
             env.setdefault(k, v)
+        env["GDAL_HTTP_CONNECTTIMEOUT"] = str(min(10.0, self.timeout_s))
+        env["GDAL_HTTP_TIMEOUT"] = str(self.timeout_s)
+        env.update({
+            "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": ".tif",
+            "CPL_VSIL_CURL_USE_HEAD": "YES",
+            "GDAL_HTTP_MULTIRANGE": "SERIAL",
+            "GDAL_HTTP_MAX_RETRY": "0",
+            "GDAL_HTTP_PROXY": "",
+            "NO_PROXY": "127.0.0.1",
+            "no_proxy": "127.0.0.1",
+            "PROJ_NETWORK": "OFF",
+        })
         return env
 
     def _srtm_cog_url(self) -> str:
@@ -216,20 +243,34 @@ class AUElvisDEMConnector:
             return os.environ.get("TRAILFORGE_DEA_SRTM_HYDRO_URL", DEA_SRTM_1S_HYDRO_COG_URL)
         return os.environ.get("TRAILFORGE_DEA_SRTM_URL", DEA_SRTM_1S_SMOOTH_COG_URL)
 
-    def _http_get_bytes(self, url: str, params: dict[str, str]) -> tuple[int, str, bytes]:
+    def _download_wcs_raster(self, url: str, params: dict[str, str], dest: Path) -> bool:
+        """Download a bounded WCS response to a temporary GeoTIFF for inspection."""
         owns_client = self._client is None
         http = (
             self._client
             if self._client is not None
             else httpx.Client(
                 timeout=httpx.Timeout(self.timeout_s, connect=min(10.0, self.timeout_s)),
-                follow_redirects=True,
-                headers={"User-Agent": USER_AGENT},
+                headers=IDENTITY_HTTP_HEADERS,
             )
         )
         try:
-            resp = http.get(url, params=params, headers={"User-Agent": USER_AGENT})
-            return (resp.status_code, resp.headers.get("content-type", ""), resp.content)
+            with stream_upstream(http, url, params=params) as resp:
+                content_type = resp.headers.get("content-type", "").lower()
+                if (
+                    resp.status_code != 200 or "content-range" in resp.headers
+                    or "xml" in content_type or "html" in content_type
+                ):
+                    return False
+                with dest.open("wb") as file:
+                    for chunk in iter_bounded_response(
+                        resp, max_bytes=_MAX_WCS_GEOTIFF_BYTES, max_duration_s=self.timeout_s * 2
+                    ):
+                        file.write(chunk)
+            if dest.stat().st_size < 256:
+                return False
+            with dest.open("rb") as file:
+                return file.read(4) in (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+")
         finally:
             if owns_client:
                 http.close()
@@ -240,13 +281,15 @@ class AUElvisDEMConnector:
             return False
 
         resx, resy, res_tag = wcs_resolution_for_bbox(clip_bbox)
+        width, height = _clip_dimensions(clip_bbox, resx, resy)
+        if width * height > _MAX_DEM_PIXELS:
+            return False
         cache_path = (
             self.cache_dir / "au_elvis" / f"au_5m_{res_tag}_{clip_bbox.cache_hash()}.tif"
             if self.cache_dir is not None
             else None
         )
-        if cache_path is not None and cache_path.is_file() and cache_path.stat().st_size > 0:
-            shutil.copy2(cache_path, out_tif)
+        if self._copy_cached_raster(cache_path, out_tif, expect_lidar=True):
             return True
 
         params = {
@@ -263,46 +306,31 @@ class AUElvisDEMConnector:
             "RESY": f"{resy:.6f}",
             "FORMAT": "GeoTIFF",
         }
-        try:
-            status, content_type, body = self._http_get_bytes(GA_5M_LIDAR_WCS_URL, params)
-        except Exception as exc:
-            logger.warning("GA 5m LiDAR WCS failed (%s); falling back to SRTM 1s", exc)
-            return False
+        with tempfile.TemporaryDirectory(dir=work_dir, prefix="lidar-") as tmp_dir:
+            tmp_5m = Path(tmp_dir) / "dem.tif"
+            try:
+                if not self._download_wcs_raster(GA_5M_LIDAR_WCS_URL, params, tmp_5m):
+                    return False
+                stats = inspect_raster_coverage(
+                    tmp_5m,
+                    min_valid_ratio=self.min_valid_ratio,
+                    max_exact_zero_ratio=self.max_exact_zero_ratio,
+                )
+            except Exception as exc:
+                logger.warning("GA 5m LiDAR WCS failed (%s); falling back to SRTM 1s", exc)
+                return False
 
-        if (
-            status != 200
-            or "xml" in content_type.lower()
-            or "html" in content_type.lower()
-            or len(body) < 256
-        ):
-            return False
+            if not stats.accept_5m_lidar:
+                logger.info(
+                    "GA 5m LiDAR rejected (valid=%.1f%%, zero=%.1f%%, cliff_ratio=%.1f%%); "
+                    "falling back to DEA SRTM 1s",
+                    stats.valid_frac * 100.0,
+                    stats.exact_zero_frac * 100.0,
+                    stats.zero_cliff_ratio * 100.0,
+                )
+                return False
 
-        work_dir.mkdir(parents=True, exist_ok=True)
-        tmp_5m = work_dir / "dem_au_5m_tmp.tif"
-        tmp_5m.write_bytes(body)
-        try:
-            stats = inspect_raster_coverage(
-                tmp_5m,
-                min_valid_ratio=self.min_valid_ratio,
-                max_exact_zero_ratio=self.max_exact_zero_ratio,
-            )
-        except Exception as exc:
-            logger.warning("GA 5m LiDAR GeoTIFF unreadable (%s); falling back to SRTM 1s", exc)
-            tmp_5m.unlink(missing_ok=True)
-            return False
-
-        if not stats.accept_5m_lidar:
-            logger.info(
-                "GA 5m LiDAR rejected (valid=%.1f%%, zero=%.1f%%, cliff_ratio=%.1f%%); "
-                "falling back to DEA SRTM 1s",
-                stats.valid_frac * 100.0,
-                stats.exact_zero_frac * 100.0,
-                stats.zero_cliff_ratio * 100.0,
-            )
-            tmp_5m.unlink(missing_ok=True)
-            return False
-
-        tmp_5m.replace(out_tif)
+            tmp_5m.replace(out_tif)
         if cache_path is not None:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             tmp_cache = cache_path.with_suffix(".tif.tmp")
@@ -326,18 +354,27 @@ class AUElvisDEMConnector:
             "FORMAT": "GeoTIFF",
         }
         try:
-            status, content_type, body = self._http_get_bytes(GA_SRTM_1S_WCS_URL, params)
+            return self._download_wcs_raster(GA_SRTM_1S_WCS_URL, params, out_tif)
         except Exception as exc:
             logger.warning("GA SRTM 1s backup WCS failed: %s", exc)
             return False
-        if (
-            status != 200
-            or "xml" in content_type.lower()
-            or "html" in content_type.lower()
-            or len(body) < 256
-        ):
+
+    def _copy_cached_raster(
+        self, cache_path: Path | None, out_tif: Path, *, expect_lidar: bool = False
+    ) -> bool:
+        if cache_path is None or not cache_path.is_file():
             return False
-        out_tif.write_bytes(body)
+        try:
+            stats = inspect_raster_coverage(
+                cache_path, min_valid_ratio=self.min_valid_ratio,
+                max_exact_zero_ratio=self.max_exact_zero_ratio,
+            )
+        except Exception as exc:
+            logger.warning("Ignoring invalid cached DEM %s (%s)", cache_path, exc)
+            return False
+        if (expect_lidar and not stats.accept_5m_lidar) or stats.valid_frac < 0.05:
+            return False
+        shutil.copy2(cache_path, out_tif)
         return True
 
     def _fetch_srtm_1s(self, clip_bbox: BBox, out_tif: Path) -> Path:
@@ -348,13 +385,44 @@ class AUElvisDEMConnector:
             if self.cache_dir is not None
             else None
         )
-        if cache_path is not None and cache_path.is_file() and cache_path.stat().st_size > 0:
-            shutil.copy2(cache_path, out_tif)
+        if self._copy_cached_raster(cache_path, out_tif):
             return out_tif
 
-        vsicurl_cog = f"/vsicurl/{self._srtm_cog_url()}"
+        width, height = _clip_dimensions(clip_bbox, _SRTM_PIXEL_DEG, _SRTM_PIXEL_DEG)
+        with tempfile.TemporaryDirectory(dir=out_tif.parent, prefix="srtm-") as tmp_dir:
+            tmp_tif = Path(tmp_dir) / "dem.tif"
+            if (
+                not self._fetch_srtm_1s_cog(clip_bbox, tmp_tif, width=width, height=height)
+                and not self._fetch_srtm_1s_wcs_backup(clip_bbox, tmp_tif)
+            ):
+                raise RuntimeError(
+                    "Both DEA SRTM 1s COG and GA SRTM 2024 WCS backup failed for "
+                    f"{clip_bbox.as_tuple()}"
+                )
+
+            stats = inspect_raster_coverage(tmp_tif)
+            if stats.valid_frac < 0.05:
+                raise RuntimeError(
+                    f"Outside Australian DEM coverage (valid={stats.valid_frac * 100.0:.1f}%)"
+                )
+            tmp_tif.replace(out_tif)
+
+        if cache_path is not None:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_cache = cache_path.with_suffix(".tif.tmp")
+            shutil.copy2(out_tif, tmp_cache)
+            tmp_cache.replace(cache_path)
+        return out_tif
+
+    def _fetch_srtm_1s_cog(
+        self, clip_bbox: BBox, out_tif: Path, *, width: int, height: int
+    ) -> bool:
+        if shutil.which("gdal_translate") is None:
+            return False
         cmd = [
             "gdal_translate",
+            "-if",
+            "GTiff",
             "-of",
             "GTiff",
             "-ot",
@@ -374,35 +442,40 @@ class AUElvisDEMConnector:
             f"{clip_bbox.min_y:.6f}",
             "-projwin_srs",
             "EPSG:4326",
-            vsicurl_cog,
-            str(out_tif),
+            "-outsize",
+            str(width),
+            str(height),
         ]
-        gdal_ok = False
-        if shutil.which("gdal_translate") is not None:
-            proc = subprocess.run(
-                cmd, env=self._gdal_env(), capture_output=True, text=True, check=False
+        timeout = self.timeout_s * 4
+        try:
+            http = (
+                nullcontext(self._client)
+                if self._client is not None
+                else httpx.Client(
+                    timeout=httpx.Timeout(self.timeout_s, connect=min(10.0, self.timeout_s)),
+                    headers=IDENTITY_HTTP_HEADERS,
+                )
             )
-            gdal_ok = proc.returncode == 0 and out_tif.is_file() and out_tif.stat().st_size > 0
-
-        if not gdal_ok and not self._fetch_srtm_1s_wcs_backup(clip_bbox, out_tif):
-            raise RuntimeError(
-                "Both DEA SRTM 1s COG and GA SRTM 2024 WCS backup failed for "
-                f"{clip_bbox.as_tuple()}"
-            )
-
-        stats = inspect_raster_coverage(out_tif)
-        if stats.valid_frac < 0.05:
-            out_tif.unlink(missing_ok=True)
-            raise RuntimeError(
-                f"Outside Australian DEM coverage (valid={stats.valid_frac * 100.0:.1f}%)"
-            )
-
-        if cache_path is not None:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_cache = cache_path.with_suffix(".tif.tmp")
-            shutil.copy2(out_tif, tmp_cache)
-            tmp_cache.replace(cache_path)
-        return out_tif
+            with (
+                http as client,
+                cog_range_path(self._srtm_cog_url(), client, timeout_s=timeout) as source,
+            ):
+                proc = subprocess.run(
+                    [*cmd, source.path, str(out_tif)], env=self._gdal_env(),
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+                    timeout=timeout,
+                )
+            if (
+                not source.failed.is_set() and proc.returncode == 0 and out_tif.is_file()
+                and 0 < out_tif.stat().st_size <= _MAX_WCS_GEOTIFF_BYTES
+            ):
+                return True
+        except (
+            httpx.InvalidURL, httpx.HTTPError, OSError, ValueError, subprocess.TimeoutExpired,
+        ) as exc:
+            logger.warning("DEA SRTM 1s COG request failed (%s)", type(exc).__name__)
+        out_tif.unlink(missing_ok=True)
+        return False
 
     def fetch_dem(
         self,
@@ -418,13 +491,16 @@ class AUElvisDEMConnector:
                 raise FileNotFoundError(f"Local DEM GeoTIFF not found: {src}")
             return (src, "synthetic")
 
-        work_dir.mkdir(parents=True, exist_ok=True)
         clip_bbox = bbox.round_enclosing(step_deg=0.001)
         if not is_in_australia_coverage(clip_bbox):
             raise RuntimeError(
                 f"Requested bbox {clip_bbox.as_tuple()} is outside Australia DEM bounds"
             )
+        width, height = _clip_dimensions(clip_bbox, _SRTM_PIXEL_DEG, _SRTM_PIXEL_DEG)
+        if clip_bbox.width <= 0 or clip_bbox.height <= 0 or width * height > _MAX_DEM_PIXELS:
+            raise ValueError("Requested DEM clip exceeds the pixel limit. Use smaller bake tiles.")
 
+        work_dir.mkdir(parents=True, exist_ok=True)
         out_tif = work_dir / "dem_raw.tif"
         if self.prefer_5m and self._fetch_5m_lidar_wcs(clip_bbox, work_dir, out_tif):
             return (out_tif, "5m-lidar")

@@ -38,10 +38,10 @@ from trailforge.ingestion.connectors.base import (
     dedupe_poi_features,
     deterministic_feature_id,
     parse_elevation_m,
-    stream_download_file,
 )
 from trailforge.ingestion.connectors.osm import (
     DEFAULT_AU_PBF_URL,
+    download_osm_pbf,
     parse_osm_track_feature,
 )
 from trailforge.ingestion.segmenter import infer_state_from_lonlat
@@ -613,11 +613,7 @@ class StreamingPBFExtractor:
             raise ValueError(
                 "Either source_pbf or cache_dir must be configured for StreamingPBFExtractor"
             )
-        filename = Path(self.pbf_url.split("?")[0]).name or "australia-latest.osm.pbf"
-        dest = self.cache_dir / "geofabrik" / filename
-        logger.info("Ensuring Geofabrik PBF cache at %s from %s", dest, self.pbf_url)
-        self.source_pbf = stream_download_file(self.pbf_url, dest, client=self._client)
-        return self.source_pbf
+        return download_osm_pbf(self.pbf_url, self.cache_dir, client=self._client)
 
     def extract_bbox(
         self,

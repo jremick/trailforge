@@ -26,8 +26,7 @@
 #     preserves upstream `Mcp-Session-Id` and `WWW-Authenticate` response headers.
 
 trails.example.com {
-	# Match web/nginx.conf (`client_max_body_size 17m`) for 15 MiB multipart GPX uploads
-	# and community condition report photo attachments.
+	# Outer ceiling. The web service applies smaller request limits by route.
 	request_body {
 		max_size 17MB
 	}

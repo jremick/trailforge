@@ -39,6 +39,14 @@ _TIFF_TYPE_SIZES: Final[dict[int, tuple[int, str]]] = {
     11: (4, "f"),  # FLOAT
     12: (8, "d"),  # DOUBLE
 }
+_TIFF_TAG_VALUE_LIMITS: Final[dict[int, int]] = {
+    256: 1, 257: 1, 258: 1, 259: 1, 273: 65_536, 277: 1, 278: 1, 279: 65_536,
+    317: 1, 339: 1, 33550: 3, 33922: 240, 34735: 4_096, 42113: 128,
+}
+_TIFF_SAMPLE_FORMATS: Final[set[tuple[int, int, int]]] = {
+    (1, 1, 16), (1, 2, 16), (1, 2, 32), (1, 3, 32), (1, 3, 64), (3, 3, 32)
+}
+_MAX_REMOTE_TIFF_STRIP_BYTES: Final[int] = 8 * 1024 * 1024
 
 
 @functools.lru_cache(maxsize=16)
@@ -55,6 +63,8 @@ def _to_linestring(geom: BaseGeometry | Mapping[str, Any]) -> LineString:
 
 def _decode_pure_python_geotiff(
     path: Path,
+    *,
+    max_pixels: int | None = None,
 ) -> tuple[np.ndarray, tuple[float, float, float, float], int, float | None]:
     """Decode classic GeoTIFF (uncompressed/DEFLATE, Predictor 1/3) using stdlib + NumPy.
 
@@ -83,6 +93,11 @@ def _decode_pure_python_geotiff(
     for idx in range(num_entries):
         entry_off = ifd_offset + 2 + idx * 12
         tag, dtype, count = struct.unpack_from(f"{endian}HHI", raw, entry_off)
+        max_count = _TIFF_TAG_VALUE_LIMITS.get(tag)
+        if max_count is None:
+            continue
+        if not 0 < count <= max_count:
+            raise ValueError(f"Invalid TIFF tag size for {tag}: {path}")
         val_bytes = raw[entry_off + 8 : entry_off + 12]
         type_info = _TIFF_TYPE_SIZES.get(dtype)
         if type_info is None:
@@ -94,6 +109,8 @@ def _decode_pure_python_geotiff(
         else:
             data_off = struct.unpack_from(f"{endian}I", val_bytes, 0)[0]
             payload = raw[data_off : data_off + total_bytes]
+        if len(payload) < total_bytes:
+            raise ValueError(f"Truncated TIFF tag {tag}: {path}")
 
         if dtype == 2:
             tags[tag] = payload.rstrip(b"\x00").decode("ascii", errors="replace")
@@ -106,6 +123,10 @@ def _decode_pure_python_geotiff(
 
     cols = int(tags[256])
     rows = int(tags[257])
+    if max_pixels is not None and (
+        cols <= 0 or rows <= 0 or cols * rows > max_pixels or int(tags.get(277, 1)) != 1
+    ):
+        raise ValueError("DEM raster exceeds the pixel limit or has multiple bands")
     bits_per_sample = int(tags.get(258, 32))
     compression = int(tags.get(259, 1))
     strip_offsets = tags[273]
@@ -122,8 +143,21 @@ def _decode_pure_python_geotiff(
         raise ValueError(
             f"Pure-Python GeoTIFF reader supports uncompressed/DEFLATE, got {compression}"
         )
+    if (predictor, sample_format, bits_per_sample) not in _TIFF_SAMPLE_FORMATS:
+        raise ValueError(
+            f"Unsupported TIFF predictor={predictor}, format={sample_format}, "
+            f"bits={bits_per_sample} for {path}"
+        )
+    if rows_per_strip <= 0 or len(strip_offsets) != math.ceil(rows / rows_per_strip):
+        raise ValueError(f"Invalid TIFF strip count: {path}")
 
     bytes_per_sample = bits_per_sample // 8
+    row_byte_len = cols * bytes_per_sample
+    if (
+        max_pixels is not None
+        and min(rows_per_strip, rows) * row_byte_len > _MAX_REMOTE_TIFF_STRIP_BYTES
+    ):
+        raise ValueError("DEM raster exceeds the decoded strip size limit")
     arr = np.empty((rows, cols), dtype=np.float32)
 
     row_cursor = 0
@@ -133,9 +167,12 @@ def _decode_pure_python_geotiff(
         strip_rows = min(rows_per_strip, rows - row_cursor)
         chunk = raw[s_off : s_off + s_cnt]
         if compression in (8, 32946):
-            chunk = zlib.decompress(chunk)
+            expected_bytes = strip_rows * row_byte_len
+            decoder = zlib.decompressobj()
+            chunk = decoder.decompress(chunk, expected_bytes + 1)
+            if len(chunk) != expected_bytes or not decoder.eof:
+                raise ValueError(f"Invalid TIFF strip length: {path}")
 
-        row_byte_len = cols * bytes_per_sample
         if predictor == 3 and sample_format == 3 and bits_per_sample == 32:
             buf = np.frombuffer(chunk, dtype=np.uint8, count=strip_rows * row_byte_len).reshape(
                 strip_rows, row_byte_len
@@ -232,7 +269,13 @@ class DemSampler:
     when installed with a transparent pure-Python GeoTIFF fallback otherwise.
     """
 
-    def __init__(self, dem_path: Path | str, *, force_pure_python: bool = False) -> None:
+    def __init__(
+        self,
+        dem_path: Path | str,
+        *,
+        force_pure_python: bool = False,
+        max_pixels: int | None = None,
+    ) -> None:
         self.path = Path(dem_path).expanduser().resolve()
         if not self.path.is_file():
             raise FileNotFoundError(f"DEM GeoTIFF not found: {self.path}")
@@ -253,6 +296,13 @@ class DemSampler:
             import rasterio  # type: ignore[import-not-found]
 
             ds = rasterio.open(self.path)
+            if max_pixels is not None and (
+                ds.count != 1
+                or ds.width * ds.height > max_pixels
+                or ds.block_shapes[0][0] * ds.block_shapes[0][1] > max_pixels
+            ):
+                ds.close()
+                raise ValueError("DEM raster exceeds the pixel limit or has multiple bands")
             self._rio_ds = ds
             self.backend = "rasterio"
             self.width: int = int(ds.width)
@@ -264,9 +314,11 @@ class DemSampler:
             self._origin_y: float = float(t.f)
             self._dy: float = abs(float(t.e))
             self.crs_epsg: int = int(ds.crs.to_epsg() or 4326) if ds.crs is not None else 4326
-            self._data = ds.read(1).astype(np.float32, copy=False)
+            self._data = ds.read(1, out_dtype="float32")
         else:
-            arr, (ox, dx, oy, dy), epsg, nodata = _decode_pure_python_geotiff(self.path)
+            arr, (ox, dx, oy, dy), epsg, nodata = _decode_pure_python_geotiff(
+                self.path, max_pixels=max_pixels
+            )
             self.backend = "pure_python"
             self._data = arr
             self.height, self.width = int(arr.shape[0]), int(arr.shape[1])

@@ -119,7 +119,13 @@ All ArcGIS REST queries send `geometry=<min_x>,<min_y>,<max_x>,<max_y>`, `geomet
    - ArcGIS REST: `resultRecordCount=1000`, increment `resultOffset` while `exceededTransferLimit` is true (up to `max_pages=5` per tile; subdivide any tile that hits the cap). Retries: `2` attempts, connect timeout `8 s`, read timeout `25 s`. Outages log warnings and preserve last-known DB state.
    - OGC WFS 2.0.0: `count=2500`, partition statewide bounding boxes into `1.0° × 1.0°` tiles (`_iter_spatial_tiles`) so every response stays bounded in RAM.
 3. **Memory-Bounded Disk-to-Disk Streaming (`< 300 MB` Peak RAM):**
-   - Large downloads (Geofabrik PBF) stream in `1 MiB` (`1_048_576` B) chunks to `.part` files with atomic rename.
+   - Geofabrik PBF downloads stream to a temporary file with a 4 GiB default ceiling
+     (`TRAILFORGE_PBF_MAX_DOWNLOAD_BYTES`) and leave at least 256 MiB free in the cache filesystem.
+     The cache checks the completed file against its recorded transfer length before reuse.
+     An older cache without a length record is refreshed on the next automatic download.
+     Use `--pbf` to supply an existing extract directly for an offline bake.
+   - Live DEM clips are limited to 32 million pixels and 128 MiB per GeoTIFF. Use smaller
+     bake tiles when a window exceeds the raster budget.
    - All GDAL/OGR subprocesses run with strict memory caps:
      ```ini
      GDAL_CACHEMAX=128

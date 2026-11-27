@@ -22,7 +22,9 @@ from trailforge.ingestion.connectors.base import (
     clean_feature_name,
     normalize_surface_class,
     normalize_tracktype,
+    read_bounded_json,
     stream_download_file,
+    stream_upstream,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,7 +32,12 @@ logger = logging.getLogger(__name__)
 DEFAULT_AU_PBF_URL: Final[str] = (
     "https://download.geofabrik.de/australia-oceania/australia-latest.osm.pbf"
 )
+DEFAULT_PBF_MAX_DOWNLOAD_BYTES: Final[int] = 4 * 1024**3
 DEFAULT_OVERPASS_URL: Final[str] = "https://overpass-api.de/api/interpreter"
+_MAX_OVERPASS_BYTES: Final[int] = 12 * 1024 * 1024
+_MAX_OVERPASS_ELEMENTS: Final[int] = 20_000
+_MAX_OVERPASS_WAY_POINTS: Final[int] = 20_000
+_MAX_OVERPASS_POINTS: Final[int] = 300_000
 
 _GATE_BARRIERS: Final[frozenset[str]] = frozenset(
     {"gate", "lift_gate", "swing_gate", "bollard", "chain", "cattle_grid", "block"}
@@ -38,6 +45,23 @@ _GATE_BARRIERS: Final[frozenset[str]] = frozenset(
 _NON_VEHICULAR_HIGHWAYS: Final[frozenset[str]] = frozenset(
     {"footway", "steps", "pedestrian", "cycleway", "bridleway"}
 )
+
+
+def download_osm_pbf(url: str, cache_dir: Path, *, client: httpx.Client | None = None) -> Path:
+    """Cache a complete, size-verified Geofabrik PBF within the configured disk budget."""
+    limit = os.environ.get("TRAILFORGE_PBF_MAX_DOWNLOAD_BYTES", "").strip()
+    try:
+        max_bytes = int(limit) if limit else DEFAULT_PBF_MAX_DOWNLOAD_BYTES
+    except ValueError as exc:
+        raise ValueError("TRAILFORGE_PBF_MAX_DOWNLOAD_BYTES must be a positive integer") from exc
+    if max_bytes <= 0:
+        raise ValueError("TRAILFORGE_PBF_MAX_DOWNLOAD_BYTES must be a positive integer")
+
+    filename = Path(url.split("?")[0]).name or "australia-latest.osm.pbf"
+    dest = cache_dir / "geofabrik" / filename
+    return stream_download_file(
+        url, dest, max_bytes=max_bytes, verify_cached_size=True, client=client
+    )
 
 
 def _classify_osm_track(
@@ -230,12 +254,7 @@ class OSMConnector:
         else:
             if self.cache_dir is None:
                 raise ValueError("cache_dir is required when downloading remote Australia PBF")
-            filename = Path(self.pbf_url.split("?")[0]).name or "australia-latest.osm.pbf"
-            src = stream_download_file(
-                self.pbf_url,
-                self.cache_dir / "geofabrik" / filename,
-                client=self._client,
-            )
+            src = download_osm_pbf(self.pbf_url, self.cache_dir, client=self._client)
 
         out_pbf.parent.mkdir(parents=True, exist_ok=True)
         bbox_str = f"{bbox.min_x:.6f},{bbox.min_y:.6f},{bbox.max_x:.6f},{bbox.max_y:.6f}"
@@ -275,18 +294,17 @@ class OSMConnector:
             if self._client is not None
             else httpx.Client(
                 timeout=httpx.Timeout(self.timeout_s, connect=min(8.0, self.timeout_s)),
-                follow_redirects=True,
                 headers={"User-Agent": USER_AGENT},
             )
         )
         try:
-            resp = http.post(
-                self.overpass_url,
-                data={"data": query},
-                headers={"User-Agent": USER_AGENT},
-            )
-            resp.raise_for_status()
-            payload = resp.json()
+            with stream_upstream(
+                http, self.overpass_url, method="POST", data={"data": query}
+            ) as resp:
+                resp.raise_for_status()
+                payload, _ = read_bounded_json(
+                    resp, max_bytes=_MAX_OVERPASS_BYTES, max_duration_s=self.timeout_s * 2
+                )
         except Exception as exc:
             logger.warning("Overpass track query failed (%s); returning empty list", exc)
             return []
@@ -295,32 +313,45 @@ class OSMConnector:
                 http.close()
 
         elements = payload.get("elements") if isinstance(payload, dict) else None
-        if not isinstance(elements, list):
+        if not isinstance(elements, list) or len(elements) > _MAX_OVERPASS_ELEMENTS:
             return []
 
         gate_node_ids: set[int] = set()
         for el in elements:
             if isinstance(el, dict) and el.get("type") == "node":
                 tags = el.get("tags") or {}
-                if str(tags.get("barrier") or "").lower() in _GATE_BARRIERS:
+                if isinstance(tags, Mapping) and str(
+                    tags.get("barrier") or ""
+                ).lower() in _GATE_BARRIERS:
                     nid = el.get("id")
                     if isinstance(nid, int):
                         gate_node_ids.add(nid)
 
         tracks: list[RawTrackFeature] = []
+        points_seen = 0
         for el in elements:
             if not isinstance(el, dict) or el.get("type") != "way":
                 continue
             geom_pts = el.get("geometry") or []
-            if len(geom_pts) < 2:
-                continue
-            coords = [[float(p["lon"]), float(p["lat"])] for p in geom_pts]
-            tags = dict(el.get("tags") or {})
             nodes = el.get("nodes") or []
+            if not isinstance(geom_pts, list) or len(geom_pts) < 2:
+                continue
+            if not isinstance(nodes, list):
+                continue
+            points_seen += len(geom_pts) + len(nodes)
+            if len(geom_pts) > _MAX_OVERPASS_WAY_POINTS or points_seen > _MAX_OVERPASS_POINTS:
+                logger.warning("Overpass query exceeded the geometry limit")
+                return []
+            try:
+                coords = [[float(p["lon"]), float(p["lat"])] for p in geom_pts]
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            properties = el.get("tags")
+            tags = dict(properties) if isinstance(properties, Mapping) else {}
             tags["osm_way_id"] = el.get("id")
             if el.get("version") is not None:
                 tags["osm_version"] = el.get("version")
-            if any(nid in gate_node_ids for nid in nodes):
+            if any(isinstance(nid, int) and nid in gate_node_ids for nid in nodes):
                 tags["has_gate_barrier"] = True
             feat = {
                 "type": "Feature",
