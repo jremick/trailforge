@@ -219,7 +219,10 @@ export class OfflinePacksPanel {
             `
             : "";
 
-        const bundleUrl = resolvePackBundleUrl(region);
+        const hasBundleArchive =
+          region.bundle_url !== null &&
+          (region.bundle_size_bytes === undefined || region.bundle_size_bytes > 0);
+        const bundleUrl = hasBundleArchive ? resolvePackBundleUrl(region) : null;
 
         const attributions =
           cached?.attributions?.length
@@ -279,7 +282,7 @@ export class OfflinePacksPanel {
                   : ""
               }
               ${
-                isReady && this.state.online
+                isReady && this.state.online && bundleUrl
                   ? `<a class="tf-mini-btn" href="${escapeHtml(bundleUrl)}" download="${escapeHtml(region.region_id)}.tar.gz" title="Download full offline tar.gz archive">⬇ .tar.gz</a>`
                   : ""
               }

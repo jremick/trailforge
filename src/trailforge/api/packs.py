@@ -25,7 +25,9 @@ from trailforge.db.session import get_db
 from trailforge.packs.builder import (
     BUNDLE_FILENAME,
     MANIFEST_FILENAME,
+    SHARDS_DIRNAME,
     SNAPSHOT_FILENAME,
+    SNAPSHOT_FORMAT_SHARDED,
     STATIC_PACK_TELEMETRY_POLICY,
     TERRAIN_TILE_FILENAME,
     VECTOR_TILE_FILENAME,
@@ -62,6 +64,7 @@ def _get_region_build_lock(region_id: str) -> threading.Lock:
             _PACK_BUILD_LOCKS[region_id] = lock
         return lock
 _RANGE_RE: Final[re.Pattern[str]] = re.compile(r"^bytes=(\d*)-(\d*)$")
+_SHARD_NAME_RE: Final[re.Pattern[str]] = re.compile(r"^tracks_[0-9]{2,3}\.json\.gz$")
 _ALLOWED_DEM_ROOTS: Final[tuple[Path, ...]] = (
     Path("tests/fixtures").resolve(),
     Path("/data").resolve(),
@@ -77,6 +80,8 @@ class PackBuildRequest(BaseModel):
     )
     version: str | None = Field(default=None, max_length=64)
     skip_tiles: bool = Field(default=False)
+    sharded: bool | None = Field(default=None)
+    include_bundle: bool = Field(default=True)
 
 
 def get_packs_dir_dep() -> Path:
@@ -176,6 +181,35 @@ def _resolve_pack_tile(packs_dir: Path, region_id: str, filename: str) -> Path:
             detail="Requested pack PMTiles archive is not allowed",
         )
     return _resolve_pack_file(packs_dir, region_id, filename)
+
+
+def _resolve_pack_shard(packs_dir: Path, region_id: str, shard_name: str) -> Path:
+    """Confine a pack shard read strictly inside ``<packs_dir>/<region_id>/shards/``."""
+    region = _validate_region_id(region_id)
+    if _has_unsafe_path_chars(shard_name) or _SHARD_NAME_RE.match(shard_name) is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Invalid shard filename",
+        )
+    shards_dir = (packs_dir.resolve() / region.region_id / SHARDS_DIRNAME).resolve()
+    raw_target = shards_dir / shard_name
+    if raw_target.is_symlink():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Symlink shard files are forbidden",
+        )
+    target = raw_target.resolve()
+    if not target.is_relative_to(shards_dir):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Shard path escapes shards directory",
+        )
+    if not target.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Pack shard {shard_name!r} has not been built for region {region.region_id!r}",
+        )
+    return target
 
 
 def _require_current_pack(packs_dir: Path, region_id: str, db: Session) -> None:
@@ -287,6 +321,10 @@ def _build_region_summary(
     public_base = _get_packs_public_base_url()
 
     local_current = manifest is not None and pack_manifest_is_current(manifest, telemetry_revision)
+    snapshot_format: str | None = None
+    shard_count = 0
+    shard_hash: str | None = None
+    has_bundle = True
     if local_current and manifest is not None:
         pack_status = "ready"
         version = manifest.version
@@ -295,13 +333,26 @@ def _build_region_summary(
         bundle_size_bytes = (
             int(bundle_path.stat().st_size) if bundle_path.is_file() else manifest.bundle_size_bytes
         )
+        has_bundle = bundle_path.is_file() or (
+            manifest.bundle_url is not None and manifest.bundle_size_bytes > 0
+        )
         track_count = manifest.track_count
         segment_count = manifest.segment_count
         poi_count = manifest.poi_count
-        vector_available = vector_path.is_file()
-        terrain_available = terrain_path.is_file()
+        remote_static_manifest = bool(
+            public_base and manifest.community_telemetry_policy == STATIC_PACK_TELEMETRY_POLICY
+        )
+        vector_available = vector_path.is_file() or (
+            remote_static_manifest and bool(manifest.vector_available)
+        )
+        terrain_available = terrain_path.is_file() or (
+            remote_static_manifest and bool(manifest.terrain_available)
+        )
         bounds = manifest.bounds
         attributions = manifest.attributions
+        snapshot_format = manifest.snapshot_format
+        shard_count = manifest.shard_count
+        shard_hash = manifest.shard_hash
     elif (
         not local_current
         and public_base
@@ -361,19 +412,32 @@ def _build_region_summary(
         else None
     )
 
-    if public_base and pack_status == "ready" and active_policy == STATIC_PACK_TELEMETRY_POLICY:
+    use_public_remote = bool(
+        public_base and pack_status == "ready" and active_policy == STATIC_PACK_TELEMETRY_POLICY
+    )
+    if use_public_remote:
         remote = f"{public_base}/{rid}/{STATIC_PACK_TELEMETRY_POLICY}"
         manifest_url = f"{remote}/{MANIFEST_FILENAME}"
         snapshot_url = f"{remote}/{SNAPSHOT_FILENAME}"
-        bundle_url = f"{remote}/{BUNDLE_FILENAME}"
+        bundle_url: str | None = f"{remote}/{BUNDLE_FILENAME}" if has_bundle else None
         vector_pmtiles_url = f"{remote}/{VECTOR_TILE_FILENAME}"
         terrain_pmtiles_url = f"{remote}/{TERRAIN_TILE_FILENAME}"
+        shards_base_url: str | None = (
+            f"{remote}/{SHARDS_DIRNAME}"
+            if snapshot_format == SNAPSHOT_FORMAT_SHARDED and shard_count > 0
+            else None
+        )
     else:
         manifest_url = f"/api/packs/{rid}/{MANIFEST_FILENAME}"
         snapshot_url = f"/api/packs/{rid}/{SNAPSHOT_FILENAME}"
-        bundle_url = f"/api/packs/{rid}/{BUNDLE_FILENAME}"
+        bundle_url = f"/api/packs/{rid}/{BUNDLE_FILENAME}" if has_bundle else None
         vector_pmtiles_url = f"/api/packs/{rid}/tiles/{VECTOR_TILE_FILENAME}"
         terrain_pmtiles_url = f"/api/packs/{rid}/tiles/{TERRAIN_TILE_FILENAME}"
+        shards_base_url = (
+            f"/api/packs/{rid}/{SHARDS_DIRNAME}"
+            if snapshot_format == SNAPSHOT_FORMAT_SHARDED and shard_count > 0
+            else None
+        )
 
     return {
         "region_id": rid,
@@ -390,6 +454,10 @@ def _build_region_summary(
         "version": version,
         "community_telemetry_policy": active_policy,
         "community_telemetry_revision": active_revision,
+        "snapshot_format": snapshot_format,
+        "shard_count": shard_count,
+        "shard_hash": shard_hash,
+        "shards_base_url": shards_base_url,
         "generated_at": generated_at,
         "total_size_bytes": total_size_bytes,
         "bundle_size_bytes": bundle_size_bytes,
@@ -456,6 +524,8 @@ def build_pack_endpoint(
             dem_path=dem_path,
             version=req.version,
             skip_tiles=req.skip_tiles,
+            sharded=req.sharded,
+            include_bundle=req.include_bundle,
         )
         db_row = db.get(OfflinePack, region.region_id)
         summary = _build_region_summary(
@@ -505,6 +575,35 @@ def get_pack_snapshot_endpoint(
     return StreamingResponse(
         _stream_file_slice(snapshot_path, 0, file_size),
         media_type="application/json",
+        headers={
+            **headers,
+            "Content-Length": str(file_size),
+        },
+    )
+
+
+@router.get("/{region_id}/shards/{shard_name:path}")
+def get_pack_shard_endpoint(
+    region_id: str,
+    shard_name: str,
+    request: Request,
+    packs_dir: Path = Depends(get_packs_dir_dep),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Stream a built sharded pack's gzipped track detail shard (raw ``application/gzip``)."""
+    shard_path = _resolve_pack_shard(packs_dir, region_id, shard_name)
+    _require_current_pack(packs_dir, _validate_region_id(region_id).region_id, db)
+    etag, file_size = _compute_etag(shard_path)
+    headers = {
+        "ETag": etag,
+        "Cache-Control": "no-store",
+    }
+    if_none_match = (request.headers.get("if-none-match") or "").strip()
+    if if_none_match and (if_none_match == etag or if_none_match == f"W/{etag}"):
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
+    return StreamingResponse(
+        _stream_file_slice(shard_path, 0, file_size),
+        media_type="application/gzip",
         headers={
             **headers,
             "Content-Length": str(file_size),

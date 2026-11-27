@@ -26,7 +26,7 @@ from urllib.parse import quote, urlsplit
 import httpx
 
 from trailforge.config import get_settings
-from trailforge.packs.builder import STATIC_PACK_TELEMETRY_POLICY
+from trailforge.packs.builder import SHARDS_DIRNAME, STATIC_PACK_TELEMETRY_POLICY
 from trailforge.tiles.builder import (
     PUBLIC_VECTOR_PMTILES_FILENAME,
     STATIC_TILE_TELEMETRY_POLICY,
@@ -295,6 +295,23 @@ def discover_sync_artifacts(
                                 size_bytes=int(fpath.stat().st_size),
                             )
                         )
+                if current_policy:
+                    shards_dir = rdir / SHARDS_DIRNAME
+                    if shards_dir.is_dir():
+                        for spath in sorted(shards_dir.glob("tracks_*.json.gz")):
+                            if spath.is_file():
+                                artifacts.append(
+                                    R2SyncArtifact(
+                                        local_path=spath,
+                                        object_key=_join_key(
+                                            packs_prefix,
+                                            f"{rid}/{STATIC_PACK_TELEMETRY_POLICY}/{SHARDS_DIRNAME}/{spath.name}",
+                                        ),
+                                        content_type="application/gzip",
+                                        cache_control="no-store",
+                                        size_bytes=int(spath.stat().st_size),
+                                    )
+                                )
 
     return artifacts
 

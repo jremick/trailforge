@@ -787,11 +787,16 @@ export interface RainfallSummaryResponse {
 /* ---------- Slice 09 Offline Regional Packs, Sync Queue & In-Cab Recorder ---------- */
 
 export type PackBuildStatus = "ready" | "not_built" | "building" | "failed" | string;
+export type PackSnapshotFormat = "inline_v1" | "sharded_v2";
 
 export interface OfflinePackRegionItem {
   region_id: string;
   community_telemetry_policy?: string | null;
   community_telemetry_revision?: string | null;
+  snapshot_format?: PackSnapshotFormat | null;
+  shard_count?: number;
+  shard_hash?: string | null;
+  shards_base_url?: string | null;
   name: string;
   description: string;
   category?: "region" | "state" | string;
@@ -803,6 +808,7 @@ export interface OfflinePackRegionItem {
   version?: string | null;
   generated_at?: string | null;
   total_size_bytes?: number;
+  bundle_size_bytes?: number;
   track_count?: number;
   segment_count?: number;
   poi_count?: number;
@@ -830,12 +836,17 @@ export interface OfflinePackManifest {
   region_id: string;
   community_telemetry_policy?: string | null;
   community_telemetry_revision?: string | null;
+  snapshot_format?: PackSnapshotFormat;
+  shard_count?: number;
+  shard_hash?: string | null;
+  shards_base_url?: string | null;
   name?: string;
   version?: string;
   generated_at?: string;
   bbox?: BBoxTuple;
   bounds?: BBoxTuple;
   total_size_bytes?: number;
+  bundle_size_bytes?: number;
   counts?: Record<string, number>;
   attributions?: string[];
   files?: Record<string, OfflinePackFileEntry> | OfflinePackFileEntry[];
@@ -846,13 +857,76 @@ export interface OfflinePackManifest {
   snowline_bands_m?: number[];
 }
 
+export interface OfflinePackTrackIndexEntry {
+  track_id: string;
+  name: string;
+  alt_names?: string[];
+  state: string;
+  total_length_m: number;
+  effective_grade?: string | null;
+  grade?: string | null;
+  primary_park_name?: string | null;
+  bbox?: BBoxTuple | null;
+  segments?: SegmentSummaryItem[];
+}
+
+export interface OfflinePackShardTrack extends OfflinePackTrackIndexEntry {
+  primary_source?: string;
+  has_osm_source?: boolean;
+  trail_class?: string;
+  is_vehicular?: boolean;
+  elev_min_m?: number | null;
+  elev_max_m?: number | null;
+  elev_gain_m?: number;
+  elev_loss_m?: number;
+  max_slope_deg?: number | null;
+  sustained_slope_deg?: number | null;
+  waterway_crossing_count?: number;
+  is_4wd_only?: boolean;
+  has_gate_barrier?: boolean;
+  access_status?: string;
+  primary_park_id?: number | null;
+  park_ids?: number[];
+  score?: number | null;
+  live_grade?: string | null;
+  live_score?: number | null;
+  confidence_level?: string;
+  sample_count?: number;
+  last_driven_at?: string | null;
+  avg_speed_kmh?: number | null;
+  est_duration_min?: number | null;
+  vehicle_class_split?: Record<string, number | { count: number; pct: number }>;
+  live_breakdown?: TrackInspectorDetail["live_breakdown"];
+  rainfall_context?: RainfallContext | null;
+  obstacle_hotspots?: ObstacleHotspotItem[];
+  source_refs?: Array<Record<string, unknown>>;
+  baseline_breakdown?: BaselineBreakdown | null;
+  elevation_profile?: ElevationProfilePoint[];
+  waterway_crossings?: WaterwayCrossingItem[];
+  coords?: Array<[number, number]>;
+  segment_count?: number;
+  is_active?: boolean;
+  closure_status?: string;
+  closure_ids?: number[];
+}
+
+export interface OfflinePackShard {
+  schema_version: string;
+  region_id: string;
+  shard_index: number;
+  tracks: Record<string, OfflinePackShardTrack>;
+}
+
 export interface OfflinePackSnapshot {
+  schema_version?: string;
   region_id: string;
   version?: string;
   generated_at?: string;
+  shard_count?: number;
+  shard_hash?: string | null;
   bounds?: BBoxTuple;
   attributions?: string[];
-  tracks?: TrackInspectorDetail[];
+  tracks?: Array<TrackInspectorDetail | OfflinePackTrackIndexEntry>;
   pois?: PoiItem[];
   capad_parks?: ParkTenureItem[];
   closures?: unknown;
@@ -865,6 +939,8 @@ export interface DownloadedPackRecord {
   name: string;
   version: string;
   downloaded_at: string;
+  snapshot_format?: PackSnapshotFormat;
+  shard_count?: number;
   total_size_bytes: number;
   track_count: number;
   segment_count: number;

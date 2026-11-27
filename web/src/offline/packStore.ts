@@ -14,23 +14,87 @@ import type {
   OfflinePackFileEntry,
   OfflinePackManifest,
   OfflinePackRegionItem,
+  OfflinePackShard,
+  OfflinePackShardTrack,
   OfflinePackSnapshot,
+  OfflinePackTrackIndexEntry,
+  ParkTenureItem,
   PoiItem,
+  SegmentSummaryItem,
   TileManifestResponse,
   TrackInspectorDetail,
 } from "../types";
 import { verifySha256Hex } from "./rangeSlice";
+import { haversineDistanceM } from "./recorderEngine";
 
 export const OFFLINE_DB_NAME = "trailforge-offline-v1";
-export const OFFLINE_DB_VERSION = 1;
+export const OFFLINE_DB_VERSION = 2;
 export const PACKS_CACHE_NAME = "trailforge-packs-v1";
 const ACTIVE_PACK_KEY = "trailforge.active_offline_pack";
+const MAX_SHARD_CACHE_ENTRIES = 4;
+const SHARD_DOWNLOAD_CONCURRENCY = 4;
+const NEARBY_POI_RADIUS_M = 1500;
+const MAX_NEARBY_POIS = 25;
 
 export type OfflineStoreName =
   | "packs"
   | "snapshots"
+  | "pack_shards"
   | "offline_pins"
   | "sync_queue";
+
+/**
+ * Deterministic FNV-1a 32-bit hash over UTF-8 bytes (matches Python backend ``fnv1a_32``).
+ */
+export function fnv1a32(value: string): number {
+  const bytes = new TextEncoder().encode(value);
+  let h = 0x811c9dc5;
+  for (let i = 0; i < bytes.length; i += 1) {
+    h ^= bytes[i]!;
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h >>> 0;
+}
+
+export function shardIndexForTrack(trackId: string, shardCount: number): number {
+  if (shardCount <= 1) return 0;
+  return fnv1a32(trackId) % shardCount;
+}
+
+export function packShardFilename(shardIndex: number): string {
+  return `tracks_${String(shardIndex).padStart(2, "0")}.json.gz`;
+}
+
+export function packShardStorageKey(regionId: string, shardIndex: number): string {
+  return `${regionId}:${shardIndex}`;
+}
+
+async function gunzipToJson<T>(bytes: Uint8Array): Promise<T> {
+  if (typeof DecompressionStream === "undefined") {
+    throw new Error("DecompressionStream('gzip') is not supported in this browser");
+  }
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  }).pipeThrough(
+    new DecompressionStream("gzip") as unknown as TransformStream<
+      Uint8Array,
+      Uint8Array
+    >
+  );
+  const text = await new Response(stream).text();
+  return JSON.parse(text) as T;
+}
+
+function isShardedSnapshot(snap: OfflinePackSnapshot | null | undefined): boolean {
+  if (!snap) return false;
+  return (
+    snap.schema_version === "trailforge_pack_snapshot_v2" ||
+    (typeof snap.shard_count === "number" && snap.shard_count > 0)
+  );
+}
 
 export interface OfflineKvBackend {
   get<T>(store: OfflineStoreName, key: string): Promise<T | null>;
@@ -46,6 +110,7 @@ export class MemoryOfflineBackend implements OfflineKvBackend {
   private readonly tables = new Map<OfflineStoreName, Map<string, unknown>>([
     ["packs", new Map()],
     ["snapshots", new Map()],
+    ["pack_shards", new Map()],
     ["offline_pins", new Map()],
     ["sync_queue", new Map()],
   ]);
@@ -75,7 +140,11 @@ class IndexedDbOfflineBackend implements OfflineKvBackend {
 
   constructor(
     private readonly name: string = OFFLINE_DB_NAME,
-    private readonly stores: readonly OfflineStoreName[] = ["packs", "snapshots"]
+    private readonly stores: readonly OfflineStoreName[] = [
+      "packs",
+      "snapshots",
+      "pack_shards",
+    ]
   ) {}
 
   private open(): Promise<IDBDatabase> {
@@ -144,15 +213,30 @@ let memoryActivePackId: string | null = null;
 // In-memory cache of deserialized offline pack snapshots so rapid search keystrokes and
 // track clicks do not structured-clone multi-MB IndexedDB objects on every interaction.
 const snapshotMemCache = new Map<string, OfflinePackSnapshot | null>();
-const trackIndexMemCache = new Map<string, Map<string, TrackInspectorDetail>>();
+const trackIndexMemCache = new Map<
+  string,
+  Map<string, TrackInspectorDetail | OfflinePackTrackIndexEntry>
+>();
+const shardMemCache = new Map<string, OfflinePackShard>();
+const parkIndexMemCache = new Map<string, Map<number, ParkTenureItem>>();
+const closureIndexMemCache = new Map<string, Map<number, ClosureItem>>();
 
 function clearSnapshotMemCache(regionId?: string): void {
   if (regionId) {
     snapshotMemCache.delete(regionId);
     trackIndexMemCache.delete(regionId);
+    parkIndexMemCache.delete(regionId);
+    closureIndexMemCache.delete(regionId);
+    const prefix = `${regionId}:`;
+    for (const key of Array.from(shardMemCache.keys())) {
+      if (key.startsWith(prefix)) shardMemCache.delete(key);
+    }
   } else {
     snapshotMemCache.clear();
     trackIndexMemCache.clear();
+    parkIndexMemCache.clear();
+    closureIndexMemCache.clear();
+    shardMemCache.clear();
   }
 }
 
@@ -185,13 +269,15 @@ async function loadSnapshotCached(
   );
   snapshotMemCache.set(regionId, snap);
   trackIndexMemCache.delete(regionId);
+  parkIndexMemCache.delete(regionId);
+  closureIndexMemCache.delete(regionId);
   return snap;
 }
 
 function getTrackIndexForSnapshot(
   regionId: string,
   snap: OfflinePackSnapshot
-): Map<string, TrackInspectorDetail> {
+): Map<string, TrackInspectorDetail | OfflinePackTrackIndexEntry> {
   let idx = trackIndexMemCache.get(regionId);
   if (!idx) {
     idx = new Map();
@@ -201,6 +287,272 @@ function getTrackIndexForSnapshot(
     trackIndexMemCache.set(regionId, idx);
   }
   return idx;
+}
+
+function getParkIndexForSnapshot(
+  regionId: string,
+  snap: OfflinePackSnapshot
+): Map<number, ParkTenureItem> {
+  let idx = parkIndexMemCache.get(regionId);
+  if (!idx) {
+    idx = new Map();
+    for (const park of snap.capad_parks ?? []) {
+      if (typeof park.id === "number") {
+        idx.set(park.id, park);
+      }
+    }
+    parkIndexMemCache.set(regionId, idx);
+  }
+  return idx;
+}
+
+function getClosureIndexForSnapshot(
+  regionId: string,
+  snap: OfflinePackSnapshot
+): Map<number, ClosureItem> {
+  let idx = closureIndexMemCache.get(regionId);
+  if (!idx) {
+    idx = new Map();
+    if (Array.isArray(snap.closures)) {
+      for (const item of snap.closures as ClosureItem[]) {
+        const cid = item.closure_id ?? (typeof item.id === "number" ? item.id : null);
+        if (typeof cid === "number") {
+          idx.set(cid, item);
+        }
+      }
+    }
+    closureIndexMemCache.set(regionId, idx);
+  }
+  return idx;
+}
+
+async function loadShardCached(
+  regionId: string,
+  shardIndex: number
+): Promise<OfflinePackShard | null> {
+  const key = packShardStorageKey(regionId, shardIndex);
+  const cached = shardMemCache.get(key);
+  if (cached) {
+    // Move to MRU position
+    shardMemCache.delete(key);
+    shardMemCache.set(key, cached);
+    return cached;
+  }
+
+  const raw = await getOfflineBackend().get<Uint8Array | ArrayBuffer>(
+    "pack_shards",
+    key
+  );
+  if (!raw) return null;
+  const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+  const shard = await gunzipToJson<OfflinePackShard>(bytes);
+
+  shardMemCache.set(key, shard);
+  while (shardMemCache.size > MAX_SHARD_CACHE_ENTRIES) {
+    const oldest = shardMemCache.keys().next().value;
+    if (oldest !== undefined) shardMemCache.delete(oldest);
+    else break;
+  }
+  return shard;
+}
+
+function computeNearbyPoisForShardedTrack(
+  raw: OfflinePackShardTrack,
+  pois: readonly PoiItem[] | undefined
+): PoiItem[] {
+  if (!pois || pois.length === 0) return [];
+  const coords = raw.coords ?? [];
+  let minLon = Infinity;
+  let minLat = Infinity;
+  let maxLon = -Infinity;
+  let maxLat = -Infinity;
+
+  if (coords.length > 0) {
+    for (const pt of coords) {
+      if (pt[0] < minLon) minLon = pt[0];
+      if (pt[0] > maxLon) maxLon = pt[0];
+      if (pt[1] < minLat) minLat = pt[1];
+      if (pt[1] > maxLat) maxLat = pt[1];
+    }
+  } else if (raw.bbox && raw.bbox.length === 4) {
+    [minLon, minLat, maxLon, maxLat] = raw.bbox;
+  } else {
+    return [];
+  }
+
+  // Conservative 0.02 deg (~2.2 km) bbox prefilter before exact haversine check
+  const padDeg = 0.02;
+  const minLonPad = minLon - padDeg;
+  const maxLonPad = maxLon + padDeg;
+  const minLatPad = minLat - padDeg;
+  const maxLatPad = maxLat + padDeg;
+  const samplePts: Array<[number, number]> =
+    coords.length > 0
+      ? coords
+      : [[(minLon + maxLon) / 2, (minLat + maxLat) / 2]];
+
+  const hits: Array<{ poi: PoiItem; distM: number }> = [];
+  for (const poi of pois) {
+    if (
+      poi.lon < minLonPad ||
+      poi.lon > maxLonPad ||
+      poi.lat < minLatPad ||
+      poi.lat > maxLatPad
+    ) {
+      continue;
+    }
+    let best = Infinity;
+    for (const pt of samplePts) {
+      const d = haversineDistanceM(poi.lat, poi.lon, pt[1], pt[0]);
+      if (d < best) best = d;
+    }
+    if (best <= NEARBY_POI_RADIUS_M) {
+      hits.push({ poi, distM: Math.round(best * 10) / 10 });
+    }
+  }
+
+  hits.sort((a, b) => a.distM - b.distM || a.poi.name.localeCompare(b.poi.name));
+  return hits.slice(0, MAX_NEARBY_POIS).map(({ poi, distM }) => ({
+    ...poi,
+    distance_m: distM,
+  }));
+}
+
+function hydrateShardedTrack(
+  regionId: string,
+  snap: OfflinePackSnapshot,
+  raw: OfflinePackShardTrack
+): TrackInspectorDetail {
+  const parkIndex = getParkIndexForSnapshot(regionId, snap);
+  const closureIndex = getClosureIndexForSnapshot(regionId, snap);
+
+  const primaryPark =
+    typeof raw.primary_park_id === "number"
+      ? (parkIndex.get(raw.primary_park_id) ?? null)
+      : null;
+  const capadParks: ParkTenureItem[] = [];
+  const seenParkIds = new Set<number>();
+  for (const pid of raw.park_ids ?? []) {
+    if (seenParkIds.has(pid)) continue;
+    const pk = parkIndex.get(pid);
+    if (pk) {
+      seenParkIds.add(pid);
+      capadParks.push(pk);
+    }
+  }
+  if (primaryPark && typeof primaryPark.id === "number" && !seenParkIds.has(primaryPark.id)) {
+    capadParks.unshift(primaryPark);
+  }
+  capadParks.sort((a, b) => a.name.localeCompare(b.name));
+
+  const activeClosures: ClosureItem[] = [];
+  for (const cid of raw.closure_ids ?? []) {
+    const c = closureIndex.get(cid);
+    if (c) activeClosures.push(c);
+  }
+
+  const conditionReports: ConditionReportItem[] = [];
+  const communityGateWarnings: ConditionReportItem[] = [];
+  if (Array.isArray(snap.reports)) {
+    for (const rep of snap.reports as ConditionReportItem[]) {
+      if (rep.track_id !== raw.track_id) continue;
+      conditionReports.push(rep);
+      if (
+        rep.is_gate_warning ||
+        rep.report_type === "locked_gate" ||
+        rep.report_type === "private_property"
+      ) {
+        communityGateWarnings.push(rep);
+      }
+    }
+  }
+
+  const corridorSegId = `${raw.track_id}:corridor`;
+  const effGrade = raw.effective_grade ?? raw.grade ?? null;
+  const elevationProfile = (raw.elevation_profile ?? []).map((p) => ({
+    ...p,
+    segment_id: p.segment_id ?? corridorSegId,
+  }));
+  const segments: SegmentSummaryItem[] =
+    raw.coords && raw.coords.length >= 2
+      ? [
+          {
+            segment_id: corridorSegId,
+            segment_seq: 1,
+            name: raw.name,
+            length_m: raw.total_length_m,
+            max_slope_deg: raw.max_slope_deg ?? null,
+            sustained_slope_deg: raw.sustained_slope_deg ?? null,
+            elev_min_m: raw.elev_min_m ?? null,
+            elev_max_m: raw.elev_max_m ?? null,
+            elev_gain_m: raw.elev_gain_m ?? 0,
+            elev_loss_m: raw.elev_loss_m ?? 0,
+            waterway_crossing_count: raw.waterway_crossing_count ?? 0,
+            is_4wd_only: Boolean(raw.is_4wd_only),
+            has_gate_barrier: Boolean(raw.has_gate_barrier),
+            access_status: raw.access_status ?? "public",
+            primary_source: raw.primary_source,
+            elevation_profile_m: elevationProfile.map((p) => [p.dist_m, p.elev_m]),
+            effective_grade: effGrade,
+            grade: effGrade,
+            score: raw.score ?? null,
+            geometry: {
+              type: "LineString",
+              coordinates: raw.coords,
+            },
+          },
+        ]
+      : [];
+
+  return {
+    track_id: raw.track_id,
+    name: raw.name,
+    alt_names: raw.alt_names ?? [],
+    state: raw.state,
+    primary_source: raw.primary_source,
+    trail_class: raw.trail_class,
+    total_length_m: raw.total_length_m,
+    elev_min_m: raw.elev_min_m ?? null,
+    elev_max_m: raw.elev_max_m ?? null,
+    min_elev_m: raw.elev_min_m ?? null,
+    max_elev_m: raw.elev_max_m ?? null,
+    elev_gain_m: raw.elev_gain_m ?? 0,
+    elev_loss_m: raw.elev_loss_m ?? 0,
+    max_slope_deg: raw.max_slope_deg ?? null,
+    sustained_slope_deg: raw.sustained_slope_deg ?? null,
+    waterway_crossing_count: raw.waterway_crossing_count ?? 0,
+    is_4wd_only: Boolean(raw.is_4wd_only),
+    has_gate_barrier: Boolean(raw.has_gate_barrier),
+    access_status: raw.access_status ?? "public",
+    primary_park_name: raw.primary_park_name ?? primaryPark?.name ?? null,
+    primary_park: primaryPark,
+    capad_parks: capadParks,
+    effective_grade: effGrade,
+    grade: effGrade,
+    score: raw.score ?? null,
+    live_grade: raw.live_grade ?? null,
+    live_score: raw.live_score ?? null,
+    confidence_level: raw.confidence_level ?? "none",
+    sample_count: raw.sample_count ?? 0,
+    last_driven_at: raw.last_driven_at ?? null,
+    avg_speed_kmh: raw.avg_speed_kmh ?? null,
+    est_duration_min: raw.est_duration_min ?? null,
+    vehicle_class_split: raw.vehicle_class_split ?? {},
+    live_breakdown: raw.live_breakdown ?? null,
+    rainfall_context: raw.rainfall_context ?? null,
+    obstacle_hotspots: raw.obstacle_hotspots ?? [],
+    bbox: raw.bbox ?? null,
+    baseline_breakdown: raw.baseline_breakdown ?? null,
+    elevation_profile: elevationProfile,
+    waterway_crossings: raw.waterway_crossings ?? [],
+    segment_count: raw.segment_count ?? segments.length,
+    closure_status: raw.closure_status ?? "open",
+    active_closures: activeClosures,
+    segments,
+    nearby_pois: computeNearbyPoisForShardedTrack(raw, snap.pois),
+    condition_reports: conditionReports,
+    community_gate_warnings: communityGateWarnings,
+  };
 }
 
 export function getOfflineBackend(): OfflineKvBackend {
@@ -294,8 +646,20 @@ export async function saveOfflinePackData(
 export async function removeOfflinePack(regionId: string): Promise<void> {
   const backend = getOfflineBackend();
   const existing = await getDownloadedPack(regionId);
+  const existingSnap = await backend.get<OfflinePackSnapshot>("snapshots", regionId);
+  const shardCount = Math.max(
+    existing?.shard_count ?? 0,
+    existingSnap?.shard_count ?? 0
+  );
   await backend.delete("packs", regionId);
   await backend.delete("snapshots", regionId);
+  if (shardCount > 0) {
+    await Promise.all(
+      Array.from({ length: shardCount }, (_, idx) =>
+        backend.delete("pack_shards", packShardStorageKey(regionId, idx))
+      )
+    );
+  }
   clearSnapshotMemCache(regionId);
   notifySwInvalidatePackCache(regionId);
 
@@ -394,6 +758,74 @@ export async function downloadRegionalPackToDevice(
     new TextDecoder().decode(snapBuf)
   ) as OfflinePackSnapshot;
 
+  const isSharded =
+    manifest.snapshot_format === "sharded_v2" || isShardedSnapshot(snapshot);
+  const shardCount = isSharded
+    ? Math.max(0, Number(manifest.shard_count ?? snapshot.shard_count ?? 0))
+    : 0;
+  const backend = getOfflineBackend();
+  const existingPack = await getDownloadedPack(region.region_id);
+
+  let allVerified = snapCheck === "verified";
+  let cachedBytes = snapBuf.byteLength;
+  const writtenShardKeys: string[] = [];
+
+  if (shardCount > 0) {
+    const shardsBaseUrl = resolvePackAssetUrl(
+      region.shards_base_url ?? manifest.shards_base_url,
+      `/api/packs/${rid}/shards`
+    ).replace(/\/+$/, "");
+
+    let nextIdx = 0;
+    let completed = 0;
+    const workerCount = Math.min(SHARD_DOWNLOAD_CONCURRENCY, shardCount);
+
+    const downloadWorker = async (): Promise<void> => {
+      while (true) {
+        const idx = nextIdx;
+        nextIdx += 1;
+        if (idx >= shardCount) return;
+
+        const fname = packShardFilename(idx);
+        const shardUrl = `${shardsBaseUrl}/${fname}`;
+        const res = await fetch(shardUrl, { cache: "no-store" });
+        if (!res.ok) {
+          throw new Error(`Shard ${fname} fetch failed (HTTP ${res.status})`);
+        }
+        const buf = await res.arrayBuffer();
+        const entry = findManifestFileEntry(manifest, `shards/${fname}`);
+        const check = await verifySha256Hex(buf, entry?.sha256);
+        if (check === "mismatch") {
+          allVerified = false;
+          throw new Error(`Shard ${fname} SHA-256 verification failed`);
+        }
+        if (check !== "verified") {
+          allVerified = false;
+        }
+        const key = packShardStorageKey(region.region_id, idx);
+        await backend.put("pack_shards", key, new Uint8Array(buf));
+        writtenShardKeys.push(key);
+        cachedBytes += buf.byteLength;
+        completed += 1;
+        const pct = Math.round(32 + (completed / shardCount) * 26);
+        onProgress?.({
+          stage: `Downloading track shards (${completed}/${shardCount})…`,
+          pct,
+        });
+      }
+    };
+
+    try {
+      await Promise.all(Array.from({ length: workerCount }, () => downloadWorker()));
+    } catch (err) {
+      await Promise.all(
+        writtenShardKeys.map((k) => backend.delete("pack_shards", k))
+      );
+      clearSnapshotMemCache(region.region_id);
+      throw err;
+    }
+  }
+
   const vectorCachePath = buildOfflinePackTileCachePath(
     region.region_id,
     "vector"
@@ -413,8 +845,6 @@ export async function downloadRegionalPackToDevice(
 
   let hasVector = false;
   let hasTerrain = false;
-  let allVerified = snapCheck === "verified";
-  let cachedBytes = snapBuf.byteLength;
 
   const cacheTile = async (
     tileUrl: string,
@@ -461,7 +891,12 @@ export async function downloadRegionalPackToDevice(
       62
     );
   } catch (err) {
-    if (err instanceof Error && err.message.includes("SHA-256")) throw err;
+    if (err instanceof Error && err.message.includes("SHA-256")) {
+      await Promise.all(
+        writtenShardKeys.map((k) => backend.delete("pack_shards", k))
+      );
+      throw err;
+    }
   }
 
   try {
@@ -473,7 +908,25 @@ export async function downloadRegionalPackToDevice(
       86
     );
   } catch (err) {
-    if (err instanceof Error && err.message.includes("SHA-256")) throw err;
+    if (err instanceof Error && err.message.includes("SHA-256")) {
+      await Promise.all(
+        writtenShardKeys.map((k) => backend.delete("pack_shards", k))
+      );
+      throw err;
+    }
+  }
+
+  // Clean up any stale surplus shards if the region sharded count shrank on update
+  const prevShardCount = existingPack?.shard_count ?? 0;
+  if (prevShardCount > shardCount) {
+    await Promise.all(
+      Array.from({ length: prevShardCount - shardCount }, (_, offset) =>
+        backend.delete(
+          "pack_shards",
+          packShardStorageKey(region.region_id, shardCount + offset)
+        )
+      )
+    );
   }
 
   const counts = manifest.counts ?? {};
@@ -482,6 +935,8 @@ export async function downloadRegionalPackToDevice(
     name: manifest.name ?? region.name,
     version: manifest.version ?? region.version ?? "1",
     downloaded_at: new Date().toISOString(),
+    snapshot_format: shardCount > 0 ? "sharded_v2" : "inline_v1",
+    shard_count: shardCount,
     total_size_bytes: manifest.total_size_bytes ?? region.total_size_bytes ?? cachedBytes,
     track_count:
       counts.tracks ?? region.track_count ?? snapshot.tracks?.length ?? 0,
@@ -499,6 +954,7 @@ export async function downloadRegionalPackToDevice(
   };
 
   onProgress?.({ stage: "Saving pack to IndexedDB…", pct: 96 });
+  clearSnapshotMemCache(region.region_id);
   await saveOfflinePackData(record, snapshot);
   onProgress?.({ stage: "Offline pack ready", pct: 100 });
   return record;
@@ -554,6 +1010,26 @@ export async function getOfflineTileManifest(
   };
 }
 
+async function resolveTrackFromPackSnapshot(
+  regionId: string,
+  snap: OfflinePackSnapshot,
+  trackId: string
+): Promise<TrackInspectorDetail | null> {
+  const indexHit = getTrackIndexForSnapshot(regionId, snap).get(trackId);
+  if (!indexHit) return null;
+
+  if (isShardedSnapshot(snap)) {
+    const shardCount = Math.max(1, Number(snap.shard_count ?? 0));
+    const shardIdx = shardIndexForTrack(trackId, shardCount);
+    const shard = await loadShardCached(regionId, shardIdx);
+    const shardTrack = shard?.tracks?.[trackId];
+    if (!shardTrack) return null;
+    return hydrateShardedTrack(regionId, snap, shardTrack);
+  }
+
+  return indexHit as TrackInspectorDetail;
+}
+
 export async function getOfflineTrackDetail(
   trackId: string
 ): Promise<TrackInspectorDetail | null> {
@@ -562,7 +1038,7 @@ export async function getOfflineTrackDetail(
   if (activeId) {
     const activeSnap = await loadSnapshotCached(activeId);
     if (activeSnap) {
-      const hit = getTrackIndexForSnapshot(activeId, activeSnap).get(trackId);
+      const hit = await resolveTrackFromPackSnapshot(activeId, activeSnap, trackId);
       if (hit) return hit;
     }
   }
@@ -572,7 +1048,7 @@ export async function getOfflineTrackDetail(
     if (pack.region_id === activeId) continue;
     const snap = await loadSnapshotCached(pack.region_id);
     if (!snap) continue;
-    const hit = getTrackIndexForSnapshot(pack.region_id, snap).get(trackId);
+    const hit = await resolveTrackFromPackSnapshot(pack.region_id, snap, trackId);
     if (hit) return hit;
   }
   return null;
@@ -582,7 +1058,9 @@ export async function getOfflineTracksGeoJson(
   regionId?: string | null
 ): Promise<FeatureCollection | null> {
   const resolved = await resolvePreferredPackAndSnapshot(regionId);
-  const tracks = resolved?.snapshot?.tracks;
+  const snap = resolved?.snapshot;
+  if (!snap || isShardedSnapshot(snap)) return null;
+  const tracks = snap.tracks;
   if (!tracks || tracks.length === 0) return null;
 
   const features: Feature[] = [];

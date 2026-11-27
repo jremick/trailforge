@@ -72,6 +72,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Exclude community-trip telemetry from a pack intended for public CDN hosting.",
     )
+    format_group = parser.add_mutually_exclusive_group()
+    format_group.add_argument(
+        "--sharded",
+        action="store_true",
+        help="Force compact sharded_v2 snapshot + gzipped track detail shards.",
+    )
+    format_group.add_argument(
+        "--inline",
+        action="store_true",
+        help="Force legacy inline_v1 single-file snapshot.json.",
+    )
+    parser.add_argument(
+        "--no-bundle",
+        action="store_true",
+        help="Skip generating bundle.tar.gz (useful when hosting large sharded packs on R2).",
+    )
     return parser
 
 
@@ -80,6 +96,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     target_regions = list(PACK_REGION_IDS) if args.all_regions else [args.region]
+    sharded_opt: bool | None = True if args.sharded else (False if args.inline else None)
 
     engine = get_engine(args.database_url)
     results_summary: list[dict[str, object]] = []
@@ -94,6 +111,8 @@ def main(argv: list[str] | None = None) -> int:
                     version=args.version,
                     skip_tiles=args.skip_tiles,
                     static_only=args.static_only,
+                    sharded=sharded_opt,
+                    include_bundle=not args.no_bundle,
                 )
                 results_summary.append(
                     {
@@ -101,7 +120,9 @@ def main(argv: list[str] | None = None) -> int:
                         "pack_dir": str(res.pack_dir),
                         "manifest_path": str(res.manifest_path),
                         "manifest_sha256": res.manifest_sha256,
-                        "bundle_path": str(res.bundle_path),
+                        "bundle_path": str(res.bundle_path) if res.bundle_path else None,
+                        "snapshot_format": res.manifest.snapshot_format,
+                        "shard_count": res.manifest.shard_count,
                         "vector_available": res.manifest.vector_available,
                         "terrain_available": res.manifest.terrain_available,
                         "counts": res.manifest.counts,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import io
 import json
@@ -26,6 +27,7 @@ from trailforge.api.packs import get_packs_dir_dep
 from trailforge.api.packs import router as packs_router
 from trailforge.auth.dependencies import require_admin
 from trailforge.auth.security import create_access_token, hash_password
+from trailforge.config import get_settings
 from trailforge.db.models import OfflinePack, TrackSegment, TrackSegmentGrade, User
 from trailforge.db.session import get_db
 from trailforge.feeds.sync import sync_from_fixtures
@@ -33,10 +35,17 @@ from trailforge.ingestion.connectors.fixtures import load_corridor_fixtures
 from trailforge.ingestion.pipeline import ingest_corridor_dataset
 from trailforge.packs.builder import (
     MANIFEST_FILENAME,
+    SHARDS_DIRNAME,
     SNAPSHOT_FILENAME,
+    SNAPSHOT_FORMAT_SHARDED,
+    STATIC_PACK_TELEMETRY_POLICY,
     TERRAIN_TILE_FILENAME,
     VECTOR_TILE_FILENAME,
     build_regional_pack,
+    compute_shard_count,
+    fnv1a_32,
+    shard_filename,
+    shard_index_for_track,
 )
 from trailforge.packs.catalog import (
     PACK_ATTRIBUTIONS,
@@ -587,6 +596,288 @@ def test_all_four_regional_packs_build_checksums_tarball_snapshot_range_and_memo
                         assert r_tile_range.content[:7] == b"PMTiles"
                         assert len(r_tile_range.content) == 127
 
+            app.dependency_overrides.clear()
+    finally:
+        _truncate_all(postgis_engine)
+
+
+def test_sharded_v2_hash_vectors_shard_endpoint_security_and_r2_manifest_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Official FNV-1a 32-bit reference vectors (must match TypeScript fnv1a32 byte-for-byte)
+    assert fnv1a_32("") == 0x811C9DC5
+    assert fnv1a_32("a") == 0xE40C292C
+    assert fnv1a_32("foobar") == 0xBF9CF968
+    assert compute_shard_count(0) == 4
+    assert compute_shard_count(500) == 4
+    assert compute_shard_count(57_190) == 58
+    assert compute_shard_count(200_000) == 64
+    assert shard_filename(0) == "tracks_00.json.gz"
+    assert shard_filename(12) == "tracks_12.json.gz"
+
+    packs_dir = tmp_path / "packs_sharded"
+    alps_dir = packs_dir / "australian-alps"
+    shards_dir = alps_dir / SHARDS_DIRNAME
+    shards_dir.mkdir(parents=True)
+
+    shard0_bytes = gzip.compress(
+        json.dumps(
+            {
+                "schema_version": "trailforge_pack_shard_v2",
+                "region_id": "australian-alps",
+                "shard_index": 0,
+                "tracks": {},
+            }
+        ).encode("utf-8")
+    )
+    shard0_path = shards_dir / "tracks_00.json.gz"
+    shard0_path.write_bytes(shard0_bytes)
+
+    outside_file = tmp_path / "secret.json.gz"
+    outside_file.write_bytes(b"secret")
+    (shards_dir / "tracks_01.json.gz").symlink_to(outside_file)
+
+    manifest_payload = {
+        "schema_version": "trailforge_pack_manifest_v1",
+        "region_id": "australian-alps",
+        "pack_id": "australian-alps",
+        "name": "Australian Alps / High Country",
+        "description": "Sharded R2 test pack",
+        "region_type": "tactical",
+        "version": "2026.11.28",
+        "generated_at": "2026-11-28T00:00:00Z",
+        "community_telemetry_policy": STATIC_PACK_TELEMETRY_POLICY,
+        "snapshot_format": SNAPSHOT_FORMAT_SHARDED,
+        "shard_count": 4,
+        "shard_hash": "fnv1a32",
+        "shards_base_url": "/api/packs/australian-alps/shards",
+        "bbox": [146.5, -37.6, 149.2, -35.6],
+        "bounds": [146.5, -37.6, 149.2, -35.6],
+        "vector_available": True,
+        "terrain_available": True,
+        "manifest_url": "/api/packs/australian-alps/manifest.json",
+        "snapshot_url": "/api/packs/australian-alps/snapshot.json",
+        "bundle_url": None,
+        "vector_pmtiles_url": "/api/packs/australian-alps/tiles/vector.pmtiles",
+        "terrain_pmtiles_url": "/api/packs/australian-alps/tiles/terrain.pmtiles",
+        "counts": {"tracks": 57190, "segments": 271925, "pois": 1200},
+        "track_count": 57190,
+        "segment_count": 271925,
+        "poi_count": 1200,
+        "total_size_bytes": 12345678,
+        "bundle_size_bytes": 0,
+        "files": {
+            "shards/tracks_00.json.gz": {
+                "path": "shards/tracks_00.json.gz",
+                "size_bytes": len(shard0_bytes),
+                "sha256": _sha256_bytes(shard0_bytes),
+            }
+        },
+        "attributions": list(get_pack_region("australian-alps").attributions),
+    }
+    (alps_dir / MANIFEST_FILENAME).write_text(json.dumps(manifest_payload), encoding="utf-8")
+
+    class _EmptyResult:
+        def scalars(self) -> _EmptyResult:
+            return self
+
+        def all(self) -> list[object]:
+            return []
+
+    class _EmptySession:
+        def execute(self, *_args: object, **_kwargs: object) -> _EmptyResult:
+            return _EmptyResult()
+
+        def scalar(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    app = _build_test_app()
+    app.dependency_overrides[get_packs_dir_dep] = lambda: packs_dir
+    app.dependency_overrides[get_db] = lambda: _EmptySession()
+    monkeypatch.setenv("TRAILFORGE_PACKS_PUBLIC_BASE_URL", "https://tiles.example.test/packs")
+    get_settings.cache_clear()
+
+    try:
+        with TestClient(app) as client:
+            # R2-only mode: manifest exists on disk without local .pmtiles -> vector/terrain True!
+            r_list = client.get("/api/packs")
+            assert r_list.status_code == 200
+            alps = next(
+                r for r in r_list.json()["regions"] if r["region_id"] == "australian-alps"
+            )
+            assert alps["status"] == "ready"
+            assert alps["vector_available"] is True
+            assert alps["terrain_available"] is True
+            assert alps["snapshot_format"] == "sharded_v2"
+            assert alps["shard_count"] == 4
+            assert alps["shard_hash"] == "fnv1a32"
+            assert (
+                alps["shards_base_url"]
+                == "https://tiles.example.test/packs/australian-alps/static_v1/shards"
+            )
+            assert alps["bundle_url"] is None
+            assert alps["bundle_size_bytes"] == 0
+
+            # Shard download returns raw application/gzip (NO Content-Encoding) + ETag/304
+            r_s0 = client.get("/api/packs/australian-alps/shards/tracks_00.json.gz")
+            assert r_s0.status_code == 200
+            assert r_s0.headers["content-type"].startswith("application/gzip")
+            assert "content-encoding" not in r_s0.headers
+            assert r_s0.headers["cache-control"] == "no-store"
+            assert r_s0.content == shard0_bytes
+            etag = r_s0.headers["etag"]
+            assert (
+                client.get(
+                    "/api/packs/australian-alps/shards/tracks_00.json.gz",
+                    headers={"If-None-Match": etag},
+                ).status_code
+                == 304
+            )
+
+            # Symlink shard rejected -> 422; invalid/traversal names -> 422; missing -> 404
+            assert (
+                client.get("/api/packs/australian-alps/shards/tracks_01.json.gz").status_code
+                == 422
+            )
+            for bad in (
+                "/api/packs/australian-alps/shards/..%2Fmanifest.json",
+                "/api/packs/australian-alps/shards/sub/tracks_00.json.gz",
+                "/api/packs/australian-alps/shards/not_a_shard.json",
+            ):
+                assert client.get(bad).status_code == 422, bad
+            assert (
+                client.get("/api/packs/australian-alps/shards/tracks_02.json.gz").status_code
+                == 404
+            )
+    finally:
+        app.dependency_overrides.clear()
+        monkeypatch.delenv("TRAILFORGE_PACKS_PUBLIC_BASE_URL", raising=False)
+        get_settings.cache_clear()
+
+
+@pytest.mark.integration
+def test_sharded_v2_pack_build_static_only_no_bundle_and_shard_api(
+    postgis_engine: Engine,
+    fixtures_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    packs_dir = tmp_path / "sharded_packs"
+    monkeypatch.setenv("TRAILFORGE_PACKS_DIR", str(packs_dir))
+    _truncate_all(postgis_engine)
+
+    try:
+        with Session(postgis_engine) as session:
+            ds = load_corridor_fixtures(fixtures_dir, osm_filename="osm_tracks.geojson")
+            ingest_corridor_dataset(session, ds, commit=True)
+            sync_from_fixtures(session, fixtures_dir / "closures_sample.json")
+
+            sample_seg = session.execute(
+                select(TrackSegment)
+                .where(
+                    TrackSegment.is_active.is_(True),
+                    TrackSegment.name == "Davies Plain Track Lower",
+                )
+                .order_by(TrackSegment.segment_seq.asc())
+                .limit(1)
+            ).scalar_one()
+            grd = session.get(TrackSegmentGrade, sample_seg.segment_id)
+            assert grd is not None
+            grd.live_grade = "Extreme"
+            grd.live_score = 92.0
+            grd.confidence_level = "high"
+            grd.sample_count = 6
+            grd.live_breakdown = {
+                "version": "live_v2",
+                "sample_count": 6,
+                "is_obstacle_hotspot": True,
+                "obstacle_reasons": ["Crawl"],
+            }
+            grd.rainfall_context = {
+                "source": "Open-Meteo",
+                "rain_24h_mm": 12.0,
+                "rain_72h_mm": 24.5,
+                "wet_risk_level": "wet",
+                "wet_score_adjustment": 6.0,
+                "is_stale": False,
+            }
+            session.commit()
+
+            result = build_regional_pack(
+                session,
+                "australian-alps",
+                packs_dir,
+                skip_tiles=True,
+                static_only=True,
+                sharded=True,
+                include_bundle=False,
+            )
+
+            assert result.bundle_path is None
+            assert result.manifest.snapshot_format == SNAPSHOT_FORMAT_SHARDED
+            assert result.manifest.shard_count == 4
+            assert result.manifest.shard_hash == "fnv1a32"
+            assert result.manifest.bundle_url is None
+            assert result.manifest.bundle_size_bytes == 0
+            assert result.manifest.community_telemetry_policy == STATIC_PACK_TELEMETRY_POLICY
+
+            # Verify snapshot.json v2 schema & compact track index
+            snap = json.loads(result.snapshot_path.read_text(encoding="utf-8"))
+            assert snap["schema_version"] == "trailforge_pack_snapshot_v2"
+            assert snap["shard_count"] == 4
+            assert snap["shard_hash"] == "fnv1a32"
+            assert len(snap["tracks"]) >= 5
+            assert snap["hotspots"]["features"] == []  # static_only strips community hotspots
+            for idx_item in snap["tracks"]:
+                assert "segments" not in idx_item
+                assert "nearby_pois" not in idx_item
+                assert "baseline_breakdown" not in idx_item
+
+            # Verify all 4 shards exist, match SHA-256 in manifest, and hold every track by FNV-1a
+            loaded_shards: dict[int, dict[str, object]] = {}
+            for s_idx in range(4):
+                rel = f"{SHARDS_DIRNAME}/{shard_filename(s_idx)}"
+                assert rel in result.manifest.files
+                disk_path = result.pack_dir / rel
+                raw = disk_path.read_bytes()
+                assert len(raw) == result.manifest.files[rel].size_bytes
+                assert _sha256_bytes(raw) == result.manifest.files[rel].sha256
+                payload = json.loads(gzip.decompress(raw).decode("utf-8"))
+                assert payload["schema_version"] == "trailforge_pack_shard_v2"
+                assert payload["shard_index"] == s_idx
+                loaded_shards[s_idx] = payload["tracks"]
+
+            for idx_item in snap["tracks"]:
+                tid = idx_item["track_id"]
+                expected_shard = shard_index_for_track(tid, 4)
+                assert tid in loaded_shards[expected_shard]
+                detail = loaded_shards[expected_shard][tid]
+                assert isinstance(detail, dict)
+                assert detail["baseline_breakdown"] is not None
+                assert len(detail["elevation_profile"]) <= 40
+                assert len(detail["coords"]) <= 64
+                # Static-only strips community live telemetry
+                assert detail["live_grade"] is None
+                assert detail["sample_count"] == 0
+                assert detail["obstacle_hotspots"] == []
+                if detail["name"] == "Davies Plain Track Lower":
+                    assert detail["rainfall_context"]["wet_risk_level"] == "wet"
+                    assert len(detail["closure_ids"]) >= 1
+                    assert len(detail["park_ids"]) >= 1
+
+            # Verify HTTP endpoints serve shards and return 404 for omitted bundle.tar.gz
+            app = _build_test_app()
+            app.dependency_overrides[get_db] = lambda: session
+            app.dependency_overrides[get_packs_dir_dep] = lambda: packs_dir
+            with TestClient(app) as client:
+                r_shard = client.get("/api/packs/australian-alps/shards/tracks_00.json.gz")
+                assert r_shard.status_code == 200
+                assert r_shard.headers["content-type"].startswith("application/gzip")
+                assert (
+                    _sha256_bytes(r_shard.content)
+                    == result.manifest.files["shards/tracks_00.json.gz"].sha256
+                )
+                assert client.get("/api/packs/australian-alps/bundle.tar.gz").status_code == 404
             app.dependency_overrides.clear()
     finally:
         _truncate_all(postgis_engine)

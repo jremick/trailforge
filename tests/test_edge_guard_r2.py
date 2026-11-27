@@ -1424,6 +1424,58 @@ def test_r2_sync_mock_http_streaming_etag_skip_and_cli_dry_run(tmp_path: Path) -
     assert "australian-alps/static_v1/bundle.tar.gz" in keys
 
 
+def test_r2_sync_discovers_and_uploads_sharded_v2_pack_shards(tmp_path: Path) -> None:
+    packs_dir = tmp_path / "packs"
+    static_pack = packs_dir / "australian-alps"
+    static_shards = static_pack / "shards"
+    static_shards.mkdir(parents=True)
+    (static_pack / "manifest.json").write_text(
+        json.dumps(
+            {
+                "region_id": "australian-alps",
+                "community_telemetry_policy": "static_v1",
+                "snapshot_format": "sharded_v2",
+                "shard_count": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (static_pack / "snapshot.json").write_text('{"schema_version":"trailforge_pack_snapshot_v2"}')
+    (static_shards / "tracks_00.json.gz").write_bytes(b"\x1f\x8bshard0")
+    (static_shards / "tracks_01.json.gz").write_bytes(b"\x1f\x8bshard1")
+
+    # Live-policy pack shards must NOT be published to public R2
+    live_pack = packs_dir / "blue-mountains"
+    live_shards = live_pack / "shards"
+    live_shards.mkdir(parents=True)
+    (live_pack / "manifest.json").write_text(
+        json.dumps(
+            {
+                "region_id": "blue-mountains",
+                "community_telemetry_policy": "live_v2",
+                "snapshot_format": "sharded_v2",
+                "shard_count": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (live_shards / "tracks_00.json.gz").write_bytes(b"\x1f\x8blive-shard")
+
+    discovered = r2_sync.discover_sync_artifacts(packs_dir=packs_dir, packs_prefix="packs")
+    by_key = {art.object_key: art for art in discovered}
+    assert "packs/australian-alps/static_v1/shards/tracks_00.json.gz" in by_key
+    assert "packs/australian-alps/static_v1/shards/tracks_01.json.gz" in by_key
+    assert (
+        by_key["packs/australian-alps/static_v1/shards/tracks_00.json.gz"].content_type
+        == "application/gzip"
+    )
+    assert (
+        by_key["packs/australian-alps/static_v1/shards/tracks_00.json.gz"].cache_control
+        == "no-store"
+    )
+    assert not any("blue-mountains" in k for k in by_key)
+
+
 # -----------------------------------------------------------------------------
 # 6. PostGIS Integration Tests (Usage DB Rollup + Trip Upload Daily Quota + Photo 507)
 # -----------------------------------------------------------------------------
