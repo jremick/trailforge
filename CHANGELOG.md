@@ -5,6 +5,24 @@ All notable changes to **TrailForge** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-11-28
+
+Feature & scale release (publishing `:v1.4.0`, `:v1.4`, and `:latest` multi-arch `linux/amd64` + `linux/arm64` GHCR images) introducing **compact normalized & sharded offline regional packs (`sharded_v2`)** for 50,000+ track Australian regions while preserving 100% backward compatibility with `inline_v1` small packs.
+
+### Added
+- **Normalized & Sharded Offline Pack Builder (`src/trailforge/packs/builder.py`, `src/trailforge/packs/cli.py`):** Regions exceeding `PACK_SHARD_THRESHOLD` (`500` tracks, or forced via `--sharded`) now stream a lightweight search-index `snapshot.json` (`trailforge_pack_snapshot_v2`) with deduplicated region POIs, CAPAD parks, closures, reports, and hotspots alongside `K` (`4–64`) deterministic FNV-1a 32-bit gzipped track detail shards (`shards/tracks_00.json.gz` .. `tracks_{K-1:02d}.json.gz`). Eliminates redundant per-track POI/park/segment duplication (reducing 57k-track regional pack metadata by >50x while staying under the `< 300 MB` streaming RAM budget), adds `--sharded`/`--inline` and `--no-bundle` CLI flags, and uses fast `compresslevel=1` when bundling already-compressed sharded packs.
+- **Pack Shard Streaming Endpoint & R2 Sync (`src/trailforge/api/packs.py`, `src/trailforge/packs/r2_sync.py`):** Added `GET /api/packs/{region_id}/shards/{shard_name}` with strict filename allowlist (`^tracks_[0-9]{2,3}\.json\.gz$`), symlink/path-confinement enforcement, telemetry-revision validation, ETag/`304`, and raw `application/gzip` streaming (no `Content-Encoding` mutation so SHA-256 checksums match identically across API, proxy, and CDN). Extended `discover_sync_artifacts` to sync `static_v1` pack shards to Cloudflare R2 (`<region>/static_v1/shards/tracks_XX.json.gz`), while keeping live-policy shards off public object storage.
+- **PWA IndexedDB v2 Shard Store & On-Demand Track Hydration (`web/src/offline/packStore.ts`, `web/src/components/packsPanel.ts`, `web/src/types.ts`):** Upgraded offline IndexedDB schema (`OFFLINE_DB_VERSION = 2`) with a dedicated `pack_shards` store for compressed shard blobs, concurrency-4 download with per-shard SHA-256 verification and automatic partial-shard rollback on failure, 4-shard LRU decompression via standard `DecompressionStream("gzip")`, single-shard `TrackInspectorDetail` hydration (CAPAD parks, closures, condition reports, gate warnings, nearby POIs within 1.5 km, simplified corridor geometry, and offline multi-track route planning), and automatic shard cleanup on `removeOfflinePack`.
+
+### Fixed
+- **R2-Offloaded Pack Catalog Availability (`src/trailforge/api/packs.py`, `web/src/components/packsPanel.ts`):** `_build_region_summary` now honors `manifest.vector_available` and `manifest.terrain_available` when `TRAILFORGE_PACKS_PUBLIC_BASE_URL` serves `static_v1` PMTiles from Cloudflare R2 and only `manifest.json` is mirrored on the API disk, and cleanly omits `bundle_url` / hides the `.tar.gz` download button when a pack is built with `--no-bundle`.
+
+### Verification Metrics (`v1.4.0`)
+- **Offline CI Tests:** `528` automated offline tests passing (`335` Python/PostGIS unit, integration, migration, MCP, OAuth 2.1, privacy, resource-budget & sharded pack tests + `193` Vitest web tests across 20 files; `0` failures, `0` high/critical npm CVEs).
+- **Zero Schema Migration Needed:** Database schema remains at Alembic revision `0011_closure_datasets` (drop-in upgrade from `v1.3.0`).
+
+---
+
 ## [1.3.0] - 2026-11-27
 
 Feature, privacy, and end-to-end security hardening release (publishing `:v1.3.0`, `:v1.3`, and `:latest` multi-arch `linux/amd64` + `linux/arm64` GHCR images) introducing **split-stack OpenMapTiles vector basemaps & Pan-Australia cartographic labels**, **trigram search & cached track grades (`0009`)**, **consent-gated revocable community telemetry (`0010`)**, **dataset-scoped closure safety (`0011`)**, **per-account offline browser isolation**, and **strict GIS, route-planning, matching & proxy resource budgets** across `522` passing automated offline tests (`332` Python/PostGIS + `190` Vitest).
