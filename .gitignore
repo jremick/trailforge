@@ -30,6 +30,8 @@ web/.vite/
 .env.local
 .env.*.local
 .wrangler/
+.anti-slop/telemetry.jsonl
+.anti-slop/last-verify.json
 
 # Runtime outputs, caches, tile builds, and GIS artifacts
 /data/
