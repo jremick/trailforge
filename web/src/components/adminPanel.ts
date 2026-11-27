@@ -67,7 +67,6 @@ export class AdminConsolePanel {
       "Admin Console — Traffic, Storage, Friend Invites and Users"
     );
     this.root.setAttribute("aria-hidden", "true");
-    this.render();
   }
 
   isPanelOpen(): boolean {
@@ -88,7 +87,9 @@ export class AdminConsolePanel {
 
   updateState(patch: Partial<AdminPanelState>): void {
     this.state = { ...this.state, ...patch };
-    this.render();
+    if (this.isOpen) {
+      this.render();
+    }
   }
 
   private render(): void {

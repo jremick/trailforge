@@ -144,7 +144,6 @@ export class RigAccountPanel {
       "Rig profiles, trip telemetry, saved tracks, pins, and account"
     );
     this.root.setAttribute("aria-hidden", "true");
-    this.render();
   }
 
   open(tab?: AccountPanelTab): void {
@@ -171,7 +170,9 @@ export class RigAccountPanel {
     if (signedOut) {
       this.aiTokens.reset();
     }
-    this.render();
+    if (this.isOpen) {
+      this.render();
+    }
   }
 
   private render(): void {

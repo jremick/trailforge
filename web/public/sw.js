@@ -1,10 +1,39 @@
 // TrailForge Offline PWA Service Worker (Slices 01–09)
 // Supports offline SPA shell caching + HTTP 206 Partial Content Range slicing
-// for downloaded regional PMTiles packs so MapLibre GL JS 5 renders 100% offline.
+// for downloaded regional PMTiles packs so MapLibre GL JS renders 100% offline.
 
-const SHELL_CACHE = "trailforge-shell-v2";
+const SHELL_CACHE = "trailforge-shell-v3";
 const PACKS_CACHE = "trailforge-packs-v1";
 const ALLOWED_CACHES = new Set([SHELL_CACHE, PACKS_CACHE]);
+const MAX_MEM_PACK_BLOBS = 2;
+
+let packsCachePromise = null;
+// Small in-memory LRU cache of active PMTiles blobs so rapid MapLibre Range 206 pan/zoom
+// requests don't re-open CacheStorage and re-materialize Response.blob() 50x per gesture.
+const packBlobCache = new Map();
+
+function getPacksCache() {
+  if (!packsCachePromise) {
+    packsCachePromise = caches.open(PACKS_CACHE).catch((err) => {
+      packsCachePromise = null;
+      throw err;
+    });
+  }
+  return packsCachePromise;
+}
+
+function clearPackBlobCache(regionId) {
+  if (!regionId) {
+    packBlobCache.clear();
+    return;
+  }
+  const prefix = `/api/packs/${encodeURIComponent(regionId)}/`;
+  for (const key of packBlobCache.keys()) {
+    if (key.startsWith(prefix)) {
+      packBlobCache.delete(key);
+    }
+  }
+}
 
 const PRECACHE_URLS = [
   "/",
@@ -42,6 +71,7 @@ self.addEventListener("install", (event) => {
 });
 
 self.addEventListener("activate", (event) => {
+  packBlobCache.clear();
   event.waitUntil(
     caches
       .keys()
@@ -54,6 +84,13 @@ self.addEventListener("activate", (event) => {
       )
       .then(() => self.clients.claim())
   );
+});
+
+self.addEventListener("message", (event) => {
+  const data = event.data;
+  if (data && data.type === "INVALIDATE_PACK_CACHE") {
+    clearPackBlobCache(typeof data.regionId === "string" ? data.regionId : null);
+  }
 });
 
 /**
@@ -99,21 +136,49 @@ function parseByteRange(rangeHeader, totalLength) {
 }
 
 /**
- * Serve cached PMTiles with exact HTTP 206 Partial Content byte slicing so
- * MapLibre GL JS 5 `pmtiles://` protocol renders offline regional packs seamlessly.
+ * Load a cached PMTiles Blob from SW memory LRU or CacheStorage.
  */
-async function respondFromCachedPackTile(request) {
-  const cache = await caches.open(PACKS_CACHE);
-  const url = new URL(request.url);
-  const cached = (await cache.match(url.pathname)) || (await cache.match(request.url));
+async function loadCachedPackBlob(request, pathname) {
+  const memHit = packBlobCache.get(pathname);
+  if (memHit) {
+    // Refresh LRU position
+    packBlobCache.delete(pathname);
+    packBlobCache.set(pathname, memHit);
+    return memHit;
+  }
+
+  const cache = await getPacksCache();
+  const cached = (await cache.match(pathname)) || (await cache.match(request.url));
   if (!cached) {
     return null;
   }
 
   const blob = await cached.blob();
-  const total = blob.size;
   const contentType =
     cached.headers.get("Content-Type") || "application/octet-stream";
+  const entry = { blob, contentType };
+  packBlobCache.set(pathname, entry);
+  while (packBlobCache.size > MAX_MEM_PACK_BLOBS) {
+    const oldestKey = packBlobCache.keys().next().value;
+    if (oldestKey !== undefined) packBlobCache.delete(oldestKey);
+    else break;
+  }
+  return entry;
+}
+
+/**
+ * Serve cached PMTiles with exact HTTP 206 Partial Content byte slicing so
+ * MapLibre `pmtiles://` protocol renders offline regional packs seamlessly.
+ */
+async function respondFromCachedPackTile(request) {
+  const url = new URL(request.url);
+  const entry = await loadCachedPackBlob(request, url.pathname);
+  if (!entry) {
+    return null;
+  }
+
+  const { blob, contentType } = entry;
+  const total = blob.size;
   const rangeHeader = request.headers.get("Range");
   const isHead = request.method === "HEAD";
 
@@ -170,10 +235,17 @@ self.addEventListener("fetch", (event) => {
 
   // Never intercept cross-origin requests:
   // - External raster basemaps fail gracefully inside MapLibre
-  // - Cloudflare R2 absolute PMTiles URLs (e.g. https://tiles.example.com/*.pmtiles)
-  //   stream HTTP 206 Range requests directly from R2 edge CDN; downloaded offline packs
-  //   are cached under same-origin /api/packs/<region>/tiles/*.pmtiles below.
+  // - Cloudflare R2 absolute PMTiles URLs stream HTTP 206 Range requests directly from R2 CDN
   if (url.origin !== self.location.origin) return;
+
+  // Never intercept MCP Streamable HTTP / SSE or OAuth discovery metadata endpoints
+  if (
+    url.pathname === "/mcp" ||
+    url.pathname.startsWith("/mcp/") ||
+    url.pathname.startsWith("/.well-known/")
+  ) {
+    return;
+  }
 
   // Offline regional PMTiles: serve Range 206 directly from PACKS_CACHE when downloaded!
   if (isPackPmtilesPath(url.pathname)) {
@@ -238,7 +310,26 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Static app assets (/assets/*, /icons/*): cache-first with background refresh
+  // Content-hashed Vite bundles (/assets/*) are immutable: pure Cache-First (no redundant fetch)
+  if (url.pathname.startsWith("/assets/")) {
+    event.respondWith(
+      caches.match(request).then((cached) => {
+        if (cached) return cached;
+        return fetch(request).then((response) => {
+          if (response.ok) {
+            const copy = response.clone();
+            caches
+              .open(SHELL_CACHE)
+              .then((cache) => cache.put(request, copy));
+          }
+          return response;
+        });
+      })
+    );
+    return;
+  }
+
+  // Other static app assets (/icons/*, /manifest.webmanifest): cache-first with background refresh
   event.respondWith(
     caches.match(request).then((cached) => {
       const networkFetch = fetch(request)

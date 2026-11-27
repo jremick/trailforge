@@ -99,7 +99,6 @@ export class RoutePlannerDrawer {
     this.root.className = "tf-account-panel tf-route-panel";
     this.root.setAttribute("aria-label", "Interactive Multi-Track Route Planner");
     this.root.setAttribute("aria-hidden", "true");
-    this.render();
   }
 
   isPanelOpen(): boolean {

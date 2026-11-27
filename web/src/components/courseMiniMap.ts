@@ -1,5 +1,10 @@
 import type { Feature, FeatureCollection, LineString, Point } from "geojson";
-import maplibregl, { type LayerSpecification, type SourceSpecification, type StyleSpecification } from "maplibre-gl";
+import * as maplibregl from "maplibre-gl";
+import type {
+  LayerSpecification,
+  SourceSpecification,
+  StyleSpecification,
+} from "maplibre-gl";
 import { getApiBaseUrl } from "../adminHelpers";
 import {
   findNearestPointOnTrackCourseGeo,

@@ -394,7 +394,7 @@ export function buildTrailForgeStyle(
     selectedTrackId = null,
   } = options;
 
-  const showOsm = initialBasemap === "osm" || initialBasemap === "opentopo";
+  const showOsm = initialBasemap === "osm";
   const showOpenTopo = initialBasemap === "opentopo";
   const showSat = initialBasemap === "satellite";
 

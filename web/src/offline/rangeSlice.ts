@@ -84,7 +84,14 @@ export function sliceArrayBufferResponse(
   }
 
   if (parsed.status === 200) {
-    return new Response(isHead ? null : new Uint8Array(bytes), {
+    const body = isHead
+      ? null
+      : bytes.buffer instanceof ArrayBuffer &&
+          bytes.byteOffset === 0 &&
+          bytes.byteLength === bytes.buffer.byteLength
+        ? bytes.buffer
+        : bytes.slice();
+    return new Response(body, {
       status: 200,
       headers: {
         "Content-Type": contentType,
@@ -125,13 +132,22 @@ export async function computeSha256Hex(
   ) {
     return null;
   }
-  const view =
-    data instanceof Uint8Array
-      ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
-      : new Uint8Array(data);
-  const copy = new Uint8Array(view.byteLength);
-  copy.set(view);
-  const hashBuf = await globalThis.crypto.subtle.digest("SHA-256", copy);
+  let digestInput: BufferSource;
+  if (data instanceof ArrayBuffer) {
+    digestInput = data;
+  } else if (data.buffer instanceof ArrayBuffer) {
+    // Pass the non-shared ArrayBuffer view directly to SubtleCrypto (zero 2x RAM spike on 150-400 MB PMTiles)
+    digestInput =
+      data.byteOffset === 0 && data.byteLength === data.buffer.byteLength
+        ? data.buffer
+        : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  } else {
+    // SharedArrayBuffer cannot be passed directly to SubtleCrypto.digest
+    const copy = new Uint8Array(data.byteLength);
+    copy.set(data);
+    digestInput = copy;
+  }
+  const hashBuf = await globalThis.crypto.subtle.digest("SHA-256", digestInput);
   return Array.from(new Uint8Array(hashBuf))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");

@@ -293,6 +293,35 @@ describe("Native Capacitor vs Browser PWA runtime bridge", () => {
     expect(imu.getMetrics().shock_event_count).toBe(1);
     await imu.stop();
     expect(removeListener).toHaveBeenCalled();
+
+    // Verify 50 Hz sensor callbacks throttle onMetrics instead of firing per-sample
+    const onMetrics = vi.fn();
+    let accelCb2: ((ev: Record<string, unknown>) => void) | null = null;
+    const imu2 = await startHighRateImuCapture(
+      { maxSamples: 20, metricsIntervalMs: 500, onMetrics },
+      {
+        windowObj: {
+          Capacitor: {
+            isNativePlatform: () => true,
+            getPlatform: () => "android",
+            Plugins: {
+              Motion: {
+                addListener: (name, cb) => {
+                  if (name === "accel") accelCb2 = cb;
+                  return Promise.resolve({ remove: vi.fn() });
+                },
+              },
+            },
+          },
+        },
+      }
+    );
+    for (let i = 0; i < 50; i += 1) {
+      accelCb2!({ accelerationIncludingGravity: { x: 0, y: 0, z: STANDARD_GRAVITY_MPS2 } });
+    }
+    expect(imu2.getSamples()).toHaveLength(20);
+    expect(onMetrics.mock.calls.length).toBeLessThanOrEqual(2);
+    await imu2.stop();
   });
 
   it("bridges KeepAwake between native Capacitor plugin and browser Screen Wake Lock", async () => {

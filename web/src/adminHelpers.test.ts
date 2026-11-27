@@ -106,6 +106,15 @@ describe("Cloudflare R2 PMTiles, pack assets & VITE_API_BASE_URL resolution", ()
     expect(buildOfflinePackTileCachePath("australian-alps", "terrain")).toBe(
       "/api/packs/australian-alps/tiles/terrain.pmtiles"
     );
+
+    // Protocol-relative URLs (//evil.example/...) must be rejected and fall back safely
+    expect(
+      resolvePackAssetUrl(
+        "//evil.example/payload.pmtiles",
+        "/api/packs/australian-alps/tiles/vector.pmtiles",
+        ""
+      )
+    ).toBe("/api/packs/australian-alps/tiles/vector.pmtiles");
   });
 });
 

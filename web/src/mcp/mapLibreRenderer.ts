@@ -1,9 +1,11 @@
 import type { Feature, FeatureCollection, LineString, Point } from "geojson";
-import maplibregl, {
-  type GeoJSONSource,
-  type LngLatBoundsLike,
-  type Map as MapLibreMap,
-  type StyleSpecification,
+import * as maplibregl from "maplibre-gl";
+import maplibreWorkerRaw from "maplibre-gl/dist/maplibre-gl-worker.mjs?raw";
+import type {
+  GeoJSONSource,
+  LngLatBoundsLike,
+  Map as MapLibreMap,
+  StyleSpecification,
 } from "maplibre-gl";
 import { Protocol } from "pmtiles";
 import { getGradeColor } from "../presets";
@@ -15,10 +17,24 @@ import {
 } from "./types";
 
 let pmtilesRegistered = false;
+let mcpWorkerBlobUrl: string | null = null;
 
 function ensurePmtilesProtocol(): void {
   if (pmtilesRegistered) return;
   try {
+    if (
+      !mcpWorkerBlobUrl &&
+      maplibreWorkerRaw &&
+      typeof URL !== "undefined" &&
+      typeof URL.createObjectURL === "function" &&
+      typeof Blob !== "undefined" &&
+      typeof maplibregl.setWorkerUrl === "function"
+    ) {
+      mcpWorkerBlobUrl = URL.createObjectURL(
+        new Blob([maplibreWorkerRaw], { type: "text/javascript" })
+      );
+      maplibregl.setWorkerUrl(mcpWorkerBlobUrl);
+    }
     const protocol = new Protocol();
     maplibregl.addProtocol("pmtiles", protocol.tile);
     pmtilesRegistered = true;
@@ -381,7 +397,7 @@ export function mountMapLibreMap(
         ]
       : [148.125, -36.615];
 
-    map = new maplibregl.Map({
+    const m = new maplibregl.Map({
       container: options.container,
       style,
       center,
@@ -390,17 +406,18 @@ export function mountMapLibreMap(
       pitchWithRotate: false,
       dragRotate: false,
     });
+    map = m;
 
-    map.addControl(
+    m.addControl(
       new maplibregl.NavigationControl({ showCompass: true, showZoom: true }),
       "top-right"
     );
-    map.addControl(
+    m.addControl(
       new maplibregl.ScaleControl({ maxWidth: 110, unit: "metric" }),
       "bottom-left"
     );
 
-    map.on("load", () => {
+    m.on("load", () => {
       if (!map || fallenBack) return;
       if (overlays.bounds) {
         const b = overlays.bounds;
@@ -416,7 +433,7 @@ export function mountMapLibreMap(
       }
     });
 
-    map.on("error", (ev) => {
+    m.on("error", (ev) => {
       tileErrorCount += 1;
       console.debug("MapLibre MCP error event:", ev.error);
       if (tileErrorCount >= 2) {
@@ -424,7 +441,7 @@ export function mountMapLibreMap(
       }
     });
 
-    map.on("click", "tfm-lines-main", (ev) => {
+    m.on("click", "tfm-lines-main", (ev) => {
       const feat = ev.features?.[0];
       const trackId = feat?.properties?.track_id;
       if (typeof trackId === "string" && trackId) {
@@ -432,7 +449,7 @@ export function mountMapLibreMap(
       }
     });
 
-    map.on("mousemove", "tfm-lines-main", (ev) => {
+    m.on("mousemove", "tfm-lines-main", (ev) => {
       if (!map) return;
       map.getCanvas().style.cursor = "pointer";
       if (ev.lngLat) {
@@ -440,7 +457,7 @@ export function mountMapLibreMap(
       }
     });
 
-    map.on("mouseleave", "tfm-lines-main", () => {
+    m.on("mouseleave", "tfm-lines-main", () => {
       if (map) map.getCanvas().style.cursor = "";
     });
   } catch (err) {

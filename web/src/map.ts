@@ -1,6 +1,7 @@
 import type { FeatureCollection } from "geojson";
-import maplibregl from "maplibre-gl";
+import * as maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
+import maplibreWorkerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?url";
 import { Protocol } from "pmtiles";
 import {
   DEFAULT_CENTER_LAT,
@@ -43,10 +44,13 @@ import type {
 let pmtilesProtocolRegistered = false;
 
 /**
- * Register the PMTiles v4 protocol handler with MapLibre GL JS 5 once.
+ * Register the PMTiles v4 protocol handler and MapLibre GL JS v6 worker URL once.
  */
 export function ensurePmtilesProtocol(): void {
   if (pmtilesProtocolRegistered) return;
+  if (maplibreWorkerUrl && typeof maplibregl.setWorkerUrl === "function") {
+    maplibregl.setWorkerUrl(maplibreWorkerUrl);
+  }
   const protocol = new Protocol();
   maplibregl.addProtocol("pmtiles", protocol.tile);
   pmtilesProtocolRegistered = true;
@@ -202,6 +206,10 @@ export class TrailForgeMap {
   private userPins: UserPinItem[] = [];
   private readonly loadedIconIds = new Set<string>();
   private readonly loadingIcons = new Set<string>();
+  private hoverRafId: number | null = null;
+  private pendingHoverEvent: maplibregl.MapMouseEvent | null = null;
+  private lastHoverKey: string | null = null;
+  private lastHoverHtml: string | null = null;
 
   constructor(
     container: HTMLElement,
@@ -245,8 +253,28 @@ export class TrailForgeMap {
     );
 
     this.map.on("mousemove", (e) => {
-      callbacks.onCursorMove?.(e.lngLat.lat, e.lngLat.lng);
-      this.handlePointerHover(e);
+      this.pendingHoverEvent = e;
+      if (this.hoverRafId === null) {
+        this.hoverRafId = window.requestAnimationFrame(() => {
+          this.hoverRafId = null;
+          const ev = this.pendingHoverEvent;
+          this.pendingHoverEvent = null;
+          if (!ev) return;
+          callbacks.onCursorMove?.(ev.lngLat.lat, ev.lngLat.lng);
+          this.handlePointerHover(ev);
+        });
+      }
+    });
+
+    this.map.on("mouseout", () => {
+      if (this.hoverRafId !== null) {
+        window.cancelAnimationFrame(this.hoverRafId);
+        this.hoverRafId = null;
+      }
+      this.pendingHoverEvent = null;
+      this.lastHoverKey = null;
+      this.lastHoverHtml = null;
+      this.hoverPopup.remove();
     });
 
     this.map.on("click", (e) => {
@@ -632,6 +660,13 @@ export class TrailForgeMap {
   }
 
   destroy(): void {
+    if (this.hoverRafId !== null) {
+      window.cancelAnimationFrame(this.hoverRafId);
+      this.hoverRafId = null;
+    }
+    this.pendingHoverEvent = null;
+    this.lastHoverKey = null;
+    this.lastHoverHtml = null;
     this.hoverPopup.remove();
     this.map.remove();
   }
@@ -763,27 +798,50 @@ export class TrailForgeMap {
 
     if (!hit) {
       this.map.getCanvas().style.cursor = "";
-      this.hoverPopup.remove();
+      if (this.lastHoverKey !== null) {
+        this.lastHoverKey = null;
+        this.lastHoverHtml = null;
+        this.hoverPopup.remove();
+      }
       return;
     }
 
     const layerId = hit.layer.id;
     const props = (hit.properties ?? {}) as Record<string, unknown>;
+    const featureIdentity = String(
+      hit.id ??
+        props.segment_id ??
+        props.track_id ??
+        props.id ??
+        props.poi_id ??
+        props.name ??
+        props.title ??
+        ""
+    );
+    const hoverKey = `${layerId}:${featureIdentity}:${this.routePlanMode ? "rp" : "nm"}`;
+    const updateHoverPopup = (html: string): void => {
+      this.hoverPopup.setLngLat(e.lngLat);
+      if (this.lastHoverKey !== hoverKey || this.lastHoverHtml !== html) {
+        this.lastHoverKey = hoverKey;
+        this.lastHoverHtml = html;
+        this.hoverPopup.setHTML(html);
+      }
+      if (!this.hoverPopup.isOpen()) {
+        this.hoverPopup.addTo(this.map);
+      }
+    };
 
     if (layerId === "tf-planned-route-pins-dot") {
       this.map.getCanvas().style.cursor = "pointer";
       const title = String(props.title ?? "Planned Route Waypoint");
       const kind = String(props.kind ?? "leg").toUpperCase();
-      this.hoverPopup
-        .setLngLat(e.lngLat)
-        .setHTML(
-          `<div class="tf-popup-title">${escapeHtml(title)}</div>
-           <div class="tf-popup-meta">
-             <span class="tf-popup-dot" style="background:#14b8a6"></span>
-             <span>Planned Route · ${escapeHtml(kind)}</span>
-           </div>`
-        )
-        .addTo(this.map);
+      updateHoverPopup(
+        `<div class="tf-popup-title">${escapeHtml(title)}</div>
+         <div class="tf-popup-meta">
+           <span class="tf-popup-dot" style="background:#14b8a6"></span>
+           <span>Planned Route · ${escapeHtml(kind)}</span>
+         </div>`
+      );
       return;
     }
 
@@ -794,17 +852,14 @@ export class TrailForgeMap {
       const legNum =
         typeof props.leg_index === "number" ? `Leg ${props.leg_index + 1}` : "Planned Route";
       const hint = this.routePlanMode ? "Already in route" : "Click to inspect track";
-      this.hoverPopup
-        .setLngLat(e.lngLat)
-        .setHTML(
-          `<div class="tf-popup-title">${escapeHtml(name)}</div>
-           <div class="tf-popup-meta">
-             <span class="tf-popup-dot" style="background:#14b8a6"></span>
-             <span>${escapeHtml(legNum)} · ${escapeHtml(grade)}</span>
-             <span class="tf-popup-hint">${escapeHtml(hint)}</span>
-           </div>`
-        )
-        .addTo(this.map);
+      updateHoverPopup(
+        `<div class="tf-popup-title">${escapeHtml(name)}</div>
+         <div class="tf-popup-meta">
+           <span class="tf-popup-dot" style="background:#14b8a6"></span>
+           <span>${escapeHtml(legNum)} · ${escapeHtml(grade)}</span>
+           <span class="tf-popup-hint">${escapeHtml(hint)}</span>
+         </div>`
+      );
       return;
     }
 
@@ -817,17 +872,14 @@ export class TrailForgeMap {
       const notes = typeof props.notes === "string" ? props.notes.slice(0, 90) : "";
       const confirms = typeof props.confirm_count === "number" ? props.confirm_count : 0;
       const stale = props.is_stale === true ? " · Stale" : "";
-      this.hoverPopup
-        .setLngLat(e.lngLat)
-        .setHTML(
-          `<div class="tf-popup-title">${isGate ? "⛔ " : "⚠ "}${escapeHtml(label)}</div>
-           <div class="tf-popup-meta">
-             <span class="tf-popup-warn">${isGate ? "Gate / Access Warning" : "Community Report"}</span>
-             <span>· ✓${confirms}${escapeHtml(stale)}</span>
-           </div>
-           ${notes ? `<div class="tf-popup-note">${escapeHtml(notes)}</div>` : ""}`
-        )
-        .addTo(this.map);
+      updateHoverPopup(
+        `<div class="tf-popup-title">${isGate ? "⛔ " : "⚠ "}${escapeHtml(label)}</div>
+         <div class="tf-popup-meta">
+           <span class="tf-popup-warn">${isGate ? "Gate / Access Warning" : "Community Report"}</span>
+           <span>· ✓${confirms}${escapeHtml(stale)}</span>
+         </div>
+         ${notes ? `<div class="tf-popup-note">${escapeHtml(notes)}</div>` : ""}`
+      );
       return;
     }
 
@@ -867,16 +919,13 @@ export class TrailForgeMap {
           reasonsText = formatHotspotReason(props.obstacle_reasons);
         }
       }
-      this.hoverPopup
-        .setLngLat(e.lngLat)
-        .setHTML(
-          `<div class="tf-popup-title">⚡ Obstacle Hotspot · ${escapeHtml(trackName)}</div>
-           <div class="tf-popup-meta">
-             <span class="tf-popup-warn">${escapeHtml([avgSpeed, rough, wet].filter(Boolean).join(" · ") || "Slow / rough segment")}</span>
-           </div>
-           ${reasonsText ? `<div class="tf-popup-note">${escapeHtml(reasonsText)}</div>` : ""}`
-        )
-        .addTo(this.map);
+      updateHoverPopup(
+        `<div class="tf-popup-title">⚡ Obstacle Hotspot · ${escapeHtml(trackName)}</div>
+         <div class="tf-popup-meta">
+           <span class="tf-popup-warn">${escapeHtml([avgSpeed, rough, wet].filter(Boolean).join(" · ") || "Slow / rough segment")}</span>
+         </div>
+         ${reasonsText ? `<div class="tf-popup-note">${escapeHtml(reasonsText)}</div>` : ""}`
+      );
       return;
     }
 
@@ -886,13 +935,10 @@ export class TrailForgeMap {
         typeof props.observation_count === "number"
           ? `${props.observation_count} trace${props.observation_count === 1 ? "" : "s"}`
           : "Anonymized spur";
-      this.hoverPopup
-        .setLngLat(e.lngLat)
-        .setHTML(
-          `<div class="tf-popup-title">Unmapped Track Candidate</div>
-           <div class="tf-popup-meta">${escapeHtml(count)} · Off-network telemetry</div>`
-        )
-        .addTo(this.map);
+      updateHoverPopup(
+        `<div class="tf-popup-title">Unmapped Track Candidate</div>
+         <div class="tf-popup-meta">${escapeHtml(count)} · Off-network telemetry</div>`
+      );
       return;
     }
 
@@ -904,14 +950,11 @@ export class TrailForgeMap {
         typeof props.notes === "string" && props.notes
           ? `<div class="tf-popup-note">${escapeHtml(props.notes)}</div>`
           : "";
-      this.hoverPopup
-        .setLngLat(e.lngLat)
-        .setHTML(
-          `<div class="tf-popup-title">${escapeHtml(name)}</div>
-           <div class="tf-popup-meta">Personal Pin · ${escapeHtml(cat)}</div>
-           ${notes}`
-        )
-        .addTo(this.map);
+      updateHoverPopup(
+        `<div class="tf-popup-title">${escapeHtml(name)}</div>
+         <div class="tf-popup-meta">Personal Pin · ${escapeHtml(cat)}</div>
+         ${notes}`
+      );
       return;
     }
 
@@ -929,18 +972,15 @@ export class TrailForgeMap {
       const stale = props.is_stale === true ? " · STALE CACHE" : "";
       const hasTrack =
         typeof props.track_id === "string" && props.track_id.length > 0;
-      this.hoverPopup
-        .setLngLat(e.lngLat)
-        .setHTML(
-          `<div class="tf-popup-title">⚠ ${escapeHtml(title)}</div>
-           <div class="tf-popup-meta">
-             <span class="tf-popup-warn">${escapeHtml(typeLabel)}</span>
-             ${agency ? `<span>· ${escapeHtml(agency)}</span>` : ""}
-             ${stale ? `<span class="tf-popup-warn">${escapeHtml(stale)}</span>` : ""}
-             ${hasTrack ? `<span class="tf-popup-hint">Click to inspect</span>` : ""}
-           </div>`
-        )
-        .addTo(this.map);
+      updateHoverPopup(
+        `<div class="tf-popup-title">⚠ ${escapeHtml(title)}</div>
+         <div class="tf-popup-meta">
+           <span class="tf-popup-warn">${escapeHtml(typeLabel)}</span>
+           ${agency ? `<span>· ${escapeHtml(agency)}</span>` : ""}
+           ${stale ? `<span class="tf-popup-warn">${escapeHtml(stale)}</span>` : ""}
+           ${hasTrack ? `<span class="tf-popup-hint">Click to inspect</span>` : ""}
+         </div>`
+      );
       return;
     }
 
@@ -961,14 +1001,11 @@ export class TrailForgeMap {
         typeof props.access_note === "string" && props.access_note
           ? `<div class="tf-popup-note">${escapeHtml(props.access_note)}</div>`
           : "";
-      this.hoverPopup
-        .setLngLat(e.lngLat)
-        .setHTML(
-          `<div class="tf-popup-title">${escapeHtml(name)}</div>
-           <div class="tf-popup-meta">${escapeHtml([cat, elev].filter(Boolean).join(" · "))}</div>
-           ${note}`
-        )
-        .addTo(this.map);
+      updateHoverPopup(
+        `<div class="tf-popup-title">${escapeHtml(name)}</div>
+         <div class="tf-popup-meta">${escapeHtml([cat, elev].filter(Boolean).join(" · "))}</div>
+         ${note}`
+      );
       return;
     }
 
@@ -996,25 +1033,21 @@ export class TrailForgeMap {
     const clickHint = this.routePlanMode
       ? "+ Click to add to route"
       : "Click to inspect";
-    this.hoverPopup
-      .setLngLat(e.lngLat)
-      .setHTML(
-        `<div class="tf-popup-title">${escapeHtml(trackName)}</div>
-         <div class="tf-popup-meta">
-           <span class="tf-popup-dot" style="background:${color}"></span>
-           <span>${escapeHtml(grade)}</span>
-           ${liveGrade ? `<span>· Live: ${escapeHtml(liveGrade)}</span>` : ""}
-           ${slope ? `<span>· ${escapeHtml(slope)}</span>` : ""}
-           ${wetRisk ? `<span class="tf-popup-warn">· ${escapeHtml(wetRisk)}</span>` : ""}
-           <span class="tf-popup-hint">${escapeHtml(clickHint)}</span>
-         </div>`
-      )
-      .addTo(this.map);
+    updateHoverPopup(
+      `<div class="tf-popup-title">${escapeHtml(trackName)}</div>
+       <div class="tf-popup-meta">
+         <span class="tf-popup-dot" style="background:${color}"></span>
+         <span>${escapeHtml(grade)}</span>
+         ${liveGrade ? `<span>· Live: ${escapeHtml(liveGrade)}</span>` : ""}
+         ${slope ? `<span>· ${escapeHtml(slope)}</span>` : ""}
+         ${wetRisk ? `<span class="tf-popup-warn">· ${escapeHtml(wetRisk)}</span>` : ""}
+         <span class="tf-popup-hint">${escapeHtml(clickHint)}</span>
+       </div>`
+    );
   }
 
   private applyBasemapVisibility(): void {
-    const showOsm =
-      this.currentBasemap === "osm" || this.currentBasemap === "opentopo";
+    const showOsm = this.currentBasemap === "osm";
     const showOpenTopo = this.currentBasemap === "opentopo";
     const showSat = this.currentBasemap === "satellite";
 

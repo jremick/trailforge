@@ -53,6 +53,7 @@ export interface BackgroundLocationHandle {
 export interface ImuCaptureOptions {
   maxSamples?: number;
   sampleRateHz?: number;
+  metricsIntervalMs?: number;
   onMetrics?: (metrics: ImuMetrics) => void;
 }
 
@@ -229,17 +230,6 @@ function clampAngleDeg(deg: number): number {
   return Math.max(-90, Math.min(90, deg));
 }
 
-function percentile(sorted: readonly number[], p: number): number {
-  if (sorted.length === 0) return 0;
-  if (sorted.length === 1) return sorted[0]!;
-  const idx = Math.max(0, Math.min(1, p)) * (sorted.length - 1);
-  const lo = Math.floor(idx);
-  const hi = Math.ceil(idx);
-  if (lo === hi) return sorted[lo]!;
-  const frac = idx - lo;
-  return sorted[lo]! * (1 - frac) + sorted[hi]! * frac;
-}
-
 /**
  * Detect whether TrailForge is executing inside native Capacitor iOS,
  * native Capacitor Android, or a standard desktop/mobile web PWA browser.
@@ -359,32 +349,52 @@ export function classifyClinometerAlert(
  * - Shock impulse detection: dynamic jolt > 0.8g OR total magnitude > 1.8g
  *   with rising-edge impulse grouping so sustained 50 Hz hits count once
  */
-export function computeImuMetrics(samples: readonly ImuSample[]): ImuMetrics {
-  const valid = samples.filter(
-    (s) =>
-      Number.isFinite(s.ax) && Number.isFinite(s.ay) && Number.isFinite(s.az)
-  );
+function percentileTyped(sorted: Float64Array, len: number, p: number): number {
+  if (len === 0) return 0;
+  if (len === 1) return sorted[0]!;
+  const idx = Math.max(0, Math.min(1, p)) * (len - 1);
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  if (lo === hi) return sorted[lo]!;
+  const frac = idx - lo;
+  return sorted[lo]! * (1 - frac) + sorted[hi]! * frac;
+}
 
-  if (valid.length === 0) {
-    return {
-      sample_count: 0,
-      roughness_rms: null,
-      roughness_p95: null,
-      shock_event_count: 0,
-      max_pitch_deg: null,
-      max_roll_deg: null,
-      latest_pitch_deg: null,
-      latest_roll_deg: null,
-    };
+const EMPTY_IMU_METRICS_RESULT: ImuMetrics = {
+  sample_count: 0,
+  roughness_rms: null,
+  roughness_p95: null,
+  shock_event_count: 0,
+  max_pitch_deg: null,
+  max_roll_deg: null,
+  latest_pitch_deg: null,
+  latest_roll_deg: null,
+};
+
+export function computeImuMetrics(samples: readonly ImuSample[]): ImuMetrics {
+  const n = samples.length;
+  if (n === 0) return { ...EMPTY_IMU_METRICS_RESULT };
+
+  const mags = new Float64Array(n);
+  const validIdx = new Int32Array(n);
+  let validCount = 0;
+  let magSum = 0;
+
+  for (let i = 0; i < n; i += 1) {
+    const s = samples[i]!;
+    if (Number.isFinite(s.ax) && Number.isFinite(s.ay) && Number.isFinite(s.az)) {
+      const m = Math.hypot(s.ax, s.ay, s.az);
+      mags[validCount] = m;
+      validIdx[validCount] = i;
+      magSum += m;
+      validCount += 1;
+    }
   }
 
-  const magnitudes = valid.map((s) => Math.hypot(s.ax, s.ay, s.az));
-  const baseline =
-    valid.length === 1
-      ? 1.0
-      : magnitudes.reduce((acc, m) => acc + m, 0) / magnitudes.length;
+  if (validCount === 0) return { ...EMPTY_IMU_METRICS_RESULT };
 
-  const dynamicDevs: number[] = [];
+  const baseline = validCount === 1 ? 1.0 : magSum / validCount;
+  const dynDevs = new Float64Array(validCount);
   let sumSq = 0;
   let shockCount = 0;
   let inShock = false;
@@ -393,11 +403,11 @@ export function computeImuMetrics(samples: readonly ImuSample[]): ImuMetrics {
   let latestPitch = 0;
   let latestRoll = 0;
 
-  for (let i = 0; i < valid.length; i += 1) {
-    const sample = valid[i]!;
-    const mag = magnitudes[i]!;
+  for (let k = 0; k < validCount; k += 1) {
+    const sample = samples[validIdx[k]!]!;
+    const mag = mags[k]!;
     const dyn = Math.abs(mag - baseline);
-    dynamicDevs.push(dyn);
+    dynDevs[k] = dyn;
     sumSq += dyn * dyn;
 
     const isShock =
@@ -409,15 +419,20 @@ export function computeImuMetrics(samples: readonly ImuSample[]): ImuMetrics {
       inShock = false;
     }
 
-    const derived = computePitchRollDeg(sample.ax, sample.ay, sample.az);
-    const pitch =
-      typeof sample.pitch_deg === "number" && Number.isFinite(sample.pitch_deg)
-        ? round1(clampAngleDeg(sample.pitch_deg))
-        : derived.pitch_deg;
-    const roll =
-      typeof sample.roll_deg === "number" && Number.isFinite(sample.roll_deg)
-        ? round1(clampAngleDeg(sample.roll_deg))
-        : derived.roll_deg;
+    const hasPitch =
+      typeof sample.pitch_deg === "number" && Number.isFinite(sample.pitch_deg);
+    const hasRoll =
+      typeof sample.roll_deg === "number" && Number.isFinite(sample.roll_deg);
+    const derived =
+      hasPitch && hasRoll
+        ? null
+        : computePitchRollDeg(sample.ax, sample.ay, sample.az);
+    const pitch = hasPitch
+      ? round1(clampAngleDeg(sample.pitch_deg!))
+      : derived!.pitch_deg;
+    const roll = hasRoll
+      ? round1(clampAngleDeg(sample.roll_deg!))
+      : derived!.roll_deg;
 
     if (Math.abs(pitch) > maxPitchAbs) maxPitchAbs = Math.abs(pitch);
     if (Math.abs(roll) > maxRollAbs) maxRollAbs = Math.abs(roll);
@@ -425,12 +440,12 @@ export function computeImuMetrics(samples: readonly ImuSample[]): ImuMetrics {
     latestRoll = roll;
   }
 
-  const sortedDyn = [...dynamicDevs].sort((a, b) => a - b);
-  const rms = Math.sqrt(sumSq / valid.length);
-  const p95 = percentile(sortedDyn, 0.95);
+  dynDevs.sort();
+  const rms = Math.sqrt(sumSq / validCount);
+  const p95 = percentileTyped(dynDevs, validCount, 0.95);
 
   return {
-    sample_count: valid.length,
+    sample_count: validCount,
     roughness_rms: round4(rms),
     roughness_p95: round4(p95),
     shock_event_count: shockCount,
@@ -642,8 +657,25 @@ export async function startHighRateImuCapture(
   const mode = getRuntimeMode(env);
   const win = resolveWindow(env);
   const maxSamples = Math.max(10, Math.floor(options.maxSamples ?? DEFAULT_IMU_MAX_SAMPLES));
+  const metricsIntervalMs = Math.max(50, Math.floor(options.metricsIntervalMs ?? 250));
 
-  const ring: ImuSample[] = [];
+  // Fixed-capacity typed-array circular buffer (O(1) insert, zero GC churn at 50 Hz)
+  const tMsBuf = new Float64Array(maxSamples);
+  const axBuf = new Float64Array(maxSamples);
+  const ayBuf = new Float64Array(maxSamples);
+  const azBuf = new Float64Array(maxSamples);
+  const magBuf = new Float64Array(maxSamples);
+  const pitchBuf = new Float32Array(maxSamples);
+  const rollBuf = new Float32Array(maxSamples);
+  const scratchDyn = new Float64Array(maxSamples);
+
+  let writeIdx = 0;
+  let count = 0;
+  let magSum = 0;
+  let metricsDirty = true;
+  let cachedMetrics: ImuMetrics = { ...EMPTY_IMU_METRICS_RESULT };
+  let lastEmitMs = 0;
+
   let cachedOrientation: { pitch_deg: number | null; roll_deg: number | null } = {
     pitch_deg: null,
     roll_deg: null,
@@ -652,30 +684,140 @@ export async function startHighRateImuCapture(
   let stopped = false;
   const cleanups: Array<() => Promise<void> | void> = [];
 
-  const pushSample = (sample: ImuSample): ImuMetrics => {
-    const derived = computePitchRollDeg(sample.ax, sample.ay, sample.az);
-    const normalized: ImuSample = {
-      t_ms: Number.isFinite(sample.t_ms) ? Math.round(sample.t_ms) : Date.now(),
-      ax: round4(sample.ax),
-      ay: round4(sample.ay),
-      az: round4(sample.az),
-      pitch_deg:
-        typeof sample.pitch_deg === "number" && Number.isFinite(sample.pitch_deg)
-          ? round1(clampAngleDeg(sample.pitch_deg))
-          : (cachedOrientation.pitch_deg ?? derived.pitch_deg),
-      roll_deg:
-        typeof sample.roll_deg === "number" && Number.isFinite(sample.roll_deg)
-          ? round1(clampAngleDeg(sample.roll_deg))
-          : (cachedOrientation.roll_deg ?? derived.roll_deg),
-    };
-    ring.push(normalized);
-    if (ring.length > maxSamples) {
-      ring.splice(0, ring.length - maxSamples);
+  const computeRingMetrics = (): ImuMetrics => {
+    if (!metricsDirty) return cachedMetrics;
+    if (count === 0) {
+      cachedMetrics = { ...EMPTY_IMU_METRICS_RESULT };
+      metricsDirty = false;
+      return cachedMetrics;
     }
-    const metrics = computeImuMetrics(ring);
-    options.onMetrics?.(metrics);
+
+    const startIdx = count < maxSamples ? 0 : writeIdx;
+    const baseline = count === 1 ? 1.0 : magSum / count;
+    let sumSq = 0;
+    let shockCount = 0;
+    let inShock = false;
+    let maxPitchAbs = 0;
+    let maxRollAbs = 0;
+    let latestPitch = 0;
+    let latestRoll = 0;
+
+    for (let k = 0; k < count; k += 1) {
+      const idx = (startIdx + k) % maxSamples;
+      const mag = magBuf[idx]!;
+      const dyn = Math.abs(mag - baseline);
+      scratchDyn[k] = dyn;
+      sumSq += dyn * dyn;
+
+      const isShock =
+        dyn > SHOCK_DYNAMIC_THRESHOLD_G || mag > SHOCK_TOTAL_THRESHOLD_G;
+      if (isShock && !inShock) {
+        shockCount += 1;
+        inShock = true;
+      } else if (!isShock) {
+        inShock = false;
+      }
+
+      const pitch = pitchBuf[idx]!;
+      const roll = rollBuf[idx]!;
+      const absP = Math.abs(pitch);
+      const absR = Math.abs(roll);
+      if (absP > maxPitchAbs) maxPitchAbs = absP;
+      if (absR > maxRollAbs) maxRollAbs = absR;
+      latestPitch = pitch;
+      latestRoll = roll;
+    }
+
+    const activeSlice = scratchDyn.subarray(0, count);
+    activeSlice.sort();
+    const rms = Math.sqrt(sumSq / count);
+    const p95 = percentileTyped(activeSlice, count, 0.95);
+
+    cachedMetrics = {
+      sample_count: count,
+      roughness_rms: round4(rms),
+      roughness_p95: round4(p95),
+      shock_event_count: shockCount,
+      max_pitch_deg: round1(maxPitchAbs),
+      max_roll_deg: round1(maxRollAbs),
+      latest_pitch_deg: round1(latestPitch),
+      latest_roll_deg: round1(latestRoll),
+    };
+    metricsDirty = false;
+    return cachedMetrics;
+  };
+
+  const ingestSample = (sample: ImuSample, fromSensor: boolean): ImuMetrics => {
+    if (
+      !Number.isFinite(sample.ax) ||
+      !Number.isFinite(sample.ay) ||
+      !Number.isFinite(sample.az)
+    ) {
+      return cachedMetrics;
+    }
+
+    const ax = round4(sample.ax);
+    const ay = round4(sample.ay);
+    const az = round4(sample.az);
+    const mag = Math.hypot(ax, ay, az);
+
+    const hasSamplePitch =
+      typeof sample.pitch_deg === "number" && Number.isFinite(sample.pitch_deg);
+    const hasSampleRoll =
+      typeof sample.roll_deg === "number" && Number.isFinite(sample.roll_deg);
+    const needDerived =
+      (!hasSamplePitch && cachedOrientation.pitch_deg === null) ||
+      (!hasSampleRoll && cachedOrientation.roll_deg === null);
+    const derived = needDerived ? computePitchRollDeg(ax, ay, az) : null;
+
+    const pitch = hasSamplePitch
+      ? round1(clampAngleDeg(sample.pitch_deg!))
+      : (cachedOrientation.pitch_deg ?? derived!.pitch_deg);
+    const roll = hasSampleRoll
+      ? round1(clampAngleDeg(sample.roll_deg!))
+      : (cachedOrientation.roll_deg ?? derived!.roll_deg);
+
+    if (count === maxSamples) {
+      magSum -= magBuf[writeIdx]!;
+    } else {
+      count += 1;
+    }
+
+    tMsBuf[writeIdx] = Number.isFinite(sample.t_ms)
+      ? Math.round(sample.t_ms)
+      : Date.now();
+    axBuf[writeIdx] = ax;
+    ayBuf[writeIdx] = ay;
+    azBuf[writeIdx] = az;
+    magBuf[writeIdx] = mag;
+    pitchBuf[writeIdx] = pitch;
+    rollBuf[writeIdx] = roll;
+    magSum += mag;
+    writeIdx = (writeIdx + 1) % maxSamples;
+    metricsDirty = true;
+
+    const nowMs = Date.now();
+    if (fromSensor) {
+      // Throttle heavy p95/RMS recalculation to <=4 Hz while keeping latest pitch/roll fresh
+      if (options.onMetrics && nowMs - lastEmitMs >= metricsIntervalMs) {
+        lastEmitMs = nowMs;
+        const m = computeRingMetrics();
+        options.onMetrics(m);
+        return m;
+      }
+      return cachedMetrics;
+    }
+
+    const metrics = computeRingMetrics();
+    if (options.onMetrics && nowMs - lastEmitMs >= metricsIntervalMs) {
+      lastEmitMs = nowMs;
+      options.onMetrics(metrics);
+    }
     return metrics;
   };
+
+  const pushSample = (sample: ImuSample): ImuMetrics =>
+    ingestSample(sample, false);
 
   const motionPlugin = win?.Capacitor?.Plugins?.Motion;
   if (mode !== "pwa_browser" && motionPlugin?.addListener) {
@@ -696,12 +838,15 @@ export async function startHighRateImuCapture(
         if (!Number.isFinite(ax) || !Number.isFinite(ay) || !Number.isFinite(az)) {
           return;
         }
-        pushSample({
-          t_ms: Date.now(),
-          ax,
-          ay,
-          az,
-        });
+        ingestSample(
+          {
+            t_ms: Date.now(),
+            ax,
+            ay,
+            az,
+          },
+          true
+        );
       });
       cleanups.push(() => accelHandle.remove());
 
@@ -755,12 +900,15 @@ export async function startHighRateImuCapture(
       if (!Number.isFinite(ax) || !Number.isFinite(ay) || !Number.isFinite(az)) {
         return;
       }
-      pushSample({
-        t_ms: Date.now(),
-        ax,
-        ay,
-        az,
-      });
+      ingestSample(
+        {
+          t_ms: Date.now(),
+          ax,
+          ay,
+          az,
+        },
+        true
+      );
     };
 
     if ("DeviceOrientationEvent" in win) {
@@ -783,11 +931,31 @@ export async function startHighRateImuCapture(
   return {
     mode,
     isNativeSensor,
-    getSamples: () => [...ring],
-    getMetrics: () => computeImuMetrics(ring),
+    getSamples: (): ImuSample[] => {
+      const out: ImuSample[] = new Array(count);
+      const startIdx = count < maxSamples ? 0 : writeIdx;
+      for (let k = 0; k < count; k += 1) {
+        const idx = (startIdx + k) % maxSamples;
+        out[k] = {
+          t_ms: tMsBuf[idx]!,
+          ax: axBuf[idx]!,
+          ay: ayBuf[idx]!,
+          az: azBuf[idx]!,
+          pitch_deg: round1(pitchBuf[idx]!),
+          roll_deg: round1(rollBuf[idx]!),
+        };
+      }
+      return out;
+    },
+    getMetrics: () => computeRingMetrics(),
     pushSample,
     clear: () => {
-      ring.length = 0;
+      writeIdx = 0;
+      count = 0;
+      magSum = 0;
+      metricsDirty = false;
+      lastEmitMs = 0;
+      cachedMetrics = { ...EMPTY_IMU_METRICS_RESULT };
       cachedOrientation = { pitch_deg: null, roll_deg: null };
     },
     stop: async () => {

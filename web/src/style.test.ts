@@ -294,6 +294,15 @@ describe("MapLibre 5 PMTiles & offline fallback style builder", () => {
       (byId.get("tf-snow-line-fill")?.layout as { visibility?: string })
         ?.visibility
     ).toBe("none");
+
+    // OpenTopoMap basemap must not simultaneously load OSM raster tiles underneath
+    const openTopoStyle = buildTrailForgeStyle({
+      initialBasemap: "opentopo",
+      layers,
+    });
+    const otById = new Map(openTopoStyle.layers.map((l) => [l.id, l]));
+    expect(otById.get("basemap-opentopo")?.layout).toEqual({ visibility: "visible" });
+    expect(otById.get("basemap-osm-underlay")?.layout).toEqual({ visibility: "none" });
   });
 
   it("converts fallback /api/pois items into GeoJSON with resolved outdoor icons", () => {

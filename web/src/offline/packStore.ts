@@ -142,6 +142,67 @@ class IndexedDbOfflineBackend implements OfflineKvBackend {
 
 let activeBackend: OfflineKvBackend | null = null;
 let memoryActivePackId: string | null = null;
+// In-memory cache of deserialized offline pack snapshots so rapid search keystrokes and
+// track clicks do not structured-clone multi-MB IndexedDB objects on every interaction.
+const snapshotMemCache = new Map<string, OfflinePackSnapshot | null>();
+const trackIndexMemCache = new Map<string, Map<string, TrackInspectorDetail>>();
+
+function clearSnapshotMemCache(regionId?: string): void {
+  if (regionId) {
+    snapshotMemCache.delete(regionId);
+    trackIndexMemCache.delete(regionId);
+  } else {
+    snapshotMemCache.clear();
+    trackIndexMemCache.clear();
+  }
+}
+
+function notifySwInvalidatePackCache(regionId?: string): void {
+  try {
+    if (
+      typeof navigator !== "undefined" &&
+      "serviceWorker" in navigator &&
+      navigator.serviceWorker.controller
+    ) {
+      navigator.serviceWorker.controller.postMessage({
+        type: "INVALIDATE_PACK_CACHE",
+        regionId: regionId ?? null,
+      });
+    }
+  } catch (err) {
+    console.debug("Failed to notify service worker of pack cache invalidation:", err);
+  }
+}
+
+async function loadSnapshotCached(
+  regionId: string
+): Promise<OfflinePackSnapshot | null> {
+  if (snapshotMemCache.has(regionId)) {
+    return snapshotMemCache.get(regionId) ?? null;
+  }
+  const snap = await getOfflineBackend().get<OfflinePackSnapshot>(
+    "snapshots",
+    regionId
+  );
+  snapshotMemCache.set(regionId, snap);
+  trackIndexMemCache.delete(regionId);
+  return snap;
+}
+
+function getTrackIndexForSnapshot(
+  regionId: string,
+  snap: OfflinePackSnapshot
+): Map<string, TrackInspectorDetail> {
+  let idx = trackIndexMemCache.get(regionId);
+  if (!idx) {
+    idx = new Map();
+    for (const trk of snap.tracks ?? []) {
+      idx.set(trk.track_id, trk);
+    }
+    trackIndexMemCache.set(regionId, idx);
+  }
+  return idx;
+}
 
 export function getOfflineBackend(): OfflineKvBackend {
   if (activeBackend) return activeBackend;
@@ -158,6 +219,7 @@ export function setOfflineBackendForTesting(
 ): void {
   activeBackend = backend;
   memoryActivePackId = null;
+  clearSnapshotMemCache();
 }
 
 export function getActiveOfflinePackId(): string | null {
@@ -207,6 +269,9 @@ export async function saveOfflinePackData(
   const backend = getOfflineBackend();
   await backend.put("packs", record.region_id, record);
   await backend.put("snapshots", record.region_id, snapshot);
+  snapshotMemCache.set(record.region_id, snapshot);
+  trackIndexMemCache.delete(record.region_id);
+  notifySwInvalidatePackCache(record.region_id);
 }
 
 export async function removeOfflinePack(regionId: string): Promise<void> {
@@ -214,6 +279,8 @@ export async function removeOfflinePack(regionId: string): Promise<void> {
   const existing = await getDownloadedPack(regionId);
   await backend.delete("packs", regionId);
   await backend.delete("snapshots", regionId);
+  clearSnapshotMemCache(regionId);
+  notifySwInvalidatePackCache(regionId);
 
   if (getActiveOfflinePackId() === regionId) {
     setActiveOfflinePackId(null);
@@ -428,10 +495,7 @@ async function resolvePreferredPackAndSnapshot(
   if (targetId) {
     const pack = await backend.get<DownloadedPackRecord>("packs", targetId);
     if (pack) {
-      const snapshot = await backend.get<OfflinePackSnapshot>(
-        "snapshots",
-        targetId
-      );
+      const snapshot = await loadSnapshotCached(targetId);
       return { pack, snapshot };
     }
   }
@@ -439,10 +503,7 @@ async function resolvePreferredPackAndSnapshot(
   const all = await listDownloadedPacks();
   const first = all[0];
   if (!first) return null;
-  const snapshot = await backend.get<OfflinePackSnapshot>(
-    "snapshots",
-    first.region_id
-  );
+  const snapshot = await loadSnapshotCached(first.region_id);
   return { pack: first, snapshot };
 }
 
@@ -473,25 +534,23 @@ export async function getOfflineTileManifest(
 export async function getOfflineTrackDetail(
   trackId: string
 ): Promise<TrackInspectorDetail | null> {
-  const backend = getOfflineBackend();
   const activeId = getActiveOfflinePackId();
-  const snapshots: OfflinePackSnapshot[] = [];
 
   if (activeId) {
-    const activeSnap = await backend.get<OfflinePackSnapshot>(
-      "snapshots",
-      activeId
-    );
-    if (activeSnap) snapshots.push(activeSnap);
-  }
-  const allSnaps = await backend.getAll<OfflinePackSnapshot>("snapshots");
-  for (const s of allSnaps) {
-    if (s.region_id !== activeId) snapshots.push(s);
+    const activeSnap = await loadSnapshotCached(activeId);
+    if (activeSnap) {
+      const hit = getTrackIndexForSnapshot(activeId, activeSnap).get(trackId);
+      if (hit) return hit;
+    }
   }
 
-  for (const snap of snapshots) {
-    const found = (snap.tracks ?? []).find((t) => t.track_id === trackId);
-    if (found) return found;
+  const packs = await listDownloadedPacks();
+  for (const pack of packs) {
+    if (pack.region_id === activeId) continue;
+    const snap = await loadSnapshotCached(pack.region_id);
+    if (!snap) continue;
+    const hit = getTrackIndexForSnapshot(pack.region_id, snap).get(trackId);
+    if (hit) return hit;
   }
   return null;
 }

@@ -72,7 +72,6 @@ export class OfflinePacksPanel {
     this.root.className = "tf-account-panel tf-packs-panel";
     this.root.setAttribute("aria-label", "Offline Regional Packs & Sync Queue");
     this.root.setAttribute("aria-hidden", "true");
-    this.render();
   }
 
   isPanelOpen(): boolean {
@@ -92,7 +91,9 @@ export class OfflinePacksPanel {
 
   updateState(patch: Partial<PacksPanelState>): void {
     this.state = { ...this.state, ...patch };
-    this.render();
+    if (this.isOpen) {
+      this.render();
+    }
   }
 
   private mergedRegions(): OfflinePackRegionItem[] {

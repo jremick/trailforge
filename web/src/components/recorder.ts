@@ -19,7 +19,7 @@ import {
 import {
   SIMULATED_HIGH_COUNTRY_WAYPOINTS,
   buildBacktrackGuidance,
-  computeRecorderStats,
+  haversineDistanceM,
   synthesizeSimulatedImuBurst,
 } from "../offline/recorderEngine";
 import { escapeHtml } from "../presets";
@@ -94,6 +94,10 @@ export class InCabRecorderHud {
   private expanded = false;
   private phase: RecorderPhase = "idle";
   private points: RecordedBreadcrumbPoint[] = [];
+  private runningDistanceM = 0;
+  private startTimeMs: number | null = null;
+  private lastPointTimeMs: number | null = null;
+  private lastSpeedKmh = 0;
   private backtrackActive = false;
   private wakeLockEnabled = false;
   private wakeLockStatus: "off" | "active" | "unsupported" = "off";
@@ -101,6 +105,9 @@ export class InCabRecorderHud {
   private imuHandle: ImuCaptureHandle | null = null;
   private recordedImuSamples: ImuSample[] = [];
   private imuMetrics: ImuMetrics = { ...EMPTY_IMU_METRICS };
+  private lastMapPublishMs = 0;
+  private mapPublishTimerId: number | null = null;
+  private renderedStructKey = "";
 
   private locationHandle: BackgroundLocationHandle | null = null;
   private isNativeBackgroundGps = false;
@@ -141,8 +148,12 @@ export class InCabRecorderHud {
     const handle = await startHighRateImuCapture({
       maxSamples: 1500,
       sampleRateHz: 50,
+      metricsIntervalMs: 250,
       onMetrics: (metrics) => {
         this.imuMetrics = metrics;
+        if (this.expanded && this.phase === "recording") {
+          this.patchLiveMetricsInPlace();
+        }
       },
     });
     this.imuHandle = handle;
@@ -235,6 +246,7 @@ export class InCabRecorderHud {
       this.simIndex >= SIMULATED_HIGH_COUNTRY_WAYPOINTS.length
     ) {
       this.points = [];
+      this.resetRunningStats();
       this.simIndex = 0;
       imu.clear();
       this.imuMetrics = { ...EMPTY_IMU_METRICS };
@@ -257,10 +269,10 @@ export class InCabRecorderHud {
         (SIMULATED_HIGH_COUNTRY_WAYPOINTS.length - this.simIndex) * 25_000;
 
       const burst = synthesizeSimulatedImuBurst(wp, baseMs, 8);
-      let metrics = this.imuMetrics;
       for (const sample of burst) {
-        metrics = imu.pushSample(sample);
+        imu.pushSample(sample);
       }
+      const metrics = imu.getMetrics();
       this.imuMetrics = metrics;
 
       this.appendPoint({
@@ -290,6 +302,7 @@ export class InCabRecorderHud {
     if (this.phase !== "recording") return;
     this.phase = "paused";
     await this.stopTimersAndWatchers();
+    this.flushMapPointsNow();
     this.render();
   }
 
@@ -304,6 +317,7 @@ export class InCabRecorderHud {
 
   private async stopRecording(): Promise<void> {
     await this.stopTimersAndWatchers();
+    this.flushMapPointsNow();
     // Snapshot collected IMU samples & metrics for mobile-sync while releasing live listeners
     if (this.imuHandle) {
       this.imuMetrics = this.imuHandle.getMetrics();
@@ -326,6 +340,7 @@ export class InCabRecorderHud {
     await this.stopImuCapture(true);
     this.recordedImuSamples = [];
     this.points = [];
+    this.resetRunningStats();
     this.backtrackActive = false;
     this.phase = "idle";
     this.simIndex = 0;
@@ -336,13 +351,211 @@ export class InCabRecorderHud {
     this.render();
   }
 
-  private appendPoint(pt: RecordedBreadcrumbPoint): void {
-    this.points = [...this.points, pt];
+  private resetRunningStats(): void {
+    this.runningDistanceM = 0;
+    this.startTimeMs = null;
+    this.lastPointTimeMs = null;
+    this.lastSpeedKmh = 0;
+  }
+
+  private getCurrentStats(): {
+    distanceM: number;
+    durationS: number;
+    currentSpeedKmh: number;
+    currentElevM: number | null;
+    pointCount: number;
+    latestRoughnessRms: number | null;
+  } {
+    const count = this.points.length;
+    if (count === 0) {
+      return {
+        distanceM: 0,
+        durationS: 0,
+        currentSpeedKmh: 0,
+        currentElevM: null,
+        pointCount: 0,
+        latestRoughnessRms: null,
+      };
+    }
+    const last = this.points[count - 1]!;
+    const durationS =
+      this.startTimeMs !== null && this.lastPointTimeMs !== null
+        ? Math.max(0, Math.round((this.lastPointTimeMs - this.startTimeMs) / 1000))
+        : 0;
+    return {
+      distanceM: Math.round(this.runningDistanceM * 10) / 10,
+      durationS,
+      currentSpeedKmh: Math.round(this.lastSpeedKmh * 10) / 10,
+      currentElevM: last.elev_m ?? null,
+      pointCount: count,
+      latestRoughnessRms: last.roughness_rms ?? null,
+    };
+  }
+
+  private scheduleMapPointsPublish(): void {
+    const now = Date.now();
+    if (now - this.lastMapPublishMs >= 500) {
+      this.lastMapPublishMs = now;
+      if (this.mapPublishTimerId !== null) {
+        window.clearTimeout(this.mapPublishTimerId);
+        this.mapPublishTimerId = null;
+      }
+      this.callbacks.onPointsChanged(this.points, this.backtrackActive);
+      return;
+    }
+    if (this.mapPublishTimerId === null) {
+      this.mapPublishTimerId = window.setTimeout(() => {
+        this.mapPublishTimerId = null;
+        this.lastMapPublishMs = Date.now();
+        this.callbacks.onPointsChanged(this.points, this.backtrackActive);
+      }, 500 - (now - this.lastMapPublishMs));
+    }
+  }
+
+  private flushMapPointsNow(): void {
+    if (this.mapPublishTimerId !== null) {
+      window.clearTimeout(this.mapPublishTimerId);
+      this.mapPublishTimerId = null;
+    }
+    this.lastMapPublishMs = Date.now();
     this.callbacks.onPointsChanged(this.points, this.backtrackActive);
+  }
+
+  private appendPoint(pt: RecordedBreadcrumbPoint): void {
+    const prev = this.points.length > 0 ? this.points[this.points.length - 1]! : null;
+    const ptMs = Date.parse(pt.timestamp);
+    if (prev) {
+      const segM = haversineDistanceM(prev.lat, prev.lon, pt.lat, pt.lon);
+      this.runningDistanceM += segM;
+      if (typeof pt.speed_mps === "number" && Number.isFinite(pt.speed_mps)) {
+        this.lastSpeedKmh = Math.max(0, pt.speed_mps * 3.6);
+      } else if (Number.isFinite(ptMs) && this.lastPointTimeMs !== null) {
+        const dtS = (ptMs - this.lastPointTimeMs) / 1000;
+        if (dtS > 0.2) {
+          this.lastSpeedKmh = Math.min(140, (segM / dtS) * 3.6);
+        }
+      }
+    } else {
+      this.startTimeMs = Number.isFinite(ptMs) ? ptMs : null;
+      this.lastSpeedKmh =
+        typeof pt.speed_mps === "number" && Number.isFinite(pt.speed_mps)
+          ? Math.max(0, pt.speed_mps * 3.6)
+          : 0;
+    }
+    if (Number.isFinite(ptMs)) {
+      this.lastPointTimeMs = ptMs;
+    }
+
+    // Mutate in place (O(1)) instead of cloning the full points array on every GPS fix
+    this.points.push(pt);
+    this.scheduleMapPointsPublish();
     if (this.points.length === 1 || this.points.length % 5 === 0) {
       this.callbacks.onCenterOnPoint(pt.lat, pt.lon);
     }
-    this.render();
+
+    if (this.canPatchInPlace()) {
+      this.patchLiveMetricsInPlace();
+    } else {
+      this.render();
+    }
+  }
+
+  private computeStructKey(): string {
+    return [
+      this.expanded ? "1" : "0",
+      this.phase,
+      this.backtrackActive ? "1" : "0",
+      this.errorMsg ?? "",
+      this.points.length >= 2 ? "2+" : this.points.length === 1 ? "1" : "0",
+      this.wakeLockStatus,
+      this.motionEnabled ? "1" : "0",
+      this.savingTrip ? "1" : "0",
+      this.isNativeBackgroundGps ? "1" : "0",
+    ].join("|");
+  }
+
+  private canPatchInPlace(): boolean {
+    return (
+      this.renderedStructKey !== "" &&
+      this.renderedStructKey === this.computeStructKey() &&
+      !this.backtrackActive
+    );
+  }
+
+  private patchLiveMetricsInPlace(): void {
+    const stats = this.getCurrentStats();
+    const pill = this.root.querySelector<HTMLElement>("[data-role='rec-toggle']");
+    if (pill) {
+      pill.textContent =
+        this.phase === "recording"
+          ? `● REC ${(stats.distanceM / 1000).toFixed(2)} km · ${formatClock(stats.durationS)}`
+          : this.phase === "paused"
+            ? `❚❚ PAUSED ${(stats.distanceM / 1000).toFixed(2)} km`
+            : this.phase === "stopped"
+              ? `■ SAVING (${stats.pointCount} pts)`
+              : "● In-Cab Recorder";
+    }
+    if (!this.expanded) return;
+
+    const setStat = (key: string, value: string): void => {
+      const el = this.root.querySelector<HTMLElement>(`[data-rec-stat='${key}']`);
+      if (el && el.textContent !== value) el.textContent = value;
+    };
+
+    const latestPitch = this.imuMetrics.latest_pitch_deg;
+    const latestRoll = this.imuMetrics.latest_roll_deg;
+    const clinoAlert = classifyClinometerAlert(latestPitch, latestRoll);
+    const pitchAlert = classifyClinometerAlert(latestPitch, 0);
+    const rollAlert = classifyClinometerAlert(0, latestRoll);
+    const clinoBadge =
+      clinoAlert === "hazard"
+        ? "⚠ HAZARD ≥25°"
+        : clinoAlert === "caution"
+          ? "⚠ CAUTION ≥15°"
+          : "LEVEL";
+
+    const clinoCard = this.root.querySelector<HTMLElement>("[data-role='clinometer']");
+    if (clinoCard) {
+      clinoCard.className = `tf-clino-card tf-clino-${clinoAlert}`;
+      clinoCard.dataset.severity = clinoAlert;
+    }
+    const pitchAxis = this.root.querySelector<HTMLElement>("[data-clino-axis='pitch']");
+    if (pitchAxis) pitchAxis.className = `tf-clino-axis tf-clino-axis-${pitchAlert}`;
+    const rollAxis = this.root.querySelector<HTMLElement>("[data-clino-axis='roll']");
+    if (rollAxis) rollAxis.className = `tf-clino-axis tf-clino-axis-${rollAlert}`;
+    const pitchBar = this.root.querySelector<HTMLElement>("[data-clino-bar='pitch']");
+    if (pitchBar) pitchBar.style.width = `${clinoBarFillPct(latestPitch)}%`;
+    const rollBar = this.root.querySelector<HTMLElement>("[data-clino-bar='roll']");
+    if (rollBar) rollBar.style.width = `${clinoBarFillPct(latestRoll)}%`;
+
+    const roughDisplay = this.imuMetrics.roughness_rms ?? stats.latestRoughnessRms;
+    const p95Display = this.imuMetrics.roughness_p95;
+
+    setStat("clino-badge", clinoBadge);
+    setStat("pitch", formatSignedDeg(latestPitch));
+    setStat("roll", formatSignedDeg(latestRoll));
+    setStat(
+      "max-pitch",
+      `Max P ${this.imuMetrics.max_pitch_deg !== null ? `${this.imuMetrics.max_pitch_deg.toFixed(1)}°` : "—"}`
+    );
+    setStat(
+      "max-roll",
+      `· Max R ${this.imuMetrics.max_roll_deg !== null ? `${this.imuMetrics.max_roll_deg.toFixed(1)}°` : "—"}`
+    );
+    setStat("imu-count", `· IMU ${this.imuMetrics.sample_count} smpl`);
+    setStat("dist", `${(stats.distanceM / 1000).toFixed(2)} km`);
+    setStat("time", formatClock(stats.durationS));
+    setStat("speed", `${stats.currentSpeedKmh.toFixed(1)} km/h`);
+    setStat("elev", stats.currentElevM !== null ? `${Math.round(stats.currentElevM)} m` : "—");
+    setStat("pts", String(stats.pointCount));
+    setStat("rough", roughDisplay !== null ? `${roughDisplay.toFixed(2)}g` : "—");
+    setStat("p95", p95Display !== null ? `${p95Display.toFixed(2)}g` : "—");
+
+    const shocksEl = this.root.querySelector<HTMLElement>("[data-rec-stat='shocks']");
+    if (shocksEl) {
+      shocksEl.textContent = String(this.imuMetrics.shock_event_count);
+      shocksEl.className = this.imuMetrics.shock_event_count > 0 ? "tf-accent-amber" : "";
+    }
   }
 
   private async stopTimersAndWatchers(): Promise<void> {
@@ -354,6 +567,10 @@ export class InCabRecorderHud {
     if (this.simTimerId !== null) {
       window.clearInterval(this.simTimerId);
       this.simTimerId = null;
+    }
+    if (this.mapPublishTimerId !== null) {
+      window.clearTimeout(this.mapPublishTimerId);
+      this.mapPublishTimerId = null;
     }
   }
 
@@ -445,7 +662,7 @@ export class InCabRecorderHud {
   }
 
   private render(): void {
-    const stats = computeRecorderStats(this.points);
+    const stats = this.getCurrentStats();
     const backtrack = this.backtrackActive
       ? buildBacktrackGuidance(this.points)
       : null;
@@ -496,32 +713,32 @@ export class InCabRecorderHud {
       <div class="tf-clino-card tf-clino-${clinoAlert}" data-role="clinometer" data-severity="${clinoAlert}">
         <div class="tf-clino-head">
           <span class="tf-clino-title">4WD Clinometer</span>
-          <span class="tf-clino-badge mono">${escapeHtml(clinoBadge)}</span>
+          <span class="tf-clino-badge mono" data-rec-stat="clino-badge">${escapeHtml(clinoBadge)}</span>
         </div>
         <div class="tf-clino-grid mono">
-          <div class="tf-clino-axis tf-clino-axis-${pitchAlert}">
+          <div class="tf-clino-axis tf-clino-axis-${pitchAlert}" data-clino-axis="pitch">
             <div class="tf-clino-row">
               <span class="tf-stat-label">Pitch</span>
-              <strong>${escapeHtml(formatSignedDeg(latestPitch))}</strong>
+              <strong data-rec-stat="pitch">${escapeHtml(formatSignedDeg(latestPitch))}</strong>
             </div>
             <div class="tf-clino-bar">
-              <div class="tf-clino-bar-fill" style="width:${clinoBarFillPct(latestPitch)}%"></div>
+              <div class="tf-clino-bar-fill" data-clino-bar="pitch" style="width:${clinoBarFillPct(latestPitch)}%"></div>
             </div>
           </div>
-          <div class="tf-clino-axis tf-clino-axis-${rollAlert}">
+          <div class="tf-clino-axis tf-clino-axis-${rollAlert}" data-clino-axis="roll">
             <div class="tf-clino-row">
               <span class="tf-stat-label">Roll</span>
-              <strong>${escapeHtml(formatSignedDeg(latestRoll))}</strong>
+              <strong data-rec-stat="roll">${escapeHtml(formatSignedDeg(latestRoll))}</strong>
             </div>
             <div class="tf-clino-bar">
-              <div class="tf-clino-bar-fill" style="width:${clinoBarFillPct(latestRoll)}%"></div>
+              <div class="tf-clino-bar-fill" data-clino-bar="roll" style="width:${clinoBarFillPct(latestRoll)}%"></div>
             </div>
           </div>
         </div>
         <div class="tf-clino-foot mono">
-          <span>Max P ${this.imuMetrics.max_pitch_deg !== null ? `${this.imuMetrics.max_pitch_deg.toFixed(1)}°` : "—"}</span>
-          <span>· Max R ${this.imuMetrics.max_roll_deg !== null ? `${this.imuMetrics.max_roll_deg.toFixed(1)}°` : "—"}</span>
-          <span>· IMU ${this.imuMetrics.sample_count} smpl</span>
+          <span data-rec-stat="max-pitch">Max P ${this.imuMetrics.max_pitch_deg !== null ? `${this.imuMetrics.max_pitch_deg.toFixed(1)}°` : "—"}</span>
+          <span data-rec-stat="max-roll">· Max R ${this.imuMetrics.max_roll_deg !== null ? `${this.imuMetrics.max_roll_deg.toFixed(1)}°` : "—"}</span>
+          <span data-rec-stat="imu-count">· IMU ${this.imuMetrics.sample_count} smpl</span>
         </div>
       </div>
     `;
@@ -600,14 +817,14 @@ export class InCabRecorderHud {
           ${clinometerHtml}
 
           <div class="tf-recorder-stats mono">
-            <div><span class="tf-stat-label">Dist</span><strong>${(stats.distanceM / 1000).toFixed(2)} km</strong></div>
-            <div><span class="tf-stat-label">Time</span><strong>${formatClock(stats.durationS)}</strong></div>
-            <div><span class="tf-stat-label">Speed</span><strong>${stats.currentSpeedKmh.toFixed(1)} km/h</strong></div>
-            <div><span class="tf-stat-label">Elev</span><strong>${stats.currentElevM !== null ? `${Math.round(stats.currentElevM)} m` : "—"}</strong></div>
-            <div><span class="tf-stat-label">Pts</span><strong>${stats.pointCount}</strong></div>
-            <div><span class="tf-stat-label">Rough</span><strong>${roughDisplay !== null ? `${roughDisplay.toFixed(2)}g` : "—"}</strong></div>
-            <div><span class="tf-stat-label">Shocks</span><strong class="${this.imuMetrics.shock_event_count > 0 ? "tf-accent-amber" : ""}">${this.imuMetrics.shock_event_count}</strong></div>
-            <div><span class="tf-stat-label">P95</span><strong>${p95Display !== null ? `${p95Display.toFixed(2)}g` : "—"}</strong></div>
+            <div><span class="tf-stat-label">Dist</span><strong data-rec-stat="dist">${(stats.distanceM / 1000).toFixed(2)} km</strong></div>
+            <div><span class="tf-stat-label">Time</span><strong data-rec-stat="time">${formatClock(stats.durationS)}</strong></div>
+            <div><span class="tf-stat-label">Speed</span><strong data-rec-stat="speed">${stats.currentSpeedKmh.toFixed(1)} km/h</strong></div>
+            <div><span class="tf-stat-label">Elev</span><strong data-rec-stat="elev">${stats.currentElevM !== null ? `${Math.round(stats.currentElevM)} m` : "—"}</strong></div>
+            <div><span class="tf-stat-label">Pts</span><strong data-rec-stat="pts">${stats.pointCount}</strong></div>
+            <div><span class="tf-stat-label">Rough</span><strong data-rec-stat="rough">${roughDisplay !== null ? `${roughDisplay.toFixed(2)}g` : "—"}</strong></div>
+            <div><span class="tf-stat-label">Shocks</span><strong data-rec-stat="shocks" class="${this.imuMetrics.shock_event_count > 0 ? "tf-accent-amber" : ""}">${this.imuMetrics.shock_event_count}</strong></div>
+            <div><span class="tf-stat-label">P95</span><strong data-rec-stat="p95">${p95Display !== null ? `${p95Display.toFixed(2)}g` : "—"}</strong></div>
           </div>
 
           <div class="tf-recorder-controls">
@@ -669,6 +886,7 @@ export class InCabRecorderHud {
       >${escapeHtml(pillLabel)}</button>
     `;
 
+    this.renderedStructKey = this.computeStructKey();
     this.bindHandlers();
   }
 

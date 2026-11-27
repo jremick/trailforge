@@ -63,19 +63,19 @@ import {
   uploadTripJson,
   voteConditionReport,
 } from "./api";
-import {
+import type {
+  AccountPanelTab,
   RigAccountPanel,
-  type AccountPanelTab,
 } from "./components/accountPanel";
-import {
+import type {
   AdminConsolePanel,
-  type AdminPanelTab,
+  AdminPanelTab,
 } from "./components/adminPanel";
 import { renderAttributionFooter } from "./components/footer";
 import { TrackInspectorDrawer } from "./components/inspector";
-import { OfflinePacksPanel } from "./components/packsPanel";
+import type { OfflinePacksPanel } from "./components/packsPanel";
 import { InCabRecorderHud } from "./components/recorder";
-import { RoutePlannerDrawer } from "./components/routePlanner";
+import type { RoutePlannerDrawer } from "./components/routePlanner";
 import { Sidebar } from "./components/sidebar";
 import { TopBar } from "./components/topbar";
 import {
@@ -222,10 +222,18 @@ class TrailForgeApp {
   private readonly topbar: TopBar;
   private readonly sidebar: Sidebar;
   private readonly inspector: TrackInspectorDrawer;
-  private readonly accountPanel: RigAccountPanel;
-  private readonly adminPanel: AdminConsolePanel;
-  private readonly packsPanel: OfflinePacksPanel;
-  private readonly routePlanner: RoutePlannerDrawer;
+  private readonly accountPanelEl: HTMLElement;
+  private readonly adminPanelEl: HTMLElement;
+  private readonly packsPanelEl: HTMLElement;
+  private readonly routePanelEl: HTMLElement;
+  private accountPanel: RigAccountPanel | null = null;
+  private accountPanelPromise: Promise<RigAccountPanel> | null = null;
+  private adminPanel: AdminConsolePanel | null = null;
+  private adminPanelPromise: Promise<AdminConsolePanel> | null = null;
+  private packsPanel: OfflinePacksPanel | null = null;
+  private packsPanelPromise: Promise<OfflinePacksPanel> | null = null;
+  private routePlanner: RoutePlannerDrawer | null = null;
+  private routePlannerPromise: Promise<RoutePlannerDrawer> | null = null;
   private readonly recorderHud: InCabRecorderHud;
   private readonly map: TrailForgeMap;
   private readonly demoBannerEl: HTMLElement;
@@ -493,10 +501,10 @@ class TrailForgeApp {
         onSearchClear: () => this.map.clearSearchPin(),
         onPresetChange: (presetId) => this.selectPreset(presetId),
         onRoutePlannerClick: () => {
-          if (this.routePlanner.isPanelOpen()) {
+          if (this.routePlanner?.isPanelOpen()) {
             this.closeRoutePlanner();
           } else {
-            this.openRoutePlanner();
+            void this.openRoutePlanner();
           }
         },
         onHealthClick: () => void this.refreshHealth(true),
@@ -508,24 +516,24 @@ class TrailForgeApp {
           void this.refreshClosures(true);
         },
         onRigAccountClick: () => {
-          if (this.accountPanel.isPanelOpen()) {
+          if (this.accountPanel?.isPanelOpen()) {
             this.closeAccountPanel();
           } else {
-            this.openAccountPanel("rig");
+            void this.openAccountPanel("rig");
           }
         },
         onOfflinePacksClick: () => {
-          if (this.packsPanel.isPanelOpen()) {
+          if (this.packsPanel?.isPanelOpen()) {
             this.closePacksPanel();
           } else {
-            this.openPacksPanel();
+            void this.openPacksPanel();
           }
         },
         onAdminClick: () => {
-          if (this.adminPanel.isPanelOpen()) {
+          if (this.adminPanel?.isPanelOpen()) {
             this.closeAdminPanel();
           } else {
-            this.openAdminPanel("overview");
+            void this.openAdminPanel("overview");
           }
         },
       }
@@ -693,566 +701,10 @@ class TrailForgeApp {
       }
     );
 
-    this.accountPanel = new RigAccountPanel(
-      this.q(root, "[data-role='account-panel']"),
-      this.buildAccountPanelState(),
-      {
-        onClose: () => this.closeAccountPanel(),
-        onOpenAdminConsole: () => this.openAdminPanel("overview"),
-        onSelectAnonymousRig: (cls) => {
-          this.anonymousRigClass = cls;
-          saveStoredAnonRig(cls);
-          this.syncUrlState({ rigClass: cls }, "replace");
-          this.syncRigUiState();
-          this.showToast(`Rig suitability preview set to ${cls}`, "info");
-          this.refreshOpenInspectorForRig();
-          this.refreshPlannedRouteForRig();
-        },
-        onLogin: async (email, password) => {
-          const res = await loginAccount({ email, password });
-          this.user = res.user;
-          await this.loadSignedInUserData();
-          this.showToast(`Signed in as ${res.user.display_name}`, "success");
-          this.refreshOpenInspectorForRig();
-          this.refreshPlannedRouteForRig();
-        },
-        onRegister: async (displayName, email, password, inviteCode) => {
-          const res = await registerAccount({
-            display_name: displayName,
-            email,
-            password,
-            invite_code: inviteCode ?? null,
-          });
-          this.user = res.user;
-          await this.loadSignedInUserData();
-          this.showToast(`Account created for ${res.user.display_name}`, "success");
-          this.refreshOpenInspectorForRig();
-          this.refreshPlannedRouteForRig();
-        },
-        onLogout: async () => {
-          await logoutAccount();
-          this.user = null;
-          this.vehicles = [];
-          this.trips = [];
-          this.latestUploadedTrip = null;
-          this.favorites = [];
-          this.pins = [];
-          this.savedRoutes = [];
-          this.activeSavedRouteId = null;
-          this.adminStats = null;
-          this.adminInvites = [];
-          this.adminUsers = [];
-          this.latestCreatedInvite = null;
-          this.closeAdminPanel();
-          this.setCoordPickMode(null);
-          this.map.setUserPins([]);
-          this.syncRigUiState();
-          this.syncOfflinePanelState();
-          this.syncRoutePlannerUiState();
-          this.showToast("Signed out — anonymous browsing active", "info");
-          this.refreshOpenInspectorForRig();
-          this.refreshPlannedRouteForRig();
-        },
-        onSaveVehicle: async (payload, editingId) => {
-          if (editingId) {
-            await updateVehicle(editingId, payload);
-            this.showToast(`Updated ${payload.name}`, "success");
-          } else {
-            await createVehicle(payload);
-            this.showToast(`Saved vehicle profile ${payload.name}`, "success");
-          }
-          await this.reloadVehicles();
-          this.refreshOpenInspectorForRig();
-          this.refreshPlannedRouteForRig();
-        },
-        onActivateVehicle: async (id) => {
-          const updated = await activateVehicle(id);
-          await this.reloadVehicles();
-          this.showToast(
-            `Active rig: ${updated.name} (${updated.capability_class})`,
-            "success"
-          );
-          this.refreshOpenInspectorForRig();
-          this.refreshPlannedRouteForRig();
-        },
-        onDeleteVehicle: async (id) => {
-          await deleteVehicle(id);
-          await this.reloadVehicles();
-          this.showToast("Vehicle profile deleted", "info");
-          this.refreshOpenInspectorForRig();
-          this.refreshPlannedRouteForRig();
-        },
-        onUploadTripGpx: async (file, params) => {
-          const uploaded = await uploadTripGpx(file, params);
-          this.latestUploadedTrip = uploaded;
-          await this.reloadTrips();
-          void this.refreshUnmappedCandidates();
-          this.showToast(
-            `Matched ${uploaded.matched_segment_count ?? 0} segments (${uploaded.observations_published ?? 0} published)`,
-            "success"
-          );
-        },
-        onUploadTripJson: async (payload) => {
-          const uploaded = await uploadTripJson(payload);
-          this.latestUploadedTrip = uploaded;
-          await this.reloadTrips();
-          void this.refreshUnmappedCandidates();
-          this.showToast(
-            `Matched ${uploaded.matched_segment_count ?? 0} segments`,
-            "success"
-          );
-        },
-        onToggleTripVisibility: async (tripId, nextVis) => {
-          await updateTrip(tripId, { visibility: nextVis });
-          await this.reloadTrips();
-          void this.refreshUnmappedCandidates();
-          this.showToast(
-            nextVis === "private"
-              ? "Trip set to Private — anonymized observations revoked"
-              : "Trip shared as Anonymous Community telemetry",
-            "info"
-          );
-        },
-        onExportTrip: async (tripId, fmt) => {
-          const url = buildTripExportUrl(tripId, fmt);
-          await downloadAuthenticatedExport(
-            url,
-            `trip_${tripId}.${fmt === "gpx" ? "gpx" : "geojson"}`
-          );
-          this.showToast(`Exported trip (${fmt.toUpperCase()})`, "success");
-        },
-        onDeleteTrip: async (tripId) => {
-          await deleteTrip(tripId);
-          this.trips = this.trips.filter((t) => getTripId(t) !== tripId);
-          if (
-            this.latestUploadedTrip &&
-            getTripId(this.latestUploadedTrip) === tripId
-          ) {
-            this.latestUploadedTrip = null;
-          }
-          this.syncRigUiState();
-          void this.refreshUnmappedCandidates();
-          this.showToast("Trip deleted & any public observations revoked", "info");
-        },
-        onOpenFavoriteTrack: (trackId) => {
-          this.closeAccountPanel();
-          void this.openTrackInspector(trackId);
-        },
-        onRemoveFavorite: async (trackId) => {
-          await removeFavorite(trackId);
-          this.favorites = this.favorites.filter((f) => f.track_id !== trackId);
-          this.syncRigUiState();
-          this.showToast("Removed track from favorites", "info");
-        },
-        onTogglePinDropMode: (active) => {
-          this.setCoordPickMode(active ? "pin" : null);
-          if (active) {
-            this.shellEl.classList.remove("account-open");
-          }
-        },
-        onCreatePin: async (payload) => {
-          if (!this.isOnline || !this.user) {
-            const localPin: UserPinItem = {
-              id: `offline-pin-${generateClientUuid()}`,
-              name: payload.name,
-              category: payload.category,
-              notes: payload.notes ?? null,
-              lon: payload.lon,
-              lat: payload.lat,
-              track_id: payload.track_id ?? null,
-              created_at: new Date().toISOString(),
-            };
-            await saveOfflinePin(localPin);
-            if (this.user) {
-              await enqueueOfflinePin(payload, localPin.id);
-            }
-            this.pendingPinCoords = null;
-            this.setCoordPickMode(null);
-            await this.refreshOfflineLocalState();
-            this.showToast(
-              `Saved offline pin "${payload.name}"${this.user ? " (queued to sync)" : ""}`,
-              "success"
-            );
-            return;
-          }
-          try {
-            const created = await createPin(payload);
-            this.pins = [created, ...this.pins];
-            this.pendingPinCoords = null;
-            this.setCoordPickMode(null);
-            this.renderCombinedPinsOnMap();
-            this.syncRigUiState();
-            this.showToast(
-              `Dropped pin "${created.name ?? created.title ?? payload.name}"`,
-              "success"
-            );
-          } catch (err) {
-            const status =
-              err && typeof err === "object" && "status" in err
-                ? Number((err as { status: unknown }).status)
-                : null;
-            if (status === null || status === 503) {
-              const localPin: UserPinItem = {
-                id: `offline-pin-${generateClientUuid()}`,
-                name: payload.name,
-                category: payload.category,
-                notes: payload.notes ?? null,
-                lon: payload.lon,
-                lat: payload.lat,
-                track_id: payload.track_id ?? null,
-                created_at: new Date().toISOString(),
-              };
-              await saveOfflinePin(localPin);
-              await enqueueOfflinePin(payload, localPin.id);
-              this.pendingPinCoords = null;
-              this.setCoordPickMode(null);
-              await this.refreshOfflineLocalState();
-              this.showToast(
-                `Network unreachable — saved pin "${payload.name}" offline & queued to sync`,
-                "info"
-              );
-              return;
-            }
-            throw err;
-          }
-        },
-        onSelectPin: (pin) => {
-          this.map.flyToCoordinate(
-            pin.lat,
-            pin.lon,
-            pin.name ?? pin.title ?? "Pin",
-            14
-          );
-          this.updateCursorReadout(pin.lat, pin.lon);
-        },
-        onDeletePin: async (id) => {
-          if (id.startsWith("offline-pin-")) {
-            await deleteOfflinePin(id);
-            await this.refreshOfflineLocalState();
-            this.showToast("Offline pin deleted", "info");
-            return;
-          }
-          await deletePin(id);
-          this.pins = this.pins.filter((p) => p.id !== id);
-          this.renderCombinedPinsOnMap();
-          this.syncRigUiState();
-          this.showToast("Personal pin deleted", "info");
-        },
-        onExportUser: async (fmt) => {
-          const url = buildUserExportUrl(fmt);
-          await downloadAuthenticatedExport(
-            url,
-            `trailforge_saved.${fmt === "gpx" ? "gpx" : "geojson"}`
-          );
-          this.showToast(
-            `Exported saved tracks & pins (${fmt.toUpperCase()})`,
-            "success"
-          );
-        },
-      }
-    );
-
-    this.adminPanel = new AdminConsolePanel(
-      this.q(root, "[data-role='admin-panel']"),
-      {
-        currentUserId: null,
-        registrationMode: this.authConfig.registration_mode,
-        loading: false,
-        stats: null,
-        invites: [],
-        users: [],
-        latestCreatedInvite: null,
-        busyAction: null,
-        error: null,
-      },
-      {
-        onClose: () => this.closeAdminPanel(),
-        onRefresh: () => this.refreshAdminConsoleData(),
-        onCreateInvite: async (payload) => {
-          this.adminPanel.updateState({
-            busyAction: "create-invite",
-            error: null,
-          });
-          try {
-            const created = await createAdminInvite(payload);
-            this.latestCreatedInvite = created;
-            this.adminInvites = [created, ...this.adminInvites];
-            this.adminPanel.updateState({
-              invites: this.adminInvites,
-              latestCreatedInvite: created,
-            });
-            this.showToast(`Created invite code ${created.code}`, "success");
-            void this.refreshAdminConsoleData();
-          } catch (err) {
-            const msg = formatFriendlyApiError(err, "Failed to create invite");
-            this.adminPanel.updateState({ error: msg });
-            this.showToast(msg, "error");
-          } finally {
-            this.adminPanel.updateState({ busyAction: null });
-          }
-        },
-        onRevokeInvite: async (inviteId) => {
-          this.adminPanel.updateState({
-            busyAction: `revoke-${inviteId}`,
-            error: null,
-          });
-          try {
-            await revokeAdminInvite(inviteId);
-            await this.refreshAdminConsoleData();
-            this.showToast("Invite code revoked", "info");
-          } catch (err) {
-            const msg = formatFriendlyApiError(err, "Failed to revoke invite");
-            this.adminPanel.updateState({ error: msg });
-            this.showToast(msg, "error");
-          } finally {
-            this.adminPanel.updateState({ busyAction: null });
-          }
-        },
-        onCopyInviteCode: async (code) => {
-          await this.copyTextToClipboard(
-            code,
-            `Copied invite code ${code}`,
-            "Select and copy the invite code manually"
-          );
-        },
-        onPatchUser: async (userId, patch) => {
-          this.adminPanel.updateState({
-            busyAction: `user-${userId}`,
-            error: null,
-          });
-          try {
-            const updated = await patchAdminUser(userId, patch);
-            this.adminUsers = this.adminUsers.map((u) =>
-              u.id === updated.id ? updated : u
-            );
-            this.adminPanel.updateState({ users: this.adminUsers });
-            this.showToast(
-              `Updated ${updated.display_name} (${updated.role}, ${updated.is_active ? "active" : "suspended"})`,
-              "success"
-            );
-            void this.refreshAdminConsoleData();
-          } catch (err) {
-            const msg = formatFriendlyApiError(err, "Failed to update user");
-            this.adminPanel.updateState({ error: msg });
-            this.showToast(msg, "error");
-          } finally {
-            this.adminPanel.updateState({ busyAction: null });
-          }
-        },
-        onSyncClosures: async () => {
-          this.adminPanel.updateState({
-            busyAction: "sync-closures",
-            error: null,
-          });
-          try {
-            await triggerAdminClosuresSync();
-            await Promise.all([
-              this.refreshClosures(false),
-              this.refreshAdminConsoleData(),
-            ]);
-            this.showToast("Agency closure feeds synced", "success");
-          } catch (err) {
-            const msg = formatFriendlyApiError(err, "Closure sync failed");
-            this.adminPanel.updateState({ error: msg });
-            this.showToast(msg, "error");
-          } finally {
-            this.adminPanel.updateState({ busyAction: null });
-          }
-        },
-        onRecomputeGrades: async () => {
-          this.adminPanel.updateState({
-            busyAction: "recompute-grades",
-            error: null,
-          });
-          try {
-            await triggerAdminGradingRecompute();
-            await Promise.all([
-              this.refreshHotspotsGeoJson(),
-              this.refreshAdminConsoleData(),
-            ]);
-            this.refreshOpenInspectorForRig();
-            this.showToast("Live crowdsourced grades recomputed", "success");
-          } catch (err) {
-            const msg = formatFriendlyApiError(
-              err,
-              "Live grade recomputation failed"
-            );
-            this.adminPanel.updateState({ error: msg });
-            this.showToast(msg, "error");
-          } finally {
-            this.adminPanel.updateState({ busyAction: null });
-          }
-        },
-      }
-    );
-
-    this.packsPanel = new OfflinePacksPanel(
-      this.q(root, "[data-role='packs-panel']"),
-      {
-        online: initiallyOnline,
-        isAdmin: false,
-        loading: false,
-        regions: [],
-        downloaded: [],
-        activeOfflinePackId: this.activeOfflinePackId,
-        syncQueue: [],
-        syncing: false,
-        buildingRegionId: null,
-        downloadingRegionId: null,
-        downloadProgress: null,
-        error: null,
-      },
-      {
-        onClose: () => this.closePacksPanel(),
-        onRefresh: () => this.refreshPacksCatalog(),
-        onBuildPack: async (regionId) => {
-          this.packsPanel.updateState({
-            buildingRegionId: regionId,
-            error: null,
-          });
-          try {
-            await buildRegionPack(regionId);
-            await this.refreshPacksCatalog();
-            this.showToast(`Built offline regional pack: ${regionId}`, "success");
-          } catch (err) {
-            const msg = formatFriendlyApiError(err, "Failed to build pack");
-            this.packsPanel.updateState({ error: msg });
-            this.showToast(msg, "error");
-          } finally {
-            this.packsPanel.updateState({ buildingRegionId: null });
-          }
-        },
-        onDownloadPack: async (region) => {
-          this.packsPanel.updateState({
-            downloadingRegionId: region.region_id,
-            downloadProgress: { stage: "Starting download…", pct: 5 },
-            error: null,
-          });
-          try {
-            const record = await downloadRegionalPackToDevice(region, (prog) => {
-              this.packsPanel.updateState({ downloadProgress: prog });
-            });
-            await this.refreshOfflineLocalState();
-            this.showToast(
-              `Downloaded ${record.name} for offline use (${record.track_count} tracks)`,
-              "success"
-            );
-          } catch (err) {
-            const msg =
-              err instanceof Error ? err.message : "Pack download failed";
-            this.packsPanel.updateState({ error: msg });
-            this.showToast(msg, "error");
-          } finally {
-            this.packsPanel.updateState({
-              downloadingRegionId: null,
-              downloadProgress: null,
-            });
-          }
-        },
-        onUseOfflinePack: async (regionId) => {
-          this.activeOfflinePackId = regionId;
-          setActiveOfflinePackId(regionId);
-          this.syncOfflinePanelState();
-          await this.loadVectorAndTerrainLayers();
-          await Promise.all([
-            this.refreshClosures(false),
-            this.refreshReportsGeoJson(),
-            this.refreshHotspotsGeoJson(),
-          ]);
-          if (regionId) {
-            this.setActiveBasemap("offline-topo");
-            const preset = getPresetById(regionId);
-            if (preset) {
-              this.map.flyToPreset(preset, this.getMapLeftPadding(16));
-            }
-            this.showToast(
-              `Switched to offline pack "${regionId}" (zero network tiles)`,
-              "success"
-            );
-          } else {
-            this.showToast("Returned to live TrailForge API tiles", "info");
-          }
-        },
-        onRemovePack: async (regionId) => {
-          await removeOfflinePack(regionId);
-          this.activeOfflinePackId = getActiveOfflinePackId();
-          await this.refreshOfflineLocalState();
-          this.showToast(`Removed cached pack ${regionId}`, "info");
-        },
-        onSyncNow: () => this.handleFlushSyncQueue(true),
-      }
-    );
-
-    this.routePlanner = new RoutePlannerDrawer(
-      this.q(root, "[data-role='route-panel']"),
-      this.buildRoutePlannerState(),
-      {
-        onClose: () => this.closeRoutePlanner(),
-        onTogglePlanMode: (active) => this.setRoutePlanMode(active),
-        onRouteNameChange: (name) => {
-          this.routeName = name;
-        },
-        onRouteNotesChange: (notes) => {
-          this.routeNotes = notes;
-        },
-        onMoveLegUp: (idx) => {
-          this.routeTrackIds = moveRouteTrackUp(this.routeTrackIds, idx);
-          this.syncUrlState({ routeTrackIds: [...this.routeTrackIds] }, "replace");
-          void this.recomputePlannedRoute(false);
-        },
-        onMoveLegDown: (idx) => {
-          this.routeTrackIds = moveRouteTrackDown(this.routeTrackIds, idx);
-          this.syncUrlState({ routeTrackIds: [...this.routeTrackIds] }, "replace");
-          void this.recomputePlannedRoute(false);
-        },
-        onRemoveLeg: (idx) => {
-          this.routeTrackIds = removeRouteTrackAt(this.routeTrackIds, idx);
-          this.syncUrlState({ routeTrackIds: [...this.routeTrackIds] }, "replace");
-          void this.recomputePlannedRoute(false);
-        },
-        onClearRoute: () => {
-          this.routePlanAbort?.abort();
-          this.routeTrackIds = [];
-          this.routeWaypoints = [];
-          this.routeAnalysis = null;
-          this.routeName = "";
-          this.routeNotes = "";
-          this.activeSavedRouteId = null;
-          this.routeError = null;
-          this.setRoutePlanMode(false);
-          this.map.setPlannedRoute(null, null);
-          this.syncUrlState({ routeTrackIds: [] }, "replace");
-          this.syncRoutePlannerUiState();
-          this.syncRigUiState();
-          this.showToast("Cleared active route", "info");
-        },
-        onInspectTrack: (trackId) => {
-          this.closeRoutePlanner();
-          void this.openTrackInspector(trackId);
-        },
-        onZoomToRoute: (bbox) => {
-          this.map.fitBBox(bbox, this.getMapLeftPadding(24), 420);
-        },
-        onPoiSelect: (poi) => {
-          this.map.flyToCoordinate(poi.lat, poi.lon, poi.name, 14);
-          this.updateCursorReadout(poi.lat, poi.lon);
-          this.showToast(`Located ${poi.name}`, "info");
-        },
-        onOpenRigPanel: () => {
-          this.openAccountPanel("rig");
-        },
-        onOpenSignIn: () => {
-          this.openAccountPanel("account");
-        },
-        onExportRoute: (fmt) => this.handleExportPlannedRoute(fmt),
-        onSaveRoute: (asNew) => this.handleSavePlannedRoute(asNew),
-        onLoadSavedRoute: (routeId) => this.handleLoadSavedRoute(routeId),
-        onDeleteSavedRoute: (routeId) => this.handleDeleteSavedRoute(routeId),
-        onExportSavedRoute: (routeId, fmt) =>
-          this.handleExportSavedRoute(routeId, fmt),
-        onCopyGridForgeCli: (cli) => this.handleCopyGridForgeCli(cli),
-      }
-    );
+    this.accountPanelEl = this.q(root, "[data-role='account-panel']");
+    this.adminPanelEl = this.q(root, "[data-role='admin-panel']");
+    this.packsPanelEl = this.q(root, "[data-role='packs-panel']");
+    this.routePanelEl = this.q(root, "[data-role='route-panel']");
 
     this.recorderHud = new InCabRecorderHud(
       this.q(root, "[data-role='recorder-hud']"),
@@ -1420,8 +872,622 @@ class TrailForgeApp {
     this.map.setUserPins([...this.offlinePins, ...this.pins]);
   }
 
+  private ensureAccountPanel(): Promise<RigAccountPanel> {
+    if (this.accountPanel) return Promise.resolve(this.accountPanel);
+    if (!this.accountPanelPromise) {
+      this.accountPanelPromise = import("./components/accountPanel").then(
+        ({ RigAccountPanel }) => {
+          const panel = new RigAccountPanel(
+            this.accountPanelEl,
+            this.buildAccountPanelState(),
+            {
+              onClose: () => this.closeAccountPanel(),
+              onOpenAdminConsole: () => void this.openAdminPanel("overview"),
+              onSelectAnonymousRig: (cls) => {
+                this.anonymousRigClass = cls;
+                saveStoredAnonRig(cls);
+                this.syncUrlState({ rigClass: cls }, "replace");
+                this.syncRigUiState();
+                this.showToast(`Rig suitability preview set to ${cls}`, "info");
+                this.refreshOpenInspectorForRig();
+                this.refreshPlannedRouteForRig();
+              },
+              onLogin: async (email, password) => {
+                const res = await loginAccount({ email, password });
+                this.user = res.user;
+                await this.loadSignedInUserData();
+                this.showToast(`Signed in as ${res.user.display_name}`, "success");
+                this.refreshOpenInspectorForRig();
+                this.refreshPlannedRouteForRig();
+              },
+              onRegister: async (displayName, email, password, inviteCode) => {
+                const res = await registerAccount({
+                  display_name: displayName,
+                  email,
+                  password,
+                  invite_code: inviteCode ?? null,
+                });
+                this.user = res.user;
+                await this.loadSignedInUserData();
+                this.showToast(
+                  `Account created for ${res.user.display_name}`,
+                  "success"
+                );
+                this.refreshOpenInspectorForRig();
+                this.refreshPlannedRouteForRig();
+              },
+              onLogout: async () => {
+                await logoutAccount();
+                this.user = null;
+                this.vehicles = [];
+                this.trips = [];
+                this.latestUploadedTrip = null;
+                this.favorites = [];
+                this.pins = [];
+                this.savedRoutes = [];
+                this.activeSavedRouteId = null;
+                this.adminStats = null;
+                this.adminInvites = [];
+                this.adminUsers = [];
+                this.latestCreatedInvite = null;
+                this.closeAdminPanel();
+                this.setCoordPickMode(null);
+                this.map.setUserPins([]);
+                this.syncRigUiState();
+                this.syncOfflinePanelState();
+                this.syncRoutePlannerUiState();
+                this.showToast("Signed out — anonymous browsing active", "info");
+                this.refreshOpenInspectorForRig();
+                this.refreshPlannedRouteForRig();
+              },
+              onSaveVehicle: async (payload, editingId) => {
+                if (editingId) {
+                  await updateVehicle(editingId, payload);
+                  this.showToast(`Updated ${payload.name}`, "success");
+                } else {
+                  await createVehicle(payload);
+                  this.showToast(`Saved vehicle profile ${payload.name}`, "success");
+                }
+                await this.reloadVehicles();
+                this.refreshOpenInspectorForRig();
+                this.refreshPlannedRouteForRig();
+              },
+              onActivateVehicle: async (id) => {
+                const updated = await activateVehicle(id);
+                await this.reloadVehicles();
+                this.showToast(
+                  `Active rig: ${updated.name} (${updated.capability_class})`,
+                  "success"
+                );
+                this.refreshOpenInspectorForRig();
+                this.refreshPlannedRouteForRig();
+              },
+              onDeleteVehicle: async (id) => {
+                await deleteVehicle(id);
+                await this.reloadVehicles();
+                this.showToast("Vehicle profile deleted", "info");
+                this.refreshOpenInspectorForRig();
+                this.refreshPlannedRouteForRig();
+              },
+              onUploadTripGpx: async (file, params) => {
+                const uploaded = await uploadTripGpx(file, params);
+                this.latestUploadedTrip = uploaded;
+                await this.reloadTrips();
+                if (this.layerState.unmapped) void this.refreshUnmappedCandidates();
+                this.showToast(
+                  `Matched ${uploaded.matched_segment_count ?? 0} segments (${uploaded.observations_published ?? 0} published)`,
+                  "success"
+                );
+              },
+              onUploadTripJson: async (payload) => {
+                const uploaded = await uploadTripJson(payload);
+                this.latestUploadedTrip = uploaded;
+                await this.reloadTrips();
+                if (this.layerState.unmapped) void this.refreshUnmappedCandidates();
+                this.showToast(
+                  `Matched ${uploaded.matched_segment_count ?? 0} segments`,
+                  "success"
+                );
+              },
+              onToggleTripVisibility: async (tripId, nextVis) => {
+                await updateTrip(tripId, { visibility: nextVis });
+                await this.reloadTrips();
+                if (this.layerState.unmapped) void this.refreshUnmappedCandidates();
+                this.showToast(
+                  nextVis === "private"
+                    ? "Trip set to Private — anonymized observations revoked"
+                    : "Trip shared as Anonymous Community telemetry",
+                  "info"
+                );
+              },
+              onExportTrip: async (tripId, fmt) => {
+                const url = buildTripExportUrl(tripId, fmt);
+                await downloadAuthenticatedExport(
+                  url,
+                  `trip_${tripId}.${fmt === "gpx" ? "gpx" : "geojson"}`
+                );
+                this.showToast(`Exported trip (${fmt.toUpperCase()})`, "success");
+              },
+              onDeleteTrip: async (tripId) => {
+                await deleteTrip(tripId);
+                this.trips = this.trips.filter((t) => getTripId(t) !== tripId);
+                if (
+                  this.latestUploadedTrip &&
+                  getTripId(this.latestUploadedTrip) === tripId
+                ) {
+                  this.latestUploadedTrip = null;
+                }
+                this.syncRigUiState();
+                if (this.layerState.unmapped) void this.refreshUnmappedCandidates();
+                this.showToast(
+                  "Trip deleted & any public observations revoked",
+                  "info"
+                );
+              },
+              onOpenFavoriteTrack: (trackId) => {
+                this.closeAccountPanel();
+                void this.openTrackInspector(trackId);
+              },
+              onRemoveFavorite: async (trackId) => {
+                await removeFavorite(trackId);
+                this.favorites = this.favorites.filter(
+                  (f) => f.track_id !== trackId
+                );
+                this.syncRigUiState();
+                this.showToast("Removed track from favorites", "info");
+              },
+              onTogglePinDropMode: (active) => {
+                this.setCoordPickMode(active ? "pin" : null);
+                if (active) {
+                  this.shellEl.classList.remove("account-open");
+                }
+              },
+              onCreatePin: async (payload) => {
+                if (!this.isOnline || !this.user) {
+                  const localPin: UserPinItem = {
+                    id: `offline-pin-${generateClientUuid()}`,
+                    name: payload.name,
+                    category: payload.category,
+                    notes: payload.notes ?? null,
+                    lon: payload.lon,
+                    lat: payload.lat,
+                    track_id: payload.track_id ?? null,
+                    created_at: new Date().toISOString(),
+                  };
+                  await saveOfflinePin(localPin);
+                  if (this.user) {
+                    await enqueueOfflinePin(payload, localPin.id);
+                  }
+                  this.pendingPinCoords = null;
+                  this.setCoordPickMode(null);
+                  await this.refreshOfflineLocalState();
+                  this.showToast(
+                    `Saved offline pin "${payload.name}"${this.user ? " (queued to sync)" : ""}`,
+                    "success"
+                  );
+                  return;
+                }
+                try {
+                  const created = await createPin(payload);
+                  this.pins = [created, ...this.pins];
+                  this.pendingPinCoords = null;
+                  this.setCoordPickMode(null);
+                  this.renderCombinedPinsOnMap();
+                  this.syncRigUiState();
+                  this.showToast(
+                    `Dropped pin "${created.name ?? created.title ?? payload.name}"`,
+                    "success"
+                  );
+                } catch (err) {
+                  const status =
+                    err && typeof err === "object" && "status" in err
+                      ? Number((err as { status: unknown }).status)
+                      : null;
+                  if (status === null || status === 503) {
+                    const localPin: UserPinItem = {
+                      id: `offline-pin-${generateClientUuid()}`,
+                      name: payload.name,
+                      category: payload.category,
+                      notes: payload.notes ?? null,
+                      lon: payload.lon,
+                      lat: payload.lat,
+                      track_id: payload.track_id ?? null,
+                      created_at: new Date().toISOString(),
+                    };
+                    await saveOfflinePin(localPin);
+                    await enqueueOfflinePin(payload, localPin.id);
+                    this.pendingPinCoords = null;
+                    this.setCoordPickMode(null);
+                    await this.refreshOfflineLocalState();
+                    this.showToast(
+                      `Network unreachable — saved pin "${payload.name}" offline & queued to sync`,
+                      "info"
+                    );
+                    return;
+                  }
+                  throw err;
+                }
+              },
+              onSelectPin: (pin) => {
+                this.map.flyToCoordinate(
+                  pin.lat,
+                  pin.lon,
+                  pin.name ?? pin.title ?? "Pin",
+                  14
+                );
+                this.updateCursorReadout(pin.lat, pin.lon);
+              },
+              onDeletePin: async (id) => {
+                if (id.startsWith("offline-pin-")) {
+                  await deleteOfflinePin(id);
+                  await this.refreshOfflineLocalState();
+                  this.showToast("Offline pin deleted", "info");
+                  return;
+                }
+                await deletePin(id);
+                this.pins = this.pins.filter((p) => p.id !== id);
+                this.renderCombinedPinsOnMap();
+                this.syncRigUiState();
+                this.showToast("Personal pin deleted", "info");
+              },
+              onExportUser: async (fmt) => {
+                const url = buildUserExportUrl(fmt);
+                await downloadAuthenticatedExport(
+                  url,
+                  `trailforge_saved.${fmt === "gpx" ? "gpx" : "geojson"}`
+                );
+                this.showToast(
+                  `Exported saved tracks & pins (${fmt.toUpperCase()})`,
+                  "success"
+                );
+              },
+            }
+          );
+          this.accountPanel = panel;
+          return panel;
+        }
+      );
+    }
+    return this.accountPanelPromise;
+  }
+
+  private ensureAdminPanel(): Promise<AdminConsolePanel> {
+    if (this.adminPanel) return Promise.resolve(this.adminPanel);
+    if (!this.adminPanelPromise) {
+      this.adminPanelPromise = import("./components/adminPanel").then(
+        ({ AdminConsolePanel }) => {
+          const panel = new AdminConsolePanel(
+            this.adminPanelEl,
+            {
+              currentUserId: this.user?.id ?? null,
+              registrationMode: this.authConfig.registration_mode,
+              loading: false,
+              stats: this.adminStats,
+              invites: this.adminInvites,
+              users: this.adminUsers,
+              latestCreatedInvite: this.latestCreatedInvite,
+              busyAction: null,
+              error: null,
+            },
+            {
+              onClose: () => this.closeAdminPanel(),
+              onRefresh: () => this.refreshAdminConsoleData(),
+              onCreateInvite: async (payload) => {
+                panel.updateState({ busyAction: "create-invite", error: null });
+                try {
+                  const created = await createAdminInvite(payload);
+                  this.latestCreatedInvite = created;
+                  this.adminInvites = [created, ...this.adminInvites];
+                  panel.updateState({
+                    invites: this.adminInvites,
+                    latestCreatedInvite: created,
+                  });
+                  this.showToast(`Created invite code ${created.code}`, "success");
+                  void this.refreshAdminConsoleData();
+                } catch (err) {
+                  const msg = formatFriendlyApiError(err, "Failed to create invite");
+                  panel.updateState({ error: msg });
+                  this.showToast(msg, "error");
+                } finally {
+                  panel.updateState({ busyAction: null });
+                }
+              },
+              onRevokeInvite: async (inviteId) => {
+                panel.updateState({ busyAction: `revoke-${inviteId}`, error: null });
+                try {
+                  await revokeAdminInvite(inviteId);
+                  await this.refreshAdminConsoleData();
+                  this.showToast("Invite code revoked", "info");
+                } catch (err) {
+                  const msg = formatFriendlyApiError(err, "Failed to revoke invite");
+                  panel.updateState({ error: msg });
+                  this.showToast(msg, "error");
+                } finally {
+                  panel.updateState({ busyAction: null });
+                }
+              },
+              onCopyInviteCode: async (code) => {
+                await this.copyTextToClipboard(
+                  code,
+                  `Copied invite code ${code}`,
+                  "Select and copy the invite code manually"
+                );
+              },
+              onPatchUser: async (userId, patch) => {
+                panel.updateState({ busyAction: `user-${userId}`, error: null });
+                try {
+                  const updated = await patchAdminUser(userId, patch);
+                  this.adminUsers = this.adminUsers.map((u) =>
+                    u.id === updated.id ? updated : u
+                  );
+                  panel.updateState({ users: this.adminUsers });
+                  this.showToast(
+                    `Updated ${updated.display_name} (${updated.role}, ${updated.is_active ? "active" : "suspended"})`,
+                    "success"
+                  );
+                  void this.refreshAdminConsoleData();
+                } catch (err) {
+                  const msg = formatFriendlyApiError(err, "Failed to update user");
+                  panel.updateState({ error: msg });
+                  this.showToast(msg, "error");
+                } finally {
+                  panel.updateState({ busyAction: null });
+                }
+              },
+              onSyncClosures: async () => {
+                panel.updateState({ busyAction: "sync-closures", error: null });
+                try {
+                  await triggerAdminClosuresSync();
+                  await Promise.all([
+                    this.refreshClosures(false),
+                    this.refreshAdminConsoleData(),
+                  ]);
+                  this.showToast("Agency closure feeds synced", "success");
+                } catch (err) {
+                  const msg = formatFriendlyApiError(err, "Closure sync failed");
+                  panel.updateState({ error: msg });
+                  this.showToast(msg, "error");
+                } finally {
+                  panel.updateState({ busyAction: null });
+                }
+              },
+              onRecomputeGrades: async () => {
+                panel.updateState({ busyAction: "recompute-grades", error: null });
+                try {
+                  await triggerAdminGradingRecompute();
+                  await Promise.all([
+                    this.refreshHotspotsGeoJson(),
+                    this.refreshAdminConsoleData(),
+                  ]);
+                  this.refreshOpenInspectorForRig();
+                  this.showToast("Live crowdsourced grades recomputed", "success");
+                } catch (err) {
+                  const msg = formatFriendlyApiError(
+                    err,
+                    "Live grade recomputation failed"
+                  );
+                  panel.updateState({ error: msg });
+                  this.showToast(msg, "error");
+                } finally {
+                  panel.updateState({ busyAction: null });
+                }
+              },
+            }
+          );
+          this.adminPanel = panel;
+          return panel;
+        }
+      );
+    }
+    return this.adminPanelPromise;
+  }
+
+  private ensurePacksPanel(): Promise<OfflinePacksPanel> {
+    if (this.packsPanel) return Promise.resolve(this.packsPanel);
+    if (!this.packsPanelPromise) {
+      this.packsPanelPromise = import("./components/packsPanel").then(
+        ({ OfflinePacksPanel }) => {
+          const panel = new OfflinePacksPanel(
+            this.packsPanelEl,
+            {
+              online: this.isOnline,
+              isAdmin: canManageAdminCompute(this.user),
+              loading: false,
+              regions: this.packRegions,
+              downloaded: this.downloadedPacks,
+              activeOfflinePackId: this.activeOfflinePackId,
+              syncQueue: this.syncQueue,
+              syncing: this.isSyncingQueue,
+              buildingRegionId: null,
+              downloadingRegionId: null,
+              downloadProgress: null,
+              error: null,
+            },
+            {
+              onClose: () => this.closePacksPanel(),
+              onRefresh: () => this.refreshPacksCatalog(),
+              onBuildPack: async (regionId) => {
+                panel.updateState({ buildingRegionId: regionId, error: null });
+                try {
+                  await buildRegionPack(regionId);
+                  await this.refreshPacksCatalog();
+                  this.showToast(
+                    `Built offline regional pack: ${regionId}`,
+                    "success"
+                  );
+                } catch (err) {
+                  const msg = formatFriendlyApiError(err, "Failed to build pack");
+                  panel.updateState({ error: msg });
+                  this.showToast(msg, "error");
+                } finally {
+                  panel.updateState({ buildingRegionId: null });
+                }
+              },
+              onDownloadPack: async (region) => {
+                panel.updateState({
+                  downloadingRegionId: region.region_id,
+                  downloadProgress: { stage: "Starting download…", pct: 5 },
+                  error: null,
+                });
+                try {
+                  const record = await downloadRegionalPackToDevice(
+                    region,
+                    (prog) => {
+                      panel.updateState({ downloadProgress: prog });
+                    }
+                  );
+                  await this.refreshOfflineLocalState();
+                  this.showToast(
+                    `Downloaded ${record.name} for offline use (${record.track_count} tracks)`,
+                    "success"
+                  );
+                } catch (err) {
+                  const msg =
+                    err instanceof Error ? err.message : "Pack download failed";
+                  panel.updateState({ error: msg });
+                  this.showToast(msg, "error");
+                } finally {
+                  panel.updateState({
+                    downloadingRegionId: null,
+                    downloadProgress: null,
+                  });
+                }
+              },
+              onUseOfflinePack: async (regionId) => {
+                this.activeOfflinePackId = regionId;
+                setActiveOfflinePackId(regionId);
+                this.syncOfflinePanelState();
+                await this.loadVectorAndTerrainLayers();
+                await Promise.all([
+                  this.refreshClosures(false),
+                  this.refreshReportsGeoJson(),
+                  this.refreshHotspotsGeoJson(),
+                ]);
+                if (regionId) {
+                  this.setActiveBasemap("offline-topo");
+                  const preset = getPresetById(regionId);
+                  if (preset) {
+                    this.map.flyToPreset(preset, this.getMapLeftPadding(16));
+                  }
+                  this.showToast(
+                    `Switched to offline pack "${regionId}" (zero network tiles)`,
+                    "success"
+                  );
+                } else {
+                  this.showToast("Returned to live TrailForge API tiles", "info");
+                }
+              },
+              onRemovePack: async (regionId) => {
+                await removeOfflinePack(regionId);
+                this.activeOfflinePackId = getActiveOfflinePackId();
+                await this.refreshOfflineLocalState();
+                this.showToast(`Removed cached pack ${regionId}`, "info");
+              },
+              onSyncNow: () => this.handleFlushSyncQueue(true),
+            }
+          );
+          this.packsPanel = panel;
+          return panel;
+        }
+      );
+    }
+    return this.packsPanelPromise;
+  }
+
+  private ensureRoutePlanner(): Promise<RoutePlannerDrawer> {
+    if (this.routePlanner) return Promise.resolve(this.routePlanner);
+    if (!this.routePlannerPromise) {
+      this.routePlannerPromise = import("./components/routePlanner").then(
+        ({ RoutePlannerDrawer }) => {
+          const panel = new RoutePlannerDrawer(
+            this.routePanelEl,
+            this.buildRoutePlannerState(),
+            {
+              onClose: () => this.closeRoutePlanner(),
+              onTogglePlanMode: (active) => this.setRoutePlanMode(active),
+              onRouteNameChange: (name) => {
+                this.routeName = name;
+              },
+              onRouteNotesChange: (notes) => {
+                this.routeNotes = notes;
+              },
+              onMoveLegUp: (idx) => {
+                this.routeTrackIds = moveRouteTrackUp(this.routeTrackIds, idx);
+                this.syncUrlState(
+                  { routeTrackIds: [...this.routeTrackIds] },
+                  "replace"
+                );
+                void this.recomputePlannedRoute(false);
+              },
+              onMoveLegDown: (idx) => {
+                this.routeTrackIds = moveRouteTrackDown(this.routeTrackIds, idx);
+                this.syncUrlState(
+                  { routeTrackIds: [...this.routeTrackIds] },
+                  "replace"
+                );
+                void this.recomputePlannedRoute(false);
+              },
+              onRemoveLeg: (idx) => {
+                this.routeTrackIds = removeRouteTrackAt(this.routeTrackIds, idx);
+                this.syncUrlState(
+                  { routeTrackIds: [...this.routeTrackIds] },
+                  "replace"
+                );
+                void this.recomputePlannedRoute(false);
+              },
+              onClearRoute: () => {
+                this.routePlanAbort?.abort();
+                this.routeTrackIds = [];
+                this.routeWaypoints = [];
+                this.routeAnalysis = null;
+                this.routeName = "";
+                this.routeNotes = "";
+                this.activeSavedRouteId = null;
+                this.routeError = null;
+                this.setRoutePlanMode(false);
+                this.map.setPlannedRoute(null, null);
+                this.syncUrlState({ routeTrackIds: [] }, "replace");
+                this.syncRoutePlannerUiState();
+                this.syncRigUiState();
+                this.showToast("Cleared active route", "info");
+              },
+              onInspectTrack: (trackId) => {
+                this.closeRoutePlanner();
+                void this.openTrackInspector(trackId);
+              },
+              onZoomToRoute: (bbox) => {
+                this.map.fitBBox(bbox, this.getMapLeftPadding(24), 420);
+              },
+              onPoiSelect: (poi) => {
+                this.map.flyToCoordinate(poi.lat, poi.lon, poi.name, 14);
+                this.updateCursorReadout(poi.lat, poi.lon);
+                this.showToast(`Located ${poi.name}`, "info");
+              },
+              onOpenRigPanel: () => {
+                void this.openAccountPanel("rig");
+              },
+              onOpenSignIn: () => {
+                void this.openAccountPanel("account");
+              },
+              onExportRoute: (fmt) => this.handleExportPlannedRoute(fmt),
+              onSaveRoute: (asNew) => this.handleSavePlannedRoute(asNew),
+              onLoadSavedRoute: (routeId) => this.handleLoadSavedRoute(routeId),
+              onDeleteSavedRoute: (routeId) => this.handleDeleteSavedRoute(routeId),
+              onExportSavedRoute: (routeId, fmt) =>
+                this.handleExportSavedRoute(routeId, fmt),
+              onCopyGridForgeCli: (cli) => this.handleCopyGridForgeCli(cli),
+            }
+          );
+          this.routePlanner = panel;
+          return panel;
+        }
+      );
+    }
+    return this.routePlannerPromise;
+  }
+
   private syncOfflinePanelState(): void {
-    this.packsPanel.updateState({
+    this.packsPanel?.updateState({
       online: this.isOnline,
       isAdmin: canManageAdminCompute(this.user),
       regions: this.packRegions,
@@ -1458,14 +1524,14 @@ class TrailForgeApp {
   }
 
   private async refreshPacksCatalog(): Promise<void> {
-    this.packsPanel.updateState({ loading: true, error: null });
+    this.packsPanel?.updateState({ loading: true, error: null });
     try {
       const catalog = await fetchPacksCatalog();
       this.packRegions = catalog.regions ?? [];
     } catch {
       // Keep cached fallback regions cleanly when offline
     } finally {
-      this.packsPanel.updateState({ loading: false });
+      this.packsPanel?.updateState({ loading: false });
       await this.refreshOfflineLocalState();
     }
   }
@@ -1519,7 +1585,7 @@ class TrailForgeApp {
     }
   }
 
-  private openPacksPanel(): void {
+  private async openPacksPanel(): Promise<void> {
     if (this.inspector.openState()) {
       this.inspector.close();
       this.shellEl.classList.remove("inspector-open");
@@ -1527,13 +1593,23 @@ class TrailForgeApp {
     this.closeAccountPanel();
     this.closeAdminPanel();
     this.closeRoutePlanner();
-    this.packsPanel.open();
+    const panel = await this.ensurePacksPanel();
+    panel.updateState({
+      online: this.isOnline,
+      isAdmin: canManageAdminCompute(this.user),
+      regions: this.packRegions,
+      downloaded: this.downloadedPacks,
+      activeOfflinePackId: this.activeOfflinePackId,
+      syncQueue: this.syncQueue,
+      syncing: this.isSyncingQueue,
+    });
+    panel.open();
     this.shellEl.classList.add("packs-open");
     void this.refreshPacksCatalog();
   }
 
   private closePacksPanel(): void {
-    this.packsPanel.close();
+    this.packsPanel?.close();
     this.shellEl.classList.remove("packs-open");
   }
 
@@ -1561,11 +1637,11 @@ class TrailForgeApp {
   }
 
   private syncRoutePlannerUiState(): void {
-    this.routePlanner.updateState(this.buildRoutePlannerState());
+    this.routePlanner?.updateState(this.buildRoutePlannerState());
     this.topbar.updateRouteSummary({
       legCount: this.routeTrackIds.length,
       planModeActive: this.routePlanMode,
-      panelOpen: this.routePlanner.isPanelOpen(),
+      panelOpen: this.routePlanner?.isPanelOpen() ?? false,
     });
     if (this.routePlanMode) {
       const n = this.routeTrackIds.length;
@@ -1576,7 +1652,7 @@ class TrailForgeApp {
     }
   }
 
-  private openRoutePlanner(): void {
+  private async openRoutePlanner(): Promise<void> {
     if (this.inspector.openState()) {
       this.inspector.close();
       this.shellEl.classList.remove("inspector-open");
@@ -1584,8 +1660,9 @@ class TrailForgeApp {
     this.closeAccountPanel();
     this.closeAdminPanel();
     this.closePacksPanel();
-    this.routePlanner.updateState(this.buildRoutePlannerState());
-    this.routePlanner.open();
+    const panel = await this.ensureRoutePlanner();
+    panel.updateState(this.buildRoutePlannerState());
+    panel.open();
     this.shellEl.classList.add("route-open");
     this.syncRoutePlannerUiState();
     if (this.user && this.isOnline) {
@@ -1597,7 +1674,7 @@ class TrailForgeApp {
     if (this.routePlanMode) {
       this.setRoutePlanMode(false);
     }
-    this.routePlanner.close();
+    this.routePlanner?.close();
     this.shellEl.classList.remove("route-open");
     this.syncRoutePlannerUiState();
   }
@@ -1937,14 +2014,14 @@ class TrailForgeApp {
       this.user?.display_name ?? null,
       this.favorites.length + this.pins.length + this.offlinePins.length
     );
-    this.topbar.updateAdminAccess(isAdmin, this.adminPanel.isPanelOpen());
-    this.accountPanel.updateState(this.buildAccountPanelState());
-    this.packsPanel.updateState({ isAdmin: canManageAdminCompute(this.user) });
-    this.adminPanel.updateState({
+    this.topbar.updateAdminAccess(isAdmin, this.adminPanel?.isPanelOpen() ?? false);
+    this.accountPanel?.updateState(this.buildAccountPanelState());
+    this.packsPanel?.updateState({ isAdmin: canManageAdminCompute(this.user) });
+    this.adminPanel?.updateState({
       currentUserId: this.user?.id ?? null,
       registrationMode: this.authConfig.registration_mode,
     });
-    if (!isAdmin && this.adminPanel.isPanelOpen()) {
+    if (!isAdmin && this.adminPanel?.isPanelOpen()) {
       this.closeAdminPanel();
     }
     this.recorderHud.updateContext({
@@ -1973,7 +2050,7 @@ class TrailForgeApp {
     this.syncRoutePlannerUiState();
   }
 
-  private openAccountPanel(tab?: AccountPanelTab): void {
+  private async openAccountPanel(tab?: AccountPanelTab): Promise<void> {
     if (this.inspector.openState()) {
       this.inspector.close();
       this.shellEl.classList.remove("inspector-open");
@@ -1981,17 +2058,18 @@ class TrailForgeApp {
     this.closeAdminPanel();
     this.closePacksPanel();
     this.closeRoutePlanner();
-    this.accountPanel.updateState(this.buildAccountPanelState());
-    this.accountPanel.open(tab);
+    const panel = await this.ensureAccountPanel();
+    panel.updateState(this.buildAccountPanelState());
+    panel.open(tab);
     this.shellEl.classList.add("account-open");
   }
 
   private closeAccountPanel(): void {
-    this.accountPanel.close();
+    this.accountPanel?.close();
     this.shellEl.classList.remove("account-open");
   }
 
-  private openAdminPanel(tab?: AdminPanelTab): void {
+  private async openAdminPanel(tab?: AdminPanelTab): Promise<void> {
     if (!isAdminUser(this.user)) {
       this.showToast("Admin privileges required", "error");
       return;
@@ -2003,21 +2081,22 @@ class TrailForgeApp {
     this.closeAccountPanel();
     this.closePacksPanel();
     this.closeRoutePlanner();
-    this.adminPanel.open(tab);
+    const panel = await this.ensureAdminPanel();
+    panel.open(tab);
     this.shellEl.classList.add("admin-open");
     this.topbar.updateAdminAccess(true, true);
     void this.refreshAdminConsoleData();
   }
 
   private closeAdminPanel(): void {
-    this.adminPanel.close();
+    this.adminPanel?.close();
     this.shellEl.classList.remove("admin-open");
     this.topbar.updateAdminAccess(isAdminUser(this.user), false);
   }
 
   private async refreshAdminConsoleData(): Promise<void> {
     if (!isAdminUser(this.user)) return;
-    this.adminPanel.updateState({ loading: true, error: null });
+    this.adminPanel?.updateState({ loading: true, error: null });
     try {
       const [stats, invites, users] = await Promise.all([
         fetchAdminStats(),
@@ -2027,7 +2106,7 @@ class TrailForgeApp {
       this.adminStats = stats;
       this.adminInvites = invites;
       this.adminUsers = users;
-      this.adminPanel.updateState({
+      this.adminPanel?.updateState({
         stats: this.adminStats,
         invites: this.adminInvites,
         users: this.adminUsers,
@@ -2036,11 +2115,11 @@ class TrailForgeApp {
           stats.registration_mode ?? this.authConfig.registration_mode,
       });
     } catch (err) {
-      this.adminPanel.updateState({
+      this.adminPanel?.updateState({
         error: formatFriendlyApiError(err, "Failed to load admin console data"),
       });
     } finally {
-      this.adminPanel.updateState({ loading: false });
+      this.adminPanel?.updateState({ loading: false });
     }
   }
 
@@ -2061,7 +2140,7 @@ class TrailForgeApp {
     } else {
       this.pinDropBannerEl.classList.add("hidden");
     }
-    this.accountPanel.updateState(this.buildAccountPanelState());
+    this.accountPanel?.updateState(this.buildAccountPanelState());
   }
 
   private bindEvents(root: HTMLElement): void {
@@ -2131,13 +2210,13 @@ class TrailForgeApp {
           }
         } else if (this.routePlanMode) {
           this.setRoutePlanMode(false);
-        } else if (this.routePlanner.isPanelOpen()) {
+        } else if (this.routePlanner?.isPanelOpen()) {
           this.closeRoutePlanner();
-        } else if (this.adminPanel.isPanelOpen()) {
+        } else if (this.adminPanel?.isPanelOpen()) {
           this.closeAdminPanel();
-        } else if (this.packsPanel.isPanelOpen()) {
+        } else if (this.packsPanel?.isPanelOpen()) {
           this.closePacksPanel();
-        } else if (this.accountPanel.isPanelOpen()) {
+        } else if (this.accountPanel?.isPanelOpen()) {
           this.closeAccountPanel();
         } else if (this.inspector.openState()) {
           this.inspector.close();
@@ -2189,12 +2268,13 @@ class TrailForgeApp {
     void this.refreshClosures(false);
     void this.refreshHotspotsGeoJson();
     void this.refreshReportsGeoJson();
-    void this.refreshUnmappedCandidates();
-    void this.refreshPacksCatalog();
+    if (this.layerState.unmapped) {
+      void this.refreshUnmappedCandidates();
+    }
     void this.hydrateAuthSession();
 
     if (this.initialUrlState.routeTrackIds.length > 0) {
-      this.openRoutePlanner();
+      void this.openRoutePlanner();
       void this.recomputePlannedRoute(this.initialUrlState.lat === null);
     } else if (this.initialUrlState.trackId) {
       void this.openTrackInspector(this.initialUrlState.trackId, undefined, {
@@ -2204,14 +2284,27 @@ class TrailForgeApp {
       });
     }
 
-    window.setInterval(
-      () => void this.refreshHealth(false),
-      HEALTH_POLL_INTERVAL_MS
-    );
-    window.setInterval(
-      () => void this.refreshClosures(false),
-      CLOSURES_POLL_INTERVAL_MS
-    );
+    const isPageVisible = (): boolean =>
+      typeof document === "undefined" || document.visibilityState === "visible";
+
+    window.setInterval(() => {
+      if (isPageVisible()) {
+        void this.refreshHealth(false);
+      }
+    }, HEALTH_POLL_INTERVAL_MS);
+    window.setInterval(() => {
+      if (isPageVisible()) {
+        void this.refreshClosures(false);
+      }
+    }, CLOSURES_POLL_INTERVAL_MS);
+
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible" && this.isOnline) {
+          void this.refreshHealth(false);
+        }
+      });
+    }
 
     void registerServiceWorker((status) => {
       this.sidebar.updateSwStatus(status);

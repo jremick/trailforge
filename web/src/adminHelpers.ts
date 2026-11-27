@@ -61,7 +61,9 @@ export function resolvePackAssetUrl(
   const trimmed = (rawUrl ?? "").trim();
   if (trimmed) {
     if (isAbsoluteHttpUrl(trimmed)) return trimmed;
-    if (trimmed.startsWith("/")) return resolveApiUrl(trimmed, baseOverride);
+    if (trimmed.startsWith("/") && !trimmed.startsWith("//")) {
+      return resolveApiUrl(trimmed, baseOverride);
+    }
   }
   return resolveApiUrl(fallbackPath, baseOverride);
 }
