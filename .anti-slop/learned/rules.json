@@ -1,0 +1,318 @@
+{
+  "schema_version": 1,
+  "next_id": 7,
+  "rules": [
+    {
+      "id": "L-001",
+      "title": "[OPT-SEC-01] Python subprocess call with shell=True",
+      "status": "approved",
+      "created_at": "2026-11-27T21:43:32Z",
+      "updated_at": "2026-11-27T21:43:32Z",
+      "captured": {
+        "bad_example": "subprocess.run(f\"tar -czf {archive} {src}\", shell=True, check=True)\n",
+        "desired_outcome": "Pass an argv list with shell=False (the default) so untrusted inputs cannot trigger shell injection.",
+        "valid_neighbouring_case": "subprocess.run([\"tar\", \"-czf\", archive, src], shell=False, check=True)\n",
+        "why_it_matters": "Kept opt-in as a focused guard complementary to full SAST; build/ops wrapper repos sometimes invoke shell pipelines intentionally.",
+        "file_glob": "*.py",
+        "source_context": "library:security-boundaries/OPT-SEC-01"
+      },
+      "proposal": {
+        "layer": "deterministic_check",
+        "severity": "error",
+        "file_glob": "*.py",
+        "pattern": "\\bsubprocess\\.(?:run|Popen|call|check_call|check_output)\\s*\\([^\\n]*\\bshell\\s*=\\s*True\\b",
+        "match_mode": "line",
+        "canonical_path": null,
+        "rule_text": null,
+        "why_not_deterministic": null,
+        "remediation": "Pass an argv list with shell=False (the default) so untrusted inputs cannot trigger shell injection.",
+        "retirement_trigger": "Retire if repo CI already enforces Bandit B602 or Semgrep subprocess-shell rules on every PR.",
+        "proposal_sha256": "e7723fd07f802a1e50f8692745adca005c83984be288b5ab942755c457c8272e"
+      },
+      "verification": {
+        "verified_at": "2026-11-27T21:43:32Z",
+        "proposal_sha256": "e7723fd07f802a1e50f8692745adca005c83984be288b5ab942755c457c8272e",
+        "mechanical": true,
+        "passed": true,
+        "bad_case_caught": true,
+        "bad_case_hits": 1,
+        "valid_neighbour_clean": true,
+        "valid_neighbour_hits": 0,
+        "repo_scan_files": 121,
+        "repo_scan_hits": 0,
+        "max_repo_hits": 0,
+        "repo_sample_hits": [],
+        "notes": []
+      },
+      "approval": {
+        "approved_by": "jremick",
+        "approved_at": "2026-11-27T21:43:32Z",
+        "note": "Enabled from optional library (security-boundaries/OPT-SEC-01).",
+        "approved_proposal_sha256": "e7723fd07f802a1e50f8692745adca005c83984be288b5ab942755c457c8272e"
+      },
+      "retirement": null,
+      "library_rule_id": "OPT-SEC-01",
+      "library_pack": "security-boundaries"
+    },
+    {
+      "id": "L-002",
+      "title": "[OPT-SEC-02] Unsafe yaml.load() without SafeLoader",
+      "status": "approved",
+      "created_at": "2026-11-27T21:43:32Z",
+      "updated_at": "2026-11-27T21:43:33Z",
+      "captured": {
+        "bad_example": "config = yaml.load(raw_text)\n",
+        "desired_outcome": "Use yaml.safe_load(...) or pass Loader=yaml.SafeLoader to prevent arbitrary object deserialization.",
+        "valid_neighbouring_case": "config = yaml.load(raw_text, Loader=yaml.SafeLoader)\n",
+        "why_it_matters": "Only relevant to Python repos using PyYAML; kept optional so non-YAML projects and dedicated SAST pipelines avoid redundant rules.",
+        "file_glob": "*.py",
+        "source_context": "library:security-boundaries/OPT-SEC-02"
+      },
+      "proposal": {
+        "layer": "deterministic_check",
+        "severity": "error",
+        "file_glob": "*.py",
+        "pattern": "\\byaml\\.load\\s*\\((?![^\\n]*(?:SafeLoader|CSafeLoader|BaseLoader|CBaseLoader))[^()\\n]*\\)",
+        "match_mode": "line",
+        "canonical_path": null,
+        "rule_text": null,
+        "why_not_deterministic": null,
+        "remediation": "Use yaml.safe_load(...) or pass Loader=yaml.SafeLoader to prevent arbitrary object deserialization.",
+        "retirement_trigger": "Retire once Ruff S506 / Bandit B506 or PyYAML removal makes this check redundant.",
+        "proposal_sha256": "ff7fa8779513d145219fe3e72c459478f5f8d019059874dd56ed22c119637cf6"
+      },
+      "verification": {
+        "verified_at": "2026-11-27T21:43:33Z",
+        "proposal_sha256": "ff7fa8779513d145219fe3e72c459478f5f8d019059874dd56ed22c119637cf6",
+        "mechanical": true,
+        "passed": true,
+        "bad_case_caught": true,
+        "bad_case_hits": 1,
+        "valid_neighbour_clean": true,
+        "valid_neighbour_hits": 0,
+        "repo_scan_files": 121,
+        "repo_scan_hits": 0,
+        "max_repo_hits": 0,
+        "repo_sample_hits": [],
+        "notes": []
+      },
+      "approval": {
+        "approved_by": "jremick",
+        "approved_at": "2026-11-27T21:43:33Z",
+        "note": "Enabled from optional library (security-boundaries/OPT-SEC-02).",
+        "approved_proposal_sha256": "ff7fa8779513d145219fe3e72c459478f5f8d019059874dd56ed22c119637cf6"
+      },
+      "retirement": null,
+      "library_rule_id": "OPT-SEC-02",
+      "library_pack": "security-boundaries"
+    },
+    {
+      "id": "L-003",
+      "title": "[OPT-SEC-03] Dynamic eval() or exec() in production Python",
+      "status": "approved",
+      "created_at": "2026-11-27T21:43:33Z",
+      "updated_at": "2026-11-27T21:43:33Z",
+      "captured": {
+        "bad_example": "parsed = eval(user_payload)\n",
+        "desired_outcome": "Replace eval()/exec() with ast.literal_eval(), json.loads(), or an explicit dispatch table.",
+        "valid_neighbouring_case": "parsed = ast.literal_eval(user_payload)\n",
+        "why_it_matters": "Code generators, REPL harnesses, and plugin loaders may legitimately use exec(); kept opt-in to preserve low default false positives.",
+        "file_glob": "*.py",
+        "source_context": "library:security-boundaries/OPT-SEC-03"
+      },
+      "proposal": {
+        "layer": "deterministic_check",
+        "severity": "error",
+        "file_glob": "*.py",
+        "pattern": "(?<![.\\w])(?:eval|exec)\\s*\\(",
+        "match_mode": "line",
+        "canonical_path": null,
+        "rule_text": null,
+        "why_not_deterministic": null,
+        "remediation": "Replace eval()/exec() with ast.literal_eval(), json.loads(), or an explicit dispatch table.",
+        "retirement_trigger": "Retire once Bandit B307/B102 or Ruff S307/S102 enforces this rule in CI.",
+        "proposal_sha256": "040030bed0dde719395b7f2a02d4835c197c2fb5f3d9e0d97a7500f114f076c4"
+      },
+      "verification": {
+        "verified_at": "2026-11-27T21:43:33Z",
+        "proposal_sha256": "040030bed0dde719395b7f2a02d4835c197c2fb5f3d9e0d97a7500f114f076c4",
+        "mechanical": true,
+        "passed": true,
+        "bad_case_caught": true,
+        "bad_case_hits": 1,
+        "valid_neighbour_clean": true,
+        "valid_neighbour_hits": 0,
+        "repo_scan_files": 121,
+        "repo_scan_hits": 0,
+        "max_repo_hits": 0,
+        "repo_sample_hits": [],
+        "notes": []
+      },
+      "approval": {
+        "approved_by": "jremick",
+        "approved_at": "2026-11-27T21:43:33Z",
+        "note": "Enabled from optional library (security-boundaries/OPT-SEC-03).",
+        "approved_proposal_sha256": "040030bed0dde719395b7f2a02d4835c197c2fb5f3d9e0d97a7500f114f076c4"
+      },
+      "retirement": null,
+      "library_rule_id": "OPT-SEC-03",
+      "library_pack": "security-boundaries"
+    },
+    {
+      "id": "L-004",
+      "title": "[OPT-CFG-01] Floating :latest base image tag in Dockerfile",
+      "status": "approved",
+      "created_at": "2026-11-27T21:43:33Z",
+      "updated_at": "2026-11-27T21:43:33Z",
+      "captured": {
+        "bad_example": "FROM python:latest\n",
+        "desired_outcome": "Pin an explicit version tag or image digest (for example, FROM python:3.12-slim or @sha256:...) for reproducible builds.",
+        "valid_neighbouring_case": "FROM python:3.12-slim\n",
+        "why_it_matters": "Disposable local dev containers occasionally track :latest intentionally; kept opt-in so non-Docker or scratch dev setups are unaffected.",
+        "file_glob": "*Dockerfile*,Dockerfile*,*.dockerfile",
+        "source_context": "library:build-config-hygiene/OPT-CFG-01"
+      },
+      "proposal": {
+        "layer": "deterministic_check",
+        "severity": "warning",
+        "file_glob": "*Dockerfile*,Dockerfile*,*.dockerfile",
+        "pattern": "(?i)^\\s*FROM\\s+(?:--platform=\\S+\\s+)?[^\\s@]+:latest(?:\\s|$)",
+        "match_mode": "line",
+        "canonical_path": null,
+        "rule_text": null,
+        "why_not_deterministic": null,
+        "remediation": "Pin an explicit version tag or image digest (for example, FROM python:3.12-slim or @sha256:...) for reproducible builds.",
+        "retirement_trigger": "Retire once Hadolint DL3007 or container policy checks enforce pinned base images in CI.",
+        "proposal_sha256": "8dd69f2f0c963d4b907fd95392b32acc4461cd1f82bef1e72a29c19a37655e97"
+      },
+      "verification": {
+        "verified_at": "2026-11-27T21:43:33Z",
+        "proposal_sha256": "8dd69f2f0c963d4b907fd95392b32acc4461cd1f82bef1e72a29c19a37655e97",
+        "mechanical": true,
+        "passed": true,
+        "bad_case_caught": true,
+        "bad_case_hits": 1,
+        "valid_neighbour_clean": true,
+        "valid_neighbour_hits": 0,
+        "repo_scan_files": 2,
+        "repo_scan_hits": 0,
+        "max_repo_hits": 0,
+        "repo_sample_hits": [],
+        "notes": []
+      },
+      "approval": {
+        "approved_by": "jremick",
+        "approved_at": "2026-11-27T21:43:33Z",
+        "note": "Enabled from optional library (build-config-hygiene/OPT-CFG-01).",
+        "approved_proposal_sha256": "8dd69f2f0c963d4b907fd95392b32acc4461cd1f82bef1e72a29c19a37655e97"
+      },
+      "retirement": null,
+      "library_rule_id": "OPT-CFG-01",
+      "library_pack": "build-config-hygiene"
+    },
+    {
+      "id": "L-005",
+      "title": "[OPT-CFG-02] World-writable chmod 777 / 0o777 permissions",
+      "status": "approved",
+      "created_at": "2026-11-27T21:43:33Z",
+      "updated_at": "2026-11-27T21:43:33Z",
+      "captured": {
+        "bad_example": "chmod -R 777 /var/app/uploads\n",
+        "desired_outcome": "Grant least-privilege permissions (such as 755 for executables or 644/600 for data and secrets) instead of world-writable 777.",
+        "valid_neighbouring_case": "chmod 755 scripts/entrypoint.sh\n",
+        "why_it_matters": "Agents sometimes reach for chmod 777 to bypass container permission errors quickly, but isolated ephemeral build scripts may occasionally have custom mount requirements.",
+        "file_glob": "*.sh,*.bash,*.zsh,*.py,*Dockerfile*,Dockerfile*,*.dockerfile,*.yml,*.yaml",
+        "source_context": "library:build-config-hygiene/OPT-CFG-02"
+      },
+      "proposal": {
+        "layer": "deterministic_check",
+        "severity": "error",
+        "file_glob": "*.sh,*.bash,*.zsh,*.py,*Dockerfile*,Dockerfile*,*.dockerfile,*.yml,*.yaml",
+        "pattern": "\\bchmod\\s+(?:-[A-Za-z]+\\s+)*0?777\\b|\\b0o777\\b",
+        "match_mode": "line",
+        "canonical_path": null,
+        "rule_text": null,
+        "why_not_deterministic": null,
+        "remediation": "Grant least-privilege permissions (such as 755 for executables or 644/600 for data and secrets) instead of world-writable 777.",
+        "retirement_trigger": "Retire once infrastructure policy linters (Checkov, Trivy, ShellCheck) enforce least-privilege modes in CI.",
+        "proposal_sha256": "b0e6f7441cd4bdcde3a222ba9131a8f0a8ab1f565a8df7f56c1a61e3ae545f6a"
+      },
+      "verification": {
+        "verified_at": "2026-11-27T21:43:33Z",
+        "proposal_sha256": "b0e6f7441cd4bdcde3a222ba9131a8f0a8ab1f565a8df7f56c1a61e3ae545f6a",
+        "mechanical": true,
+        "passed": true,
+        "bad_case_caught": true,
+        "bad_case_hits": 1,
+        "valid_neighbour_clean": true,
+        "valid_neighbour_hits": 0,
+        "repo_scan_files": 132,
+        "repo_scan_hits": 0,
+        "max_repo_hits": 0,
+        "repo_sample_hits": [],
+        "notes": []
+      },
+      "approval": {
+        "approved_by": "jremick",
+        "approved_at": "2026-11-27T21:43:33Z",
+        "note": "Enabled from optional library (build-config-hygiene/OPT-CFG-02).",
+        "approved_proposal_sha256": "b0e6f7441cd4bdcde3a222ba9131a8f0a8ab1f565a8df7f56c1a61e3ae545f6a"
+      },
+      "retirement": null,
+      "library_rule_id": "OPT-CFG-02",
+      "library_pack": "build-config-hygiene"
+    },
+    {
+      "id": "L-006",
+      "title": "[OPT-NET-01] Python HTTP call without explicit timeout",
+      "status": "approved",
+      "created_at": "2026-11-27T21:43:33Z",
+      "updated_at": "2026-11-27T21:43:34Z",
+      "captured": {
+        "bad_example": "resp = requests.get(\"https://api.example.com/v1/health\")\n",
+        "desired_outcome": "Pass an explicit timeout=... argument (for example, timeout=10 or timeout=(3, 10)) so outbound requests fail fast instead of hanging indefinitely.",
+        "valid_neighbouring_case": "resp = requests.get(\"https://api.example.com/v1/health\", timeout=10)\n",
+        "why_it_matters": "Internal one-off scripts, local fixture servers, or repositories wrapping a custom HTTPAdapter with default timeouts may intentionally omit per-call timeout arguments.",
+        "file_glob": "*.py",
+        "source_context": "library:network-timeouts/OPT-NET-01"
+      },
+      "proposal": {
+        "layer": "deterministic_check",
+        "severity": "warning",
+        "file_glob": "*.py",
+        "pattern": "\\b(?:requests\\.(?:get|post|put|patch|delete|head|options|request)|urllib\\.request\\.urlopen)\\s*\\((?![^\\n]*\\btimeout\\s*=)[^()\\n]*\\)",
+        "match_mode": "line",
+        "canonical_path": null,
+        "rule_text": null,
+        "why_not_deterministic": null,
+        "remediation": "Pass an explicit timeout=... argument (for example, timeout=10 or timeout=(3, 10)) so outbound requests fail fast instead of hanging indefinitely.",
+        "retirement_trigger": "Retire once Ruff S113 / Bandit B113 or a project-wide HTTP client wrapper enforces timeouts in CI.",
+        "proposal_sha256": "3f9c1d396b551a7de8155377b84106a12b40806bf6222783c1148cd8299b6103"
+      },
+      "verification": {
+        "verified_at": "2026-11-27T21:43:34Z",
+        "proposal_sha256": "3f9c1d396b551a7de8155377b84106a12b40806bf6222783c1148cd8299b6103",
+        "mechanical": true,
+        "passed": true,
+        "bad_case_caught": true,
+        "bad_case_hits": 1,
+        "valid_neighbour_clean": true,
+        "valid_neighbour_hits": 0,
+        "repo_scan_files": 121,
+        "repo_scan_hits": 0,
+        "max_repo_hits": 0,
+        "repo_sample_hits": [],
+        "notes": []
+      },
+      "approval": {
+        "approved_by": "jremick",
+        "approved_at": "2026-11-27T21:43:34Z",
+        "note": "Enabled from optional library (network-timeouts/OPT-NET-01).",
+        "approved_proposal_sha256": "3f9c1d396b551a7de8155377b84106a12b40806bf6222783c1148cd8299b6103"
+      },
+      "retirement": null,
+      "library_rule_id": "OPT-NET-01",
+      "library_pack": "network-timeouts"
+    }
+  ]
+}
