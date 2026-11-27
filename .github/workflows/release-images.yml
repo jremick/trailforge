@@ -14,7 +14,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 env:
   REGISTRY: ghcr.io
@@ -22,6 +21,7 @@ env:
 jobs:
   resolve-tag:
     name: Resolve Release Tag & Semver Channel
+    permissions: {}
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
@@ -71,21 +71,25 @@ jobs:
   build-backend:
     name: Build & Push Backend Image (linux/amd64, linux/arm64)
     needs: resolve-tag
+    permissions:
+      contents: read
+      packages: write
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.resolve-tag.outputs.checkout_ref }}
+          persist-credentials: false
 
       - name: Set up QEMU for multi-arch builds
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -93,7 +97,7 @@ jobs:
 
       - name: Extract Docker metadata (tags & OCI labels)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ghcr.io/${{ github.repository_owner }}/trailforge-backend
           tags: |
@@ -109,7 +113,7 @@ jobs:
             org.opencontainers.image.licenses=GPL-3.0-or-later
 
       - name: Build and push multi-arch backend image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: ./Dockerfile
@@ -125,21 +129,25 @@ jobs:
   build-web:
     name: Build & Push Web PWA Image (linux/amd64, linux/arm64)
     needs: resolve-tag
+    permissions:
+      contents: read
+      packages: write
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.resolve-tag.outputs.checkout_ref }}
+          persist-credentials: false
 
       - name: Set up QEMU for multi-arch builds
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -147,7 +155,7 @@ jobs:
 
       - name: Extract Docker metadata (tags & OCI labels)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ghcr.io/${{ github.repository_owner }}/trailforge-web
           tags: |
@@ -163,7 +171,7 @@ jobs:
             org.opencontainers.image.licenses=GPL-3.0-or-later
 
       - name: Build and push multi-arch web image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: ./web
           file: ./web/Dockerfile
@@ -178,24 +186,42 @@ jobs:
     name: Trigger Railway Production Redeploy (Optional)
     needs: [resolve-tag, build-backend]
     if: ${{ needs.resolve-tag.outputs.is_stable == 'true' }}
+    permissions: {}
     runs-on: ubuntu-latest
     steps:
+      - name: Install pinned Railway CLI (checksum-verified, no secrets in env)
+        env:
+          RAILWAY_CLI_VERSION: v5.76.0
+          RAILWAY_CLI_SHA256: d479d0fd9a6a03a9c32780608245f3a3eba8c727ec02b0e5130a871128a75afd
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/railway.tar.gz"
+          url="https://github.com/railwayapp/cli/releases/download/${RAILWAY_CLI_VERSION}/railway-${RAILWAY_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL "${url}" -o "${archive}"
+          printf '%s  %s\n' "${RAILWAY_CLI_SHA256}" "${archive}" | sha256sum -c -
+          mkdir -p "${HOME}/.local/bin"
+          tar -xzf "${archive}" -C "${HOME}/.local/bin" railway
+          chmod 0755 "${HOME}/.local/bin/railway"
+          rm -f "${archive}"
+
       - name: Redeploy Railway backend services from latest GHCR image
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
           RAILWAY_SERVICES: ${{ vars.RAILWAY_SERVICES || 'api worker' }}
         run: |
+          set -euo pipefail
+          set -f
           if [ -z "${RAILWAY_TOKEN}" ]; then
             echo "RAILWAY_TOKEN secret is not configured; skipping automatic Railway redeploy."
             exit 0
           fi
 
-          bash <(curl -fsSL https://railway.com/install.sh)
-          export PATH="${HOME}/.railway/bin:${HOME}/.local/bin:/usr/local/bin:${PATH}"
+          export PATH="${HOME}/.local/bin:/usr/local/bin:${PATH}"
 
-          # Normalize commas/whitespace into space-separated service names (default: api worker)
-          SERVICES="$(printf '%s' "${RAILWAY_SERVICES}" | tr ',' ' ')"
-          for svc in ${SERVICES}; do
+          # Parse comma/whitespace-separated service names safely without glob expansion
+          IFS=', ' read -r -a services <<< "${RAILWAY_SERVICES}"
+          for svc in "${services[@]}"; do
+            [ -n "${svc}" ] || continue
             echo "Triggering Railway redeploy from latest image for service: ${svc}"
             railway redeploy --service "${svc}" --from-source --yes
           done

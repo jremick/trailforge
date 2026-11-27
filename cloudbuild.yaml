@@ -91,6 +91,7 @@ steps:
         docker exec db pg_isready -U trailforge -d trailforge
 
         docker run --rm --network cloudbuild \
+          --mount type=bind,source=/workspace/web/src,target=/app/web/src,readonly \
           -e DATABASE_URL="postgresql+psycopg://trailforge:trailforge@db:5432/trailforge" \
           -e TEST_DATABASE_URL="postgresql+psycopg://trailforge:trailforge@db:5432/trailforge" \
           "trailforge-backend:ci-${BUILD_ID}" \
