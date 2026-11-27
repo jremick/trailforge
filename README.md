@@ -114,6 +114,7 @@ High-value priorities planned next (kept updated as milestones ship; see [`docs/
 | **Optional Valhalla Sidecar** (`/trace_attributes` with HMM fallback) | [`deploy/valhalla.md`](deploy/valhalla.md) |
 | **Demo Walkthrough, Sample GPX & GridForge Print Handoff** | [`examples/README.md`](examples/README.md) |
 | **Spatial Schema, GIS Connectors & Engineering Invariants** | [`docs/SPEC_GIS_SCHEMA.md`](docs/SPEC_GIS_SCHEMA.md) · [`AGENTS.md`](AGENTS.md) |
+| **Community Telemetry Privacy & Upgrade Guide** | [`docs/COMMUNITY_PRIVACY.md`](docs/COMMUNITY_PRIVACY.md) |
 | **Contributing, Architecture Rules & Release History** | [`CONTRIBUTING.md`](CONTRIBUTING.md) · [`CHANGELOG.md`](CHANGELOG.md) |
 
 **Stack:** Python 3.12 + FastAPI · PostgreSQL 16 + PostGIS 3.4 · GDAL / `osmium` / Tippecanoe / `rio-rgbify` / `PMTiles` · TypeScript + Vite + MapLibre GL JS 6 PWA (`~350 MiB` idle RAM, `< 300 MB` streaming bake/pack RAM, `0.18–0.63 ms` GIST lookups at 11k+ segments).

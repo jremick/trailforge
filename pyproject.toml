@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "trailforge"
-version = "1.2.1"
+version = "1.3.0"
 description = "Open-source, self-hostable Pan-Australia 4WD & off-road mapping, live track-grading, route planning, and AI/MCP trail-intelligence platform"
 readme = "README.md"
 license = "GPL-3.0-or-later"
