@@ -86,8 +86,12 @@ def _decode_pure_python_geotiff(
     magic, ifd_offset = struct.unpack_from(f"{endian}HI", raw, 2)
     if magic != 42:
         raise ValueError(f"Unsupported TIFF magic {magic} (BigTIFF requires rasterio): {path}")
+    if ifd_offset + 2 > len(raw):
+        raise ValueError(f"Truncated TIFF IFD header: {path}")
 
     num_entries = struct.unpack_from(f"{endian}H", raw, ifd_offset)[0]
+    if ifd_offset + 2 + num_entries * 12 > len(raw):
+        raise ValueError(f"Truncated TIFF IFD table: {path}")
     tags: dict[int, Any] = {}
 
     for idx in range(num_entries):
@@ -121,10 +125,15 @@ def _decode_pure_python_geotiff(
             vals = struct.unpack_from(f"{endian}{count}{fmt_char}", payload, 0)
             tags[tag] = vals[0] if count == 1 else list(vals)
 
+    for required_tag in (256, 257, 273, 279):
+        if required_tag not in tags:
+            raise ValueError(f"Missing required TIFF tag {required_tag}: {path}")
     cols = int(tags[256])
     rows = int(tags[257])
+    if cols <= 0 or rows <= 0:
+        raise ValueError(f"Invalid TIFF dimensions {cols}x{rows}: {path}")
     if max_pixels is not None and (
-        cols <= 0 or rows <= 0 or cols * rows > max_pixels or int(tags.get(277, 1)) != 1
+        cols * rows > max_pixels or int(tags.get(277, 1)) != 1
     ):
         raise ValueError("DEM raster exceeds the pixel limit or has multiple bands")
     bits_per_sample = int(tags.get(258, 32))
@@ -165,6 +174,8 @@ def _decode_pure_python_geotiff(
         if row_cursor >= rows:
             break
         strip_rows = min(rows_per_strip, rows - row_cursor)
+        if s_off + s_cnt > len(raw):
+            raise ValueError(f"Truncated TIFF strip data: {path}")
         chunk = raw[s_off : s_off + s_cnt]
         if compression in (8, 32946):
             expected_bytes = strip_rows * row_byte_len

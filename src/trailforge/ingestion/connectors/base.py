@@ -15,6 +15,7 @@ import re
 import shutil
 import tempfile
 import time
+import zlib
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -735,25 +736,73 @@ def iter_bounded_response(
     max_duration_s: float,
     chunk_bytes: int = 65_536,
 ) -> Iterator[bytes]:
-    """Read an identity-encoded response with cumulative byte and duration limits."""
+    """Read an identity or gzip response with cumulative byte and duration limits."""
     encoding = response.headers.get("content-encoding", "identity").strip().lower()
-    if encoding != "identity":
-        raise UpstreamLimitError("Upstream server did not honor identity encoding")
+    if encoding not in ("", "identity", "gzip", "x-gzip"):
+        raise UpstreamLimitError(f"Unsupported upstream content encoding: {encoding!r}")
 
+    is_gzip = encoding in ("gzip", "x-gzip")
     declared_size = checked_content_length(response, max_bytes)
     deadline = time.monotonic() + max_duration_s
-    received = 0
-    chunks = response.iter_bytes() if response.is_stream_consumed else response.iter_raw()
-    for chunk in chunks:
-        received += len(chunk)
-        if received > max_bytes:
+
+    if response.is_stream_consumed:
+        decoded_bytes = 0
+        for chunk in response.iter_bytes():
+            decoded_bytes += len(chunk)
+            if decoded_bytes > max_bytes:
+                raise UpstreamLimitError("Upstream response exceeds the size limit")
+            if time.monotonic() > deadline:
+                raise UpstreamLimitError("Upstream response exceeds the download time limit")
+            for offset in range(0, len(chunk), chunk_bytes):
+                yield chunk[offset : offset + chunk_bytes]
+        if not is_gzip and declared_size is not None and decoded_bytes != declared_size:
+            raise UpstreamLimitError("Incomplete upstream response")
+        return
+
+    wire_bytes = 0
+    decoded_bytes = 0
+    decoder = zlib.decompressobj(zlib.MAX_WBITS + 16) if is_gzip else None
+    for chunk in response.iter_raw():
+        wire_bytes += len(chunk)
+        if wire_bytes > max_bytes:
             raise UpstreamLimitError("Upstream response exceeds the size limit")
         if time.monotonic() > deadline:
             raise UpstreamLimitError("Upstream response exceeds the download time limit")
-        for offset in range(0, len(chunk), chunk_bytes):
-            yield chunk[offset : offset + chunk_bytes]
-    if declared_size is not None and received != declared_size:
+        if decoder is None:
+            decoded_bytes += len(chunk)
+            for offset in range(0, len(chunk), chunk_bytes):
+                yield chunk[offset : offset + chunk_bytes]
+            continue
+
+        data = chunk
+        while data:
+            step_limit = min(chunk_bytes, max_bytes - decoded_bytes + 1)
+            try:
+                out = decoder.decompress(data, step_limit)
+            except zlib.error as exc:
+                raise UpstreamLimitError("Invalid upstream gzip response") from exc
+            decoded_bytes += len(out)
+            if decoded_bytes > max_bytes:
+                raise UpstreamLimitError("Upstream response exceeds the size limit")
+            if time.monotonic() > deadline:
+                raise UpstreamLimitError("Upstream response exceeds the download time limit")
+            if out:
+                yield out
+            if decoder.eof:
+                trailing = decoder.unused_data
+                if not trailing:
+                    break
+                decoder = zlib.decompressobj(zlib.MAX_WBITS + 16)
+                data = trailing
+            elif decoder.unconsumed_tail:
+                data = decoder.unconsumed_tail
+            else:
+                break
+
+    if declared_size is not None and wire_bytes != declared_size:
         raise UpstreamLimitError("Incomplete upstream response")
+    if decoder is not None and not decoder.eof:
+        raise UpstreamLimitError("Incomplete upstream gzip response")
 
 
 def read_bounded_json(

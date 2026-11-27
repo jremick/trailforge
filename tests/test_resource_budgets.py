@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import gzip
 import json
+import struct
 import zipfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, func, select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from tests.test_matching_hmm import _build_offline_corridor_segments, _InMemoryCorridorHMMMatcher
@@ -23,6 +27,7 @@ from trailforge.ingestion.connectors import au_states, base, dem
 from trailforge.ingestion.connectors.fixtures import load_corridor_fixtures
 from trailforge.ingestion.pbf import StreamingPBFExtractor
 from trailforge.ingestion.pipeline import ingest_corridor_dataset
+from trailforge.ingestion.terrain import _decode_pure_python_geotiff
 from trailforge.matching import hmm, imu, parse_gpx, trim_privacy_buffer
 from trailforge.matching.protocol import MatchedSegmentTraversal, MatchResult
 from trailforge.routes import planner
@@ -248,3 +253,87 @@ def test_route_limits_count_repeat_legs_before_building_their_geometry(
                 assert large_result.status_code == 422, large_result.text
     finally:
         _truncate_route_test_tables(postgis_engine)
+
+
+def test_iter_bounded_response_supports_empty_and_bounded_gzip_encoding() -> None:
+    payload = b'{"features":[]}'
+    gz_multi = gzip.compress(b'{"features":') + gzip.compress(b"[]}")
+    gz_bomb = gzip.compress(b"A" * 4096)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/empty-enc":
+            return httpx.Response(200, headers={"Content-Encoding": ""}, content=payload)
+        if request.url.path == "/gzip-ok":
+            return httpx.Response(
+                200,
+                headers={"Content-Encoding": "gzip", "Content-Length": str(len(gz_multi))},
+                stream=_SmallStream(gz_multi[:15], gz_multi[15:]),
+            )
+        if request.url.path == "/gzip-bomb":
+            return httpx.Response(
+                200,
+                headers={"Content-Encoding": "x-gzip"},
+                stream=_SmallStream(gz_bomb),
+            )
+        return httpx.Response(200, headers={"Content-Encoding": "br"}, content=b"compressed")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with client.stream("GET", "https://fixtures.invalid/empty-enc") as resp:
+            assert b"".join(
+                base.iter_bounded_response(resp, max_bytes=128, max_duration_s=5.0)
+            ) == payload
+
+        with client.stream("GET", "https://fixtures.invalid/gzip-ok") as resp:
+            assert b"".join(
+                base.iter_bounded_response(resp, max_bytes=128, max_duration_s=5.0, chunk_bytes=8)
+            ) == payload
+
+        with (
+            client.stream("GET", "https://fixtures.invalid/gzip-bomb") as resp,
+            pytest.raises(base.UpstreamLimitError, match="size limit"),
+        ):
+            list(
+                base.iter_bounded_response(
+                    resp, max_bytes=256, max_duration_s=5.0, chunk_bytes=64
+                )
+            )
+
+        with (
+            client.stream("GET", "https://fixtures.invalid/br") as resp,
+            pytest.raises(base.UpstreamLimitError, match="Unsupported upstream content encoding"),
+        ):
+            list(base.iter_bounded_response(resp, max_bytes=128, max_duration_s=5.0))
+
+
+def test_plan_route_translates_statement_timeout_to_work_budget_exceeded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _TimeoutOrig(Exception):
+        sqlstate = "57014"
+
+    def _boom(*_args: object, **_kwargs: object) -> object:
+        raise DBAPIError("SELECT 1", {}, _TimeoutOrig("statement timeout"))
+
+    monkeypatch.setattr(planner, "_plan_route_with_geometry_impl", _boom)
+    with pytest.raises(planner.RouteWorkBudgetExceeded, match="Split the route"):
+        planner.plan_route_with_geometry(cast(Session, None), ["trk-1"])
+
+
+def test_pure_python_geotiff_rejects_truncated_ifd_and_missing_tags(tmp_path: Path) -> None:
+    # Header points IFD offset past end of file
+    truncated_ifd = tmp_path / "truncated_ifd.tif"
+    truncated_ifd.write_bytes(b"II" + struct.pack("<HI", 42, 999))
+    with pytest.raises(ValueError, match="Truncated TIFF IFD header"):
+        _decode_pure_python_geotiff(truncated_ifd)
+
+    # Header claims 10 IFD entries without entry payload bytes
+    truncated_table = tmp_path / "truncated_table.tif"
+    truncated_table.write_bytes(b"II" + struct.pack("<HIH", 42, 8, 10))
+    with pytest.raises(ValueError, match="Truncated TIFF IFD table"):
+        _decode_pure_python_geotiff(truncated_table)
+
+    # Valid empty IFD (0 entries) missing ImageWidth/ImageLength/StripOffsets/StripByteCounts
+    empty_ifd = tmp_path / "empty_ifd.tif"
+    empty_ifd.write_bytes(b"II" + struct.pack("<HIH", 42, 8, 0))
+    with pytest.raises(ValueError, match="Missing required TIFF tag"):
+        _decode_pure_python_geotiff(empty_ifd)

@@ -18,6 +18,7 @@ from typing import Any, Final, Literal
 
 from pydantic import BaseModel, Field
 from sqlalchemy import case, func, select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session, defer, load_only
 
 from trailforge.api.tracks import ParkSummary, PoiResponse
@@ -723,6 +724,30 @@ def plan_route_with_geometry(
     name: str | None = None,
 ) -> tuple[PlannedRouteAnalysis, list[OrientedLegTrack]]:
     """Plan and analyze a chained multi-track route, returning `(analysis, oriented_leg_tracks)`."""
+    try:
+        return _plan_route_with_geometry_impl(
+            session,
+            track_ids,
+            vehicle_class=vehicle_class,
+            vehicle_profile=vehicle_profile,
+            waypoints=waypoints,
+            name=name,
+        )
+    except DBAPIError as exc:
+        if getattr(exc.orig, "sqlstate", None) == "57014":
+            raise RouteWorkBudgetExceeded() from exc
+        raise
+
+
+def _plan_route_with_geometry_impl(
+    session: Session,
+    track_ids: Sequence[str],
+    *,
+    vehicle_class: str | None = None,
+    vehicle_profile: VehicleProfile | None = None,
+    waypoints: Sequence[RouteWaypoint | dict[str, Any]] | None = None,
+    name: str | None = None,
+) -> tuple[PlannedRouteAnalysis, list[OrientedLegTrack]]:
     if not isinstance(track_ids, (list, tuple)):
         raise ValueError("track_ids must be a list of canonical track IDs")
     cleaned_ids = [str(tid).strip() for tid in track_ids]

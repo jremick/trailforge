@@ -121,7 +121,7 @@ def cog_range_path(
                     ):
                         raise ValueError("COG provider range did not match the request")
                     encoding = resp.headers.get("Content-Encoding", "identity").strip().lower()
-                    if encoding != "identity":
+                    if encoding not in ("", "identity"):
                         raise ValueError("COG provider did not honor identity encoding")
                     declared = checked_content_length(resp, length)
                     if declared is not None and declared != length:
@@ -164,3 +164,5 @@ def cog_range_path(
             stopped.set()
             server.shutdown()
             thread.join()
+            with active_request:
+                pass
