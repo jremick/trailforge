@@ -10,7 +10,7 @@ Anonymous visitors can browse tracks, live difficulty grades, closures, elevatio
 
 | Component | Host / Tier | Est. Monthly Cost | Purpose |
 | --- | --- | --- | --- |
-| Frontend PWA + `/api/*` proxy | Cloudflare Pages + Functions (Free) | **$0** | MapLibre GL JS 5 PWA, Service Worker, same-origin API proxy |
+| Frontend PWA + `/api/*` proxy | Cloudflare Pages + Functions (Free) | **$0** | MapLibre GL JS 6 PWA, Service Worker, same-origin API proxy |
 | Vector/Terrain `PMTiles` & Offline Packs | Cloudflare R2 (Free: 10 GB, 10M reads, **$0 egress**) | **$0** | HTTP `206 Partial Content` tile streaming & `.tar.gz` downloads offloaded from Railway |
 | Edge DDoS, Rate Limiting & Analytics | Cloudflare Free WAF + Web Analytics | **$0** | Edge IP throttling, Bot Fight Mode, cookie-free traffic stats |
 | Service 1: `postgis` | Railway (`imresamu/postgis:16-3.4`, `/var/lib/postgresql/data`) | Included in Hobby | Lean PostgreSQL 16 + PostGIS 3.4 on private network |
@@ -99,7 +99,9 @@ For both options:
    - `TRAILFORGE_ORIGIN_SHARED_SECRET=<generated-64-hex>` *(blocks direct unauthenticated `*.up.railway.app` access with HTTP 403)*
    - `TRAILFORGE_ENABLE_DOCS=false` *(disables public `/docs`, `/redoc`, and `/openapi.json` in production)*
    - `AUTH_COOKIE_SECURE=true`
-   - `CORS_ORIGINS=https://trails.example.com`
+   - `CORS_ORIGINS=https://trails.example.com` *(explicit origins only; wildcard `*` is rejected at startup)*
+   - `TRAILFORGE_PUBLIC_BASE_URL=https://trails.example.com` *(required in production when `TRAILFORGE_ENABLE_MCP=true`)*
+   - `TRAILFORGE_TRUST_PROXY_HEADERS=true` and `TRAILFORGE_TRUST_CLOUDFLARE_HEADERS=true` *(auto-enabled when `TRAILFORGE_ORIGIN_SHARED_SECRET` is set)*
    - `TILES_PUBLIC_BASE_URL=https://tiles.example.com`
    - `PACKS_PUBLIC_BASE_URL=https://tiles.example.com` *(or `https://packs.example.com`)*
    - `TRAILFORGE_DEMO_BANNER=...`
@@ -206,28 +208,31 @@ Confirm `HTTP/2 206`, `access-control-allow-origin: https://trails.example.com`,
 
 ### 4.3 Create Your First Admin Account & Friend Invite Codes
 
-- **Option A — Web UI auto-bootstrap:** Register at `https://trails.example.com` using the exact email configured in `TRAILFORGE_ADMIN_EMAIL`. Because no admin exists yet, TrailForge promotes that first registration to `role="admin"` even while `TRAILFORGE_REGISTRATION_MODE=invite_only`.
-- **Option B — Admin CLI (`railway ssh --service api`):**
-  ```bash
-  # Create the first admin account directly
+In `TRAILFORGE_REGISTRATION_MODE=invite_only`, public sign-up cannot bypass invite codes even when `TRAILFORGE_ADMIN_EMAIL` is set. Bootstrap your first admin directly via the **Admin CLI** (`railway ssh --service api`):
+
+```bash
+# Create the first admin account safely via stdin (avoids password exposure in argv/ps)
+printf '%s\n' '<strong-admin-password>' | \
   python -W error::RuntimeWarning -m trailforge.auth.cli create-admin \
     --email admin@example.com \
     --name "Trail Admin" \
-    --password "<strong-admin-password>"
+    --password-stdin
 
-  # Generate a multi-use friend invite code (valid for 30 days)
-  python -W error::RuntimeWarning -m trailforge.auth.cli create-invite \
-    --label "4WD Club Mates" \
-    --max-uses 10 \
-    --expires-days 30
+# Generate a multi-use friend invite code (valid for 30 days)
+python -W error::RuntimeWarning -m trailforge.auth.cli create-invite \
+  --label "4WD Club Mates" \
+  --max-uses 10 \
+  --expires-days 30
 
-  # Inspect active/used/revoked invite codes
-  python -W error::RuntimeWarning -m trailforge.auth.cli list-invites
+# Inspect active/used/revoked invite codes
+python -W error::RuntimeWarning -m trailforge.auth.cli list-invites
 
-  # Promote an existing member account to admin if needed
-  python -W error::RuntimeWarning -m trailforge.auth.cli promote \
-    --email co-admin@example.com
-  ```
+# Promote an existing member account to admin if needed
+python -W error::RuntimeWarning -m trailforge.auth.cli promote \
+  --email co-admin@example.com
+```
+
+*(Alternatively, create a single-use bootstrap invite code with `create-invite --max-uses 1` and register through the Web UI using the email configured in `TRAILFORGE_ADMIN_EMAIL` to auto-promote the first admin.)*
 
 Once signed in as an admin, open the **Admin** console drawer in the web UI to view 24h/7d traffic, error and `429` counts, `/data/uploads` quota usage, trigger closure/grade syncs, create/revoke friend invites, and suspend or promote accounts.
 

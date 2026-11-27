@@ -18,7 +18,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-trailforge}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-trailforge}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - trailforge-pgdata:/var/lib/postgresql/data
     mem_limit: 512m
@@ -56,6 +56,8 @@ services:
       TRAILFORGE_ADMIN_EMAIL: ${TRAILFORGE_ADMIN_EMAIL:-}
       TRAILFORGE_DEMO_BANNER: ${TRAILFORGE_DEMO_BANNER:-}
       TRAILFORGE_TRUST_PROXY_HEADERS: ${TRAILFORGE_TRUST_PROXY_HEADERS:-true}
+      TRAILFORGE_TRUSTED_PROXY_CIDRS: ${TRAILFORGE_TRUSTED_PROXY_CIDRS:-127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7}
+      TRAILFORGE_TRUST_CLOUDFLARE_HEADERS: ${TRAILFORGE_TRUST_CLOUDFLARE_HEADERS:-false}
       TRAILFORGE_ORIGIN_SHARED_SECRET: ${TRAILFORGE_ORIGIN_SHARED_SECRET:-}
       TRAILFORGE_ENABLE_DOCS: ${TRAILFORGE_ENABLE_DOCS:-}
       TRAILFORGE_RATE_LIMIT_ENABLED: ${TRAILFORGE_RATE_LIMIT_ENABLED:-true}
@@ -82,7 +84,7 @@ services:
       GDAL_CACHEMAX: ${GDAL_CACHEMAX:-192}
       OMP_THREAD_LIMIT: ${OMP_THREAD_LIMIT:-1}
     ports:
-      - "${API_PORT:-8000}:8000"
+      - "127.0.0.1:${API_PORT:-8000}:8000"
     volumes:
       - trailforge-data:/data
       - trailforge_tiles:/data/tiles
@@ -148,13 +150,13 @@ services:
       dockerfile: Dockerfile
     image: trailforge-web:dev
     ports:
-      - "${WEB_PORT:-5173}:80"
+      - "127.0.0.1:${WEB_PORT:-5173}:8080"
     depends_on:
       api:
         condition: service_healthy
     mem_limit: 128m
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:80/healthz >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5

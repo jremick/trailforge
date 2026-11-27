@@ -38,18 +38,19 @@ services:
       - "traefik.http.routers.trailforge.tls=true"
       - "traefik.http.routers.trailforge.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
       - "traefik.http.routers.trailforge.middlewares=trailforge-security@docker,trailforge-upload-limit@docker"
-      - "traefik.http.services.trailforge.loadbalancer.server.port=80"
+      - "traefik.http.services.trailforge.loadbalancer.server.port=8080"
       - "traefik.http.services.trailforge.loadbalancer.passhostheader=true"
       - "traefik.http.services.trailforge.loadbalancer.responseforwarding.flushinterval=100ms"
       # Security headers (preserves Range / 206 Partial Content for PMTiles — no compression middleware)
       - "traefik.http.middlewares.trailforge-security.headers.stsSeconds=31536000"
       - "traefik.http.middlewares.trailforge-security.headers.stsIncludeSubdomains=true"
       - "traefik.http.middlewares.trailforge-security.headers.contentTypeNosniff=true"
-      - "traefik.http.middlewares.trailforge-security.headers.customFrameOptionsValue=SAMEORIGIN"
+      - "traefik.http.middlewares.trailforge-security.headers.customFrameOptionsValue=DENY"
       - "traefik.http.middlewares.trailforge-security.headers.referrerPolicy=strict-origin-when-cross-origin"
       - "traefik.http.middlewares.trailforge-security.headers.customRequestHeaders.X-Forwarded-Proto=https"
-      # Allow up to 15 MB GPX trace & condition report photo uploads (matches web/nginx.conf)
-      - "traefik.http.middlewares.trailforge-upload-limit.buffering.maxRequestBodyBytes=15728640"
+      - "traefik.http.middlewares.trailforge-security.headers.customRequestHeaders.CF-Connecting-IP="
+      # Allow up to 17 MB multipart GPX trace & condition report photo uploads (matches web/nginx.conf)
+      - "traefik.http.middlewares.trailforge-upload-limit.buffering.maxRequestBodyBytes=17825792"
       - "traefik.http.middlewares.trailforge-upload-limit.buffering.memRequestBodyBytes=2097152"
 
 networks:

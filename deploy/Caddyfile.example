@@ -26,10 +26,10 @@
 #     preserves upstream `Mcp-Session-Id` and `WWW-Authenticate` response headers.
 
 trails.example.com {
-	# Match web/nginx.conf (`client_max_body_size 15m`) for GPX trace uploads
+	# Match web/nginx.conf (`client_max_body_size 17m`) for 15 MiB multipart GPX uploads
 	# and community condition report photo attachments.
 	request_body {
-		max_size 15MB
+		max_size 17MB
 	}
 
 	# Compress HTML/JS/CSS/JSON/SVG while keeping PMTiles Range endpoints,
@@ -42,15 +42,16 @@ trails.example.com {
 
 	header {
 		X-Content-Type-Options "nosniff"
-		X-Frame-Options "SAMEORIGIN"
+		X-Frame-Options "DENY"
 		Referrer-Policy "strict-origin-when-cross-origin"
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
 	}
 
-	# Use `web:80` if Caddy shares the Docker Compose network, or
+	# Use `web:8080` if Caddy shares the Docker Compose network, or
 	# `127.0.0.1:5173` when running Caddy directly on the Docker host.
 	reverse_proxy 127.0.0.1:5173 {
 		flush_interval -1
+		header_up -CF-Connecting-IP
 		header_up Host {http.request.host}
 		header_up X-Forwarded-Host {http.request.host}
 		header_up X-Forwarded-Proto {http.request.scheme}

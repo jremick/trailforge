@@ -167,7 +167,7 @@ Add TrailForge under `mcpServers` using Streamable HTTP (`httpUrl`) or the `trai
 
 ### 3.5 Cursor
 
-Create or edit `.cursor/mcp.json` (project-scoped) or `~/.cursor/mcp.json` (global):
+Create or edit your project-scoped `<workspace>/.cursor/mcp.json` or global `~/.cursor/mcp.json`:
 
 ```json
 {
@@ -248,7 +248,7 @@ All 9 AI/MCP and OAuth 2.1 variables are documented in [`.env.example`](../.env.
 | :--- | :--- | :--- |
 | `TRAILFORGE_ENABLE_MCP` | `true` | Master kill switch for `/mcp`, `/mcp/auth`, and `/.well-known/oauth-*` (returns `404` when `false`) |
 | `TRAILFORGE_MCP_AUTH_MODE` | `hybrid` | `hybrid` (anonymous `/mcp` + OAuth `/mcp/auth`), `oauth_required`, or `anonymous_only` |
-| `TRAILFORGE_PUBLIC_BASE_URL` | `""` | Canonical public HTTPS origin (e.g. `https://trails.example.com`) for OAuth metadata & deep links — prevents internal hostnames from leaking |
+| `TRAILFORGE_PUBLIC_BASE_URL` | `""` | Canonical public HTTPS origin (e.g. `https://trails.example.com`) for OAuth metadata, RFC 8707 `resource` audience binding & deep links — **required** in production when `TRAILFORGE_ENABLE_MCP=true` |
 | `TRAILFORGE_RATE_LIMIT_MCP_PER_MIN` | `60` | Dedicated sliding-window rate limit for `/mcp` and `/mcp/auth` (tracked under `route_group="mcp"` in Admin Console) |
 | `TRAILFORGE_MCP_APP_HTML` | `""` | Optional local file path override for hot-reloading `ui://trailforge/explorer.html` during widget development |
 | `TRAILFORGE_MCP_CSP_TILE_DOMAINS` | `""` | Comma-separated bare origins allowed in `_meta.ui.csp` (`connectDomains`/`resourceDomains`; auto-includes origin of `TILES_PUBLIC_BASE_URL`) |
@@ -282,7 +282,7 @@ SEP-1865 MCP Apps run inside sandboxed **opaque-origin (`null`) or unique-origin
 | R2 CORS Profile | `AllowedOrigins` | MCP App Map Experience | Security & Cost Trade-Off |
 | :--- | :--- | :--- | :--- |
 | **[`deploy/cloudflare/r2-cors.json`](../deploy/cloudflare/r2-cors.json)** *(Default — strict)* | `["https://trails.example.com"]` | Zero-network **interactive SVG/Canvas vector map** (pan/zoom, grade colors, closures, POIs, synchronized elevation scrubbing) automatically activates inside MCP App iframes; main web UI uses full MapLibre `PMTiles`. | Prevents third-party websites from hotlinking your R2 `PMTiles` bucket; lowest read-operation exposure. |
-| **[`deploy/cloudflare/r2-cors-mcp.json`](../deploy/cloudflare/r2-cors-mcp.json)** *(Opt-in wildcard read-only)* | `["*"]` (`GET`/`HEAD` only) | Full **live MapLibre GL JS 5** vector/terrain `PMTiles` inside MCP App iframes (ensure `TILES_PUBLIC_BASE_URL` or `TRAILFORGE_MCP_CSP_TILE_DOMAINS=https://tiles.example.com` is set). | Strictly read-only (`GET`/`HEAD` only — zero write/delete risk, `$0` R2 egress), but third-party sites could read your public tiles; monitor R2 Class B read quotas. |
+| **[`deploy/cloudflare/r2-cors-mcp.json`](../deploy/cloudflare/r2-cors-mcp.json)** *(Opt-in wildcard read-only)* | `["*"]` (`GET`/`HEAD` only) | Full **live MapLibre GL JS 6** vector/terrain `PMTiles` inside MCP App iframes (ensure `TILES_PUBLIC_BASE_URL` or `TRAILFORGE_MCP_CSP_TILE_DOMAINS=https://tiles.example.com` is set). | Strictly read-only (`GET`/`HEAD` only — zero write/delete risk, `$0` R2 egress), but third-party sites could read your public tiles; monitor R2 Class B read quotas. |
 
 > **Zero-Failure Guarantee:** Even with strict single-origin `r2-cors.json` or completely offline homelabs, TrailForge's MCP App automatically switches to its built-in interactive SVG/Canvas map renderer without errors.
 

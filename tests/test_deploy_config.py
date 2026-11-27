@@ -84,8 +84,8 @@ def test_ghcr_compose_parity_with_dev_compose() -> None:
         == "ghcr.io/jremick/trailforge-web:${TRAILFORGE_IMAGE_TAG:-latest}"
     )
 
-    # 3. Safe loopback binding for reverse-proxy deployments
-    assert ghcr["services"]["web"]["ports"] == ["127.0.0.1:${WEB_PORT:-5173}:80"]
+    # 3. Safe loopback binding for reverse-proxy deployments (unprivileged Nginx on 8080)
+    assert ghcr["services"]["web"]["ports"] == ["127.0.0.1:${WEB_PORT:-5173}:8080"]
     assert "ports" not in ghcr["services"]["db"]
     assert "ports" not in ghcr["services"]["api"]
 
@@ -220,7 +220,9 @@ def test_deploy_kit_files_https_range_and_upload_limits() -> None:
     # Caddy v2 checks
     caddy = caddy_path.read_text(encoding="utf-8")
     assert "127.0.0.1:5173" in caddy
-    assert "max_size 15MB" in caddy
+    assert "max_size 17MB" in caddy
+    assert "X-Frame-Options \"DENY\"" in caddy
+    assert "header_up -CF-Connecting-IP" in caddy
     assert "X-Forwarded-Proto" in caddy
     assert "Host" in caddy
     assert "Range" in caddy and "206" in caddy
@@ -237,7 +239,9 @@ def test_deploy_kit_files_https_range_and_upload_limits() -> None:
     assert "traefik.enable=true" in labels
     assert "entrypoints=websecure" in labels
     assert "tls=true" in labels
-    assert "maxRequestBodyBytes=15728640" in labels
+    assert "maxRequestBodyBytes=17825792" in labels
+    assert "customFrameOptionsValue=DENY" in labels
+    assert "customRequestHeaders.CF-Connecting-IP=" in labels
     assert "compress" not in labels
     assert "Range" in traefik_raw and "206" in traefik_raw
     assert "AUTH_COOKIE_SECURE" in traefik["services"]["api"]["environment"]

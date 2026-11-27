@@ -11,7 +11,7 @@ This guide covers running **TrailForge** in production on a homelab server, mini
 | `db` | `imresamu/postgis:16-3.4` | Internal network only | `512m` | PostgreSQL 16 + PostGIS 3.4 |
 | `api` | `ghcr.io/jremick/trailforge-backend` | Internal network only | `512m` | FastAPI, Alembic, GDAL/PMTiles API |
 | `worker` | `ghcr.io/jremick/trailforge-backend` | Internal network only | `512m` | Closure sync, live grading, rainfall ticks |
-| `web` | `ghcr.io/jremick/trailforge-web` | `127.0.0.1:5173 -> 80` | `128m` | MapLibre GL JS 5 PWA + Range-safe Nginx proxy |
+| `web` | `ghcr.io/jremick/trailforge-web` | `127.0.0.1:5173 -> 8080` | `128m` | MapLibre GL JS 6 PWA + unprivileged Range-safe Nginx proxy |
 
 ---
 
@@ -47,21 +47,28 @@ TRAILFORGE_PRIVACY_SECRET=<generated-privacy-secret>
 
 # Required behind HTTPS reverse proxy so session cookies are TLS-only
 AUTH_COOKIE_SECURE=true
+# Explicit allowed web origin(s) — wildcard '*' is rejected at startup
 CORS_ORIGINS=https://trails.example.com
+# Required in production when MCP/OAuth is enabled (prevents Host-header poisoning)
+TRAILFORGE_PUBLIC_BASE_URL=https://trails.example.com
+
+# Proxy header trust (enabled by default in Compose; restrict CIDRs to your reverse proxy)
+TRAILFORGE_TRUST_PROXY_HEADERS=true
+TRAILFORGE_TRUSTED_PROXY_CIDRS=127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7
 
 # Enable live VIC/NSW closure feeds & Open-Meteo 72h rainfall sync
 # (kept false by default so fresh installs stay offline-safe)
 TRAILFORGE_ENABLE_LIVE_FEEDS=true
 ```
 
-> **Note:** Keep `TRAILFORGE_PRIVACY_SECRET` backed up safely. Changing it rotates anonymous telemetry `contribution_hash` derivation for future uploads (existing anonymized observations remain intact).
+> **Note:** Keep `TRAILFORGE_PRIVACY_SECRET` backed up safely. Changing it rotates anonymous telemetry `contribution_hash` derivation for future uploads (existing anonymized observations remain intact). In `TRAILFORGE_REGISTRATION_MODE=invite_only`, create your first admin via `docker compose -f docker-compose.ghcr.yml exec -T api python -m trailforge.auth.cli create-admin --email admin@example.com --name "Trail Admin" --password-stdin`.
 
 ### 2. Choose an HTTPS Reverse Proxy
 
 HTTPS is mandatory for in-cab mobile/tablet PWA features (**Service Worker offline packs**, **Geolocation API**, **Screen Wake Lock**, and **`AUTH_COOKIE_SECURE=true`**). Pick one of the three included setups:
 
 - **Private Tailnet (zero port forwarding, recommended for personal/club rigs):** follow [`deploy/tailscale-serve.md`](./tailscale-serve.md).
-- **Automatic public HTTPS via Caddy v2:** adapt [`deploy/Caddyfile.example`](./Caddyfile.example) (preserves `Host`, `X-Forwarded-Proto`, `Range` / HTTP `206 Partial Content`, and `15MB` upload limit).
+- **Automatic public HTTPS via Caddy v2:** adapt [`deploy/Caddyfile.example`](./Caddyfile.example) (preserves `Host`, `X-Forwarded-Proto`, `Range` / HTTP `206 Partial Content`, strips untrusted `CF-Connecting-IP`, enforces `X-Frame-Options: DENY`, and sets a `17MB` upload limit).
 - **Existing Traefik v3 stack:** layer [`deploy/traefik-compose.override.yml`](./traefik-compose.override.yml):
   ```bash
   TRAILFORGE_HOST=trails.example.com \

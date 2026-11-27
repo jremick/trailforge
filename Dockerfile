@@ -4,7 +4,10 @@
 # PMTiles via GDAL + osmium-tool + tippecanoe + rio-rgbify + pmtiles CLI.
 
 ARG TIPPECANOE_VERSION=2.79.0
+ARG TIPPECANOE_SHA256=b0fd9df49b6efc988288ea48774822c6de19eb48428017f27ee0b3b01d44f05d
 ARG PMTILES_VERSION=1.31.2
+ARG PMTILES_SHA256_AMD64=3ed7dbf4ec2e6dfe5e25b6f70d1ffc932729f93c86db353bf514dd71010a312f
+ARG PMTILES_SHA256_ARM64=f8bd47e7ea866863489cad588fbaf2f31f42e5821f7a03f009b3769f05801cb1
 
 # ---------------------------------------------------------------------------
 # Stage 1: Build tippecanoe from source (multi-arch arm64 & amd64)
@@ -12,6 +15,7 @@ ARG PMTILES_VERSION=1.31.2
 FROM debian:bookworm-slim AS tippecanoe-builder
 
 ARG TIPPECANOE_VERSION
+ARG TIPPECANOE_SHA256
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,7 +28,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /tmp/tippecanoe
 RUN curl -fsSL "https://github.com/felt/tippecanoe/archive/refs/tags/${TIPPECANOE_VERSION}.tar.gz" \
-    | tar -xz --strip-components=1 \
+        -o /tmp/tippecanoe.tar.gz \
+    && echo "${TIPPECANOE_SHA256}  /tmp/tippecanoe.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/tippecanoe.tar.gz --strip-components=1 \
+    && rm -f /tmp/tippecanoe.tar.gz \
     && make -j"$(nproc)" \
     && make install PREFIX=/usr/local
 
@@ -34,6 +41,8 @@ RUN curl -fsSL "https://github.com/felt/tippecanoe/archive/refs/tags/${TIPPECANO
 FROM debian:bookworm-slim AS pmtiles-downloader
 
 ARG PMTILES_VERSION
+ARG PMTILES_SHA256_AMD64
+ARG PMTILES_SHA256_ARM64
 ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -44,12 +53,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN set -eux; \
     case "${TARGETARCH}" in \
-        arm64) PMTILES_ARCH="arm64" ;; \
-        amd64) PMTILES_ARCH="x86_64" ;; \
+        arm64) PMTILES_ARCH="arm64"; PMTILES_SHA256="${PMTILES_SHA256_ARM64}" ;; \
+        amd64) PMTILES_ARCH="x86_64"; PMTILES_SHA256="${PMTILES_SHA256_AMD64}" ;; \
         *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     curl -fsSL "https://github.com/protomaps/go-pmtiles/releases/download/v${PMTILES_VERSION}/go-pmtiles_${PMTILES_VERSION}_Linux_${PMTILES_ARCH}.tar.gz" \
         -o /tmp/pmtiles.tar.gz; \
+    echo "${PMTILES_SHA256}  /tmp/pmtiles.tar.gz" | sha256sum -c -; \
     tar -xzf /tmp/pmtiles.tar.gz -C /usr/local/bin pmtiles; \
     chmod +x /usr/local/bin/pmtiles; \
     rm -f /tmp/pmtiles.tar.gz
@@ -97,21 +107,21 @@ ENV PATH="/opt/venv/bin:${PATH}"
 
 WORKDIR /app
 
-# Install Python dependencies first for layer caching (incl. built SEP-1865 MCP App asset)
-COPY pyproject.toml README.md LICENSE ./
+# Install locked Python dependencies deterministically via uv (incl. built SEP-1865 MCP App asset)
+COPY --from=ghcr.io/astral-sh/uv:0.6.14 /uv /usr/local/bin/uv
+COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src/ ./src/
 COPY --from=mcp-app-builder /web/dist-mcp/explorer.html ./src/trailforge/mcp/static/explorer.html
-RUN pip install --no-cache-dir --upgrade pip \
-    && if [ "${INSTALL_DEV}" = "true" ]; then \
-        pip install --no-cache-dir ".[gis,dev]"; \
-    else \
-        pip install --no-cache-dir ".[gis]"; \
-    fi
+RUN UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --frozen --no-cache --extra gis \
+    $( [ "${INSTALL_DEV}" = "true" ] && echo "--extra dev" || echo "--no-dev" )
 
-# Copy migrations, alembic config, and offline test suite
+# Copy migrations, alembic config, and runtime offline fixtures (strip test code in prod builds)
 COPY alembic.ini ./
 COPY migrations/ ./migrations/
 COPY tests/ ./tests/
+RUN if [ "${INSTALL_DEV}" != "true" ]; then \
+        find tests -mindepth 1 -maxdepth 1 ! -name fixtures -exec rm -rf {} +; \
+    fi
 
 # GDAL /vsicurl/ COG streaming & 16 GB laptop/homelab memory-bounded defaults
 # Note: Leave PROJ_DATA unset so system gdal-bin uses /usr/share/proj while
