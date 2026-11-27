@@ -217,16 +217,36 @@ def test_release_images_workflow_multiarch_oci_and_prerelease_guard() -> None:
         assert "type=gha" in str(build_with["cache-from"])
         assert "type=gha" in str(build_with["cache-to"])
 
-    # Optional Railway instant redeploy job: stable releases only, secret-gated, no hardcoded IDs
+    # Optional Railway instant redeploy job: stable releases only, secret-gated, pinned CLI
+    assert jobs["resolve-tag"]["permissions"] == {}
     assert "deploy-railway" in jobs
     deploy_job = jobs["deploy-railway"]
+    assert deploy_job["permissions"] == {}
     assert set(deploy_job["needs"]) == {"resolve-tag", "build-backend"}
     assert "needs.resolve-tag.outputs.is_stable == 'true'" in str(deploy_job["if"])
-    deploy_step = deploy_job["steps"][0]
+    assert len(deploy_job["steps"]) >= 2
+    install_step, deploy_step = deploy_job["steps"][0], deploy_job["steps"][1]
+    assert "RAILWAY_TOKEN" not in (install_step.get("env") or {})
+    install_run = str(install_step["run"])
+    assert "sha256sum -c -" in install_run
+    assert "install.sh" not in install_run
+    assert re.fullmatch(r"[a-f0-9]{64}", str(install_step["env"]["RAILWAY_CLI_SHA256"]))
     assert deploy_step["env"]["RAILWAY_TOKEN"] == "${{ secrets.RAILWAY_TOKEN }}"
     deploy_run = str(deploy_step["run"])
     assert 'if [ -z "${RAILWAY_TOKEN}" ]' in deploy_run
+    assert "set -f" in deploy_run
     assert 'railway redeploy --service "${svc}" --from-source --yes' in deploy_run
+
+
+@requires_repo_checkout
+def test_build_ignore_files_exclude_private_gis_and_keep_fixtures() -> None:
+    gcloudignore = (REPO_ROOT / ".gcloudignore").read_text(encoding="utf-8")
+    dockerignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8")
+    assert "#!include:.gitignore" in gcloudignore
+    for pattern in ("*.gpx", "*.geojson", "*.gpkg", "*.osm.pbf", "*.pmtiles"):
+        assert pattern in dockerignore, f".dockerignore missing {pattern}"
+    for keep in ("!tests/fixtures/**", "!examples/**", "!web/public/data/**"):
+        assert keep in dockerignore, f".dockerignore missing fixture keep rule {keep}"
 
 
 @requires_repo_checkout

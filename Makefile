@@ -49,6 +49,7 @@ test-integration:
 		psql -U "$${POSTGRES_USER:-trailforge}" -d "$(TEST_DB)" -c "CREATE EXTENSION IF NOT EXISTS postgis;" \
 	'
 	docker compose run --rm --no-deps -T \
+		-v "$(CURDIR)/web/src:/app/web/src:ro" \
 		-e "TEST_DATABASE_URL=$${TEST_DATABASE_URL:-}" \
 		api sh -ec '\
 			TEST_URL="$${TEST_DATABASE_URL:-$${DATABASE_URL%/*}/$(TEST_DB)}"; \
