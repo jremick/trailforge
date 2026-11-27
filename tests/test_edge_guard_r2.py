@@ -1476,6 +1476,39 @@ def test_r2_sync_discovers_and_uploads_sharded_v2_pack_shards(tmp_path: Path) ->
     assert not any("blue-mountains" in k for k in by_key)
 
 
+def test_r2_remote_matches_local_rejects_cache_control_drift(tmp_path: Path) -> None:
+    artifact_file = tmp_path / "manifest.json"
+    body = b'{"version":1}'
+    artifact_file.write_bytes(body)
+    md5_hex = hashlib.md5(body).hexdigest()
+    artifact = r2_sync.R2SyncArtifact(
+        local_path=artifact_file,
+        object_key="manifest.json",
+        content_type="application/json",
+        cache_control="public, max-age=60",
+        size_bytes=len(body),
+    )
+
+    matching = httpx.Response(
+        200,
+        headers={
+            "cache-control": "public, max-age=60",
+            "content-length": str(len(body)),
+            "etag": f'"{md5_hex}"',
+        },
+    )
+    drifted_cache = httpx.Response(
+        200,
+        headers={
+            "cache-control": "public, max-age=86400",
+            "content-length": str(len(body)),
+            "etag": f'"{md5_hex}"',
+        },
+    )
+    assert r2_sync._remote_matches_local(matching, artifact) is True
+    assert r2_sync._remote_matches_local(drifted_cache, artifact) is False
+
+
 # -----------------------------------------------------------------------------
 # 6. PostGIS Integration Tests (Usage DB Rollup + Trip Upload Daily Quota + Photo 507)
 # -----------------------------------------------------------------------------

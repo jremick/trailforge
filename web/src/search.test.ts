@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   MIN_CHARS_SEARCH_HINT,
   SEARCH_DEBOUNCE_MS,
+  TOPBAR_SEARCH_LIMIT,
   computeSearchClearTransition,
   computeSearchInputTransition,
   computeSearchResolvedTransition,
@@ -756,5 +757,51 @@ describe("TopBar pure search state transitions", () => {
     expect(cleared.menuMode).toBe("hidden");
     expect(cleared.results).toEqual([]);
     expect(cleared.resultsQuery).toBe("");
+  });
+
+  it("handles blank input, empty exact-coordinate matches, 1-char empty activeIdx, and limit constant", () => {
+    expect(TOPBAR_SEARCH_LIMIT).toBe(10);
+
+    const blankTransition = computeSearchInputTransition({
+      rawValue: "   ",
+      localItems: [],
+      cachedItems: null,
+    });
+    expect(blankTransition).toEqual(computeSearchClearTransition());
+    expect(blankTransition.activeIdx).toBe(-1);
+
+    const emptyCoord = computeSearchInputTransition({
+      rawValue: "-36.615, 148.125",
+      localItems: [],
+      cachedItems: null,
+    });
+    expect(emptyCoord.activeIdx).toBe(-1);
+    expect(emptyCoord.menuMode).toBe("empty");
+    expect(emptyCoord.shouldScheduleRemote).toBe(false);
+
+    const emptyOneChar = computeSearchInputTransition({
+      rawValue: "x",
+      localItems: [],
+      cachedItems: null,
+    });
+    expect(emptyOneChar.activeIdx).toBe(-1);
+    expect(emptyOneChar.menuMode).toBe("hint");
+  });
+
+  it("rejects runUnifiedSearch when the AbortSignal aborts before remote completion", async () => {
+    clearSearchCache();
+    const controller = new AbortController();
+    const abortReason = new Error("User typed newer query");
+    const remoteSearch = vi.fn(async () => {
+      controller.abort(abortReason);
+      return { query: "davies", total: 0, results: [] };
+    });
+
+    await expect(
+      runUnifiedSearch("davies", {
+        remoteSearch,
+        signal: controller.signal,
+      })
+    ).rejects.toBe(abortReason);
   });
 });

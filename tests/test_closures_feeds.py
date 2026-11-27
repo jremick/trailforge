@@ -670,6 +670,50 @@ def test_npws_rss_and_vic_paim_wfs_parsing_offline() -> None:
         assert npws_items[0].db_severity == "closed"
 
 
+def test_vic_seasonal_wfs_enforces_page_limit_and_stream_redirect_cap() -> None:
+    def wfs_handler(request: httpx.Request) -> httpx.Response:
+        start_idx = int(request.url.params.get("startIndex", "0"))
+        return httpx.Response(
+            200,
+            json={
+                "type": "FeatureCollection",
+                "numberMatched": 50,
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "vdpid": start_idx + 1,
+                            "ezi_road_name_label": f"Rd {start_idx}",
+                        },
+                        "geometry": {
+                            "type": "LineString",
+                            "coordinates": [[148.12, -36.58], [148.13, -36.59]],
+                        },
+                    }
+                ],
+            },
+        )
+
+    wfs_url = "https://wfs.example.test/ows?service=WFS&request=GetFeature&startIndex=0"
+    with (
+        httpx.Client(transport=httpx.MockTransport(wfs_handler)) as client,
+        pytest.raises(ValueError, match="WFS page limit"),
+    ):
+        VicSeasonalClosuresAdapter(source_url=wfs_url, client=client).fetch()
+
+    from trailforge.feeds.base import _stream_feed_response
+
+    def redirect_loop(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"Location": str(request.url)})
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(redirect_loop)) as client,
+        pytest.raises(httpx.TooManyRedirects),
+        _stream_feed_response(client, "https://feeds.example.test/loop"),
+    ):
+        pass
+
+
 @pytest.mark.live
 def test_live_vic_nsw_incident_feeds_smoke() -> None:
     """Optional live smoke check against VIC/NSW official closure & incident feeds."""

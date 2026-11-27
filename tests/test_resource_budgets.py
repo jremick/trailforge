@@ -142,6 +142,16 @@ def test_provider_follows_redirect_without_buffering_intermediate_body() -> None
         )
     assert len(result) == 1
 
+    def redirect_loop(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"Location": str(request.url)})
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(redirect_loop)) as client,
+        pytest.raises(base.UpstreamLimitError, match="redirect limit"),
+        base.stream_upstream(client, "https://fixtures.invalid/loop"),
+    ):
+        pass
+
 
 def test_sa_trails_zip_checks_expanded_member_size(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture

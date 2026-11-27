@@ -36,11 +36,13 @@ from trailforge.grading.cli import build_parser
 from trailforge.grading.live import (
     _MAX_SQL_IN_PARAMS,
     LIVE_FORMULA_VERSION,
+    MIN_PUBLIC_CONTRIBUTORS,
     ObservationSample,
     _chunked,
     compute_segment_live_grade,
     get_obstacle_hotspots_geojson,
     get_track_live_summary,
+    has_public_telemetry,
     recompute_live_grades,
 )
 from trailforge.grading.rainfall import (
@@ -97,6 +99,18 @@ def test_chunked_segment_id_batches_stay_under_postgres_param_limit() -> None:
     assert len(chunks) == 8
     assert all(len(c) <= _MAX_SQL_IN_PARAMS for c in chunks)
     assert [item for chunk in chunks for item in chunk] == ids
+
+
+def test_has_public_telemetry_requires_contributor_threshold_and_current_formula() -> None:
+    valid_breakdown = {"version": LIVE_FORMULA_VERSION}
+    assert has_public_telemetry(MIN_PUBLIC_CONTRIBUTORS, valid_breakdown) is True
+    assert has_public_telemetry(MIN_PUBLIC_CONTRIBUTORS + 2, valid_breakdown) is True
+    assert has_public_telemetry(MIN_PUBLIC_CONTRIBUTORS - 1, valid_breakdown) is False
+    assert has_public_telemetry(0, valid_breakdown) is False
+    assert has_public_telemetry(None, valid_breakdown) is False
+    assert has_public_telemetry(MIN_PUBLIC_CONTRIBUTORS, {"version": "legacy_v0"}) is False
+    assert has_public_telemetry(MIN_PUBLIC_CONTRIBUTORS, None) is False
+    assert has_public_telemetry(MIN_PUBLIC_CONTRIBUTORS, ["not-a-dict"]) is False
 
 
 def test_rainfall_classification_and_surface_crossing_modulation() -> None:

@@ -4,6 +4,7 @@ import {
   clearLegacyStoredAuthToken,
   fetchAuthMe,
   fetchReportsGeoJson,
+  fetchTrackDetail,
   loginAccount,
   logoutAccount,
   registerAccount,
@@ -11,6 +12,7 @@ import {
   usesSessionBearer,
 } from "./api";
 import { sanitizeReportPhotoUrl } from "./components/inspector";
+import { getOfflineBackend, setOfflineBackendForTesting } from "./offline/packStore";
 
 interface MockStorage {
   store: Map<string, string>;
@@ -149,6 +151,39 @@ describe("Browser session authentication", () => {
     });
     expect(usesSessionBearer()).toBe(true);
   });
+
+  it("clears the in-memory session bearer on HTTP 403 from fetchAuthMe while preserving it on HTTP 404", async () => {
+    vi.stubEnv("VITE_API_BASE_URL", "https://api.example.test");
+    vi.stubGlobal("window", {
+      location: new URL("https://trails.example.test/"),
+      localStorage: createMockLocalStorage(),
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(loginPayload))
+      .mockResolvedValueOnce(jsonResponse({ detail: "Not found" }, 404))
+      .mockResolvedValueOnce(jsonResponse({ detail: "Forbidden" }, 403))
+      .mockResolvedValueOnce(jsonResponse({ authenticated: false, user: null }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await loginAccount(loginInput);
+
+    // 404 must rethrow and keep the bearer token intact
+    await expect(fetchAuthMe()).rejects.toMatchObject({ status: 404 });
+
+    // 403 must clear the bearer token AND rethrow
+    await expect(fetchAuthMe()).rejects.toMatchObject({ status: 403 });
+
+    // Subsequent request after 403 must carry no Authorization header
+    await fetchAuthMe();
+
+    const requests = fetchMock.mock.calls as [string, RequestInit][];
+    expect(requests.map(([, init]) => new Headers(init.headers).get("Authorization"))).toEqual([
+      null,
+      "Bearer fixture-session-token",
+      "Bearer fixture-session-token",
+      null,
+    ]);
+  });
 });
 
 describe("Account-bound API requests", () => {
@@ -163,6 +198,53 @@ describe("Account-bound API requests", () => {
     await expect(fetchReportsGeoJson({ ownerId: "u-stale" })).rejects.toMatchObject({
       status: 409,
     });
+  });
+
+  it("rethrows HTTP 400 client errors on fetchTrackDetail instead of returning stale offline snapshots", async () => {
+    setOfflineBackendForTesting(null);
+    const backend = getOfflineBackend();
+    await backend.put("packs", "test-region", {
+      region_id: "test-region",
+      name: "Test Region",
+      downloaded_at: "2026-11-27T00:00:00Z",
+      bbox: [148.0, -37.0, 149.0, -36.0],
+      has_vector_pmtiles: false,
+      has_terrain_pmtiles: false,
+      snowline_bands_m: [1000],
+      attributions: [],
+    });
+    await backend.put("snapshots", "test-region", {
+      tracks: [
+        {
+          track_id: "trk_cached_400",
+          name: "Stale Offline Copy",
+          state: "VIC",
+          grade: "Hard",
+          score: 50,
+          total_length_m: 1000,
+        },
+      ],
+      pois: [],
+      capad_parks: [],
+    });
+
+    try {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(jsonResponse({ detail: "Bad request" }, 400))
+        .mockRejectedValueOnce(new TypeError("Network offline"));
+      vi.stubGlobal("fetch", fetchMock);
+
+      // 400 must be rethrown immediately even though an offline snapshot exists
+      await expect(fetchTrackDetail("trk_cached_400")).rejects.toMatchObject({
+        status: 400,
+      });
+
+      // Transient network failure still falls back cleanly to the offline snapshot
+      const offlineFallback = await fetchTrackDetail("trk_cached_400");
+      expect(offlineFallback.name).toBe("Stale Offline Copy");
+    } finally {
+      setOfflineBackendForTesting(null);
+    }
   });
 
   const payload = {

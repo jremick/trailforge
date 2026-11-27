@@ -533,4 +533,47 @@ describe("Track Inspector explainable helpers", () => {
     expect(crossing?.lon).toBeCloseTo(147.0525, 5);
     expect(corridor.profile.some((p) => p.slope_deg === 22)).toBe(true);
   });
+
+  it("propagates segment-level 4WD flag, non-public access precedence, and finite sustained slope", () => {
+    const detail: TrackInspectorDetail = {
+      track_id: "trk_seg_overrides",
+      name: "Segment Override Track",
+      state: "VIC",
+      grade: "Hard",
+      score: 52.0,
+      total_length_m: 1200,
+      elev_gain_m: 0,
+      waterway_crossing_count: 0,
+      is_4wd_only: false,
+      has_gate_barrier: false,
+      access_status: "public",
+      sustained_slope_deg: null,
+      max_slope_deg: null,
+      segments: [
+        {
+          segment_id: "seg_1",
+          segment_seq: 0,
+          length_m: 600,
+          grade: "Medium",
+          is_4wd_only: false,
+          access_status: "public",
+          sustained_slope_deg: Number.NaN,
+        },
+        {
+          segment_id: "seg_2",
+          segment_seq: 1,
+          length_m: 600,
+          grade: "Hard",
+          is_4wd_only: true,
+          access_status: "permit",
+          sustained_slope_deg: 11.4,
+        },
+      ],
+    };
+
+    const norm = normalizeTrackInspector(detail);
+    expect(norm.is4wdOnly).toBe(true);
+    expect(norm.accessStatus).toBe("permit");
+    expect(norm.sustainedSlopeDeg).toBeCloseTo(11.4, 2);
+  });
 });

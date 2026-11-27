@@ -50,14 +50,28 @@ def test_cog_reader_shares_budget_across_ranges_and_metadata(
         url = operation.path.removeprefix("/vsicurl/")
         assert httpx.URL(url).host == "127.0.0.1"
         assert local.get(f"{url}.aux.xml").status_code == 404
-        assert local.head(url).headers["Content-Length"] == str(len(data))
+        head_resp = local.head(url)
+        assert head_resp.status_code == 200
+        assert head_resp.headers["Content-Length"] == str(len(data))
+        assert "Content-Range" not in head_resp.headers
         assert local.head(url).status_code == 200
         first = local.get(url, headers={"Range": "bytes=2-5"})
         assert first.status_code == 206 and first.content == data[2:6]
+        assert first.headers["Content-Range"] == f"bytes 2-5/{len(data)}"
         assert local.get(url, headers={"Range": "bytes=6-9"}).status_code == 502
 
     assert reads == [(0, 0), (2, 5)]
     assert operation.failed.is_set()
+
+
+@pytest.mark.parametrize("bad_url", ["file:///etc/passwd", "ftp://fixture.test/dem.tif", "https://"])
+def test_cog_reader_rejects_non_http_or_hostless_source_urls(bad_url: str) -> None:
+    with (
+        httpx.Client(transport=httpx.MockTransport(lambda _r: httpx.Response(200))) as provider,
+        pytest.raises(ValueError, match="direct HTTP\\(S\\) URL"),
+        _cog_ranges.cog_range_path(bad_url, provider, timeout_s=3),
+    ):
+        pass
 
 
 @pytest.mark.parametrize("provider_status", [200, 302])
