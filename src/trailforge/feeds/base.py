@@ -575,18 +575,30 @@ def check_feed_record_count(count: int) -> None:
         raise ValueError(f"Upstream feed contains too many records (limit {MAX_FEED_RECORDS})")
 
 
+def _int_not_bool(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def extract_wfs_total_count(payload: Mapping[str, Any]) -> int | None:
+    """Return WFS total count, falling back to totalFeatures when numberMatched is null."""
+    raw = payload.get("numberMatched")
+    if raw is None:
+        raw = payload.get("totalFeatures")
+    return _int_not_bool(raw)
+
+
 def reject_partial_feed_snapshot(payload: Any) -> None:
     """Reject upstream responses that explicitly indicate missing records."""
     if not isinstance(payload, Mapping):
         return
     if payload.get("exceededTransferLimit") is True:
         raise ValueError("Upstream feed reported an incomplete snapshot")
-    matched = payload.get("numberMatched", payload.get("totalFeatures"))
-    returned = payload.get("numberReturned")
+    matched = extract_wfs_total_count(payload)
+    returned = _int_not_bool(payload.get("numberReturned"))
     features = payload.get("features")
     if returned is None and isinstance(features, list):
         returned = len(features)
-    if isinstance(matched, int) and isinstance(returned, int) and matched > returned:
+    if matched is not None and returned is not None and matched > returned:
         raise ValueError("Upstream feed reported an incomplete snapshot")
 
 
@@ -599,9 +611,9 @@ def _bounded_feed_response_body(resp: httpx.Response, max_bytes: int) -> bytes:
         return resp.content
 
     encoding = resp.headers.get("content-encoding", "identity").strip().lower()
-    if encoding not in ("", "identity", "gzip"):
+    if encoding not in ("", "identity", "gzip", "x-gzip"):
         raise ValueError("Unsupported upstream feed content encoding")
-    decoder = zlib.decompressobj(zlib.MAX_WBITS + 16) if encoding == "gzip" else None
+    decoder = zlib.decompressobj(zlib.MAX_WBITS + 16) if encoding in ("gzip", "x-gzip") else None
     wire_bytes = 0
     body = bytearray()
     for chunk in resp.iter_raw():
@@ -609,15 +621,27 @@ def _bounded_feed_response_body(resp: httpx.Response, max_bytes: int) -> bytes:
         if wire_bytes > max_bytes:
             raise ValueError(over_limit)
         if decoder is not None:
-            try:
-                chunk = decoder.decompress(chunk, max_bytes - len(body) + 1)
-            except zlib.error as exc:
-                raise ValueError("Invalid upstream gzip feed") from exc
-            if decoder.unused_data:
-                raise ValueError("Unexpected trailing data in upstream gzip feed")
-        if len(body) + len(chunk) > max_bytes:
-            raise ValueError(over_limit)
-        body.extend(chunk)
+            data = chunk
+            while data:
+                try:
+                    out = decoder.decompress(data, max_bytes - len(body) + 1)
+                except zlib.error as exc:
+                    raise ValueError("Invalid upstream gzip feed") from exc
+                if len(body) + len(out) > max_bytes:
+                    raise ValueError(over_limit)
+                body.extend(out)
+                if decoder.eof:
+                    trailing = decoder.unused_data
+                    if not trailing:
+                        break
+                    decoder = zlib.decompressobj(zlib.MAX_WBITS + 16)
+                    data = trailing
+                else:
+                    break
+        else:
+            if len(body) + len(chunk) > max_bytes:
+                raise ValueError(over_limit)
+            body.extend(chunk)
     if decoder is not None and not decoder.eof:
         raise ValueError("Incomplete upstream gzip feed")
     return bytes(body)

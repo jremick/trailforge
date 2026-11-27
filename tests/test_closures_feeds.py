@@ -210,6 +210,29 @@ def test_vic_wfs_follows_reported_pages_before_reconciling() -> None:
     assert offsets == [0, 1, 2]
 
 
+def test_vic_wfs_handles_null_number_matched_and_uppercase_startindex() -> None:
+    seen_params: list[list[tuple[str, str]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_params.append(list(request.url.params.multi_items()))
+        start = int(
+            next((v for k, v in request.url.params.multi_items() if k.lower() == "startindex"), "0")
+        )
+        return httpx.Response(200, json={
+            "type": "FeatureCollection",
+            "numberMatched": None,
+            "totalFeatures": 2,
+            "features": [{"id": f"road-{start}", "title": "Temporary road closure"}],
+        })
+
+    wfs_url = "https://fixtures.example.test/wfs?service=WFS&request=GetFeature&STARTINDEX=0"
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        adapter = VicSeasonalClosuresAdapter(client=client, source_url=wfs_url)
+        assert [item.external_id for item in adapter.fetch()] == ["road-0", "road-1"]
+    second_keys = [k.lower() for k, _ in seen_params[1]]
+    assert second_keys.count("startindex") == 1
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("adapter_class", [QLDParksAlertsAdapter, NTFireParksAdapter])
 def test_closure_snapshot_reconciliation_is_scoped_to_endpoint_and_fixture(

@@ -38,6 +38,7 @@ from trailforge.feeds.base import (
     FeedSourceLiteral,
     NormalizedClosure,
     check_feed_record_count,
+    extract_wfs_total_count,
     get_feeds_for_states,
     normalize_alert_type,
     normalize_db_severity,
@@ -88,8 +89,8 @@ class VicSeasonalClosuresAdapter(_BaseHttpFeedAdapter):
         if not isinstance(payload, Mapping):
             return payload
         features = payload.get("features")
-        total = payload.get("numberMatched", payload.get("totalFeatures"))
-        if not isinstance(features, list) or not isinstance(total, int) or total <= len(features):
+        total = extract_wfs_total_count(payload)
+        if not isinstance(features, list) or total is None or total <= len(features):
             reject_partial_feed_snapshot(payload)
             return payload
 
@@ -104,10 +105,11 @@ class VicSeasonalClosuresAdapter(_BaseHttpFeedAdapter):
             raise ValueError("VIC seasonal feed reported an incomplete snapshot")
         check_feed_record_count(total)
         remaining_bytes = MAX_FEED_BODY_BYTES - len(response.content)
+        base_params = [(k, v) for k, v in url.params.multi_items() if k.lower() != "startindex"]
         for _ in range(19):  # The default WFS page size is 500, with at most 10,000 records.
             if remaining_bytes <= 0:
                 raise ValueError("VIC seasonal feed pages exceed the response byte limit")
-            next_url = url.copy_set_param("startIndex", len(features))
+            next_url = url.copy_with(params=[*base_params, ("startIndex", str(len(features)))])
             response = self._http_get(str(next_url), max_bytes=remaining_bytes)
             remaining_bytes -= len(response.content)
             page = response.json()
@@ -115,7 +117,7 @@ class VicSeasonalClosuresAdapter(_BaseHttpFeedAdapter):
                 raise ValueError("Unexpected VIC seasonal WFS page format")
             next_features = page.get("features")
             if (
-                page.get("numberMatched", page.get("totalFeatures")) != total
+                extract_wfs_total_count(page) != total
                 or not isinstance(next_features, list)
                 or not next_features
                 or len(features) + len(next_features) > total

@@ -105,6 +105,16 @@ def test_http_feed_adapter_bounds_and_validates_streamed_gzip() -> None:
         with pytest.raises(ValueError, match="Incomplete upstream gzip feed"):
             adapter._http_get(max_bytes=len(payload))
 
+        # RFC 1952 multi-member gzip and x-gzip stay bounded and decode cleanly
+        multi = gzip.compress(payload[:40]) + gzip.compress(payload[40:])
+        FeedBody.body = multi
+        assert adapter._http_get(max_bytes=len(payload)).content == payload
+        with pytest.raises(ValueError, match="byte limit"):
+            adapter._http_get(max_bytes=len(payload) - 1)
+        FeedBody.body = compressed + b"not-gzip"
+        with pytest.raises(ValueError, match="Invalid upstream gzip feed"):
+            adapter._http_get(max_bytes=len(payload) + 32)
+
 
 def test_http_feed_adapter_follows_redirect_without_reading_intermediate_body() -> None:
     class RedirectBody(httpx.SyncByteStream):

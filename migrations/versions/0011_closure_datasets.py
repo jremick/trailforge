@@ -60,7 +60,11 @@ def upgrade() -> None:
     )
     op.execute(
         "UPDATE closures_alerts SET is_regional = true "
-        "WHERE CASE WHEN GeometryType(geom) IN ('POLYGON', 'MULTIPOLYGON') "
+        "WHERE CASE WHEN geom IS NOT NULL "
+        "AND GeometryType(geom) IN ('POLYGON', 'MULTIPOLYGON') "
+        "AND ST_IsValid(geom) "
+        "AND ST_XMin(geom) >= 90 AND ST_XMax(geom) <= 180 "
+        "AND ST_YMin(geom) >= -60 AND ST_YMax(geom) <= 0 "
         "THEN ST_Area(ST_Transform(geom, 3577)) > 5000000000.0 ELSE false END"
     )
     op.create_index(
