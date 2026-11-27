@@ -593,6 +593,17 @@ interface ScoredLocalCandidate {
   item: UnifiedSearchItem;
 }
 
+function compareScoredCandidates(
+  a: ScoredLocalCandidate,
+  b: ScoredLocalCandidate
+): number {
+  if (a.bucket !== b.bucket) return a.bucket - b.bucket;
+  if (a.tierRank !== b.tierRank) return a.tierRank - b.tierRank;
+  if (a.population !== b.population) return b.population - a.population;
+  if (a.titleLen !== b.titleLen) return a.titleLen - b.titleLen;
+  return a.item.title.localeCompare(b.item.title);
+}
+
 function scoreAuPlacesInternal(
   query: string,
   places: readonly AuPlaceEntry[],
@@ -614,13 +625,7 @@ function scoreAuPlacesInternal(
     });
   }
 
-  scored.sort((a, b) => {
-    if (a.bucket !== b.bucket) return a.bucket - b.bucket;
-    if (a.tierRank !== b.tierRank) return a.tierRank - b.tierRank;
-    if (a.population !== b.population) return b.population - a.population;
-    if (a.titleLen !== b.titleLen) return a.titleLen - b.titleLen;
-    return a.item.title.localeCompare(b.item.title);
-  });
+  scored.sort(compareScoredCandidates);
 
   return scored.slice(0, limit);
 }
@@ -759,13 +764,7 @@ export function resolveLocalSearch(
   const placeMatches = scoreAuPlacesInternal(trimmed, placesSource, maxResults);
   const presetMatches = scorePresetMatches(trimmed, Math.min(4, maxResults));
 
-  const combined = [...placeMatches, ...presetMatches].sort((a, b) => {
-    if (a.bucket !== b.bucket) return a.bucket - b.bucket;
-    if (a.tierRank !== b.tierRank) return a.tierRank - b.tierRank;
-    if (a.population !== b.population) return b.population - a.population;
-    if (a.titleLen !== b.titleLen) return a.titleLen - b.titleLen;
-    return a.item.title.localeCompare(b.item.title);
-  });
+  const combined = [...placeMatches, ...presetMatches].sort(compareScoredCandidates);
 
   const seen = new Set<string>();
   const items: UnifiedSearchItem[] = [];

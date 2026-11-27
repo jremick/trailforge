@@ -21,12 +21,13 @@ The runtime abstraction lives in [`web/src/native/bridge.ts`](../web/src/native/
 
 ## 2. Install Capacitor 7 & Native Plugins
 
-From `web/` (do **not** commit generated `web/ios/` or `web/android/` build directories unless you maintain your own distribution fork):
+From `web/` (do **not** commit generated Capacitor iOS or Android native project directories unless you maintain your own distribution fork):
 
 ```bash
 cd web
 
 # Build the production web bundle first (writes web/dist/)
+# Note: keep generated web/ios/ and web/android/ directories untracked
 npm ci
 npm run typecheck
 npm run build
@@ -63,10 +64,11 @@ TrailForge's Capacitor configuration is already defined in [`web/capacitor.confi
    npm run build
    npx cap add ios
    npx cap sync ios
+   # Generated Xcode plist target: web/ios/App/App/Info.plist
    ```
 
 2. **Apply required iOS permissions:**
-   Merge every key from [`mobile/ios/Info.plist.snippet.xml`](./ios/Info.plist.snippet.xml) into `web/ios/App/App/Info.plist`:
+   Merge every key from [`mobile/ios/Info.plist.snippet.xml`](./ios/Info.plist.snippet.xml) into the generated Xcode `Info.plist`:
    - `UIBackgroundModes` (`location`) — keeps GPS breadcrumb capture active while the screen is locked or TrailForge is backgrounded.
    - `NSLocationWhenInUseUsageDescription` & `NSLocationAlwaysAndWhenInUseUsageDescription` — explains remote 4WD tracking, Backtrack guidance, and mandatory `>= 250 m` privacy buffer trimming.
    - `NSMotionUsageDescription` — enables 50 Hz accelerometer roughness and 4WD pitch/roll clinometer capture.
@@ -98,10 +100,11 @@ TrailForge's Capacitor configuration is already defined in [`web/capacitor.confi
    npm run build
    npx cap add android
    npx cap sync android
+   # Generated Android manifest target: web/android/app/src/main/AndroidManifest.xml
    ```
 
 2. **Apply required Android permissions & Android 14+ Foreground Service declaration:**
-   Merge [`mobile/android/AndroidManifest.snippet.xml`](./android/AndroidManifest.snippet.xml) into `web/android/app/src/main/AndroidManifest.xml`:
+   Merge [`mobile/android/AndroidManifest.snippet.xml`](./android/AndroidManifest.snippet.xml) into the generated Android `AndroidManifest.xml`:
    - `ACCESS_FINE_LOCATION` + `ACCESS_COARSE_LOCATION` — high-accuracy GNSS breadcrumbs.
    - `ACCESS_BACKGROUND_LOCATION` — continuous tracking when screen is off (Android 10+ requires granting "Allow all the time" in App Settings after foreground grant).
    - `FOREGROUND_SERVICE` + `FOREGROUND_SERVICE_LOCATION` — required on Android 14+ (API 34+) to keep the GPS recorder alive with a persistent in-cab notification.

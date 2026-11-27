@@ -678,6 +678,25 @@ export async function fetchTrips(options?: AccountRequestOptions | AbortSignal):
   return Array.isArray(data) ? data : (data.items ?? []);
 }
 
+async function requestFormData<T>(
+  path: string,
+  form: FormData,
+  options?: AccountRequestOptions
+): Promise<T> {
+  const res = await fetch(resolveApiUrl(path), {
+    method: "POST",
+    headers: buildHeaders(undefined, options),
+    credentials: fetchCredentialsMode(options),
+    body: form,
+    signal: options?.signal,
+  });
+  if (!res.ok) {
+    const detail = await parseErrorDetail(res);
+    throw new ApiError(detail, res.status);
+  }
+  return (await res.json()) as T;
+}
+
 export async function uploadTripGpx(
   file: File,
   params: {
@@ -698,18 +717,7 @@ export async function uploadTripGpx(
     form.append("vehicle_profile_id", params.vehicle_profile_id);
   }
 
-  const res = await fetch(resolveApiUrl("/api/trips/upload"), {
-    method: "POST",
-    headers: buildHeaders(undefined, options),
-    credentials: fetchCredentialsMode(options),
-    body: form,
-    signal: options?.signal,
-  });
-  if (!res.ok) {
-    const detail = await parseErrorDetail(res);
-    throw new ApiError(detail, res.status);
-  }
-  return (await res.json()) as TripItem;
+  return requestFormData<TripItem>("/api/trips/upload", form, options);
 }
 
 export function uploadTripJson(
@@ -855,18 +863,7 @@ export async function createConditionReport(
     if (input.client_uuid) form.append("client_uuid", input.client_uuid);
     form.append("photo", input.photo, input.photo.name);
 
-    const res = await fetch(resolveApiUrl("/api/reports"), {
-      method: "POST",
-      headers: buildHeaders(undefined, options),
-      credentials: fetchCredentialsMode(options),
-      body: form,
-      signal: options?.signal,
-    });
-    if (!res.ok) {
-      const detail = await parseErrorDetail(res);
-      throw new ApiError(detail, res.status);
-    }
-    return (await res.json()) as ConditionReportItem;
+    return requestFormData<ConditionReportItem>("/api/reports", form, options);
   }
 
   return requestJson<ConditionReportItem>("/api/reports", {
@@ -959,6 +956,14 @@ export async function downloadAuthenticatedExport(
   }
   const blob = await res.blob();
   options?.signal?.throwIfAborted();
+  triggerBlobDownload(res, blob, fallbackFilename);
+}
+
+function triggerBlobDownload(
+  res: Response,
+  blob: Blob,
+  fallbackFilename: string
+): void {
   const disposition = res.headers.get("content-disposition") ?? "";
   const match = /filename="?([^";]+)"?/i.exec(disposition);
   const filename = match?.[1] ?? fallbackFilename;
@@ -975,8 +980,6 @@ export async function downloadAuthenticatedExport(
     URL.revokeObjectURL(objectUrl);
   }
 }
-
-/* ---------- Phase A Interactive Multi-Track Route Planner & Saved Routes ---------- */
 
 export async function planRoute(
   payload: RoutePlanRequest,
@@ -1067,21 +1070,7 @@ export async function exportPlannedRoute(
     }
     const blob = await res.blob();
     signal?.throwIfAborted();
-    const disposition = res.headers.get("content-disposition") ?? "";
-    const match = /filename="?([^";]+)"?/i.exec(disposition);
-    const filename = match?.[1] ?? fallbackFilename;
-
-    const objectUrl = URL.createObjectURL(blob);
-    try {
-      const a = document.createElement("a");
-      a.href = objectUrl;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-    } finally {
-      URL.revokeObjectURL(objectUrl);
-    }
+    triggerBlobDownload(res, blob, fallbackFilename);
   } catch (err) {
     signal?.throwIfAborted();
     if (err instanceof ApiError && err.status >= 400 && err.status < 500) {

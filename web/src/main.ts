@@ -231,8 +231,9 @@ function announceAccountChange(
   if (usesSessionBearer()) return;
   try {
     window.localStorage.setItem(ACCOUNT_CHANGE_KEY, `${state}:${generateClientUuid()}`);
-  } catch {
+  } catch (err) {
     // Visible tabs also recheck the session when they regain focus.
+    console.warn("Unable to broadcast account change to other tabs:", err);
   }
 }
 
@@ -241,8 +242,9 @@ function persistPendingSignOut(ownerId: string | null): void {
   try {
     if (ownerId) window.localStorage.setItem(PENDING_SIGN_OUT_KEY, ownerId);
     else window.localStorage.removeItem(PENDING_SIGN_OUT_KEY);
-  } catch {
+  } catch (err) {
     // The current tab can still retry its own queued sign-out.
+    console.warn("Unable to persist pending sign-out state locally:", err);
   }
 }
 
@@ -1097,13 +1099,7 @@ class TrailForgeApp {
       error: null,
     });
     this.adminPanelEl.replaceChildren();
-    if (this.userPrefsSaveTimer !== null) {
-      window.clearTimeout(this.userPrefsSaveTimer);
-      this.userPrefsSaveTimer = null;
-    }
-    this.userLayerPrefs = { layerOrder: null, layerVisibility: null };
-    clearStoredUserLayerPrefs();
-    this.applyResolvedLayerPreferences();
+    this.resetLocalLayerPreferences();
     this.pendingPinCoords = null;
     this.pickedReportCoords = null;
     this.setCoordPickMode(null);
@@ -1239,27 +1235,19 @@ class TrailForgeApp {
               onUploadTripGpx: async (file, params) => {
                 const request = this.requireAccountRequest();
                 const uploaded = await uploadTripGpx(file, params, request);
-                if (request.signal.aborted) return;
-                this.latestUploadedTrip = uploaded;
-                await this.reloadTrips(request);
-                if (request.signal.aborted) return;
-                if (this.layerState.unmapped) void this.refreshUnmappedCandidates();
-                this.showToast(
-                  `Matched ${uploaded.matched_segment_count ?? 0} segments (${uploaded.observations_published ?? 0} published)`,
-                  "success"
+                await this.handleTripUploaded(
+                  uploaded,
+                  request,
+                  `Matched ${uploaded.matched_segment_count ?? 0} segments (${uploaded.observations_published ?? 0} published)`
                 );
               },
               onUploadTripJson: async (payload) => {
                 const request = this.requireAccountRequest();
                 const uploaded = await uploadTripJson(payload, request);
-                if (request.signal.aborted) return;
-                this.latestUploadedTrip = uploaded;
-                await this.reloadTrips(request);
-                if (request.signal.aborted) return;
-                if (this.layerState.unmapped) void this.refreshUnmappedCandidates();
-                this.showToast(
-                  `Matched ${uploaded.matched_segment_count ?? 0} segments`,
-                  "success"
+                await this.handleTripUploaded(
+                  uploaded,
+                  request,
+                  `Matched ${uploaded.matched_segment_count ?? 0} segments`
                 );
               },
               onToggleTripVisibility: async (tripId, nextVis) => {
@@ -2188,8 +2176,11 @@ class TrailForgeApp {
     try {
       const routes = await listSavedRoutes(request);
       if (!request.signal.aborted) this.savedRoutes = routes;
-    } catch {
+    } catch (err) {
       // Preserve last loaded saved routes if offline
+      if (!request.signal.aborted) {
+        console.warn("Unable to refresh saved routes; preserving cached list:", err);
+      }
     } finally {
       if (!request.signal.aborted) {
         this.savedRoutesLoading = false;
@@ -2546,8 +2537,7 @@ class TrailForgeApp {
     }
   }
 
-  private async handleResetUserLayerPreferences(): Promise<void> {
-    const request = this.accountRequest();
+  private resetLocalLayerPreferences(): void {
     if (this.userPrefsSaveTimer !== null) {
       window.clearTimeout(this.userPrefsSaveTimer);
       this.userPrefsSaveTimer = null;
@@ -2555,6 +2545,11 @@ class TrailForgeApp {
     this.userLayerPrefs = { layerOrder: null, layerVisibility: null };
     clearStoredUserLayerPrefs();
     this.applyResolvedLayerPreferences();
+  }
+
+  private async handleResetUserLayerPreferences(): Promise<void> {
+    const request = this.accountRequest();
+    this.resetLocalLayerPreferences();
     let syncedRemote = true;
     if (request && this.isOnline) {
       try {
@@ -3004,8 +2999,9 @@ class TrailForgeApp {
       const run = (async () => {
         try {
           await this.finishSignOut(ownerId);
-        } catch {
+        } catch (err) {
           // Retry while the browser is locally signed out.
+          console.warn("Deferred online sign-out retry failed:", err);
         }
       })();
       this.authTransitionPromise = run;
@@ -3093,6 +3089,19 @@ class TrailForgeApp {
     this.syncRigUiState();
   }
 
+  private async handleTripUploaded(
+    uploaded: TripItem,
+    request: AccountRequest,
+    toastMessage: string
+  ): Promise<void> {
+    if (request.signal.aborted) return;
+    this.latestUploadedTrip = uploaded;
+    await this.reloadTrips(request);
+    if (request.signal.aborted) return;
+    if (this.layerState.unmapped) void this.refreshUnmappedCandidates();
+    this.showToast(toastMessage, "success");
+  }
+
   private async reloadTrips(request: AccountRequest): Promise<void> {
     const trips = await fetchTrips(request);
     if (request.signal.aborted) return;
@@ -3104,8 +3113,9 @@ class TrailForgeApp {
     try {
       const fc = await fetchHotspotsGeoJson();
       this.map.setHotspotsGeoJson(fc);
-    } catch {
+    } catch (err) {
       // Obstacle hotspots layer stays empty gracefully offline
+      console.debug("Unable to refresh obstacle hotspots layer:", err);
     }
   }
 
@@ -3114,8 +3124,11 @@ class TrailForgeApp {
     try {
       const fc = await fetchReportsGeoJson({ signal, ownerId: this.user?.id, anonymous: !this.user });
       if (!signal.aborted) this.map.setReportsGeoJson(fc);
-    } catch {
+    } catch (err) {
       // Reports layer stays empty gracefully offline
+      if (!signal.aborted) {
+        console.debug("Unable to refresh condition reports layer:", err);
+      }
     }
   }
 
@@ -3123,8 +3136,9 @@ class TrailForgeApp {
     try {
       const fc = await fetchUnmappedCandidatesGeoJson();
       this.map.setUnmappedGeoJson(fc);
-    } catch {
+    } catch (err) {
       // Unmapped spurs layer stays empty gracefully offline
+      console.debug("Unable to refresh unmapped candidates layer:", err);
     }
   }
 

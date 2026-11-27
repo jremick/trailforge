@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -223,6 +223,37 @@ class VicSeasonalClosuresAdapter(_BaseHttpFeedAdapter):
         return out
 
 
+def _fetch_geojson_feed_items(
+    adapter: _BaseHttpFeedAdapter,
+    parse_item: Callable[[Mapping[str, Any]], NormalizedClosure | None],
+    error_message: str,
+) -> list[NormalizedClosure]:
+    """Fetch, validate, and normalize GeoJSON FeatureCollection or list feed items."""
+    if adapter._fixture_items is not None:
+        raw_items: list[Mapping[str, Any]] = adapter._fixture_items
+    else:
+        payload = (
+            adapter._fixture_payload
+            if adapter._fixture_payload is not None
+            else adapter._fetch_json()
+        )
+        if isinstance(payload, Mapping) and isinstance(payload.get("features"), list):
+            raw_items = payload["features"]
+        elif isinstance(payload, list):
+            raw_items = payload
+        else:
+            raise ValueError(error_message)
+
+    check_feed_record_count(len(raw_items))
+    out: list[NormalizedClosure] = []
+    for item in raw_items:
+        if isinstance(item, Mapping):
+            parsed = parse_item(item)
+            if parsed is not None:
+                out.append(parsed)
+    return out
+
+
 class VicEmergencyAdapter(_BaseHttpFeedAdapter):
     """VicEmergency public GeoJSON incidents & warnings adapter."""
 
@@ -285,27 +316,11 @@ class VicEmergencyAdapter(_BaseHttpFeedAdapter):
         )
 
     def fetch(self, *, session: Session | None = None) -> list[NormalizedClosure]:
-        if self._fixture_items is not None:
-            raw_items: list[Mapping[str, Any]] = self._fixture_items
-        else:
-            payload = (
-                self._fixture_payload if self._fixture_payload is not None else self._fetch_json()
-            )
-            if isinstance(payload, Mapping) and isinstance(payload.get("features"), list):
-                raw_items = payload["features"]
-            elif isinstance(payload, list):
-                raw_items = payload
-            else:
-                raise ValueError("Unexpected VicEmergency GeoJSON payload format")
-
-        check_feed_record_count(len(raw_items))
-        out: list[NormalizedClosure] = []
-        for item in raw_items:
-            if isinstance(item, Mapping):
-                parsed = self._parse_item(item)
-                if parsed is not None:
-                    out.append(parsed)
-        return out
+        return _fetch_geojson_feed_items(
+            self,
+            self._parse_item,
+            "Unexpected VicEmergency GeoJSON payload format",
+        )
 
 
 class NSWRFSAdapter(_BaseHttpFeedAdapter):
@@ -358,27 +373,11 @@ class NSWRFSAdapter(_BaseHttpFeedAdapter):
         )
 
     def fetch(self, *, session: Session | None = None) -> list[NormalizedClosure]:
-        if self._fixture_items is not None:
-            raw_items: list[Mapping[str, Any]] = self._fixture_items
-        else:
-            payload = (
-                self._fixture_payload if self._fixture_payload is not None else self._fetch_json()
-            )
-            if isinstance(payload, Mapping) and isinstance(payload.get("features"), list):
-                raw_items = payload["features"]
-            elif isinstance(payload, list):
-                raw_items = payload
-            else:
-                raise ValueError("Unexpected NSW RFS majorIncidents payload format")
-
-        check_feed_record_count(len(raw_items))
-        out: list[NormalizedClosure] = []
-        for item in raw_items:
-            if isinstance(item, Mapping):
-                parsed = self._parse_item(item)
-                if parsed is not None:
-                    out.append(parsed)
-        return out
+        return _fetch_geojson_feed_items(
+            self,
+            self._parse_item,
+            "Unexpected NSW RFS majorIncidents payload format",
+        )
 
 
 MAX_NPWS_DESCRIPTION_CHARS: Final[int] = 32_768

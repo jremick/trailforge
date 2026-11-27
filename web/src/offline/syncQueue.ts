@@ -34,13 +34,21 @@ export function pinsFromSyncQueue(items: readonly SyncQueueItem[]): UserPinItem[
     .reverse();
 }
 
+async function enqueuePrivateItem(
+  ownerId: string,
+  item: SyncQueueItem
+): Promise<SyncQueueItem> {
+  await getPrivateOfflineBackend(ownerId).put("sync_queue", item.id, item);
+  return item;
+}
+
 export async function enqueueOfflineTrip(
   ownerId: string,
   payload: MobileTripSyncPayload
 ): Promise<SyncQueueItem> {
   const clientUuid =
     payload.client_uuid ?? payload.client_session_id ?? generateClientUuid();
-  const item: SyncQueueItem = {
+  return enqueuePrivateItem(ownerId, {
     id: `trip:${clientUuid}`,
     kind: "trip",
     created_at: new Date().toISOString(),
@@ -51,9 +59,7 @@ export async function enqueueOfflineTrip(
       client_session_id: payload.client_session_id ?? clientUuid,
     },
     last_error: null,
-  };
-  await getPrivateOfflineBackend(ownerId).put("sync_queue", item.id, item);
-  return item;
+  });
 }
 
 export async function enqueueOfflineReport(
@@ -61,16 +67,14 @@ export async function enqueueOfflineReport(
   payload: Omit<ConditionReportCreateInput, "photo">
 ): Promise<SyncQueueItem> {
   const clientUuid = payload.client_uuid ?? generateClientUuid();
-  const item: SyncQueueItem = {
+  return enqueuePrivateItem(ownerId, {
     id: `report:${clientUuid}`,
     kind: "report",
     created_at: new Date().toISOString(),
     label: `Report: ${payload.report_type.replace(/_/g, " ")}`,
     payload: { ...payload, client_uuid: clientUuid },
     last_error: null,
-  };
-  await getPrivateOfflineBackend(ownerId).put("sync_queue", item.id, item);
-  return item;
+  });
 }
 
 export async function enqueueOfflinePin(
@@ -78,16 +82,14 @@ export async function enqueueOfflinePin(
   payload: UserPinInput
 ): Promise<SyncQueueItem> {
   const clientUuid = payload.client_uuid ?? generateClientUuid();
-  const item: SyncQueueItem = {
+  return enqueuePrivateItem(ownerId, {
     id: `offline-pin-${clientUuid}`,
     kind: "pin",
     created_at: new Date().toISOString(),
     label: `Pin: ${payload.name}`,
     payload: { ...payload, client_uuid: clientUuid },
     last_error: null,
-  };
-  await getPrivateOfflineBackend(ownerId).put("sync_queue", item.id, item);
-  return item;
+  });
 }
 
 export async function deleteQueuedPin(ownerId: string, id: string): Promise<void> {

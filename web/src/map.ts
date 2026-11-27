@@ -294,14 +294,7 @@ export class TrailForgeMap {
     });
 
     this.map.on("mouseout", () => {
-      if (this.hoverRafId !== null) {
-        window.cancelAnimationFrame(this.hoverRafId);
-        this.hoverRafId = null;
-      }
-      this.pendingHoverEvent = null;
-      this.lastHoverKey = null;
-      this.lastHoverHtml = null;
-      this.hoverPopup.remove();
+      this.clearHoverPopup();
     });
 
     this.map.on("click", (e) => {
@@ -759,8 +752,7 @@ export class TrailForgeMap {
     src?.setData(EMPTY_FEATURE_COLLECTION);
   }
 
-  clearLocationPopups(): void {
-    this.clearSearchPin();
+  private clearHoverPopup(): void {
     if (this.hoverRafId !== null) {
       window.cancelAnimationFrame(this.hoverRafId);
       this.hoverRafId = null;
@@ -769,6 +761,11 @@ export class TrailForgeMap {
     this.lastHoverKey = null;
     this.lastHoverHtml = null;
     this.hoverPopup.remove();
+  }
+
+  clearLocationPopups(): void {
+    this.clearSearchPin();
+    this.clearHoverPopup();
   }
 
   zoomIn(): void {

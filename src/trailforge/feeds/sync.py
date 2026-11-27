@@ -294,8 +294,10 @@ def _propagate_segment_links(
             alert_line_m: LineString | MultiLineString | None = None
             alert_buf_m: object | None = None
             if is_line_closure:
-                alert_line_m = _to_albers(shape(item.geometry))  # type: ignore[assignment]
-                alert_buf_m = alert_line_m.buffer(LINE_BUFFER_M)
+                projected_line = _to_albers(shape(item.geometry))
+                if isinstance(projected_line, (LineString, MultiLineString)):
+                    alert_line_m = projected_line
+                    alert_buf_m = alert_line_m.buffer(LINE_BUFFER_M)
 
             dist_expr = func.ST_Distance(seg_geom_3577, alert_geom_3577)
             spatial_rows = session.execute(
