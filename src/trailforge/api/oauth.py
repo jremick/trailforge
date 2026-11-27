@@ -9,11 +9,13 @@ Exports three routers ready to include in ``trailforge.api.main``:
 
 from __future__ import annotations
 
+import secrets
 import uuid
 from datetime import UTC, datetime
 from typing import Annotated, Any, Final
 from urllib.parse import urlsplit
 
+import anyio
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, StringConstraints
@@ -104,6 +106,18 @@ _CONSENT_SECURITY_HEADERS: Final[dict[str, str]] = {
 }
 
 
+def _discovery_headers(cfg: Settings) -> dict[str, str]:
+    """Return discovery CORS & cache headers preventing shared-cache Host poisoning."""
+    headers = dict(_DISCOVERY_CORS_HEADERS)
+    if str(getattr(cfg, "public_base_url", "") or "").strip():
+        headers["Cache-Control"] = "public, max-age=300"
+        headers["Vary"] = "Origin"
+    else:
+        headers["Cache-Control"] = "private, max-age=60"
+        headers["Vary"] = "Origin, Host, X-Forwarded-Host"
+    return headers
+
+
 def _origin_from_redirect_uri(redirect_uri: str | None) -> str | None:
     """Extract bare ``scheme://netloc`` origin from a validated OAuth redirect URI."""
     if not redirect_uri:
@@ -159,23 +173,75 @@ def _oauth_error_response(exc: OAuthError) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content=exc.to_dict(), headers=headers)
 
 
+_OAUTH_LOGIN_NONCE_COOKIE: Final[str] = "tf_oauth_login_nonce"
+_OAUTH_LOGIN_NONCE_TTL_S: Final[int] = 900
+
+
 def _session_binding_for_user(user: User) -> str:
     return f"user:{user.id}:tv:{int(getattr(user, 'token_version', 1) or 1)}"
 
 
-async def _parse_form_or_json(request: Request) -> dict[str, Any]:
+def _anon_login_binding(login_nonce: str) -> str:
+    return f"anon:{login_nonce}"
+
+
+def _set_login_nonce_cookie(response: Response, nonce: str, cfg: Settings) -> None:
+    response.set_cookie(
+        key=_OAUTH_LOGIN_NONCE_COOKIE,
+        value=nonce,
+        max_age=_OAUTH_LOGIN_NONCE_TTL_S,
+        httponly=True,
+        samesite="lax",
+        secure=cfg.auth_cookie_secure,
+        path="/api/oauth/authorize",
+    )
+
+
+def _clear_login_nonce_cookie(response: Response, cfg: Settings) -> None:
+    response.delete_cookie(
+        key=_OAUTH_LOGIN_NONCE_COOKIE,
+        path="/api/oauth/authorize",
+        httponly=True,
+        samesite="lax",
+        secure=cfg.auth_cookie_secure,
+    )
+
+
+async def _parse_form_or_json(request: Request) -> dict[str, str]:
     content_type = (request.headers.get("content-type") or "").lower()
     if "application/json" in content_type:
         try:
             body = await request.json()
-            return body if isinstance(body, dict) else {}
-        except Exception:
-            return {}
+        except Exception as exc:
+            raise OAuthError("invalid_request", "Malformed JSON request body") from exc
+        if not isinstance(body, dict):
+            raise OAuthError("invalid_request", "JSON request body must be an object")
+        parsed: dict[str, str] = {}
+        for k, v in body.items():
+            if not isinstance(k, str):
+                raise OAuthError("invalid_request", "Request parameter keys must be strings")
+            if v is None:
+                continue
+            if not isinstance(v, str):
+                raise OAuthError(
+                    "invalid_request",
+                    f"Request parameter {k!r} must be a string",
+                )
+            parsed[k] = v
+        return parsed
     try:
         form = await request.form()
-        return {str(k): str(v) for k, v in form.items()}
-    except Exception:
-        return {}
+    except Exception as exc:
+        raise OAuthError("invalid_request", "Malformed form request body") from exc
+    parsed_form: dict[str, str] = {}
+    for k, v in form.items():
+        if not isinstance(v, str):
+            raise OAuthError(
+                "invalid_request",
+                f"Form parameter {k!r} must be a text value",
+            )
+        parsed_form[str(k)] = v
+    return parsed_form
 
 
 def _set_session_cookie(response: Response, token: str, cfg: Settings) -> None:
@@ -203,7 +269,7 @@ def oauth_protected_resource_root(request: Request) -> JSONResponse:
     origin = resolve_public_origin(request, settings=cfg)
     return JSONResponse(
         content=build_protected_resource_metadata(origin, resource_path="/mcp"),
-        headers=_DISCOVERY_CORS_HEADERS,
+        headers=_discovery_headers(cfg),
     )
 
 
@@ -211,7 +277,7 @@ def oauth_protected_resource_root(request: Request) -> JSONResponse:
 def oauth_protected_resource_root_options(request: Request) -> Response:
     cfg = _request_settings(request)
     _ensure_mcp_enabled(cfg)
-    return Response(status_code=status.HTTP_204_NO_CONTENT, headers=_DISCOVERY_CORS_HEADERS)
+    return Response(status_code=status.HTTP_204_NO_CONTENT, headers=_discovery_headers(cfg))
 
 
 @well_known_router.get("/.well-known/oauth-protected-resource/mcp")
@@ -222,7 +288,7 @@ def oauth_protected_resource_mcp(request: Request) -> JSONResponse:
     origin = resolve_public_origin(request, settings=cfg)
     return JSONResponse(
         content=build_protected_resource_metadata(origin, resource_path="/mcp"),
-        headers=_DISCOVERY_CORS_HEADERS,
+        headers=_discovery_headers(cfg),
     )
 
 
@@ -230,7 +296,7 @@ def oauth_protected_resource_mcp(request: Request) -> JSONResponse:
 def oauth_protected_resource_mcp_options(request: Request) -> Response:
     cfg = _request_settings(request)
     _ensure_mcp_enabled(cfg)
-    return Response(status_code=status.HTTP_204_NO_CONTENT, headers=_DISCOVERY_CORS_HEADERS)
+    return Response(status_code=status.HTTP_204_NO_CONTENT, headers=_discovery_headers(cfg))
 
 
 @well_known_router.get("/.well-known/oauth-protected-resource/mcp/auth")
@@ -241,7 +307,7 @@ def oauth_protected_resource_mcp_auth(request: Request) -> JSONResponse:
     origin = resolve_public_origin(request, settings=cfg)
     return JSONResponse(
         content=build_protected_resource_metadata(origin, resource_path="/mcp/auth"),
-        headers=_DISCOVERY_CORS_HEADERS,
+        headers=_discovery_headers(cfg),
     )
 
 
@@ -249,7 +315,7 @@ def oauth_protected_resource_mcp_auth(request: Request) -> JSONResponse:
 def oauth_protected_resource_mcp_auth_options(request: Request) -> Response:
     cfg = _request_settings(request)
     _ensure_mcp_enabled(cfg, require_oauth=True)
-    return Response(status_code=status.HTTP_204_NO_CONTENT, headers=_DISCOVERY_CORS_HEADERS)
+    return Response(status_code=status.HTTP_204_NO_CONTENT, headers=_discovery_headers(cfg))
 
 
 @well_known_router.get("/.well-known/oauth-authorization-server")
@@ -260,7 +326,7 @@ def oauth_authorization_server_metadata(request: Request) -> JSONResponse:
     origin = resolve_public_origin(request, settings=cfg)
     return JSONResponse(
         content=build_authorization_server_metadata(origin),
-        headers=_DISCOVERY_CORS_HEADERS,
+        headers=_discovery_headers(cfg),
     )
 
 
@@ -268,7 +334,7 @@ def oauth_authorization_server_metadata(request: Request) -> JSONResponse:
 def oauth_authorization_server_metadata_options(request: Request) -> Response:
     cfg = _request_settings(request)
     _ensure_mcp_enabled(cfg, require_oauth=True)
-    return Response(status_code=status.HTTP_204_NO_CONTENT, headers=_DISCOVERY_CORS_HEADERS)
+    return Response(status_code=status.HTTP_204_NO_CONTENT, headers=_discovery_headers(cfg))
 
 
 # -----------------------------------------------------------------------------
@@ -296,7 +362,9 @@ def oauth_register_client(
 
     client_ip = extract_client_ip(
         request,
-        trust_proxy_headers=bool(getattr(cfg, "trust_proxy_headers", True)),
+        trust_proxy_headers=bool(getattr(cfg, "trust_proxy_headers", False)),
+        trusted_proxy_cidrs=getattr(cfg, "trusted_proxy_cidrs", None),
+        trust_cloudflare_headers=bool(getattr(cfg, "should_trust_cloudflare_headers", False)),
     )
     try:
         reg = register_oauth_client(
@@ -349,6 +417,7 @@ def oauth_authorize_get(
     cfg = _request_settings(request)
     _ensure_mcp_enabled(cfg, require_oauth=True)
 
+    expected_origin = resolve_public_origin(request, settings=cfg)
     try:
         params = validate_authorize_request(
             db,
@@ -360,6 +429,7 @@ def oauth_authorize_get(
             code_challenge_method=code_challenge_method,
             state=state,
             resource=resource,
+            expected_origin=expected_origin,
         )
     except OAuthError as exc:
         return HTMLResponse(
@@ -372,8 +442,14 @@ def oauth_authorize_get(
 
     user = resolve_session_cookie_or_bearer_user(request, db, settings=cfg)
     if user is None:
+        existing_nonce = (request.cookies.get(_OAUTH_LOGIN_NONCE_COOKIE) or "").strip()
+        login_nonce = (
+            existing_nonce
+            if 16 <= len(existing_nonce) <= 128 and existing_nonce.isascii()
+            else secrets.token_urlsafe(24)
+        )
         csrf_token = create_oauth_csrf_nonce(
-            session_binding="anon",
+            session_binding=_anon_login_binding(login_nonce),
             action="login",
             client_id=params.client.client_id,
             redirect_uri=params.redirect_uri,
@@ -383,11 +459,13 @@ def oauth_authorize_get(
             resource=params.resource,
             settings=cfg,
         )
-        return HTMLResponse(
+        resp = HTMLResponse(
             content=render_oauth_login_html(params=params, csrf_token=csrf_token),
             status_code=status.HTTP_200_OK,
             headers=_CONSENT_SECURITY_HEADERS,
         )
+        _set_login_nonce_cookie(resp, login_nonce, cfg)
+        return resp
 
     csrf_token = create_oauth_csrf_nonce(
         session_binding=_session_binding_for_user(user),
@@ -416,8 +494,9 @@ async def oauth_authorize_post(
     cfg = _request_settings(request)
     _ensure_mcp_enabled(cfg, require_oauth=True)
 
-    form = await _parse_form_or_json(request)
+    expected_origin = resolve_public_origin(request, settings=cfg)
     try:
+        form = await _parse_form_or_json(request)
         params = validate_authorize_request(
             db,
             client_id=form.get("client_id"),
@@ -428,6 +507,7 @@ async def oauth_authorize_post(
             code_challenge_method=form.get("code_challenge_method"),
             state=form.get("state", ""),
             resource=form.get("resource") or None,
+            expected_origin=expected_origin,
         )
     except OAuthError as exc:
         return HTMLResponse(
@@ -442,9 +522,10 @@ async def oauth_authorize_post(
     csrf_token = form.get("csrf_token")
 
     if action == "login":
-        if not verify_oauth_csrf_nonce(
+        login_nonce = (request.cookies.get(_OAUTH_LOGIN_NONCE_COOKIE) or "").strip()
+        if not login_nonce or not verify_oauth_csrf_nonce(
             csrf_token,
-            session_binding="anon",
+            session_binding=_anon_login_binding(login_nonce),
             action="login",
             client_id=params.client.client_id,
             redirect_uri=params.redirect_uri,
@@ -466,7 +547,7 @@ async def oauth_authorize_post(
         raw_email = str(form.get("email") or "")
         raw_password = str(form.get("password") or "")
         fresh_login_csrf = create_oauth_csrf_nonce(
-            session_binding="anon",
+            session_binding=_anon_login_binding(login_nonce),
             action="login",
             client_id=params.client.client_id,
             redirect_uri=params.redirect_uri,
@@ -477,54 +558,35 @@ async def oauth_authorize_post(
             settings=cfg,
         )
 
-        try:
-            email = normalize_email(raw_email)
-        except ValueError:
-            verify_password(raw_password, _DUMMY_PASSWORD_HASH)
-            return HTMLResponse(
+        def _login_retry_response(message: str, status_code: int) -> HTMLResponse:
+            retry_resp = HTMLResponse(
                 content=render_oauth_login_html(
                     params=params,
                     csrf_token=fresh_login_csrf,
-                    error_message="Invalid email or password",
+                    error_message=message,
                 ),
-                status_code=status.HTTP_401_UNAUTHORIZED,
+                status_code=status_code,
                 headers=_CONSENT_SECURITY_HEADERS,
             )
+            _set_login_nonce_cookie(retry_resp, login_nonce, cfg)
+            return retry_resp
+
+        try:
+            email = normalize_email(raw_email)
+        except ValueError:
+            await anyio.to_thread.run_sync(verify_password, raw_password, _DUMMY_PASSWORD_HASH)
+            return _login_retry_response("Invalid email or password", status.HTTP_401_UNAUTHORIZED)
 
         user = db.execute(
             select(User).where(func.lower(User.email) == email).limit(1)
         ).scalar_one_or_none()
         if user is None:
-            verify_password(raw_password, _DUMMY_PASSWORD_HASH)
-            return HTMLResponse(
-                content=render_oauth_login_html(
-                    params=params,
-                    csrf_token=fresh_login_csrf,
-                    error_message="Invalid email or password",
-                ),
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                headers=_CONSENT_SECURITY_HEADERS,
-            )
-        if not verify_password(raw_password, user.password_hash):
-            return HTMLResponse(
-                content=render_oauth_login_html(
-                    params=params,
-                    csrf_token=fresh_login_csrf,
-                    error_message="Invalid email or password",
-                ),
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                headers=_CONSENT_SECURITY_HEADERS,
-            )
+            await anyio.to_thread.run_sync(verify_password, raw_password, _DUMMY_PASSWORD_HASH)
+            return _login_retry_response("Invalid email or password", status.HTTP_401_UNAUTHORIZED)
+        if not await anyio.to_thread.run_sync(verify_password, raw_password, user.password_hash):
+            return _login_retry_response("Invalid email or password", status.HTTP_401_UNAUTHORIZED)
         if not user.is_active:
-            return HTMLResponse(
-                content=render_oauth_login_html(
-                    params=params,
-                    csrf_token=fresh_login_csrf,
-                    error_message="Account is suspended",
-                ),
-                status_code=status.HTTP_403_FORBIDDEN,
-                headers=_CONSENT_SECURITY_HEADERS,
-            )
+            return _login_retry_response("Account is suspended", status.HTTP_403_FORBIDDEN)
 
         session_token = create_access_token(
             str(user.id),
@@ -549,6 +611,7 @@ async def oauth_authorize_post(
             headers=_build_consent_security_headers(params.redirect_uri),
         )
         _set_session_cookie(resp, session_token, cfg)
+        _clear_login_nonce_cookie(resp, cfg)
         return resp
 
     # Consent approval or denial requires an active user session + bound CSRF nonce
@@ -626,10 +689,10 @@ async def oauth_token_endpoint(
     cfg = _request_settings(request)
     _ensure_mcp_enabled(cfg, require_oauth=True)
 
-    form = await _parse_form_or_json(request)
-    grant_type = str(form.get("grant_type") or "").strip()
-
     try:
+        form = await _parse_form_or_json(request)
+        grant_type = str(form.get("grant_type") or "").strip()
+
         if grant_type == "authorization_code":
             payload = exchange_authorization_code(
                 db,
@@ -673,8 +736,8 @@ async def oauth_revoke_endpoint(
     cfg = _request_settings(request)
     _ensure_mcp_enabled(cfg, require_oauth=True)
 
-    form = await _parse_form_or_json(request)
     try:
+        form = await _parse_form_or_json(request)
         revoke_oauth_token(
             db,
             token=form.get("token"),

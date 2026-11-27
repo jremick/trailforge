@@ -188,17 +188,27 @@ def test_h2_validate_production_secrets_fail_closed_and_dev_warning(
     with pytest.raises(RuntimeError, match="at least 32 characters"):
         validate_production_secrets(short_cfg)
 
-    # 5. Strong >= 32 char secrets pass cleanly in production with no warnings
+    # 5. Strong >= 32 char secrets + public_base_url pass cleanly in production with no warnings
     caplog.clear()
     good_cfg = Settings(
         auth_cookie_secure=True,
         registration_mode="invite_only",
         auth_secret_key=_STRONG_AUTH_SECRET,
         privacy_secret_key=_STRONG_PRIVACY_SECRET,
+        public_base_url="https://trails.example.com",
     )
     with caplog.at_level(logging.WARNING, logger="trailforge.auth.security"):
         validate_production_secrets(good_cfg)
     assert not caplog.records
+
+    # Non-MCP production deployments do not require public_base_url
+    no_mcp_cfg = Settings(
+        auth_cookie_secure=True,
+        auth_secret_key=_STRONG_AUTH_SECRET,
+        privacy_secret_key=_STRONG_PRIVACY_SECRET,
+        enable_mcp=False,
+    )
+    validate_production_secrets(no_mcp_cfg)
 
 
 def test_h3_telemetry_point_and_imu_array_caps() -> None:
@@ -469,6 +479,7 @@ def test_m4_logout_and_admin_changes_revoke_tokens_end_to_end(
     monkeypatch.setenv("TRAILFORGE_REGISTRATION_MODE", "open")
     monkeypatch.setenv("AUTH_SECRET_KEY", _STRONG_AUTH_SECRET)
     monkeypatch.setenv("TRAILFORGE_PRIVACY_SECRET", _STRONG_PRIVACY_SECRET)
+    monkeypatch.setenv("TRAILFORGE_PUBLIC_BASE_URL", "https://trails.example.com")
     get_settings.cache_clear()
 
     try:
@@ -595,6 +606,7 @@ def test_m6_invite_checked_before_email_409_and_login_dummy_scrypt(
     monkeypatch.setenv("TRAILFORGE_ADMIN_EMAIL", "boss@example.com")
     monkeypatch.setenv("AUTH_SECRET_KEY", _STRONG_AUTH_SECRET)
     monkeypatch.setenv("TRAILFORGE_PRIVACY_SECRET", _STRONG_PRIVACY_SECRET)
+    monkeypatch.setenv("TRAILFORGE_PUBLIC_BASE_URL", "https://trails.example.com")
     get_settings.cache_clear()
 
     try:
@@ -607,8 +619,8 @@ def test_m6_invite_checked_before_email_409_and_login_dummy_scrypt(
             app.dependency_overrides[get_db] = _override_db
 
             with TestClient(app) as client:
-                # 1. Exact first-admin bootstrap still works when zero admins exist
-                r_boot = client.post(
+                # 1. SEC-M3: Unauthenticated admin email cannot bypass invite_only without invite
+                r_no_inv_admin = client.post(
                     "/api/auth/register",
                     json={
                         "email": "boss@example.com",
@@ -616,7 +628,30 @@ def test_m6_invite_checked_before_email_409_and_login_dummy_scrypt(
                         "password": "BossPassword123!",
                     },
                 )
+                assert r_no_inv_admin.status_code == 403
+
+                # Bootstrap first admin with an operator-provisioned invite code
+                session.add(
+                    InviteCode(
+                        code="TF-BOSS-2345",
+                        label="Operator Bootstrap",
+                        role="member",
+                        max_uses=1,
+                        use_count=0,
+                    )
+                )
+                session.commit()
+                r_boot = client.post(
+                    "/api/auth/register",
+                    json={
+                        "email": "boss@example.com",
+                        "display_name": "Boss Admin",
+                        "password": "BossPassword123!",
+                        "invite_code": "TF-BOSS-2345",
+                    },
+                )
                 assert r_boot.status_code == 201, r_boot.text
+                assert r_boot.json()["user"]["role"] == "admin"
                 admin_headers = {"Authorization": f"Bearer {r_boot.json()['access_token']}"}
                 client.cookies.clear()
 

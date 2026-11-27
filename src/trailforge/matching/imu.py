@@ -169,21 +169,90 @@ def _compute_dynamic_series(
     samples: Sequence[ImuSample],
     *,
     baseline_window_ms: float = DEFAULT_BASELINE_WINDOW_MS,
-) -> tuple[list[ImuSample], np.ndarray, np.ndarray, np.ndarray]:
-    """Sort samples chronologically and return ``(sorted_samples, t_ms, mag_g, dynamic_g)``."""
-    ordered = sorted(samples, key=lambda s: s.t_ms)
-    t_ms = np.fromiter((s.t_ms for s in ordered), dtype=np.float64, count=len(ordered))
-    ax = np.fromiter((s.ax for s in ordered), dtype=np.float64, count=len(ordered))
-    ay = np.fromiter((s.ay for s in ordered), dtype=np.float64, count=len(ordered))
-    az = np.fromiter((s.az for s in ordered), dtype=np.float64, count=len(ordered))
+    already_sorted: bool = False,
+) -> tuple[list[ImuSample], np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return ``(sorted_samples, t_ms, ax, ay, az, mag_g, dynamic_g)``."""
+    ordered = list(samples) if already_sorted else sorted(samples, key=lambda s: s.t_ms)
+    n = len(ordered)
+    t_ms = np.fromiter((s.t_ms for s in ordered), dtype=np.float64, count=n)
+    ax = np.fromiter((s.ax for s in ordered), dtype=np.float64, count=n)
+    ay = np.fromiter((s.ay for s in ordered), dtype=np.float64, count=n)
+    az = np.fromiter((s.az for s in ordered), dtype=np.float64, count=n)
 
     mag_g = np.sqrt(ax * ax + ay * ay + az * az)
-    if len(ordered) == 1:
+    if n == 1:
         baseline_g = np.array([1.0], dtype=np.float64)
     else:
         baseline_g = _rolling_time_mean(t_ms, mag_g, baseline_window_ms)
     dynamic_g = mag_g - baseline_g
-    return ordered, t_ms, mag_g, dynamic_g
+    return ordered, t_ms, ax, ay, az, mag_g, dynamic_g
+
+
+def _summarize_dynamic_series(
+    ordered: Sequence[ImuSample],
+    t_ms: np.ndarray,
+    ax: np.ndarray,
+    ay: np.ndarray,
+    az: np.ndarray,
+    mag_g: np.ndarray,
+    dynamic_g: np.ndarray,
+    *,
+    baseline_window_ms: float = DEFAULT_BASELINE_WINDOW_MS,
+    shock_dynamic_threshold_g: float = SHOCK_DYNAMIC_THRESHOLD_G,
+    shock_total_threshold_g: float = SHOCK_TOTAL_THRESHOLD_G,
+    shock_debounce_ms: float = DEFAULT_SHOCK_DEBOUNCE_MS,
+) -> ImuSummary:
+    """Compute vectorized ImuSummary from precomputed dynamic series (zero redundant passes)."""
+    n = len(ordered)
+    abs_dyn = np.abs(dynamic_g)
+
+    roughness_rms = round(float(np.sqrt(np.mean(dynamic_g * dynamic_g))), 4)
+    roughness_p95 = round(float(np.percentile(abs_dyn, 95)), 4)
+    shock_count = _count_shock_events(
+        t_ms,
+        mag_g,
+        dynamic_g,
+        dynamic_threshold_g=shock_dynamic_threshold_g,
+        total_threshold_g=shock_total_threshold_g,
+        debounce_ms=shock_debounce_ms,
+    )
+
+    # Vectorized pitch/roll extraction (replaces 100k-iteration Python math.atan2 loop)
+    pitch_arr = np.fromiter(
+        (math.nan if s.pitch_deg is None else abs(s.pitch_deg) for s in ordered),
+        dtype=np.float64,
+        count=n,
+    )
+    roll_arr = np.fromiter(
+        (math.nan if s.roll_deg is None else abs(s.roll_deg) for s in ordered),
+        dtype=np.float64,
+        count=n,
+    )
+    missing_pitch = np.isnan(pitch_arr)
+    missing_roll = np.isnan(roll_arr)
+    if np.any(missing_pitch) or np.any(missing_roll):
+        lp_win = min(baseline_window_ms, 500.0)
+        ax_lp = _rolling_axis_mean(t_ms, ax, lp_win)
+        ay_lp = _rolling_axis_mean(t_ms, ay, lp_win)
+        az_lp = _rolling_axis_mean(t_ms, az, lp_win)
+        if np.any(missing_pitch):
+            est_pitch = np.abs(np.degrees(np.arctan2(ax_lp, np.hypot(ay_lp, az_lp))))
+            pitch_arr = np.where(missing_pitch, est_pitch, pitch_arr)
+        if np.any(missing_roll):
+            est_roll = np.abs(np.degrees(np.arctan2(ay_lp, np.hypot(ax_lp, az_lp))))
+            roll_arr = np.where(missing_roll, est_roll, roll_arr)
+
+    max_pitch = float(np.max(pitch_arr)) if n > 0 else 0.0
+    max_roll = float(np.max(roll_arr)) if n > 0 else 0.0
+
+    return ImuSummary(
+        sample_count=n,
+        roughness_rms=roughness_rms,
+        roughness_p95=roughness_p95,
+        shock_event_count=shock_count,
+        max_pitch_deg=round(max_pitch, 2),
+        max_roll_deg=round(max_roll, 2),
+    )
 
 
 def _count_shock_events(
@@ -235,67 +304,21 @@ def process_imu_batch(
     if not samples:
         return ImuSummary()
 
-    ordered, t_ms, mag_g, dynamic_g = _compute_dynamic_series(
+    ordered, t_ms, ax, ay, az, mag_g, dynamic_g = _compute_dynamic_series(
         samples, baseline_window_ms=baseline_window_ms
     )
-    abs_dyn = np.abs(dynamic_g)
-
-    roughness_rms = round(float(np.sqrt(np.mean(dynamic_g * dynamic_g))), 4)
-    roughness_p95 = round(float(np.percentile(abs_dyn, 95)), 4)
-    shock_count = _count_shock_events(
+    return _summarize_dynamic_series(
+        ordered,
         t_ms,
+        ax,
+        ay,
+        az,
         mag_g,
         dynamic_g,
-        dynamic_threshold_g=shock_dynamic_threshold_g,
-        total_threshold_g=shock_total_threshold_g,
-        debounce_ms=shock_debounce_ms,
-    )
-
-    # Low-pass filtered axes for clinometer fallback when explicit pitch/roll are omitted
-    need_derived_clinometer = any(s.pitch_deg is None or s.roll_deg is None for s in ordered)
-    if need_derived_clinometer:
-        ax_lp = _rolling_axis_mean(
-            t_ms,
-            np.fromiter((s.ax for s in ordered), dtype=np.float64, count=len(ordered)),
-            min(baseline_window_ms, 500.0),
-        )
-        ay_lp = _rolling_axis_mean(
-            t_ms,
-            np.fromiter((s.ay for s in ordered), dtype=np.float64, count=len(ordered)),
-            min(baseline_window_ms, 500.0),
-        )
-        az_lp = _rolling_axis_mean(
-            t_ms,
-            np.fromiter((s.az for s in ordered), dtype=np.float64, count=len(ordered)),
-            min(baseline_window_ms, 500.0),
-        )
-    else:
-        ax_lp = ay_lp = az_lp = np.empty(0, dtype=np.float64)
-
-    max_pitch = 0.0
-    max_roll = 0.0
-    for i, sample in enumerate(ordered):
-        if sample.pitch_deg is not None and sample.roll_deg is not None:
-            pitch_val = abs(sample.pitch_deg)
-            roll_val = abs(sample.roll_deg)
-        else:
-            est_pitch, est_roll = compute_pitch_roll_deg(
-                float(ax_lp[i]), float(ay_lp[i]), float(az_lp[i])
-            )
-            pitch_val = abs(sample.pitch_deg) if sample.pitch_deg is not None else abs(est_pitch)
-            roll_val = abs(sample.roll_deg) if sample.roll_deg is not None else abs(est_roll)
-        if pitch_val > max_pitch:
-            max_pitch = pitch_val
-        if roll_val > max_roll:
-            max_roll = roll_val
-
-    return ImuSummary(
-        sample_count=len(ordered),
-        roughness_rms=roughness_rms,
-        roughness_p95=roughness_p95,
-        shock_event_count=shock_count,
-        max_pitch_deg=round(max_pitch, 2),
-        max_roll_deg=round(max_roll, 2),
+        baseline_window_ms=baseline_window_ms,
+        shock_dynamic_threshold_g=shock_dynamic_threshold_g,
+        shock_total_threshold_g=shock_total_threshold_g,
+        shock_debounce_ms=shock_debounce_ms,
     )
 
 
@@ -390,36 +413,91 @@ def align_imu_to_trimmed_points(
             discarded_sample_count=discarded_count,
         )
 
-    summary = process_imu_batch(retained, baseline_window_ms=baseline_window_ms)
-    _, t_ms, _mag_g, dynamic_g = _compute_dynamic_series(
-        retained, baseline_window_ms=baseline_window_ms
+    ordered, t_ms, ax, ay, az, mag_g, dynamic_g = _compute_dynamic_series(
+        retained, baseline_window_ms=baseline_window_ms, already_sorted=True
+    )
+    summary = _summarize_dynamic_series(
+        ordered,
+        t_ms,
+        ax,
+        ay,
+        az,
+        mag_g,
+        dynamic_g,
+        baseline_window_ms=baseline_window_ms,
     )
     abs_dyn = np.abs(dynamic_g)
+    dyn_sq = dynamic_g * dynamic_g
 
+    n_gps = len(trimmed_points)
+    n_imu = len(retained)
     gps_ms = np.fromiter(
         (_to_epoch_ms(pt.timestamp) for pt in trimmed_points),
         dtype=np.float64,
-        count=len(trimmed_points),
+        count=n_gps,
     )
 
-    # Partition [gps_ms[0], gps_ms[-1]] into Voronoi midpoint bins per GPS point
+    # O(M + N log M) Voronoi midpoint slicing on chronologically sorted t_ms (SEC-H3)
     midpoints = 0.5 * (gps_ms[:-1] + gps_ms[1:])
-    bin_indices = np.searchsorted(midpoints, t_ms, side="right")
+    if np.all(np.diff(gps_ms) >= 0.0):
+        edges = np.searchsorted(t_ms, midpoints, side="left")
+        starts = np.empty(n_gps, dtype=np.intp)
+        ends = np.empty(n_gps, dtype=np.intp)
+        starts[0] = 0
+        starts[1:] = edges
+        ends[:-1] = edges
+        ends[-1] = n_imu
 
-    enriched_points: list[GpsPoint] = []
-    point_p95: list[float | None] = []
-    for k, pt in enumerate(trimmed_points):
-        mask = bin_indices == k
-        if np.any(mask):
-            seg_dyn = dynamic_g[mask]
-            seg_abs = abs_dyn[mask]
-            pt_rms = round(float(np.sqrt(np.mean(seg_dyn * seg_dyn))), 4)
-            pt_p95 = round(float(np.percentile(seg_abs, 95)), 4)
-            enriched_points.append(pt.model_copy(update={"roughness_rms": pt_rms}))
-            point_p95.append(pt_p95)
-        else:
-            enriched_points.append(pt)
-            point_p95.append(None)
+        csum_sq = np.empty(n_imu + 1, dtype=np.float64)
+        csum_sq[0] = 0.0
+        np.cumsum(dyn_sq, out=csum_sq[1:])
+        counts = ends - starts
+        rms_all = np.where(
+            counts > 0,
+            np.sqrt((csum_sq[ends] - csum_sq[starts]) / np.maximum(1, counts)),
+            0.0,
+        )
+
+        enriched_points: list[GpsPoint] = []
+        point_p95: list[float | None] = []
+        for k, pt in enumerate(trimmed_points):
+            lo = int(starts[k])
+            hi = int(ends[k])
+            if hi > lo:
+                pt_rms = round(float(rms_all[k]), 4)
+                win_abs = abs_dyn[lo:hi]
+                pt_p95 = round(
+                    float(win_abs[0]) if hi - lo == 1 else float(np.percentile(win_abs, 95)),
+                    4,
+                )
+                enriched_points.append(pt.model_copy(update={"roughness_rms": pt_rms}))
+                point_p95.append(pt_p95)
+            else:
+                enriched_points.append(pt)
+                point_p95.append(None)
+    else:
+        # Rare out-of-order GPS timestamps: group by bin index via argsort in O(M log M)
+        bin_indices = np.searchsorted(midpoints, t_ms, side="right")
+        order = np.argsort(bin_indices, kind="mergesort")
+        sorted_bins = bin_indices[order]
+        sorted_dyn_sq = dyn_sq[order]
+        sorted_abs = abs_dyn[order]
+        bin_starts = np.searchsorted(sorted_bins, np.arange(n_gps), side="left")
+        bin_ends = np.searchsorted(sorted_bins, np.arange(n_gps), side="right")
+
+        enriched_points = []
+        point_p95 = []
+        for k, pt in enumerate(trimmed_points):
+            lo = int(bin_starts[k])
+            hi = int(bin_ends[k])
+            if hi > lo:
+                pt_rms = round(float(np.sqrt(np.mean(sorted_dyn_sq[lo:hi]))), 4)
+                pt_p95 = round(float(np.percentile(sorted_abs[lo:hi], 95)), 4)
+                enriched_points.append(pt.model_copy(update={"roughness_rms": pt_rms}))
+                point_p95.append(pt_p95)
+            else:
+                enriched_points.append(pt)
+                point_p95.append(None)
 
     return AlignedImuResult(
         points=enriched_points,
@@ -440,7 +518,7 @@ def enrich_match_result_with_imu(
     if not trimmed_imu_samples or not match_result.matched_segments:
         return match_result
 
-    _, t_ms, _mag_g, dynamic_g = _compute_dynamic_series(
+    _, t_ms, _ax, _ay, _az, _mag_g, dynamic_g = _compute_dynamic_series(
         trimmed_imu_samples, baseline_window_ms=baseline_window_ms
     )
     abs_dyn = np.abs(dynamic_g)

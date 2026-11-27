@@ -226,6 +226,7 @@ def test_registration_modes_invites_suspension_last_admin_and_admin_gating(
     monkeypatch.setenv(
         "TRAILFORGE_PRIVACY_SECRET", "test-access-control-privacy-secret-32chars-min-01"
     )
+    monkeypatch.setenv("TRAILFORGE_PUBLIC_BASE_URL", "https://trails.example.com")
     get_settings.cache_clear()
 
     try:
@@ -323,13 +324,34 @@ def test_registration_modes_invites_suspension_last_admin_and_admin_gating(
                 assert r_no_inv.status_code == 403
                 assert "invite" in r_no_inv.json()["detail"].lower()
 
-                # 3. Admin email bootstrap works EVEN in invite_only mode (case-insensitive)
+                # 3. SEC-M3: TRAILFORGE_ADMIN_EMAIL cannot bypass invite_only without a valid invite
+                r_bypass = client.post(
+                    "/api/auth/register",
+                    json={
+                        "email": "OWNER@Example.COM",
+                        "display_name": "Site Owner",
+                        "password": "OwnerPassword123!",
+                    },
+                )
+                assert r_bypass.status_code == 403
+
+                # With a bootstrap invite code (or CLI create-admin), first admin is promoted
+                boot_inv = InviteCode(
+                    code="TF-BOOT-2345",
+                    label="Initial Admin Bootstrap",
+                    role="member",
+                    max_uses=1,
+                    use_count=0,
+                )
+                session.add(boot_inv)
+                session.commit()
                 r_boot = client.post(
                     "/api/auth/register",
                     json={
                         "email": "OWNER@Example.COM",
                         "display_name": "Site Owner",
                         "password": "OwnerPassword123!",
+                        "invite_code": "TF-BOOT-2345",
                     },
                 )
                 assert r_boot.status_code == 201, r_boot.text
@@ -609,7 +631,7 @@ def test_registration_modes_invites_suspension_last_admin_and_admin_gating(
                     "members": 1,
                     "suspended": 0,
                 }
-                assert stats["invites"] == {"active": 0, "total": 3}
+                assert stats["invites"] == {"active": 0, "total": 4}
                 assert stats["content"]["tracks"] >= 5
                 assert stats["content"]["segments"] > 50
                 assert stats["storage"]["tiles_bytes"] == 1024

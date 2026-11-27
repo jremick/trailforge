@@ -58,6 +58,22 @@ def validate_production_secrets(settings: Settings | None = None) -> None:
             f"{MIN_PRODUCTION_SECRET_LENGTH} characters (not the development default)"
         )
 
+    cors_origins = getattr(cfg, "cors_origins_list", None) or []
+    if any(str(origin).strip() == "*" for origin in cors_origins):
+        problems.append(
+            "CORS_ORIGINS must not contain wildcard '*' when credentialed /api/* cookies "
+            "are enabled"
+        )
+
+    enable_mcp = bool(getattr(cfg, "enable_mcp", True))
+    public_base_url = str(getattr(cfg, "public_base_url", "") or "").strip()
+    if is_prod and enable_mcp and not public_base_url:
+        problems.append(
+            "TRAILFORGE_PUBLIC_BASE_URL must be set to your canonical public origin "
+            "(e.g. https://trails.example.com) when MCP/OAuth is enabled in production mode "
+            "(or set TRAILFORGE_ENABLE_MCP=false)"
+        )
+
     if not problems:
         return
 
@@ -75,10 +91,31 @@ def validate_production_secrets(settings: Settings | None = None) -> None:
 def normalize_email(email: str) -> str:
     """Normalize an email address for case-insensitive unique storage."""
     cleaned = email.strip().lower()
-    if "@" not in cleaned or cleaned.startswith("@") or cleaned.endswith("@"):
+    if not cleaned or len(cleaned) > 254:
+        raise ValueError("Invalid email address")
+    if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in cleaned):
+        raise ValueError("Invalid email address")
+    if cleaned.count("@") != 1:
         raise ValueError("Invalid email address")
     local, _, domain = cleaned.partition("@")
-    if not local or "." not in domain or domain.startswith(".") or domain.endswith("."):
+    if (
+        not local
+        or len(local) > 64
+        or local.startswith(".")
+        or local.endswith(".")
+        or ".." in local
+    ):
+        raise ValueError("Invalid email address")
+    if (
+        not domain
+        or "." not in domain
+        or domain.startswith(".")
+        or domain.endswith(".")
+        or ".." in domain
+    ):
+        raise ValueError("Invalid email address")
+    labels = domain.split(".")
+    if any(not lbl or lbl.startswith("-") or lbl.endswith("-") for lbl in labels):
         raise ValueError("Invalid email address")
     return cleaned
 

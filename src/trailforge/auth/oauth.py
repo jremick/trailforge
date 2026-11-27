@@ -340,13 +340,19 @@ def resolve_public_origin(request: Request, *, settings: Settings | None = None)
     scheme = (request.url.scheme or "http").lower()
     host = _sanitize_host(request.headers.get("host")) or _sanitize_host(request.url.netloc)
 
-    if bool(getattr(cfg, "trust_proxy_headers", True)):
-        xf_proto = (request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip().lower()
-        if xf_proto in ("http", "https"):
-            scheme = xf_proto
-        xf_host = _sanitize_host(request.headers.get("x-forwarded-host"))
-        if xf_host:
-            host = xf_host
+    client_host = request.client.host if request.client is not None else None
+    if bool(getattr(cfg, "trust_proxy_headers", False)):
+        from trailforge.api.middleware import is_trusted_proxy_peer
+
+        if is_trusted_proxy_peer(client_host, getattr(cfg, "trusted_proxy_cidrs", None)):
+            xf_proto = (
+                (request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip().lower()
+            )
+            if xf_proto in ("http", "https"):
+                scheme = xf_proto
+            xf_host = _sanitize_host(request.headers.get("x-forwarded-host"))
+            if xf_host:
+                host = xf_host
 
     resolved_host = host or "localhost"
     return f"{scheme}://{resolved_host}".rstrip("/")
@@ -516,8 +522,12 @@ def validate_redirect_uri(uri: str) -> str:
     return uri
 
 
-def validate_resource_indicator(resource: str | None) -> str | None:
-    """Validate optional RFC 8707 resource indicator URI."""
+def validate_resource_indicator(
+    resource: str | None,
+    *,
+    expected_origin: str | None = None,
+) -> str | None:
+    """Validate optional RFC 8707 resource indicator URI against canonical MCP URIs."""
     if resource is None:
         return None
     cleaned = resource.strip()
@@ -533,6 +543,15 @@ def validate_resource_indicator(resource: str | None) -> str | None:
             "invalid_target",
             "resource must be an absolute http(s) URI without fragment",
         )
+    if expected_origin:
+        norm_origin = expected_origin.strip().rstrip("/").lower()
+        norm_res = cleaned.rstrip("/").lower()
+        allowed_targets = {f"{norm_origin}/mcp", f"{norm_origin}/mcp/auth"}
+        if norm_res not in allowed_targets:
+            raise OAuthError(
+                "invalid_target",
+                "resource must match this TrailForge server's canonical /mcp or /mcp/auth URI",
+            )
     return cleaned
 
 
@@ -689,13 +708,6 @@ def register_oauth_client(
             "token_endpoint_auth_method must be 'none' or 'client_secret_post'",
         )
 
-    # Prune stale unused registrations before enforcing capacity bounds
-    prune_stale_oauth_clients(
-        db,
-        now=current_now,
-        unused_ttl_days=get_oauth_unused_client_ttl_days(cfg),
-    )
-
     ip_hash = hash_client_ip(client_ip, settings=cfg)
     if ip_hash is not None:
         daily_cap = get_oauth_dcr_max_per_ip_per_day(cfg)
@@ -718,11 +730,20 @@ def register_oauth_client(
     max_clients = get_oauth_max_clients(cfg)
     total_clients = db.execute(select(func.count(OAuthClient.client_id))).scalar_one() or 0
     if int(total_clients) >= max_clients:
-        raise OAuthError(
-            "too_many_clients",
-            "OAuth client registration table capacity reached",
-            status_code=503,
+        # Lazy fallback prune when at capacity (routine pruning runs in the background worker)
+        pruned = prune_stale_oauth_clients(
+            db,
+            now=current_now,
+            unused_ttl_days=get_oauth_unused_client_ttl_days(cfg),
         )
+        if pruned > 0:
+            total_clients = db.execute(select(func.count(OAuthClient.client_id))).scalar_one() or 0
+        if int(total_clients) >= max_clients:
+            raise OAuthError(
+                "too_many_clients",
+                "OAuth client registration table capacity reached",
+                status_code=503,
+            )
 
     client_id = generate_prefixed_token(OAUTH_CLIENT_PREFIX, nbytes=16)
     client_secret: str | None = None
@@ -771,6 +792,7 @@ def validate_authorize_request(
     code_challenge_method: str | None,
     state: str | None = None,
     resource: str | None = None,
+    expected_origin: str | None = None,
 ) -> ValidatedAuthorizeParams:
     """Validate OAuth 2.1 authorization request parameters (exact redirect_uri & PKCE S256)."""
     if not client_id or not client_id.strip():
@@ -797,7 +819,7 @@ def validate_authorize_request(
         )
 
     validated_challenge = validate_code_challenge(code_challenge, code_challenge_method)
-    validated_resource = validate_resource_indicator(resource)
+    validated_resource = validate_resource_indicator(resource, expected_origin=expected_origin)
 
     raw_scope = (scope or "").strip() or SCOPE_READ
     try:
@@ -1248,23 +1270,36 @@ def exchange_authorization_code(
     if code_row.redirect_uri != redirect_uri:
         raise OAuthError("invalid_grant", "redirect_uri mismatch")
     if code_row.consumed_at is not None:
+        # OAuth 2.1 §4.1.2 / RFC 6749 §10.5: revoke entire token family on auth-code replay
+        if code_row.token_family_id is not None:
+            revoke_token_family(db, code_row.token_family_id, now=current_now)
+            if commit:
+                db.commit()
+            else:
+                db.flush()
         raise OAuthError("invalid_grant", "Authorization code has already been used")
     if as_utc(code_row.expires_at) <= current_now:
         raise OAuthError("invalid_grant", "Authorization code has expired")
     if not verify_pkce_s256(code_verifier, code_row.code_challenge):
         raise OAuthError("invalid_grant", "PKCE code_verifier verification failed")
 
-    # Atomically consume single-use authorization code
+    # Atomically consume single-use authorization code and bind its minted token_family_id
+    family_id = uuid.uuid4()
     consumed = db.execute(
         update(OAuthAuthorizationCode)
         .where(
             OAuthAuthorizationCode.code_hash == code_digest,
             OAuthAuthorizationCode.consumed_at.is_(None),
         )
-        .values(consumed_at=current_now)
+        .values(consumed_at=current_now, token_family_id=family_id)
     )
     if int(consumed.rowcount or 0) != 1:
         db.rollback()
+        replayed_row = db.get(OAuthAuthorizationCode, code_digest)
+        if replayed_row is not None and replayed_row.token_family_id is not None:
+            revoke_token_family(db, replayed_row.token_family_id, now=current_now)
+            if commit:
+                db.commit()
         raise OAuthError("invalid_grant", "Authorization code has already been used")
 
     user = db.get(User, code_row.user_id)
@@ -1282,7 +1317,7 @@ def exchange_authorization_code(
     )
 
     token_row = OAuthToken(
-        token_family_id=uuid.uuid4(),
+        token_family_id=family_id,
         client_id=client.client_id,
         user_id=user.id,
         user_token_version=int(getattr(user, "token_version", 1) or 1),

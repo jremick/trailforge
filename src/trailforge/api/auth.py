@@ -133,7 +133,8 @@ def register_user(
     """Create a user account respecting registration_mode, invites, and admin bootstrap."""
     try:
         email = normalize_email(payload.email)
-        pw_hash = hash_password(payload.password)
+        if len(payload.password) < 8:
+            raise ValueError("Password must be at least 8 characters long")
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -147,7 +148,9 @@ def register_user(
             detail="Registration is closed",
         )
 
-    # First-admin bootstrap is only allowed when zero admins exist AND email matches admin_email.
+    # First-admin bootstrap may only auto-promote without an invite in open mode (SEC-M3).
+    # In invite_only mode, create the first admin via CLI (`trailforge-auth create-admin`)
+    # or redeem a valid invite code; never bypass invite_only based solely on email address.
     bootstrap_email = get_admin_email()
     is_admin_bootstrap = False
     if bootstrap_email and email == bootstrap_email:
@@ -162,20 +165,17 @@ def register_user(
     raw_code = normalize_invite_code(payload.invite_code) if payload.invite_code else ""
     invite: InviteCode | None = None
 
-    # Validate invite code BEFORE checking email uniqueness to prevent unauthenticated
-    # email enumeration in invite_only mode (M-6).
-    if is_admin_bootstrap:
-        assigned_role = "admin"
-    elif mode == "invite_only" and not raw_code:
+    # Validate invite code BEFORE checking email uniqueness and BEFORE scrypt hashing (SEC-H4)
+    if mode == "invite_only" and not raw_code:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="An invite code is required to register",
         )
-    elif raw_code:
+    if raw_code:
         now = datetime.now(UTC)
         invite = db.execute(
             select(InviteCode)
-            .where(func.upper(InviteCode.code) == raw_code)
+            .where(InviteCode.code == raw_code)
             .with_for_update()
         ).scalar_one_or_none()
         if invite is None:
@@ -204,6 +204,8 @@ def register_user(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Invite code has reached its maximum uses",
             )
+    elif is_admin_bootstrap and mode == "open":
+        assigned_role = "admin"
 
     existing = db.execute(
         select(User).where(func.lower(User.email) == email).limit(1)
@@ -231,6 +233,11 @@ def register_user(
                 detail="Invite code has reached its maximum uses",
             )
         used_invite_code, assigned_role = updated
+        if is_admin_bootstrap:
+            assigned_role = "admin"
+
+    # Run expensive scrypt KDF strictly after all cheap access, invite, and duplicate checks
+    pw_hash = hash_password(payload.password)
 
     user = User(
         email=email,
@@ -331,7 +338,13 @@ def logout_user(
         ctx.user.updated_at = datetime.now(UTC)
         db.commit()
     cfg = get_settings()
-    response.delete_cookie(key=cfg.auth_cookie_name, path="/")
+    response.delete_cookie(
+        key=cfg.auth_cookie_name,
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=cfg.auth_cookie_secure,
+    )
     return {"ok": True}
 
 

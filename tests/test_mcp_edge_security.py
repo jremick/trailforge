@@ -271,6 +271,7 @@ def test_sc10_mcp_rate_limit_body_cap_origin_secret_and_kill_switch() -> None:
         rate_limit_mcp_per_min=3,
         rate_limit_read_per_min=100,
         trust_proxy_headers=True,
+        trust_cloudflare_headers=True,
     )
     rl_app = _make_offline_app(settings=rl_cfg)
     reset_rate_limiter(rl_app)

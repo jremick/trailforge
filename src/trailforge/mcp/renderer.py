@@ -203,9 +203,16 @@ def _encode_png_under_budget(
 ) -> bytes:
     """Downscale 2x supersampled RGB canvas and encode PNG strictly under ``max_bytes``."""
     downscaled = supersampled.resize(target_size, Image.Resampling.LANCZOS).convert("RGB")
+    # Fast compression path (~3-5x faster than level 9 + optimize); escalate only if over budget
     buf = io.BytesIO()
-    downscaled.save(buf, format="PNG", optimize=True, compress_level=9)
+    downscaled.save(buf, format="PNG", optimize=False, compress_level=4)
     data = buf.getvalue()
+    if len(data) <= max_bytes:
+        return data
+
+    buf9 = io.BytesIO()
+    downscaled.save(buf9, format="PNG", optimize=True, compress_level=9)
+    data = buf9.getvalue()
     if len(data) <= max_bytes:
         return data
 
@@ -217,7 +224,7 @@ def _encode_png_under_budget(
             dither=Image.Dither.NONE,
         )
         qbuf = io.BytesIO()
-        quant.save(qbuf, format="PNG", optimize=True, compress_level=9)
+        quant.save(qbuf, format="PNG", optimize=False, compress_level=4)
         qdata = qbuf.getvalue()
         if len(qdata) <= max_bytes:
             return qdata

@@ -234,14 +234,54 @@ class Settings(BaseSettings):
         ),
         description="Global disk quota in MiB for condition report photo attachments.",
     )
+    db_statement_timeout_ms: int = Field(
+        default=15_000,
+        ge=0,
+        validation_alias=AliasChoices(
+            "TRAILFORGE_DB_STATEMENT_TIMEOUT_MS",
+            "DB_STATEMENT_TIMEOUT_MS",
+            "db_statement_timeout_ms",
+        ),
+        description=(
+            "PostgreSQL statement_timeout (ms) enforced on FastAPI request sessions "
+            "(0 disables; background workers and CLI pipelines are unaffected)."
+        ),
+    )
     trust_proxy_headers: bool = Field(
-        default=True,
+        default=False,
         validation_alias=AliasChoices(
             "TRAILFORGE_TRUST_PROXY_HEADERS",
             "TRUST_PROXY_HEADERS",
             "trust_proxy_headers",
         ),
-        description="Trust CF-Connecting-IP and X-Forwarded-For proxy headers for client IP.",
+        description=(
+            "Trust X-Forwarded-For / X-Forwarded-Host proxy headers when requests arrive from "
+            "a peer matching TRAILFORGE_TRUSTED_PROXY_CIDRS."
+        ),
+    )
+    trusted_proxy_cidrs: str = Field(
+        default="127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7",
+        validation_alias=AliasChoices(
+            "TRAILFORGE_TRUSTED_PROXY_CIDRS",
+            "TRUSTED_PROXY_CIDRS",
+            "trusted_proxy_cidrs",
+        ),
+        description=(
+            "Comma-separated CIDR ranges of reverse proxies allowed to supply X-Forwarded-* "
+            "headers when TRAILFORGE_TRUST_PROXY_HEADERS=true."
+        ),
+    )
+    trust_cloudflare_headers: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "TRAILFORGE_TRUST_CLOUDFLARE_HEADERS",
+            "TRUST_CLOUDFLARE_HEADERS",
+            "trust_cloudflare_headers",
+        ),
+        description=(
+            "Explicitly trust CF-Connecting-IP from a trusted proxy peer (automatically enabled "
+            "when TRAILFORGE_ORIGIN_SHARED_SECRET is set)."
+        ),
     )
     origin_shared_secret: str = Field(
         default="",
@@ -449,6 +489,11 @@ class Settings(BaseSettings):
     @property
     def enabled_states_list(self) -> list[str]:
         return [state.strip().upper() for state in self.enabled_states.split(",") if state.strip()]
+
+    @property
+    def should_trust_cloudflare_headers(self) -> bool:
+        """True when CF-Connecting-IP may be honored (origin secret set or explicit flag)."""
+        return bool(self.trust_cloudflare_headers or self.origin_shared_secret.strip())
 
     @property
     def is_production_mode(self) -> bool:

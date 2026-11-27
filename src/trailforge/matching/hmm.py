@@ -27,6 +27,7 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 from typing import Literal
 
+import anyio
 import numpy as np
 from pyproj import Transformer
 from shapely import STRtree, wkb
@@ -165,17 +166,18 @@ def _build_node_adjacency(
     if endpoint_list:
         ep_pts = [Point(x, y) for _, _, x, y in endpoint_list]
         tree = STRtree(ep_pts)
-        for i, (seg_u, end_u, xu, yu) in enumerate(endpoint_list):
-            for j_raw in tree.query(ep_pts[i].buffer(_ENDPOINT_CONNECT_TOL_M)):
+        for i, (seg_u, end_u, _xu, _yu) in enumerate(endpoint_list):
+            for j_raw in tree.query(
+                ep_pts[i], predicate="dwithin", distance=_ENDPOINT_CONNECT_TOL_M
+            ):
                 j = int(j_raw)
                 if j <= i:
                     continue
-                seg_v, end_v, xv, yv = endpoint_list[j]
+                seg_v, end_v, _xv, _yv = endpoint_list[j]
                 if seg_u == seg_v:
                     continue
-                if math.hypot(xu - xv, yu - yv) <= _ENDPOINT_CONNECT_TOL_M:
-                    adj_sets[(seg_u, end_u)].add((seg_v, end_v))
-                    adj_sets[(seg_v, end_v)].add((seg_u, end_u))
+                adj_sets[(seg_u, end_u)].add((seg_v, end_v))
+                adj_sets[(seg_v, end_v)].add((seg_u, end_u))
 
     adj: dict[tuple[int, int], list[tuple[int, int]]] = {
         k: sorted(v) for k, v in adj_sets.items()
@@ -353,6 +355,9 @@ class PostGISHMMMatcher:
                     SELECT
                         ST_GeomFromText(:trace_wkt, 4326) AS geom_4326,
                         ST_Transform(ST_GeomFromText(:trace_wkt, 4326), 3577) AS geom_3577
+                ),
+                trace_parts AS (
+                    SELECT ST_Subdivide(geom_3577, 64) AS part_3577 FROM trace
                 )
                 SELECT
                     ts.segment_id,
@@ -368,10 +373,14 @@ class PostGISHMMMatcher:
                 WHERE ts.is_active = TRUE
                   AND ts.is_vehicular = TRUE
                   AND ts.geom && ST_Expand(trace.geom_4326, :expand_deg)
-                  AND ST_DWithin(
-                      ST_Transform(ts.geom, 3577),
-                      trace.geom_3577,
-                      :corridor_radius_m
+                  AND EXISTS (
+                      SELECT 1
+                      FROM trace_parts tp
+                      WHERE ST_DWithin(
+                          ST_Transform(ts.geom, 3577),
+                          tp.part_3577,
+                          :corridor_radius_m
+                      )
                   )
                 ORDER BY ts.segment_id
                 """
@@ -442,7 +451,7 @@ class PostGISHMMMatcher:
             sigma = max(self.sigma_z_m, pt.accuracy_m or self.sigma_z_m)
             pt_bearing = bearings[idx]
 
-            nearby_indices = tree.query(p_geom.buffer(search_radius_m))
+            nearby_indices = tree.query(p_geom, predicate="dwithin", distance=search_radius_m)
             raw_cands: list[_CandidateState] = []
             had_any_within_radius = False
 
@@ -872,29 +881,20 @@ class PostGISHMMMatcher:
 
         return traversals
 
-    def match_trace_sync(
+    def _match_with_segments(
         self,
         points: Sequence[GpsPoint],
+        segments: Sequence[_CorridorSegment],
         *,
         search_radius_m: float = 45.0,
         min_confidence: float = 0.45,
     ) -> MatchResult:
-        """Synchronous in-PostGIS HMM map-matching implementation."""
-        if len(points) < 2:
-            return MatchResult(
-                matcher_name=self.name,
-                matched_segments=[],
-                unmatched_subtraces=[],
-                overall_confidence=0.0,
-                matched_fraction=0.0,
-            )
-
+        """Pure-CPU HMM map-matching over pre-fetched corridor segments (thread-safe)."""
         fwd = _wgs84_to_albers()
         xs, ys = fwd.transform([p.lon for p in points], [p.lat for p in points])
         xys = [(float(x), float(y)) for x, y in zip(xs, ys, strict=True)]
         bearings = _local_point_bearings(xys)
 
-        segments = self._fetch_corridor_segments(points, search_radius_m)
         candidates_per_pt, unmatched_reasons = self._build_candidates_per_point(
             points,
             xys,
@@ -982,6 +982,31 @@ class PostGISHMMMatcher:
             matched_fraction=matched_fraction,
         )
 
+    def match_trace_sync(
+        self,
+        points: Sequence[GpsPoint],
+        *,
+        search_radius_m: float = 45.0,
+        min_confidence: float = 0.45,
+    ) -> MatchResult:
+        """Synchronous in-PostGIS HMM map-matching implementation."""
+        if len(points) < 2:
+            return MatchResult(
+                matcher_name=self.name,
+                matched_segments=[],
+                unmatched_subtraces=[],
+                overall_confidence=0.0,
+                matched_fraction=0.0,
+            )
+
+        segments = self._fetch_corridor_segments(points, search_radius_m)
+        return self._match_with_segments(
+            points,
+            segments,
+            search_radius_m=search_radius_m,
+            min_confidence=min_confidence,
+        )
+
     async def match_trace(
         self,
         points: Sequence[GpsPoint],
@@ -990,10 +1015,23 @@ class PostGISHMMMatcher:
         min_confidence: float = 0.45,
     ) -> MatchResult:
         """Snap a privacy-trimmed GPS sequence onto active vehicular canonical track_segments."""
-        return self.match_trace_sync(
-            points,
-            search_radius_m=search_radius_m,
-            min_confidence=min_confidence,
+        if len(points) < 2:
+            return MatchResult(
+                matcher_name=self.name,
+                matched_segments=[],
+                unmatched_subtraces=[],
+                overall_confidence=0.0,
+                matched_fraction=0.0,
+            )
+        # Keep SQLAlchemy Session lookup on caller thread; offload CPU-heavy HMM Viterbi decode.
+        segments = self._fetch_corridor_segments(points, search_radius_m)
+        return await anyio.to_thread.run_sync(
+            lambda: self._match_with_segments(
+                points,
+                segments,
+                search_radius_m=search_radius_m,
+                min_confidence=min_confidence,
+            )
         )
 
 

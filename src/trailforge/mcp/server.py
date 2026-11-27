@@ -13,6 +13,7 @@ Integrator wiring contract for `src/trailforge/api/main.py`:
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import logging
 from collections.abc import AsyncIterator, Callable
@@ -39,6 +40,7 @@ from trailforge.mcp.context import (
     ANONYMOUS_CONTEXT,
     McpAuthContext,
     McpAuthResolver,
+    _coerce_auth_context,
     default_auth_resolver,
     extract_bare_origin,
     get_mcp_auth_mode,
@@ -92,7 +94,7 @@ def create_mcp_server() -> Server:
     async def _handle_list_tools() -> list[types.Tool]:
         return list_mcp_tools()
 
-    @server.call_tool(validate_input=False)
+    @server.call_tool(validate_input=True)
     async def _handle_call_tool(
         name: str, arguments: dict[str, Any] | None
     ) -> types.CallToolResult:
@@ -288,10 +290,13 @@ class TrailForgeMcpAsgiApp:
             await _send_empty_response(send, 204, extra_headers=cors_headers)
             return
 
+        client_tuple = scope.get("client")
+        client_host = str(client_tuple[0]) if client_tuple and len(client_tuple) > 0 else None
         public_origin = resolve_public_origin_from_headers(
             headers,
             scheme=str(scope.get("scheme") or "http"),
             cfg=cfg,
+            client_host=client_host,
         )
         www_auth = self._build_www_authenticate(public_origin)
 
@@ -313,8 +318,16 @@ class TrailForgeMcpAsgiApp:
                 )
                 return
 
-            with open_mcp_db_session(self.db_session_factory) as auth_db:
-                auth_ctx = await invoke_auth_resolver(self.auth_resolver, auth_header, auth_db)
+            if inspect.iscoroutinefunction(self.auth_resolver):
+                with open_mcp_db_session(self.db_session_factory) as auth_db:
+                    auth_ctx = await invoke_auth_resolver(self.auth_resolver, auth_header, auth_db)
+            else:
+                def _resolve_auth_sync() -> McpAuthContext:
+                    with open_mcp_db_session(self.db_session_factory) as auth_db:
+                        res = self.auth_resolver(auth_header, auth_db)
+                        return _coerce_auth_context(res)
+
+                auth_ctx = await anyio.to_thread.run_sync(_resolve_auth_sync)
 
             if not auth_ctx.is_authenticated:
                 await _send_json_response(

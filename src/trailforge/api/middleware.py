@@ -8,6 +8,7 @@ global security response headers, and per-IP sliding-window limits.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hmac
 import ipaddress
@@ -20,8 +21,10 @@ from collections import OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import lru_cache
 from typing import Any, Final
 
+import anyio
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -29,6 +32,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.datastructures import Headers, MutableHeaders
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from trailforge.config import Settings, get_settings
@@ -176,37 +180,125 @@ def _validate_proxy_ip(value: str | None) -> str | None:
         return None
 
 
+_DEFAULT_TRUSTED_PROXY_CIDRS: Final[str] = (
+    "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7"
+)
+
+
+@lru_cache(maxsize=32)
+def parse_trusted_proxy_networks(
+    raw_cidrs: str = _DEFAULT_TRUSTED_PROXY_CIDRS,
+) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    """Parse comma-separated CIDR strings into normalized IP network objects."""
+    nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for part in (raw_cidrs or "").split(","):
+        cleaned = part.strip()
+        if not cleaned:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(cleaned, strict=False))
+        except ValueError:
+            logger.warning("Ignoring invalid trusted proxy CIDR: %r", cleaned)
+    return tuple(nets)
+
+
+def is_trusted_proxy_peer(
+    client_host: str | None,
+    trusted_proxy_cidrs: str | None = None,
+) -> bool:
+    """Return True iff the direct TCP peer belongs to a configured trusted proxy CIDR.
+
+    Also treats Starlette's in-process ``testclient`` sentinel (unreachable over real TCP)
+    as a trusted local test harness peer when proxy trust is explicitly enabled.
+    """
+    cleaned = _sanitize_ip(client_host)
+    if not cleaned:
+        return False
+    if cleaned == "testclient":
+        return True
+    try:
+        peer_ip = ipaddress.ip_address(cleaned)
+    except ValueError:
+        return False
+    nets = parse_trusted_proxy_networks(
+        trusted_proxy_cidrs if trusted_proxy_cidrs is not None else _DEFAULT_TRUSTED_PROXY_CIDRS
+    )
+    return any(peer_ip in net for net in nets)
+
+
+def _ip_in_networks(
+    ip_str: str,
+    nets: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...],
+) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return any(addr in net for net in nets)
+
+
 def extract_client_ip_from_headers(
     headers: Headers,
     client_host: str | None = None,
     *,
-    trust_proxy_headers: bool = True,
+    trust_proxy_headers: bool = False,
+    trusted_proxy_cidrs: str | None = None,
+    trust_cloudflare_headers: bool = False,
 ) -> str:
-    """Extract client IP safely honoring validated Cloudflare & reverse-proxy headers."""
-    if trust_proxy_headers:
-        if "cf-connecting-ip" in headers:
+    """Extract client IP safely honoring peer-verified reverse-proxy & Cloudflare headers.
+
+    Hardened against X-Forwarded-For / CF-Connecting-IP spoofing (SEC-H1):
+    - Proxy headers are ignored completely unless ``trust_proxy_headers=True`` AND the direct
+      ASGI peer matches ``trusted_proxy_cidrs``.
+    - ``CF-Connecting-IP`` is only trusted when ``trust_cloudflare_headers=True`` (set when
+      ``TRAILFORGE_ORIGIN_SHARED_SECRET`` or ``TRAILFORGE_TRUST_CLOUDFLARE_HEADERS`` is enabled);
+      malformed values fall through to ``X-Forwarded-For`` instead of short-circuiting.
+    - ``X-Forwarded-For`` is parsed right-to-left, stripping trusted proxy hops and returning
+      the closest untrusted client IP.
+    """
+    raw_host = _sanitize_ip(client_host)
+    cidr_spec = (
+        trusted_proxy_cidrs if trusted_proxy_cidrs is not None else _DEFAULT_TRUSTED_PROXY_CIDRS
+    )
+    if trust_proxy_headers and is_trusted_proxy_peer(raw_host, cidr_spec):
+        if trust_cloudflare_headers and "cf-connecting-ip" in headers:
             cf_ip = _validate_proxy_ip(headers.get("cf-connecting-ip"))
             if cf_ip:
                 return cf_ip
-        elif "x-forwarded-for" in headers:
+        if "x-forwarded-for" in headers:
             xff = headers.get("x-forwarded-for") or ""
-            for part in xff.split(","):
-                if part.strip():
-                    candidate = _validate_proxy_ip(part)
-                    if candidate:
-                        return candidate
+            nets = parse_trusted_proxy_networks(cidr_spec)
+            parts = [p.strip() for p in xff.split(",") if p.strip()]
+            first_valid_trusted: str | None = None
+            for part in reversed(parts):
+                candidate = _validate_proxy_ip(part)
+                if not candidate:
+                    # Stop at malformed entry; never trust anything further left
                     break
-    host = _sanitize_ip(client_host)
-    return host or "unknown"
+                if _ip_in_networks(candidate, nets):
+                    first_valid_trusted = candidate
+                    continue
+                return candidate
+            if first_valid_trusted:
+                return first_valid_trusted
+    return raw_host or "unknown"
 
 
-def extract_client_ip(request: Request, *, trust_proxy_headers: bool = True) -> str:
+def extract_client_ip(
+    request: Request,
+    *,
+    trust_proxy_headers: bool = False,
+    trusted_proxy_cidrs: str | None = None,
+    trust_cloudflare_headers: bool = False,
+) -> str:
     """Extract client IP from a FastAPI/Starlette ``Request``."""
     client_host = request.client.host if request.client is not None else None
     return extract_client_ip_from_headers(
         request.headers,
         client_host=client_host,
         trust_proxy_headers=trust_proxy_headers,
+        trusted_proxy_cidrs=trusted_proxy_cidrs,
+        trust_cloudflare_headers=trust_cloudflare_headers,
     )
 
 
@@ -221,7 +313,11 @@ class RateLimitResult:
 
 
 class SlidingWindowRateLimiter:
-    """Thread-safe, O(1)-LRU memory-bounded in-process sliding-window rate limiter."""
+    """Thread-safe, partitioned O(1)-LRU memory-bounded sliding-window rate limiter.
+
+    Partitions keys by bucket class prefix (e.g. ``auth``, ``oauth_dcr``, ``mcp``, ``api``)
+    so flooding general read endpoints can never evict strict auth or DCR rate-limit entries.
+    """
 
     def __init__(
         self,
@@ -232,16 +328,31 @@ class SlidingWindowRateLimiter:
         self._clock: Callable[[], float] = clock or time.monotonic
         self._max_keys = max(64, max_keys)
         self._lock = threading.Lock()
-        self._buckets: OrderedDict[str, tuple[deque[float], float]] = OrderedDict()
+        self._partitions: dict[str, OrderedDict[str, tuple[deque[float], float]]] = {}
 
-    def _evict_expired_head_locked(self, now: float, *, skip_key: str) -> None:
-        """Pop already-expired LRU entries from the front of the OrderedDict in O(1) amortized."""
-        while self._buckets:
-            oldest_key, (oldest_dq, oldest_window) = next(iter(self._buckets.items()))
+    @property
+    def _buckets(self) -> OrderedDict[str, tuple[deque[float], float]]:
+        """Combined read-only snapshot across partitions (compatibility helper for diagnostics)."""
+        with self._lock:
+            merged: OrderedDict[str, tuple[deque[float], float]] = OrderedDict()
+            for part in self._partitions.values():
+                merged.update(part)
+            return merged
+
+    def _evict_expired_head_locked(
+        self,
+        buckets: OrderedDict[str, tuple[deque[float], float]],
+        now: float,
+        *,
+        skip_key: str,
+    ) -> None:
+        """Pop already-expired LRU entries from the front of a partition in O(1) amortized."""
+        while buckets:
+            oldest_key, (oldest_dq, oldest_window) = next(iter(buckets.items()))
             if oldest_key == skip_key:
                 break
             if not oldest_dq or (now - oldest_dq[-1]) >= oldest_window:
-                self._buckets.popitem(last=False)
+                buckets.popitem(last=False)
             else:
                 break
 
@@ -249,22 +360,28 @@ class SlidingWindowRateLimiter:
         """Record a hit for ``key`` if under ``limit`` within ``window_s`` seconds."""
         effective_limit = max(1, int(limit))
         effective_window = max(1.0, float(window_s))
+        partition_name = key.partition(":")[0] if ":" in key else "default"
 
         with self._lock:
             now = self._clock()
-            self._evict_expired_head_locked(now, skip_key=key)
+            buckets = self._partitions.get(partition_name)
+            if buckets is None:
+                buckets = OrderedDict()
+                self._partitions[partition_name] = buckets
 
-            entry = self._buckets.get(key)
+            self._evict_expired_head_locked(buckets, now, skip_key=key)
+
+            entry = buckets.get(key)
             if entry is None:
-                # O(1) LRU eviction keeps memory strictly bounded even under spoofed IP floods
-                while len(self._buckets) >= self._max_keys:
-                    self._buckets.popitem(last=False)
+                # O(1) LRU eviction per partition bounds memory without cross-bucket eviction
+                while len(buckets) >= self._max_keys:
+                    buckets.popitem(last=False)
                 dq: deque[float] = deque()
-                self._buckets[key] = (dq, effective_window)
+                buckets[key] = (dq, effective_window)
             else:
                 dq, _prev_window = entry
-                self._buckets[key] = (dq, effective_window)
-                self._buckets.move_to_end(key)
+                buckets[key] = (dq, effective_window)
+                buckets.move_to_end(key)
 
             cutoff = now - effective_window
             while dq and dq[0] <= cutoff:
@@ -290,9 +407,9 @@ class SlidingWindowRateLimiter:
             )
 
     def reset(self) -> None:
-        """Clear all tracked rate-limit windows."""
+        """Clear all tracked rate-limit windows across all partitions."""
         with self._lock:
-            self._buckets.clear()
+            self._partitions.clear()
 
 
 @dataclass(slots=True)
@@ -359,6 +476,8 @@ class UsageMetricsStore:
         self._cumulative: dict[str, _MetricCounters] = {}
         self._pending_requests = 0
         self._last_flush_mono = time.monotonic()
+        self._async_flush_in_flight = False
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
 
     def record(
         self,
@@ -533,17 +652,19 @@ class UsageMetricsStore:
                 self._restore_pending(batch)
                 return 0
 
-    def maybe_flush(self) -> int:
-        """Flush periodically when an active DB engine exists and thresholds are met."""
+    def _should_flush_now(self) -> bool:
         with self._lock:
             if self._pending_requests == 0:
-                return 0
+                return False
             elapsed = time.monotonic() - self._last_flush_mono
-            should_flush = (
+            return (
                 self._pending_requests >= self._flush_batch_threshold
                 or elapsed >= self._flush_interval_s
             )
-        if not should_flush:
+
+    def maybe_flush(self) -> int:
+        """Flush periodically when an active DB engine exists and thresholds are met."""
+        if not self._should_flush_now():
             return 0
 
         from trailforge.db import session as db_session
@@ -551,6 +672,38 @@ class UsageMetricsStore:
         if db_session._engine is None:
             return 0
         return self.flush(session=None)
+
+    def maybe_flush_async(self) -> None:
+        """Schedule a non-blocking background flush off the asyncio event loop (SEC-H3)."""
+        if not self._should_flush_now():
+            return
+
+        from trailforge.db import session as db_session
+
+        if db_session._engine is None:
+            return
+
+        with self._lock:
+            if self._async_flush_in_flight:
+                return
+            self._async_flush_in_flight = True
+
+        async def _run_bg_flush() -> None:
+            try:
+                await anyio.to_thread.run_sync(self.flush, None)
+            finally:
+                with self._lock:
+                    self._async_flush_in_flight = False
+
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(_run_bg_flush())
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+        except RuntimeError:
+            with self._lock:
+                self._async_flush_in_flight = False
+            self.flush(session=None)
 
     def reset(self) -> None:
         """Reset all in-memory pending and cumulative usage counters."""
@@ -806,7 +959,11 @@ def _allowed_csrf_origins(scope: Scope, headers: Headers, cfg: Settings) -> set[
     if host:
         allowed.add(f"{scheme}://{host}")
 
-    if cfg.trust_proxy_headers:
+    client_tuple = scope.get("client")
+    client_host = client_tuple[0] if client_tuple else None
+    if cfg.trust_proxy_headers and is_trusted_proxy_peer(
+        client_host, getattr(cfg, "trusted_proxy_cidrs", _DEFAULT_TRUSTED_PROXY_CIDRS)
+    ):
         xf_proto = (headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip().lower()
         xf_host = (headers.get("x-forwarded-host") or "").split(",", 1)[0].strip().lower()
         effective_proto = xf_proto or scheme
@@ -855,7 +1012,10 @@ class CookieCSRFMiddleware:
             return
 
         cfg = _resolve_settings_from_scope(scope, self._explicit_settings)
-        if not _has_cookie(headers, cfg.auth_cookie_name):
+        normalized_path = path.rstrip("/") or "/"
+        is_oauth_authorize = normalized_path == "/api/oauth/authorize"
+        # Enforce same-origin CSRF checks on POST /api/oauth/authorize even before login (SEC-H5)
+        if not is_oauth_authorize and not _has_cookie(headers, cfg.auth_cookie_name):
             await self.app(scope, receive, send)
             return
 
@@ -878,20 +1038,54 @@ class CookieCSRFMiddleware:
                 )
                 await response(scope, receive, send)
                 return
+        elif "referer" in headers:
+            referer_origin = extract_bare_origin(headers.get("referer") or "")
+            allowed_origins = _allowed_csrf_origins(scope, headers, cfg)
+            if not referer_origin or referer_origin not in allowed_origins:
+                response = JSONResponse(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    content={"detail": "Cross-site request blocked"},
+                )
+                await response(scope, receive, send)
+                return
+        elif cfg.is_production_mode:
+            response = JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={"detail": "Cross-site request blocked"},
+            )
+            await response(scope, receive, send)
+            return
 
         await self.app(scope, receive, send)
+
+
+_OAUTH_PUBLIC_CORS_PATHS: Final[frozenset[str]] = frozenset(
+    {
+        "/api/oauth/token",
+        "/api/oauth/register",
+        "/api/oauth/revoke",
+    }
+)
+
+
+def is_oauth_public_cors_path(path: str) -> bool:
+    """True for non-cookie OAuth 2.1 endpoints callable cross-origin by PKCE MCP clients."""
+    normalized = path.rstrip("/") or "/"
+    return normalized in _OAUTH_PUBLIC_CORS_PATHS
 
 
 class PathAwareCORSMiddleware:
     """Path-aware ASGI CORS middleware preserving strict cookie CORS on ``/api/*``.
 
-    - On Bearer-only / public discovery paths (``/mcp``, ``/mcp/*``, ``/.well-known/oauth-*``):
+    - On Bearer-only / public OAuth & discovery paths (``/mcp``, ``/mcp/*``,
+      ``/.well-known/oauth-*``, ``/api/oauth/{token,register,revoke}``):
       bypasses credentialed Starlette ``CORSMiddleware`` so cross-origin MCP clients receive
       clean non-credentialed CORS headers (reflected sanitized bare origin or ``*``) and
       ``Access-Control-Expose-Headers`` across ``200``, ``204``, ``401``, ``403``, ``413``,
       and ``429`` responses without duplicate ``Access-Control-Allow-Origin`` headers.
-    - On all other paths (including ``/api/*``): delegates unchanged to Starlette's
-      ``CORSMiddleware`` with ``allow_credentials=True`` and configured ``allow_origins``.
+    - On all other paths (including cookie-bearing ``/api/*`` and ``/api/oauth/authorize``):
+      delegates unchanged to Starlette's ``CORSMiddleware`` with ``allow_credentials=True``
+      and configured ``allow_origins``.
     """
 
     def __init__(
@@ -917,7 +1111,8 @@ class PathAwareCORSMiddleware:
         path = str(scope.get("path", "/"))
         mcp_route = is_mcp_path(path)
         discovery_route = is_oauth_well_known_path(path)
-        if not (mcp_route or discovery_route):
+        oauth_public_route = is_oauth_public_cors_path(path)
+        if not (mcp_route or discovery_route or oauth_public_route):
             await self._api_cors(scope, receive, send)
             return
 
@@ -929,7 +1124,28 @@ class PathAwareCORSMiddleware:
             if (bare_origin is not None and bare_origin == raw_origin.lower())
             else "*"
         )
-        allow_methods = "GET, POST, DELETE, OPTIONS" if mcp_route else "GET, OPTIONS"
+        if mcp_route:
+            allow_methods = "GET, POST, DELETE, OPTIONS"
+        elif oauth_public_route:
+            allow_methods = "POST, OPTIONS"
+        else:
+            allow_methods = "GET, OPTIONS"
+
+        # Handle CORS preflight directly for non-cookie OAuth endpoints
+        if oauth_public_route and str(scope.get("method", "GET")).upper() == "OPTIONS":
+            preflight = JSONResponse(
+                status_code=status.HTTP_204_NO_CONTENT,
+                content=None,
+                headers={
+                    "Access-Control-Allow-Origin": allow_origin,
+                    "Access-Control-Allow-Methods": allow_methods,
+                    "Access-Control-Allow-Headers": MCP_CORS_ALLOWED_HEADERS,
+                    "Access-Control-Max-Age": "600",
+                    "Vary": "Origin",
+                },
+            )
+            await preflight(scope, receive, send)
+            return
 
         async def send_with_mcp_cors(message: Message) -> None:
             if message["type"] == "http.response.start":
@@ -950,6 +1166,37 @@ class PathAwareCORSMiddleware:
             await send(message)
 
         await self.app(scope, receive, send_with_mcp_cors)
+
+
+class SelectiveGZipMiddleware:
+    """Compress JSON/GeoJSON/GPX responses >=1 KiB while bypassing Range, binary & SSE paths."""
+
+    _BYPASS_PREFIXES: Final[tuple[str, ...]] = (
+        "/api/tiles/",
+        "/api/packs/",
+        "/api/reports/photos/",
+    )
+
+    def __init__(self, app: ASGIApp, *, minimum_size: int = 1024) -> None:
+        self.app = app
+        self._gzip = GZipMiddleware(app, minimum_size=minimum_size)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = str(scope.get("path", "/"))
+        if is_mcp_path(path) or any(path.startswith(p) for p in self._BYPASS_PREFIXES):
+            await self.app(scope, receive, send)
+            return
+
+        headers = Headers(scope=scope)
+        if "range" in headers:
+            await self.app(scope, receive, send)
+            return
+
+        await self._gzip(scope, receive, send)
 
 
 class SecurityHeadersMiddleware:
@@ -1055,7 +1302,7 @@ class UsageAndRateLimitMiddleware:
                         bytes_out=len(forbidden.body),
                         rate_limited=False,
                     )
-                    self.usage_store.maybe_flush()
+                    self.usage_store.maybe_flush_async()
                 await forbidden(scope, receive, send)
                 return
 
@@ -1076,6 +1323,10 @@ class UsageAndRateLimitMiddleware:
                 headers,
                 client_host=client_host,
                 trust_proxy_headers=cfg.trust_proxy_headers,
+                trusted_proxy_cidrs=getattr(
+                    cfg, "trusted_proxy_cidrs", _DEFAULT_TRUSTED_PROXY_CIDRS
+                ),
+                trust_cloudflare_headers=cfg.should_trust_cloudflare_headers,
             )
 
             window_s = _MINUTE_WINDOW_S
@@ -1129,7 +1380,7 @@ class UsageAndRateLimitMiddleware:
                         bytes_out=len(response.body),
                         rate_limited=True,
                     )
-                    self.usage_store.maybe_flush()
+                    self.usage_store.maybe_flush_async()
                     await response(scope, receive, send)
                     return
 
@@ -1170,4 +1421,4 @@ class UsageAndRateLimitMiddleware:
                     bytes_out=bytes_out,
                     rate_limited=(status_code == status.HTTP_429_TOO_MANY_REQUESTS),
                 )
-                self.usage_store.maybe_flush()
+                self.usage_store.maybe_flush_async()

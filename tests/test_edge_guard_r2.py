@@ -119,7 +119,9 @@ def test_hardening_and_r2_settings_defaults_aliases_and_bounds(
     assert defaults.rate_limit_upload_per_day == 25
     assert defaults.uploads_max_total_mb == 500
     assert defaults.uploads_max_total_bytes == 500 * 1024 * 1024
-    assert defaults.trust_proxy_headers is True
+    assert defaults.trust_proxy_headers is False
+    assert defaults.trust_cloudflare_headers is False
+    assert "127.0.0.0/8" in defaults.trusted_proxy_cidrs
     assert defaults.tiles_public_base_url == ""
     assert defaults.packs_public_base_url == ""
     assert defaults.r2_endpoint_url == ""
@@ -238,14 +240,19 @@ def test_h1_ip_validation_spoofed_testclient_bypass_trailing_slash_and_o1_lru(
     # 1. Invalid header IPs (including "testclient" and garbage) fall back to raw peer IP
     assert (
         extract_client_ip_from_headers(
-            Headers({"CF-Connecting-IP": "testclient"}), client_host="203.0.113.5"
+            Headers({"CF-Connecting-IP": "testclient"}),
+            client_host="10.0.0.1",
+            trust_proxy_headers=True,
+            trust_cloudflare_headers=True,
         )
-        == "203.0.113.5"
+        == "10.0.0.1"
     )
     assert (
         extract_client_ip_from_headers(
             Headers({"CF-Connecting-IP": "not-an-ip", "X-Forwarded-For": "198.51.100.1"}),
             client_host="203.0.113.5",
+            trust_proxy_headers=True,
+            trust_cloudflare_headers=True,
         )
         == "203.0.113.5"
     )
@@ -253,6 +260,7 @@ def test_h1_ip_validation_spoofed_testclient_bypass_trailing_slash_and_o1_lru(
         extract_client_ip_from_headers(
             Headers({"X-Forwarded-For": "testclient, 203.0.113.5"}),
             client_host="198.51.100.44",
+            trust_proxy_headers=True,
         )
         == "198.51.100.44"
     )
@@ -260,6 +268,8 @@ def test_h1_ip_validation_spoofed_testclient_bypass_trailing_slash_and_o1_lru(
         extract_client_ip_from_headers(
             Headers({"CF-Connecting-IP": "2001:0db8:0000::0001"}),
             client_host="10.0.0.1",
+            trust_proxy_headers=True,
+            trust_cloudflare_headers=True,
         )
         == "2001:db8::1"
     )
@@ -270,6 +280,7 @@ def test_h1_ip_validation_spoofed_testclient_bypass_trailing_slash_and_o1_lru(
         rate_limit_read_per_min=10,
         rate_limit_auth_per_min=3,
         trust_proxy_headers=True,
+        trust_cloudflare_headers=True,
     )
     app = _make_healthy_app(settings=cfg, tiles_dir=tmp_path)
     with TestClient(app) as client:
@@ -359,11 +370,14 @@ def test_h1_ip_validation_spoofed_testclient_bypass_trailing_slash_and_o1_lru(
     assert "api:198.51.100.0" in lru_limiter._buckets
     assert "api:198.51.100.1" not in lru_limiter._buckets
 
-    # Flood 2,000 distinct keys -> stays strictly bounded at 64
+    # Flood 2,000 distinct keys in another partition -> each partition strictly bounded at 64
+    # AND flood partition cannot evict the isolated api partition (SEC-H1)
     for i in range(2_000):
         now[0] += 0.0001
         lru_limiter.check(f"flood:{i}", limit=5, window_s=60.0)
-    assert len(lru_limiter._buckets) == 64
+    assert len(lru_limiter._partitions["flood"]) == 64
+    assert len(lru_limiter._partitions["api"]) == 64
+    assert "api:198.51.100.0" in lru_limiter._buckets
 
 
 def test_h1_origin_shared_secret_blocks_direct_origin_and_allows_health(
@@ -461,12 +475,38 @@ def test_h2_create_app_fails_closed_on_prod_default_or_short_secrets(
     with pytest.raises(RuntimeError, match="secret"):
         create_app(settings=Settings())
 
-    # Strong >= 32-char secrets succeed cleanly in production mode
+    # Missing TRAILFORGE_PUBLIC_BASE_URL with MCP enabled fails closed in production mode
+    with pytest.raises(RuntimeError, match="TRAILFORGE_PUBLIC_BASE_URL"):
+        create_app(
+            settings=Settings(
+                auth_cookie_secure=True,
+                registration_mode="invite_only",
+                auth_secret_key=_STRONG_AUTH_SECRET,
+                privacy_secret_key=_STRONG_PRIVACY_SECRET,
+                enable_mcp=True,
+                public_base_url="",
+            )
+        )
+
+    # Wildcard CORS_ORIGINS='*' with credentialed cookies fails closed in production mode
+    with pytest.raises(RuntimeError, match="CORS_ORIGINS"):
+        create_app(
+            settings=Settings(
+                auth_cookie_secure=True,
+                auth_secret_key=_STRONG_AUTH_SECRET,
+                privacy_secret_key=_STRONG_PRIVACY_SECRET,
+                public_base_url="https://trails.example.com",
+                cors_origins="*",
+            )
+        )
+
+    # Strong >= 32-char secrets + public_base_url succeed cleanly in production mode
     prod_cfg = Settings(
         auth_cookie_secure=True,
         registration_mode="invite_only",
         auth_secret_key=_STRONG_AUTH_SECRET,
         privacy_secret_key=_STRONG_PRIVACY_SECRET,
+        public_base_url="https://trails.example.com",
     )
     assert prod_cfg.is_production_mode is True
     assert create_app(settings=prod_cfg) is not None
@@ -635,6 +675,7 @@ def test_m3_global_security_headers_and_conditional_hsts(
         auth_cookie_secure=True,
         auth_secret_key=_STRONG_AUTH_SECRET,
         privacy_secret_key=_STRONG_PRIVACY_SECRET,
+        public_base_url="https://trails.example.com",
     )
     prod_app = _make_healthy_app(settings=prod_cfg, tiles_dir=tmp_path)
     with TestClient(prod_app) as client:
@@ -775,6 +816,7 @@ def test_l4_openapi_docs_disabled_in_production_mode_unless_explicitly_enabled(
         auth_cookie_secure=True,
         auth_secret_key=_STRONG_AUTH_SECRET,
         privacy_secret_key=_STRONG_PRIVACY_SECRET,
+        public_base_url="https://trails.example.com",
     )
     assert prod_cfg.docs_enabled is False
     with TestClient(create_app(settings=prod_cfg)) as prod_client:
@@ -788,6 +830,7 @@ def test_l4_openapi_docs_disabled_in_production_mode_unless_explicitly_enabled(
         auth_cookie_secure=True,
         auth_secret_key=_STRONG_AUTH_SECRET,
         privacy_secret_key=_STRONG_PRIVACY_SECRET,
+        public_base_url="https://trails.example.com",
         enable_docs=True,
     )
     assert prod_docs_cfg.docs_enabled is True
@@ -808,7 +851,28 @@ def test_extract_client_ip_and_route_group_classification() -> None:
             "X-Forwarded-For": "203.0.113.5, 10.0.0.1",
         }
     )
-    assert extract_client_ip_from_headers(hdrs, client_host="127.0.0.1") == "198.51.100.11"
+    # Secure default: trust_proxy_headers=False returns direct peer IP
+    assert extract_client_ip_from_headers(hdrs, client_host="127.0.0.1") == "127.0.0.1"
+    # Trusted proxy + trusted Cloudflare header honors CF-Connecting-IP
+    assert (
+        extract_client_ip_from_headers(
+            hdrs,
+            client_host="127.0.0.1",
+            trust_proxy_headers=True,
+            trust_cloudflare_headers=True,
+        )
+        == "198.51.100.11"
+    )
+    # Trusted proxy WITHOUT Cloudflare trust ignores CF-Connecting-IP and strips trusted XFF hops
+    assert (
+        extract_client_ip_from_headers(
+            hdrs,
+            client_host="127.0.0.1",
+            trust_proxy_headers=True,
+            trust_cloudflare_headers=False,
+        )
+        == "203.0.113.5"
+    )
     assert (
         extract_client_ip_from_headers(
             hdrs, client_host="127.0.0.1", trust_proxy_headers=False
@@ -816,8 +880,14 @@ def test_extract_client_ip_and_route_group_classification() -> None:
         == "127.0.0.1"
     )
 
+    # Right-to-left XFF parsing prevents left-side spoofing by returning rightmost untrusted hop
     xff_only = Headers({"X-Forwarded-For": " 203.0.113.42 , 192.0.2.9 "})
-    assert extract_client_ip_from_headers(xff_only, client_host="10.0.0.2") == "203.0.113.42"
+    assert (
+        extract_client_ip_from_headers(
+            xff_only, client_host="10.0.0.2", trust_proxy_headers=True
+        )
+        == "192.0.2.9"
+    )
     assert (
         extract_client_ip_from_headers(Headers({}), client_host="192.0.2.77") == "192.0.2.77"
     )
@@ -872,6 +942,8 @@ def test_http_rate_limiting_auth_and_read_buckets_429_headers_and_health_bypass(
         rate_limit_read_per_min=10,
         rate_limit_auth_per_min=3,
         cors_origins="http://localhost:5173",
+        trust_proxy_headers=True,
+        trust_cloudflare_headers=True,
     )
     app = _make_healthy_app(settings=cfg, tiles_dir=tmp_path)
 

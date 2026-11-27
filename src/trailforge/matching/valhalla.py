@@ -19,12 +19,15 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal
 
+import anyio
 import httpx
 from shapely import STRtree
+from shapely import prepare as shapely_prepare
 from shapely.geometry import LineString, Point
 from sqlalchemy.orm import Session
 
@@ -48,6 +51,19 @@ from trailforge.matching.protocol import (
 logger = logging.getLogger(__name__)
 
 _VALHALLA_INVALID_EDGE_INDEX = 0xFFFFFFFE
+_SHARED_HTTP_LOCK = threading.Lock()
+_SHARED_HTTP_CLIENT: httpx.Client | None = None
+
+
+def _get_shared_valhalla_client() -> httpx.Client:
+    """Return a shared pooled httpx.Client for Valhalla keep-alive reuse."""
+    global _SHARED_HTTP_CLIENT
+    with _SHARED_HTTP_LOCK:
+        if _SHARED_HTTP_CLIENT is None:
+            _SHARED_HTTP_CLIENT = httpx.Client(
+                limits=httpx.Limits(max_connections=16, max_keepalive_connections=8),
+            )
+        return _SHARED_HTTP_CLIENT
 
 
 class ValhallaMatcherError(RuntimeError):
@@ -242,11 +258,12 @@ class ValhallaTrackMatcher:
 
     def _call_valhalla(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         url = f"{self.valhalla_url}/trace_attributes"
-        if self._http_client is not None:
-            resp = self._http_client.post(url, json=payload, timeout=self.timeout_s)
-        else:
-            with httpx.Client(timeout=self.timeout_s) as client:
-                resp = client.post(url, json=payload)
+        client = (
+            self._http_client
+            if self._http_client is not None
+            else _get_shared_valhalla_client()
+        )
+        resp = client.post(url, json=payload, timeout=self.timeout_s)
 
         resp.raise_for_status()
         data = resp.json()
@@ -377,7 +394,7 @@ class ValhallaTrackMatcher:
 
         return snapped_points, snapped_xys, trace_dists_m, shape_3577
 
-    def _project_snapped_to_canonical(
+    def _project_snapped_with_segments(
         self,
         raw_points: Sequence[GpsPoint],
         raw_xys: Sequence[tuple[float, float]],
@@ -385,11 +402,13 @@ class ValhallaTrackMatcher:
         snapped_xys: Sequence[tuple[float, float] | None],
         trace_dists_m: Sequence[float | None],
         shape_3577: LineString | None,
+        segments: Sequence[_CorridorSegment],
+        helper: PostGISHMMMatcher,
         *,
         search_radius_m: float,
         min_confidence: float,
     ) -> MatchResult:
-        """Project Valhalla-matched subtraces onto TrailForge canonical `track_segments`."""
+        """Pure-CPU canonical segment projection over pre-fetched corridor segments."""
         n = len(raw_points)
         corridor_points = [
             sp if sp is not None else rp
@@ -400,16 +419,16 @@ class ValhallaTrackMatcher:
             for rxy, sxy in zip(raw_xys, snapped_xys, strict=True)
         ]
         bearings = _local_point_bearings(corridor_xys)
-
-        segments = self._fetch_corridor_segments(corridor_points, search_radius_m)
         tree = STRtree([seg.geom_3577 for seg in segments]) if segments else None
 
         # Precompute alignment of each canonical segment to Valhalla's decoded Polyline6
         seg_on_shape: list[bool] = []
         if shape_3577 is not None:
+            shapely_prepare(shape_3577)
+            shape_tol = max(search_radius_m, 25.0)
             for seg in segments:
                 mid = seg.geom_3577.interpolate(0.5, normalized=True)
-                seg_on_shape.append(float(mid.distance(shape_3577)) <= max(search_radius_m, 25.0))
+                seg_on_shape.append(float(mid.distance(shape_3577)) <= shape_tol)
         else:
             seg_on_shape = [True] * len(segments)
 
@@ -429,7 +448,7 @@ class ValhallaTrackMatcher:
             pt_bearing = bearings[idx]
             d_val = trace_dists_m[idx] or 0.0
 
-            nearby = tree.query(p_geom.buffer(search_radius_m))
+            nearby = tree.query(p_geom, predicate="dwithin", distance=search_radius_m)
             raw_cands: list[_CandidateState] = []
             had_any = False
 
@@ -488,7 +507,6 @@ class ValhallaTrackMatcher:
                 unmatched_reasons.append("low_confidence" if had_any else "no_candidates")
 
         graph = _CorridorGraph(segments, max_hops=self.max_graph_hops)
-        helper = self._get_fallback_matcher()
         all_chains: list[list[_DecodedObs]] = []
         unmatched_subtraces: list[UnmatchedSubtrace] = []
 
@@ -563,6 +581,38 @@ class ValhallaTrackMatcher:
             unmatched_subtraces=unmatched_subtraces,
             overall_confidence=overall_confidence,
             matched_fraction=matched_fraction,
+        )
+
+    def _project_snapped_to_canonical(
+        self,
+        raw_points: Sequence[GpsPoint],
+        raw_xys: Sequence[tuple[float, float]],
+        snapped_points: Sequence[GpsPoint | None],
+        snapped_xys: Sequence[tuple[float, float] | None],
+        trace_dists_m: Sequence[float | None],
+        shape_3577: LineString | None,
+        *,
+        search_radius_m: float,
+        min_confidence: float,
+    ) -> MatchResult:
+        """Project Valhalla-matched subtraces onto TrailForge canonical `track_segments`."""
+        corridor_points = [
+            sp if sp is not None else rp
+            for rp, sp in zip(raw_points, snapped_points, strict=True)
+        ]
+        segments = self._fetch_corridor_segments(corridor_points, search_radius_m)
+        helper = self._get_fallback_matcher()
+        return self._project_snapped_with_segments(
+            raw_points,
+            raw_xys,
+            snapped_points,
+            snapped_xys,
+            trace_dists_m,
+            shape_3577,
+            segments,
+            helper,
+            search_radius_m=search_radius_m,
+            min_confidence=min_confidence,
         )
 
     def match_trace_sync(
@@ -640,8 +690,81 @@ class ValhallaTrackMatcher:
         min_confidence: float = 0.45,
     ) -> MatchResult:
         """Snap a privacy-trimmed GPS sequence via Valhalla onto canonical `track_segments`."""
-        return self.match_trace_sync(
-            points,
-            search_radius_m=search_radius_m,
-            min_confidence=min_confidence,
+        if len(points) < 2:
+            self.last_matcher_backend = "valhalla"
+            return MatchResult(
+                matcher_name=self.name,
+                matched_segments=[],
+                unmatched_subtraces=[],
+                overall_confidence=0.0,
+                matched_fraction=0.0,
+            )
+
+        payload = self.build_trace_attributes_payload(points, search_radius_m=search_radius_m)
+
+        def _fetch_and_extract() -> tuple[
+            list[tuple[float, float]],
+            list[GpsPoint | None],
+            list[tuple[float, float] | None],
+            list[float | None],
+            LineString | None,
+        ]:
+            response_data = self._call_valhalla(payload)
+            fwd = _wgs84_to_albers()
+            xs, ys = fwd.transform([p.lon for p in points], [p.lat for p in points])
+            raw_xys = [(float(x), float(y)) for x, y in zip(xs, ys, strict=True)]
+            snapped_pts, snapped_xys, trace_dists, shape_3577 = self._extract_snapped_points(
+                points,
+                raw_xys,
+                response_data,
+                search_radius_m=search_radius_m,
+            )
+            return raw_xys, snapped_pts, snapped_xys, trace_dists, shape_3577
+
+        try:
+            raw_xys, snapped_pts, snapped_xys, trace_dists, shape_3577 = (
+                await anyio.to_thread.run_sync(_fetch_and_extract)
+            )
+        except (httpx.HTTPError, ValueError, ValhallaMatcherError) as exc:
+            if not self.fallback_to_hmm:
+                raise ValhallaMatcherError(
+                    f"Valhalla map-matching failed at {self.valhalla_url}: {exc}"
+                ) from exc
+
+            logger.warning(
+                "Valhalla /trace_attributes unavailable; falling back to PostGISHMMMatcher",
+                extra={
+                    "valhalla_url": self.valhalla_url,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "point_count": len(points),
+                    "matcher_backend": "postgis_hmm_fallback",
+                },
+            )
+            fallback_res = await self._get_fallback_matcher().match_trace(
+                points,
+                search_radius_m=search_radius_m,
+                min_confidence=min_confidence,
+            )
+            self.last_matcher_backend = "postgis_hmm_fallback"
+            return fallback_res.model_copy(update={"matcher_name": "postgis_hmm_fallback"})
+
+        corridor_points = [
+            sp if sp is not None else rp for rp, sp in zip(points, snapped_pts, strict=True)
+        ]
+        segments = self._fetch_corridor_segments(corridor_points, search_radius_m)
+        helper = self._get_fallback_matcher()
+        return await anyio.to_thread.run_sync(
+            lambda: self._project_snapped_with_segments(
+                points,
+                raw_xys,
+                snapped_pts,
+                snapped_xys,
+                trace_dists,
+                shape_3577,
+                segments,
+                helper,
+                search_radius_m=search_radius_m,
+                min_confidence=min_confidence,
+            )
         )

@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal
 
+import anyio
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from geoalchemy2.shape import from_shape
 from pydantic import AliasChoices, BaseModel, Field, StringConstraints, ValidationError
@@ -657,7 +658,9 @@ async def _ingest_trip_trace(
             return resp, empty_imu, existing_backend, 0
 
     try:
-        trim_res = trim_privacy_buffer(points, trim_m=trim_m)
+        trim_res = await anyio.to_thread.run_sync(
+            lambda: trim_privacy_buffer(points, trim_m=trim_m)
+        )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -692,10 +695,12 @@ async def _ingest_trip_trace(
         trimmed_imu_samples: list[ImuSample] = []
 
         if imu_samples:
-            aligned = align_imu_to_trimmed_points(
-                trim_res.trimmed_points,
-                imu_samples,
-                raw_points=points,
+            aligned = await anyio.to_thread.run_sync(
+                lambda: align_imu_to_trimmed_points(
+                    trim_res.trimmed_points,
+                    imu_samples,
+                    raw_points=points,
+                )
             )
             matching_points = aligned.points
             trimmed_imu_samples = aligned.trimmed_samples
@@ -704,7 +709,9 @@ async def _ingest_trip_trace(
 
         match_result = await matcher.match_trace(matching_points)
         if trimmed_imu_samples:
-            match_result = enrich_match_result_with_imu(match_result, trimmed_imu_samples)
+            match_result = await anyio.to_thread.run_sync(
+                enrich_match_result_with_imu, match_result, trimmed_imu_samples
+            )
 
         matcher_name = match_result.matcher_name
         matcher_backend = _resolve_matcher_backend(match_result.matcher_name)
@@ -865,7 +872,10 @@ async def upload_trip(
         stripped_head = raw_bytes.lstrip()[:1]
         is_json = filename.lower().endswith(".json") or stripped_head in (b"{", b"[")
         try:
-            parsed = parse_telemetry_json(raw_bytes) if is_json else parse_gpx(raw_bytes)
+            parsed = await anyio.to_thread.run_sync(
+                parse_telemetry_json if is_json else parse_gpx,
+                raw_bytes,
+            )
         except ValueError as exc:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -906,11 +916,12 @@ async def upload_trip(
         imu_samples = req.imu_samples
 
         try:
-            parsed = parse_telemetry_json(
+            parsed = await anyio.to_thread.run_sync(
+                parse_telemetry_json,
                 {
                     "name": req.name,
                     "points": [p.model_dump() for p in req.points],
-                }
+                },
             )
         except ValueError as exc:
             raise HTTPException(
@@ -953,11 +964,12 @@ async def mobile_sync_trip(
     """Sync a mobile/Capacitor background GPS + high-rate IMU recording session."""
     _enforce_trip_upload_quota(request, current_user)
     try:
-        parsed = parse_telemetry_json(
+        parsed = await anyio.to_thread.run_sync(
+            parse_telemetry_json,
             {
                 "name": payload.name,
                 "points": [p.model_dump() for p in payload.points],
-            }
+            },
         )
     except ValueError as exc:
         raise HTTPException(
@@ -1087,6 +1099,7 @@ def get_trip_detail(
 async def update_trip(
     trip_id: str,
     payload: TripUpdateRequest,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     matcher: TrackMatcher = Depends(get_track_matcher),
@@ -1113,6 +1126,8 @@ async def update_trip(
             if trip.match_status != "skipped_too_short":
                 trip.match_status = "skipped_private"
         else:
+            # Guard full HMM/Valhalla re-matching with the member daily upload quota
+            _enforce_trip_upload_quota(request, current_user)
             # Publish from persisted privacy-trimmed geometry using a rotated contribution_hash
             _revoke_trip_contributions(db, old_hash)
             trip.contribution_nonce = uuid.uuid4()
@@ -1126,12 +1141,14 @@ async def update_trip(
             if trimmed_json and trip.match_status != "skipped_too_short":
                 geom_obj = json.loads(trimmed_json)
                 coords = geom_obj.get("coordinates") or []
-                pts = reconstruct_trimmed_points(
-                    coords,
-                    started_at=trip.started_at,
-                    ended_at=trip.ended_at,
-                    duration_s=trip.duration_s,
-                    fallback_at=trip.created_at,
+                pts = await anyio.to_thread.run_sync(
+                    lambda: reconstruct_trimmed_points(
+                        coords,
+                        started_at=trip.started_at,
+                        ended_at=trip.ended_at,
+                        duration_s=trip.duration_s,
+                        fallback_at=trip.created_at,
+                    )
                 )
                 if len(pts) >= 2:
                     match_result = await matcher.match_trace(pts)

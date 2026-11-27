@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session
 
 from trailforge.api.tracks import (
     TrackDetailResponse,
+    _escape_like,
     get_track_detail,
     list_tracks,
 )
@@ -113,6 +114,7 @@ from trailforge.routes.planner import (
     build_gridforge_cli,
     plan_route_with_geometry,
     slugify_route_name,
+    summarize_saved_routes,
 )
 from trailforge.vehicles.classifier import (
     VALID_CAPABILITY_CLASSES,
@@ -237,13 +239,19 @@ def _build_all_tool_definitions() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Track name or keyword."},
+                    "query": {
+                        "type": "string",
+                        "maxLength": 200,
+                        "description": "Track name or keyword.",
+                    },
                     "state": {
                         "type": "string",
+                        "maxLength": 16,
                         "description": "Australian state code (e.g. VIC, NSW, ACT).",
                     },
                     "region": {
                         "type": "string",
+                        "maxLength": 100,
                         "description": "Region ID or name (e.g. australian-alps, High Country).",
                     },
                     "bbox": bbox_schema,
@@ -253,12 +261,14 @@ def _build_all_tool_definitions() -> list[types.Tool]:
                     "grades": {
                         "type": "array",
                         "items": {"type": "string", "enum": list(_VALID_GRADES)},
+                        "maxItems": 4,
                     },
                     "open_only": {"type": "boolean", "default": False},
                     "vehicle_class": vehicle_class_schema,
                     "poi_types": {
                         "type": "array",
-                        "items": {"type": "string"},
+                        "items": {"type": "string", "maxLength": 64},
+                        "maxItems": 10,
                         "description": (
                             "Filter tracks with nearby POIs of these types (e.g. campground, hut)."
                         ),
@@ -282,9 +292,14 @@ def _build_all_tool_definitions() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "track_id": {"type": "string", "description": "Canonical TrailForge track_id."},
+                    "track_id": {
+                        "type": "string",
+                        "maxLength": 64,
+                        "description": "Canonical TrailForge track_id.",
+                    },
                     "track_name": {
                         "type": "string",
+                        "maxLength": 160,
                         "description": "Track name (fuzzy-matched if track_id omitted).",
                     },
                     "vehicle_class": vehicle_class_schema,
@@ -314,7 +329,7 @@ def _build_all_tool_definitions() -> list[types.Tool]:
                 "properties": {
                     "track_ids": {
                         "type": "array",
-                        "items": {"type": "string"},
+                        "items": {"type": "string", "maxLength": 64},
                         "minItems": 1,
                         "maxItems": MAX_ROUTE_TRACKS,
                     },
@@ -347,7 +362,7 @@ def _build_all_tool_definitions() -> list[types.Tool]:
                 "properties": {
                     "track_ids": {
                         "type": "array",
-                        "items": {"type": "string"},
+                        "items": {"type": "string", "maxLength": 64},
                         "minItems": 2,
                         "maxItems": 4,
                     },
@@ -369,9 +384,9 @@ def _build_all_tool_definitions() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "state": {"type": "string"},
-                    "region": {"type": "string"},
-                    "park_name": {"type": "string"},
+                    "state": {"type": "string", "maxLength": 16},
+                    "region": {"type": "string", "maxLength": 100},
+                    "park_name": {"type": "string", "maxLength": 160},
                     "bbox": bbox_schema,
                     "near_lat": {"type": "number", "minimum": -90, "maximum": 90},
                     "near_lon": {"type": "number", "minimum": -180, "maximum": 180},
@@ -392,12 +407,16 @@ def _build_all_tool_definitions() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "track_id": {"type": "string"},
+                    "track_id": {"type": "string", "maxLength": 64},
                     "lat": {"type": "number", "minimum": -90, "maximum": 90},
                     "lon": {"type": "number", "minimum": -180, "maximum": 180},
                     "radius_km": {"type": "number", "minimum": 0.5, "maximum": 50, "default": 10},
                     "bbox": bbox_schema,
-                    "poi_types": {"type": "array", "items": {"type": "string"}},
+                    "poi_types": {
+                        "type": "array",
+                        "items": {"type": "string", "maxLength": 64},
+                        "maxItems": 10,
+                    },
                     "limit": {"type": "integer", "minimum": 1, "maximum": 30, "default": 15},
                 },
             },
@@ -418,7 +437,7 @@ def _build_all_tool_definitions() -> list[types.Tool]:
                 "properties": {
                     "track_ids": {
                         "type": "array",
-                        "items": {"type": "string"},
+                        "items": {"type": "string", "maxLength": 64},
                         "minItems": 1,
                         "maxItems": MAX_ROUTE_TRACKS,
                     },
@@ -441,6 +460,7 @@ def _build_all_tool_definitions() -> list[types.Tool]:
                 "properties": {
                     "state": {
                         "type": "string",
+                        "maxLength": 16,
                         "description": "Optional AU state filter (e.g. VIC, NSW).",
                     },
                 },
@@ -457,11 +477,11 @@ def _build_all_tool_definitions() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "region": {"type": "string"},
-                    "track_id": {"type": "string"},
+                    "region": {"type": "string", "maxLength": 100},
+                    "track_id": {"type": "string", "maxLength": 64},
                     "track_ids": {
                         "type": "array",
-                        "items": {"type": "string"},
+                        "items": {"type": "string", "maxLength": 64},
                         "minItems": 1,
                         "maxItems": MAX_ROUTE_TRACKS,
                     },
@@ -479,7 +499,7 @@ def _build_all_tool_definitions() -> list[types.Tool]:
                 "type": "object",
                 "required": ["track_id"],
                 "properties": {
-                    "track_id": {"type": "string"},
+                    "track_id": {"type": "string", "maxLength": 64},
                     "vehicle_class": vehicle_class_schema,
                     "snowline_m": {
                         "type": "integer",
@@ -502,7 +522,7 @@ def _build_all_tool_definitions() -> list[types.Tool]:
                 "properties": {
                     "track_ids": {
                         "type": "array",
-                        "items": {"type": "string"},
+                        "items": {"type": "string", "maxLength": 64},
                         "minItems": 1,
                         "maxItems": MAX_ROUTE_TRACKS,
                     },
@@ -527,6 +547,7 @@ def _build_all_tool_definitions() -> list[types.Tool]:
                     "grades": {
                         "type": "array",
                         "items": {"type": "string", "enum": list(_VALID_GRADES)},
+                        "maxItems": 4,
                     },
                     "open_only": {"type": "boolean", "default": False},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 40, "default": 40},
@@ -759,11 +780,88 @@ def _resolve_region(raw_region: str | None) -> PackRegionSpec | None:
     return None
 
 
+def _parse_bounded_str(
+    raw: Any,
+    field_name: str,
+    *,
+    max_len: int,
+    upper: bool = False,
+) -> str | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError(f"{field_name} must be a string")
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    if len(cleaned) > max_len:
+        raise ValueError(f"{field_name} must be at most {max_len} characters")
+    return cleaned.upper() if upper else cleaned
+
+
+def _parse_finite_float(
+    raw: Any,
+    field_name: str,
+    *,
+    min_val: float | None = None,
+    max_val: float | None = None,
+) -> float:
+    if isinstance(raw, bool):
+        raise ValueError(f"{field_name} must be a finite number")
+    try:
+        val = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a finite number") from exc
+    if not math.isfinite(val):
+        raise ValueError(f"{field_name} must be a finite number")
+    if min_val is not None and val < min_val:
+        raise ValueError(f"{field_name} must be >= {min_val}")
+    if max_val is not None and val > max_val:
+        raise ValueError(f"{field_name} must be <= {max_val}")
+    return val
+
+
+def _parse_snowline_m(raw: Any) -> int:
+    if raw is None:
+        return 1000
+    if isinstance(raw, bool):
+        raise ValueError("snowline_m must be an integer between 0 and 3000")
+    try:
+        val = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("snowline_m must be an integer between 0 and 3000") from exc
+    if val < 0 or val > 3000:
+        raise ValueError("snowline_m must be between 0 and 3000 meters")
+    return val
+
+
+def _parse_poi_types_arg(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("poi_types must be an array of strings")
+    if len(raw) > 10:
+        raise ValueError("poi_types may contain at most 10 items")
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            raise ValueError("poi_types entries must be strings")
+        cleaned = item.strip().lower()
+        if not cleaned:
+            continue
+        if len(cleaned) > 64:
+            raise ValueError("poi_types entries must be at most 64 characters")
+        out.append(cleaned)
+    return out
+
+
 def _parse_bbox_arg(raw_bbox: Any) -> tuple[float, float, float, float] | None:
     if raw_bbox is None:
         return None
     if not isinstance(raw_bbox, (list, tuple)) or len(raw_bbox) != 4:
         raise ValueError("bbox must be [min_lon, min_lat, max_lon, max_lat]")
+    if any(isinstance(v, bool) for v in raw_bbox):
+        raise ValueError("bbox coordinates must be finite numbers")
     vals = [float(v) for v in raw_bbox]
     if not all(math.isfinite(v) for v in vals):
         raise ValueError("bbox coordinates must be finite numbers")
@@ -1399,18 +1497,25 @@ def _query_pois(
 
 def _tool_search_trails(db: Session, args: dict[str, Any]) -> types.CallToolResult:
     public_base = get_mcp_public_base_url()
-    query = str(args.get("query") or "").strip() or None
-    state = str(args.get("state") or "").strip().upper() or None
-    region_raw = str(args.get("region") or "").strip() or None
+    query = _parse_bounded_str(args.get("query"), "query", max_len=200)
+    state = _parse_bounded_str(args.get("state"), "state", max_len=16, upper=True)
+    region_raw = _parse_bounded_str(args.get("region"), "region", max_len=100)
     region_spec = _resolve_region(region_raw)
     bbox = _parse_bbox_arg(args.get("bbox"))
     near_lat = args.get("near_lat")
     near_lon = args.get("near_lon")
-    radius_km = float(args.get("radius_km") if args.get("radius_km") is not None else 40.0)
-    radius_km = max(1.0, min(150.0, radius_km))
-    grades_filter = [str(g).strip() for g in (args.get("grades") or []) if str(g).strip()]
+    radius_km = _parse_finite_float(
+        args.get("radius_km") if args.get("radius_km") is not None else 40.0,
+        "radius_km",
+        min_val=1.0,
+        max_val=150.0,
+    )
+    raw_grades = args.get("grades") or []
+    if not isinstance(raw_grades, list) or len(raw_grades) > 4:
+        raise ValueError("grades must be an array of up to 4 difficulty grades")
+    grades_filter = [str(g).strip() for g in raw_grades if str(g).strip()]
     open_only = bool(args.get("open_only", False))
-    poi_types = [str(p).strip().lower() for p in (args.get("poi_types") or []) if str(p).strip()]
+    poi_types = _parse_poi_types_arg(args.get("poi_types"))
     limit = max(1, min(25, int(args.get("limit") if args.get("limit") is not None else 10)))
     include_images = bool(args.get("include_images", False))
 
@@ -1421,7 +1526,11 @@ def _tool_search_trails(db: Session, args: dict[str, Any]) -> types.CallToolResu
     )
 
     if bbox is None and near_lat is not None and near_lon is not None:
-        bbox = _bbox_around_point(float(near_lat), float(near_lon), radius_km)
+        bbox = _bbox_around_point(
+            _parse_finite_float(near_lat, "near_lat", min_val=-90.0, max_val=90.0),
+            _parse_finite_float(near_lon, "near_lon", min_val=-180.0, max_val=180.0),
+            radius_km,
+        )
     elif bbox is None and region_spec is not None:
         bbox = region_spec.bbox
 
@@ -1470,6 +1579,7 @@ def _tool_search_trails(db: Session, args: dict[str, Any]) -> types.CallToolResu
                     TrackSegment.track_id.in_(cand_ids),
                     TrackSegment.is_active.is_(True),
                     POI.poi_type.in_(poi_types),
+                    TrackSegment.geom.op("&&")(func.ST_Expand(POI.geom, 0.03)),
                 )
             )
             .scalars()
@@ -1653,15 +1763,15 @@ def _resolve_track_id_or_disambiguate(
     if len(exact) == 1:
         return exact[0].track_id, []
 
-    pattern = f"%{term}%"
+    pattern = f"%{_escape_like(term)}%"
     matches = (
         db.execute(
             select(Track)
             .where(
                 Track.is_active.is_(True),
                 or_(
-                    Track.name.ilike(pattern),
-                    func.array_to_string(Track.alt_names, " ").ilike(pattern),
+                    Track.name.ilike(pattern, escape="\\"),
+                    func.array_to_string(Track.alt_names, " ").ilike(pattern, escape="\\"),
                 ),
             )
             .order_by(func.length(Track.name).asc(), Track.name.asc())
@@ -1692,7 +1802,7 @@ def _tool_inspect_track(
     db: Session, args: dict[str, Any], *, app_only: bool = False
 ) -> types.CallToolResult:
     public_base = get_mcp_public_base_url()
-    snowline_m = int(args.get("snowline_m") if args.get("snowline_m") is not None else 1000)
+    snowline_m = _parse_snowline_m(args.get("snowline_m"))
     include_images = False if app_only else bool(args.get("include_images", True))
 
     cap_class, _profile, rig_ctx = _resolve_rig_context(db, args.get("vehicle_class"))
@@ -1703,8 +1813,8 @@ def _tool_inspect_track(
 
     resolved_id, candidates = _resolve_track_id_or_disambiguate(
         db,
-        str(args.get("track_id") or "").strip() or None,
-        str(args.get("track_name") or "").strip() or None,
+        _parse_bounded_str(args.get("track_id"), "track_id", max_len=64),
+        _parse_bounded_str(args.get("track_name"), "track_name", max_len=160),
     )
     if resolved_id is None:
         attrs = build_mcp_attributions(["VIC", "NSW"])
@@ -1852,6 +1962,8 @@ def _parse_waypoints_arg(raw: Any) -> list[RouteWaypoint]:
         return []
     if not isinstance(raw, list):
         raise ValueError("waypoints must be a list of {name, category?, lon, lat} objects")
+    if len(raw) > 100:
+        raise ValueError("waypoints may contain at most 100 items")
     return [RouteWaypoint.model_validate(item) for item in raw]
 
 
@@ -1861,28 +1973,34 @@ def _tool_plan_route(
     *,
     app_only: bool = False,
     saved_route_id: str | None = None,
+    precomputed_analysis: PlannedRouteAnalysis | None = None,
 ) -> types.CallToolResult:
     public_base = get_mcp_public_base_url()
     track_ids = args.get("track_ids")
-    if not isinstance(track_ids, list) or not track_ids:
-        raise ValueError("track_ids must be a non-empty list of canonical track IDs (1..30)")
-    name = str(args.get("name") or "").strip() or None
-    snowline_m = int(args.get("snowline_m") if args.get("snowline_m") is not None else 1000)
+    if not isinstance(track_ids, list) or not (1 <= len(track_ids) <= MAX_ROUTE_TRACKS):
+        raise ValueError(
+            f"track_ids must be a non-empty list of 1..{MAX_ROUTE_TRACKS} canonical track IDs"
+        )
+    name = _parse_bounded_str(args.get("name"), "name", max_len=160)
+    snowline_m = _parse_snowline_m(args.get("snowline_m"))
     include_images = False if app_only else bool(args.get("include_images", True))
     waypoints = _parse_waypoints_arg(args.get("waypoints"))
 
     cap_class, profile, rig_ctx = _resolve_rig_context(db, args.get("vehicle_class"))
-    try:
-        analysis, _oriented = plan_route_with_geometry(
-            db,
-            track_ids,
-            vehicle_class=cap_class if args.get("vehicle_class") else None,
-            vehicle_profile=profile,
-            waypoints=waypoints,
-            name=name,
-        )
-    except TrackNotFoundError as exc:
-        raise ValueError(str(exc)) from exc
+    if precomputed_analysis is not None:
+        analysis = precomputed_analysis
+    else:
+        try:
+            analysis, _oriented = plan_route_with_geometry(
+                db,
+                track_ids,
+                vehicle_class=cap_class if args.get("vehicle_class") else None,
+                vehicle_profile=profile,
+                waypoints=waypoints,
+                name=name,
+            )
+        except TrackNotFoundError as exc:
+            raise ValueError(str(exc)) from exc
 
     payload = _analysis_to_route_view_payload(
         db,
@@ -2096,20 +2214,27 @@ def _tool_compare_tracks(db: Session, args: dict[str, Any]) -> types.CallToolRes
 
 def _tool_check_area_conditions(db: Session, args: dict[str, Any]) -> types.CallToolResult:
     public_base = get_mcp_public_base_url()
-    state = str(args.get("state") or "").strip().upper() or None
-    region_raw = str(args.get("region") or "").strip() or None
-    park_name = str(args.get("park_name") or "").strip() or None
+    state = _parse_bounded_str(args.get("state"), "state", max_len=16, upper=True)
+    region_raw = _parse_bounded_str(args.get("region"), "region", max_len=100)
+    park_name = _parse_bounded_str(args.get("park_name"), "park_name", max_len=160)
     region_spec = _resolve_region(region_raw)
     bbox = _parse_bbox_arg(args.get("bbox"))
     near_lat = args.get("near_lat")
     near_lon = args.get("near_lon")
-    radius_km = max(
-        1.0, min(250.0, float(args.get("radius_km") if args.get("radius_km") is not None else 50.0))
+    radius_km = _parse_finite_float(
+        args.get("radius_km") if args.get("radius_km") is not None else 50.0,
+        "radius_km",
+        min_val=1.0,
+        max_val=250.0,
     )
     include_images = bool(args.get("include_images", True))
 
     if bbox is None and near_lat is not None and near_lon is not None:
-        bbox = _bbox_around_point(float(near_lat), float(near_lon), radius_km)
+        bbox = _bbox_around_point(
+            _parse_finite_float(near_lat, "near_lat", min_val=-90.0, max_val=90.0),
+            _parse_finite_float(near_lon, "near_lon", min_val=-180.0, max_val=180.0),
+            radius_km,
+        )
     elif bbox is None and park_name:
         pk_row = db.execute(
             select(
@@ -2119,7 +2244,7 @@ def _tool_check_area_conditions(db: Session, args: dict[str, Any]) -> types.Call
                 func.ST_XMax(CAPADPark.geom),
                 func.ST_YMax(CAPADPark.geom),
             )
-            .where(CAPADPark.name.ilike(f"%{park_name}%"))
+            .where(CAPADPark.name.ilike(f"%{_escape_like(park_name)}%", escape="\\"))
             .limit(1)
         ).first()
         if pk_row is not None and pk_row[1] is not None:
@@ -2154,18 +2279,8 @@ def _tool_check_area_conditions(db: Session, args: dict[str, Any]) -> types.Call
             continue
         compact_closures.append(cc)
 
-    raw_reports = list_reports(db, include_resolved=False, limit=60)
-    compact_reports: list[CompactReportItem] = []
-    for rep in raw_reports:
-        cr = _compact_report(rep)
-        if (
-            bbox is not None
-            and cr.lon is not None
-            and cr.lat is not None
-            and not (bbox[0] <= cr.lon <= bbox[2] and bbox[1] <= cr.lat <= bbox[3])
-        ):
-            continue
-        compact_reports.append(cr)
+    raw_reports = list_reports(db, include_resolved=False, bbox=bbox, limit=60)
+    compact_reports: list[CompactReportItem] = [_compact_report(rep) for rep in raw_reports]
 
     bbox_str = f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}" if bbox is not None else None
     area_tracks = list_tracks(
@@ -2304,19 +2419,24 @@ def _tool_check_area_conditions(db: Session, args: dict[str, Any]) -> types.Call
 
 def _tool_find_pois_near(db: Session, args: dict[str, Any]) -> types.CallToolResult:
     public_base = get_mcp_public_base_url()
-    track_id = str(args.get("track_id") or "").strip() or None
+    track_id = _parse_bounded_str(args.get("track_id"), "track_id", max_len=64)
     lat = args.get("lat")
     lon = args.get("lon")
-    radius_km = max(
-        0.5, min(50.0, float(args.get("radius_km") if args.get("radius_km") is not None else 10.0))
+    radius_km = _parse_finite_float(
+        args.get("radius_km") if args.get("radius_km") is not None else 10.0,
+        "radius_km",
+        min_val=0.5,
+        max_val=50.0,
     )
     bbox = _parse_bbox_arg(args.get("bbox"))
-    poi_types = [str(p).strip().lower() for p in (args.get("poi_types") or []) if str(p).strip()]
+    poi_types = _parse_poi_types_arg(args.get("poi_types"))
     limit = max(1, min(30, int(args.get("limit") if args.get("limit") is not None else 15)))
 
     near_point: tuple[float, float, float] | None = None
     if lat is not None and lon is not None:
-        near_point = (float(lon), float(lat), radius_km * 1000.0)
+        lat_f = _parse_finite_float(lat, "lat", min_val=-90.0, max_val=90.0)
+        lon_f = _parse_finite_float(lon, "lon", min_val=-180.0, max_val=180.0)
+        near_point = (lon_f, lat_f, radius_km * 1000.0)
     elif track_id is not None:
         near_point = (0.0, 0.0, radius_km * 1000.0)
 
@@ -2704,34 +2824,19 @@ def _tool_list_my_saved_routes(db: Session) -> types.CallToolResult:
             select(PlannedRoute)
             .where(PlannedRoute.user_id == auth_ctx.user.id)
             .order_by(PlannedRoute.updated_at.desc(), PlannedRoute.created_at.desc())
+            .limit(100)
         )
         .scalars()
         .all()
     )
 
-    active_profile = db.execute(
-        select(VehicleProfile)
-        .where(VehicleProfile.user_id == auth_ctx.user.id)
-        .order_by(VehicleProfile.is_default.desc(), VehicleProfile.created_at.asc())
-        .limit(1)
-    ).scalar_one_or_none()
-
+    batch_stats = summarize_saved_routes(db, routes)
     items: list[dict[str, Any]] = []
     for r in routes:
         tids = list(r.track_ids or [])
-        wps = [
-            RouteWaypoint.model_validate(w) for w in (r.waypoints_json or []) if isinstance(w, dict)
-        ]
         deep_link = build_route_deep_link(public_base, tids, vehicle_class=r.vehicle_class)
-        try:
-            analysis, _ = plan_route_with_geometry(
-                db,
-                tids,
-                vehicle_class=r.vehicle_class,
-                vehicle_profile=active_profile,
-                waypoints=wps,
-                name=r.name,
-            )
+        stats = batch_stats.get(r.id)
+        if stats is not None:
             items.append(
                 {
                     "id": str(r.id),
@@ -2739,18 +2844,18 @@ def _tool_list_my_saved_routes(db: Session) -> types.CallToolResult:
                     "notes": r.notes,
                     "track_ids": tids,
                     "vehicle_class": r.vehicle_class,
-                    "leg_count": len(analysis.legs),
-                    "total_length_m": analysis.total_length_m,
-                    "est_duration_min": analysis.est_duration_min,
-                    "worst_grade": analysis.worst_grade,
-                    "has_blocking_closure": analysis.safety_summary.has_blocking_closure,
-                    "closure_count": analysis.safety_summary.closure_count,
-                    "wet_risk_level": analysis.safety_summary.wet_risk_level,
+                    "leg_count": stats["leg_count"],
+                    "total_length_m": stats["total_length_m"],
+                    "est_duration_min": stats["est_duration_min"],
+                    "worst_grade": stats["worst_grade"],
+                    "has_blocking_closure": stats["has_blocking_closure"],
+                    "closure_count": stats["closure_count"],
+                    "wet_risk_level": stats["wet_risk_level"],
                     "deep_link_url": deep_link,
-                    "gridforge_cli": analysis.gridforge_cli,
+                    "gridforge_cli": stats["gridforge_cli"],
                 }
             )
-        except ValueError:
+        else:
             items.append(
                 {
                     "id": str(r.id),
@@ -2920,7 +3025,7 @@ def _tool_save_planned_route(db: Session, args: dict[str, Any]) -> types.CallToo
         raise ValueError("track_ids cannot contain blank items")
 
     notes_raw = args.get("notes")
-    notes = str(notes_raw).strip() if notes_raw is not None and str(notes_raw).strip() else None
+    notes = _parse_bounded_str(notes_raw, "notes", max_len=2000)
     waypoints = _parse_waypoints_arg(args.get("waypoints"))
 
     vc_raw = args.get("vehicle_class")
@@ -2939,9 +3044,9 @@ def _tool_save_planned_route(db: Session, args: dict[str, Any]) -> types.CallToo
         .limit(1)
     ).scalar_one_or_none()
 
-    # Validate route tracks & build analysis BEFORE persisting
+    # Validate route tracks & build analysis ONCE before persisting (reused below)
     try:
-        plan_route_with_geometry(
+        validated_analysis, _ = plan_route_with_geometry(
             db,
             cleaned_ids,
             vehicle_class=vc_norm,
@@ -2999,6 +3104,7 @@ def _tool_save_planned_route(db: Session, args: dict[str, Any]) -> types.CallToo
             "include_images": False,
         },
         saved_route_id=str(route.id),
+        precomputed_analysis=validated_analysis,
     )
 
 
@@ -3188,7 +3294,7 @@ def call_mcp_tool(name: str, arguments: dict[str, Any] | None = None) -> types.C
                 res = _tool_toggle_favorite_track(db, args)
             else:
                 return _error_result(f"Unsupported MCP tool: {name!r}")
-    except (McpAuthError, ValueError, KeyError) as exc:
+    except (McpAuthError, ValueError, KeyError, TypeError) as exc:
         return _error_result(str(exc))
 
     return enforce_call_tool_result_budget(res)

@@ -300,6 +300,7 @@ def resolve_public_origin_from_headers(
     *,
     scheme: str = "http",
     cfg: Settings | None = None,
+    client_host: str | None = None,
 ) -> str:
     """Resolve canonical public origin (``TRAILFORGE_PUBLIC_BASE_URL`` > proxy headers > Host)."""
     settings = cfg or get_mcp_settings()
@@ -309,15 +310,23 @@ def resolve_public_origin_from_headers(
         return bare or configured
 
     lower_headers = {k.lower(): v for k, v in headers.items()}
-    trust_proxy = bool(getattr(settings, "trust_proxy_headers", True))
+    trust_proxy = bool(getattr(settings, "trust_proxy_headers", False))
     if trust_proxy:
-        fwd_host = (lower_headers.get("x-forwarded-host") or "").split(",")[0].strip()
-        fwd_proto = (lower_headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
-        if is_valid_host_header(fwd_host):
-            proto = fwd_proto if fwd_proto in ("http", "https") else scheme
-            if proto not in ("http", "https"):
-                proto = "http"
-            return f"{proto}://{fwd_host}"
+        peer_ok = True
+        if client_host is not None:
+            from trailforge.api.middleware import is_trusted_proxy_peer
+
+            peer_ok = is_trusted_proxy_peer(
+                client_host, getattr(settings, "trusted_proxy_cidrs", None)
+            )
+        if peer_ok:
+            fwd_host = (lower_headers.get("x-forwarded-host") or "").split(",")[0].strip()
+            fwd_proto = (lower_headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+            if is_valid_host_header(fwd_host):
+                proto = fwd_proto if fwd_proto in ("http", "https") else scheme
+                if proto not in ("http", "https"):
+                    proto = "http"
+                return f"{proto}://{fwd_host}"
 
     host = (lower_headers.get("host") or "").strip()
     if is_valid_host_header(host):

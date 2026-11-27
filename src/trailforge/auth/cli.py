@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import sys
+import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
@@ -42,7 +44,16 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Admin display name.",
     )
-    p_create.add_argument("--password", required=True, help="Password (at least 8 characters).")
+    p_create.add_argument(
+        "--password",
+        default=None,
+        help="Password (at least 8 characters; prefer --password-stdin or interactive prompt).",
+    )
+    p_create.add_argument(
+        "--password-stdin",
+        action="store_true",
+        help="Read admin password from stdin (avoids exposing secrets in process arguments).",
+    )
     p_create.add_argument("--json", action="store_true", help="Output JSON.")
 
     p_promote = sub.add_parser("promote", help="Promote an existing user to admin.")
@@ -79,10 +90,28 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_cli_password(args: argparse.Namespace) -> str:
+    if args.password_stdin:
+        raw = sys.stdin.readline().rstrip("\r\n")
+        if not raw:
+            raise ValueError("No password provided on stdin")
+        return raw
+    if args.password is not None:
+        return str(args.password)
+    if sys.stdin.isatty():
+        entered = getpass.getpass("Admin password (min 8 chars): ")
+        confirm = getpass.getpass("Confirm admin password: ")
+        if entered != confirm:
+            raise ValueError("Passwords do not match")
+        return entered
+    raise ValueError("Provide --password-stdin (recommended) or --password")
+
+
 def _cmd_create_admin(db: Session, args: argparse.Namespace) -> tuple[int, dict[str, Any] | str]:
     try:
         email = normalize_email(args.email)
-        pw_hash = hash_password(args.password)
+        password = _resolve_cli_password(args)
+        pw_hash = hash_password(password)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2, ""
@@ -103,6 +132,7 @@ def _cmd_create_admin(db: Session, args: argparse.Namespace) -> tuple[int, dict[
         return 1, ""
 
     user = User(
+        id=uuid.uuid4(),
         email=email,
         display_name=display_name,
         password_hash=pw_hash,

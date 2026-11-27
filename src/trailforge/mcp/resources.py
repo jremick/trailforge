@@ -220,21 +220,50 @@ def build_mcp_app_meta(
     }
 
 
+_HTML_CACHE: dict[str, tuple[int, int, str]] = {}
+
+
+def _read_cached_html(path: Path, *, enforce_error: bool) -> str | None:
+    """Load UTF-8 HTML from disk with (mtime_ns, size) caching and pre-read byte-size guard."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    if not path.is_file():
+        return None
+    if st.st_size >= MAX_MCP_APP_HTML_BYTES:
+        if enforce_error:
+            raise ValueError("TRAILFORGE_MCP_APP_HTML exceeds SEP-1865 10 MiB limit")
+        return None
+
+    cache_key = str(path.resolve())
+    cached = _HTML_CACHE.get(cache_key)
+    if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+        return cached[2]
+
+    html = path.read_text(encoding="utf-8")
+    if len(html.encode("utf-8")) >= MAX_MCP_APP_HTML_BYTES:
+        if enforce_error:
+            raise ValueError("TRAILFORGE_MCP_APP_HTML exceeds SEP-1865 10 MiB limit")
+        return None
+
+    if len(_HTML_CACHE) >= 8:
+        _HTML_CACHE.clear()
+    _HTML_CACHE[cache_key] = (st.st_mtime_ns, st.st_size, html)
+    return html
+
+
 def load_mcp_app_html(cfg: Settings | None = None) -> str:
     """Load `ui://trailforge/explorer.html` from override path, static bundle, or fallback."""
     override_raw = get_mcp_app_html_path(cfg)
     if override_raw:
-        override_path = Path(override_raw)
-        if override_path.is_file():
-            html = override_path.read_text(encoding="utf-8")
-            if len(html.encode("utf-8")) >= MAX_MCP_APP_HTML_BYTES:
-                raise ValueError("TRAILFORGE_MCP_APP_HTML exceeds SEP-1865 10 MiB limit")
+        html = _read_cached_html(Path(override_raw), enforce_error=True)
+        if html is not None:
             return html
 
-    if _STATIC_EXPLORER_PATH.is_file():
-        html = _STATIC_EXPLORER_PATH.read_text(encoding="utf-8")
-        if len(html.encode("utf-8")) < MAX_MCP_APP_HTML_BYTES:
-            return html
+    bundled = _read_cached_html(_STATIC_EXPLORER_PATH, enforce_error=False)
+    if bundled is not None:
+        return bundled
 
     return _FALLBACK_EXPLORER_HTML
 

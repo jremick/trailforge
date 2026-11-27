@@ -143,6 +143,7 @@ def _create_sqlite_ai_auth_schema(engine: Engine) -> None:
             resource TEXT,
             expires_at DATETIME NOT NULL,
             consumed_at DATETIME,
+            token_family_id CHAR(32),
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """,
@@ -993,7 +994,7 @@ def test_full_oauth21_pkce_dcr_rotation_reuse_revoke_and_grants(
         assert tok1["token_type"] == "Bearer"
         assert tok1["scope"] == "trailforge:read trailforge:write"
 
-        # 13. Replaying single-use auth code is rejected
+        # 13. Replaying single-use auth code is rejected & revokes token family (OAuth 2.1 §4.1.2)
         replay_code = client.post(
             "/api/oauth/token",
             data={
@@ -1006,6 +1007,49 @@ def test_full_oauth21_pkce_dcr_rotation_reuse_revoke_and_grants(
         )
         assert replay_code.status_code == 400
         assert replay_code.json()["error"] == "invalid_grant"
+        # Tokens minted from the replayed auth code are immediately revoked
+        assert (
+            client.get("/mcp/auth", headers={"Authorization": f"Bearer {access_1}"}).status_code
+            == 401
+        )
+        assert (
+            client.post(
+                "/api/oauth/token",
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_1,
+                    "client_id": client_id,
+                },
+            ).status_code
+            == 400
+        )
+
+        # Mint a fresh, un-replayed token family for the remaining grant/rotation checks
+        approve_resp_2 = client.post(
+            "/api/oauth/authorize",
+            data={
+                **auth_params,
+                "action": "consent",
+                "decision": "approve",
+                "csrf_token": consent_csrf,
+            },
+        )
+        assert approve_resp_2.status_code == 302
+        auth_code_2 = parse_qs(urlsplit(approve_resp_2.headers["location"]).query)["code"][0]
+        tok_resp_2 = client.post(
+            "/api/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": auth_code_2,
+                "redirect_uri": redirect_uri,
+                "client_id": client_id,
+                "code_verifier": code_verifier,
+            },
+        )
+        assert tok_resp_2.status_code == 200
+        tok1 = tok_resp_2.json()
+        access_1 = tok1["access_token"]
+        refresh_1 = tok1["refresh_token"]
 
         # 14. OAuth access token authenticates /mcp/auth read & write, but NOT /api/auth/tokens
         r_mcp = client.get("/mcp/auth", headers={"Authorization": f"Bearer {access_1}"})
@@ -1356,37 +1400,38 @@ def test_confidential_client_expired_code_and_dcr_bounds(
 def test_public_origin_proxy_header_trust(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TRAILFORGE_PUBLIC_BASE_URL", raising=False)
     monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+    monkeypatch.delenv("TRAILFORGE_TRUST_PROXY_HEADERS", raising=False)
     get_settings.cache_clear()
 
     app = FastAPI()
     app.include_router(well_known_router)
 
+    # Default (SEC-H1): trust_proxy_headers=False ignores spoofed forwarded headers
     with TestClient(app) as client:
-        r = client.get(
+        r_default = client.get(
             "/.well-known/oauth-authorization-server",
             headers={
                 "X-Forwarded-Proto": "https",
-                "X-Forwarded-Host": "trails.example.org",
+                "X-Forwarded-Host": "spoofed.evil.example",
             },
         )
-        assert r.status_code == 200
-        assert r.json()["issuer"] == "https://trails.example.org"
+        assert r_default.status_code == 200
+        assert "spoofed.evil.example" not in r_default.json()["issuer"]
 
-    # When trust_proxy_headers=False, ignore spoofed forwarded host
-    monkeypatch.setenv("TRAILFORGE_TRUST_PROXY_HEADERS", "false")
-    get_settings.cache_clear()
+    # When explicitly enabled behind a trusted proxy, X-Forwarded-Host is honored
+    monkeypatch.setenv("TRAILFORGE_TRUST_PROXY_HEADERS", "true")
     get_settings.cache_clear()
     try:
         with TestClient(app) as client:
-            r2 = client.get(
+            r = client.get(
                 "/.well-known/oauth-authorization-server",
                 headers={
                     "X-Forwarded-Proto": "https",
-                    "X-Forwarded-Host": "spoofed.evil.example",
+                    "X-Forwarded-Host": "trails.example.org",
                 },
             )
-            assert r2.status_code == 200
-            assert "spoofed.evil.example" not in r2.json()["issuer"]
+            assert r.status_code == 200
+            assert r.json()["issuer"] == "https://trails.example.org"
     finally:
         get_settings.cache_clear()
 

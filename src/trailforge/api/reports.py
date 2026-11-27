@@ -8,7 +8,9 @@ import uuid
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 
+import anyio
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi.responses import FileResponse
 from geoalchemy2.shape import from_shape
 from pydantic import (
     AliasChoices,
@@ -51,8 +53,8 @@ from trailforge.reports.photos import (
     PhotoPathTraversalError,
     PhotoValidationError,
     resolve_photo_path,
-    save_report_photo,
-    validate_photo_bytes,
+    sanitize_photo_bytes,
+    save_sanitized_report_photo,
 )
 from trailforge.reports.queries import (
     get_report_by_id,
@@ -180,6 +182,17 @@ def _enforce_photo_upload_quota(request: Request, current_user: User) -> None:
     check_upload_quota(current_user.id, limit_per_day=cfg.rate_limit_upload_per_day)
 
 
+def _enforce_text_report_quota(request: Request, current_user: User) -> None:
+    """Enforce daily per-member text-only report quota (skipping admins or when disabled)."""
+    cfg = getattr(getattr(request.app, "state", None), "custom_settings", None) or get_settings()
+    if not cfg.rate_limit_enabled:
+        return
+    if getattr(current_user, "role", "member") == "admin":
+        return
+    text_limit = max(50, int(cfg.rate_limit_upload_per_day) * 2)
+    check_upload_quota(f"report_text:{current_user.id}", limit_per_day=text_limit)
+
+
 def _get_user_default_vehicle_class(db: Session, user: User) -> str | None:
     profile = db.execute(
         select(VehicleProfile)
@@ -192,7 +205,7 @@ def _get_user_default_vehicle_class(db: Session, user: User) -> str | None:
 
 async def _parse_create_request(
     request: Request,
-) -> tuple[ConditionReportCreateInput, bytes | None]:
+) -> tuple[ConditionReportCreateInput, tuple[bytes, str, str] | None]:
     """Parse either ``application/json`` or ``multipart/form-data`` (+ optional ``photo``)."""
     content_type = (request.headers.get("content-type") or "").lower()
     photo_bytes: bytes | None = None
@@ -237,16 +250,18 @@ async def _parse_create_request(
             detail=exc.errors(),
         ) from exc
 
+    sanitized_photo: tuple[bytes, str, str] | None = None
     if photo_bytes is not None:
         try:
-            validate_photo_bytes(photo_bytes)
+            # Single Pillow decode/sanitize pass executed off the asyncio event loop (SEC-H2)
+            sanitized_photo = await anyio.to_thread.run_sync(sanitize_photo_bytes, photo_bytes)
         except PhotoValidationError as exc:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=str(exc),
             ) from exc
 
-    return parsed, photo_bytes
+    return parsed, sanitized_photo
 
 
 @router.get("", response_model=list[ConditionReportResponse])
@@ -302,8 +317,11 @@ def get_reports_feature_collection(
 
 
 @router.get("/photos/{filename:path}")
-def get_report_photo(filename: str) -> Response:
-    """Serve a validated report photo attachment with strict directory confinement."""
+def get_report_photo(
+    filename: str,
+    db: Session = Depends(get_db),
+) -> Response:
+    """Serve a validated, non-hidden report photo attachment via streaming FileResponse."""
     try:
         photo_path, media_type = resolve_photo_path(filename)
     except PhotoPathTraversalError as exc:
@@ -317,12 +335,22 @@ def get_report_photo(filename: str) -> Response:
             detail=str(exc),
         ) from exc
 
-    return Response(
-        content=photo_path.read_bytes(),
+    expected_url = f"/api/reports/photos/{photo_path.name}"
+    report_statuses = db.execute(
+        select(ConditionReport.status).where(ConditionReport.photo_url == expected_url)
+    ).scalars().all()
+    if report_statuses and all(st == "hidden" for st in report_statuses):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Photo not found",
+        )
+
+    return FileResponse(
+        path=photo_path,
         media_type=media_type,
         headers={
             "X-Content-Type-Options": "nosniff",
-            "Cache-Control": "public, max-age=86400",
+            "Cache-Control": "public, max-age=31536000, immutable",
         },
     )
 
@@ -360,7 +388,7 @@ async def create_report(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Create a structured condition report (supports JSON or multipart/form-data with photo)."""
-    payload, photo_bytes = await _parse_create_request(request)
+    payload, sanitized_photo = await _parse_create_request(request)
 
     # Idempotent PWA sync check via (user_id, client_uuid)
     if payload.client_uuid is not None:
@@ -437,13 +465,16 @@ async def create_report(
             db, segment_id=resolved_segment_id, track_id=resolved_track_id
         )
 
-    # Enforce per-user daily photo upload quota & save EXIF-stripped photo after validations pass
+    # Enforce per-user daily report quota (photo or text) & save EXIF-stripped photo
     saved_photo_path = None
     photo_url: str | None = None
-    if photo_bytes is not None:
+    if sanitized_photo is not None:
         _enforce_photo_upload_quota(request, user)
+        clean_bytes, ext, media_type = sanitized_photo
         try:
-            saved = save_report_photo(photo_bytes)
+            saved = await anyio.to_thread.run_sync(
+                save_sanitized_report_photo, clean_bytes, ext, media_type
+            )
             saved_photo_path = saved.path
             photo_url = saved.url
         except PhotoValidationError as exc:
@@ -451,6 +482,8 @@ async def create_report(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=str(exc),
             ) from exc
+    else:
+        _enforce_text_report_quota(request, user)
 
     now = datetime.now(UTC)
     severity = payload.severity or DEFAULT_SEVERITY_BY_TYPE[payload.report_type]

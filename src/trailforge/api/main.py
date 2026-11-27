@@ -22,6 +22,7 @@ from trailforge.api.middleware import (
     CookieCSRFMiddleware,
     PathAwareCORSMiddleware,
     SecurityHeadersMiddleware,
+    SelectiveGZipMiddleware,
     SlidingWindowRateLimiter,
     UsageAndRateLimitMiddleware,
     flush_usage_metrics,
@@ -166,6 +167,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # SecurityHeaders -> PathAwareCORS -> UsageAndRateLimit (incl. Origin Secret)
     #   -> CookieCSRF -> BodySizeLimit -> FastAPI route handlers & MCP ASGI apps.
     # Registering inner middlewares first keeps CORS & security headers on 403/413/429/507.
+    application.add_middleware(SelectiveGZipMiddleware, minimum_size=1024)
     application.add_middleware(BodySizeLimitMiddleware)
     application.add_middleware(CookieCSRFMiddleware, settings=settings)
     application.add_middleware(

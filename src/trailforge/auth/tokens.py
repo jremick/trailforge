@@ -370,8 +370,9 @@ def verify_oauth_access_token(
     *,
     now: datetime | None = None,
     touch_last_used: bool = True,
+    expected_resource_origin: str | None = None,
 ) -> McpAuthContext | None:
-    """Verify a ``tf_oat_...`` OAuth access token, enforcing revocation, expiry & version."""
+    """Verify a ``tf_oat_...`` OAuth access token (revocation, expiry, version, resource)."""
     if not raw_token or not raw_token.startswith(OAUTH_ACCESS_PREFIX):
         return None
 
@@ -387,6 +388,17 @@ def verify_oauth_access_token(
     current_now = as_utc(now) if now is not None else datetime.now(UTC)
     if as_utc(token_row.access_expires_at) <= current_now:
         return None
+
+    # RFC 8707 audience check when token carries a resource indicator and canonical origin is known
+    if token_row.resource:
+        canon_origin = expected_resource_origin
+        if not canon_origin:
+            canon_origin = str(getattr(get_settings(), "public_base_url", "") or "").strip() or None
+        if canon_origin:
+            norm_origin = canon_origin.rstrip("/").lower()
+            norm_res = token_row.resource.strip().rstrip("/").lower()
+            if norm_res not in {f"{norm_origin}/mcp", f"{norm_origin}/mcp/auth"}:
+                return None
 
     user = db.get(User, token_row.user_id)
     if user is None or not user.is_active:

@@ -29,6 +29,7 @@ from trailforge.db.session import get_db
 
 _SAFE_READ_METHODS: Final[frozenset[str]] = frozenset({"GET", "HEAD", "OPTIONS"})
 _SESSION_ONLY_PATH_PREFIXES: Final[tuple[str, ...]] = (
+    "/api/auth/logout",
     "/api/auth/tokens",
     "/api/auth/oauth-grants",
 )
