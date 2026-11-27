@@ -1,5 +1,7 @@
-# Multi-arch (arm64 / amd64) production PWA build for TrailForge web UI
-FROM node:22-alpine AS builder
+# Multi-arch (arm64 / amd64) production PWA build for TrailForge web UI.
+# Build static Vite assets natively on $BUILDPLATFORM (avoids QEMU arm64 V8/esbuild deadlocks)
+# while keeping the final Nginx runtime stage multi-arch for every target platform.
+FROM --platform=$BUILDPLATFORM node:22-alpine AS builder
 
 WORKDIR /app
 
