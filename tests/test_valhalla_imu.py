@@ -676,6 +676,7 @@ def test_valhalla_compose_override_file_and_docker_config(monkeypatch: pytest.Mo
     docker_bin = shutil.which("docker")
     if docker_bin is not None:
         monkeypatch.setenv("AUTH_SECRET_KEY", "synthetic-valhalla-compose-fixture")
+        monkeypatch.setenv("TRAILFORGE_PRIVACY_SECRET", "synthetic-valhalla-privacy-fixture")
         for base_file in (base_compose, ghcr_compose):
             proc = subprocess.run(
                 [

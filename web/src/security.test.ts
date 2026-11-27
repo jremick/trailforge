@@ -141,10 +141,29 @@ describe("Browser session authentication", () => {
     });
     expect(usesSessionBearer()).toBe(true);
   });
+
+  it("falls back to session bearer mode instead of throwing when VITE_API_BASE_URL is malformed", () => {
+    vi.stubEnv("VITE_API_BASE_URL", "http://[invalid-host");
+    vi.stubGlobal("window", {
+      location: new URL("https://trails.example.test/"),
+    });
+    expect(usesSessionBearer()).toBe(true);
+  });
 });
 
 describe("Account-bound API requests", () => {
   afterEach(() => vi.unstubAllGlobals());
+
+  it("rethrows HTTP 409 account conflicts from optional-auth endpoints instead of falling back offline", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({ detail: "The signed-in account has changed" }, 409)
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(fetchReportsGeoJson({ ownerId: "u-stale" })).rejects.toMatchObject({
+      status: 409,
+    });
+  });
 
   const payload = {
     name: "Offline drive",

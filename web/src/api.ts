@@ -108,7 +108,12 @@ export function usesSessionBearer(): boolean {
   const apiBase = getApiBaseUrl();
   if (!apiBase) return false;
   const location = typeof window === "undefined" ? undefined : window.location;
-  return !location || new URL(apiBase, location.href).origin !== location.origin;
+  if (!location) return true;
+  try {
+    return new URL(apiBase, location.href).origin !== location.origin;
+  } catch {
+    return true;
+  }
 }
 
 /** Remove a bearer saved by older releases when opening the app on any platform. */
@@ -345,6 +350,9 @@ export async function fetchTrackDetail(
     return await requestJson<TrackInspectorDetail>(url, options);
   } catch (err) {
     if (options?.signal?.aborted) throw err;
+    if (err instanceof ApiError && err.status >= 400 && err.status < 500) {
+      throw err;
+    }
     const offline = await getOfflineTrackDetail(trackId);
     if (offline) return offline;
     throw err;
@@ -819,6 +827,9 @@ export async function fetchReportsGeoJson(
     );
   } catch (err) {
     if (signal?.aborted) throw err;
+    if (err instanceof ApiError && err.status >= 400 && err.status < 500) {
+      throw err;
+    }
     const offline = await getOfflineReportsGeoJson();
     if (offline) return offline;
     throw err;
