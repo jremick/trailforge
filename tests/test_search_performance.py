@@ -489,7 +489,8 @@ def test_postgis_trigram_indexes_alembic_check_and_trigger(postgis_engine: Engin
         assert "gin_trgm_ops" in idxdef, f"{name} must use gin_trgm_ops: {idxdef}"
 
     # 2. Verify `alembic check` passes cleanly with zero drift against models.py
-    alembic_cfg = AlembicConfig(str(REPO_ROOT / "alembic.ini"))
+    # Pytest configures logging for this process, as in the shared migration fixture.
+    alembic_cfg = AlembicConfig()
     alembic_cfg.set_main_option("script_location", str(REPO_ROOT / "migrations"))
     alembic_command.check(alembic_cfg)
 
