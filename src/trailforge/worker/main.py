@@ -23,6 +23,7 @@ from trailforge.config import Settings, get_settings
 from trailforge.db.models import FeedSyncStatus, TelemetryObservation, TrackSegmentGrade, Trip
 from trailforge.db.session import DbHealthStatus, check_db_health, get_engine, reset_engine
 from trailforge.feeds.adapters import build_default_adapters
+from trailforge.feeds.base import adapter_dataset_key, live_feed_polling_enabled
 from trailforge.feeds.sync import FeedSyncResult, sync_feed
 from trailforge.grading.live import LiveGradingRecomputeSummary, recompute_live_grades
 from trailforge.matching.contribution_keys import (
@@ -91,9 +92,7 @@ def run_due_closure_syncs(
     fixture sync runs cleanly without any network calls.
     """
     live_enabled = (
-        enable_live_feeds
-        if enable_live_feeds is not None
-        else _is_truthy(os.environ.get("TRAILFORGE_ENABLE_LIVE_FEEDS"))
+        enable_live_feeds if enable_live_feeds is not None else live_feed_polling_enabled()
     )
     resolved_fixtures = (
         fixtures_path
@@ -113,11 +112,11 @@ def run_due_closure_syncs(
     engine = get_engine()
     with Session(engine) as session:
         existing_status = {
-            row.feed_name: row
+            (row.feed_name, row.dataset_key): row
             for row in session.execute(select(FeedSyncStatus)).scalars().all()
         }
         for adapter in adapters:
-            row = existing_status.get(adapter.feed_source)
+            row = existing_status.get((adapter.feed_source, adapter_dataset_key(adapter)))
             is_due = row is None or row.last_attempt_at is None
             if not is_due and row is not None and row.last_attempt_at is not None:
                 last_try = (

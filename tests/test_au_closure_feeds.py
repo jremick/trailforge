@@ -682,6 +682,14 @@ def test_real_world_qld_qfd_wa_v1_and_nt_roadreport_schemas_offline() -> None:
         assert list(nt_items[1].geometry["coordinates"]) == [132.3613, -23.7936]
 
 
+def test_combined_upstream_collections_keep_independent_records() -> None:
+    adapter = QLDParksAlertsAdapter(fixture_payload={
+        "warnings": [{"id": "warning-one", "title": "Road closure"}],
+        "incidents": {"features": [{"id": "incident-one", "title": "Flood warning"}]},
+    })
+    assert {item.external_id for item in adapter.fetch()} == {"warning-one", "incident-one"}
+
+
 def test_enabled_states_scoping_and_adapter_selection(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("TRAILFORGE_ENABLED_STATES", raising=False)
     assert resolve_enabled_states() == ("VIC", "NSW")
@@ -1096,8 +1104,9 @@ def test_pan_au_capad_joins_outage_retention_api_and_cli(
             assert cli_proc.returncode == 0, f"stderr={cli_proc.stderr}"
             cli_out = json.loads(cli_proc.stdout)
             assert cli_out["overall_ok"] is True
-            assert len(cli_out["results"]) == 11
-            assert {r["feed_source"] for r in cli_out["results"]} == set(ALL_FEED_REGISTRY.keys())
+            assert {r["feed_source"] for r in cli_out["results"]} == {
+                "vic_mapshare_seasonal", "vic_emergency", "nsw_npws", "osm_access",
+            }
         finally:
             _cleanup_pan_au_test_rows(session)
 

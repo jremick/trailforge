@@ -127,6 +127,26 @@ make web-check          # TypeScript check, Vite PWA + MCP App builds, Vitest su
 
 ---
 
+## Closure feed sync
+
+QLD defaults to Queensland Fire Department bushfire warnings. NT defaults to Road Report NT.
+The `TRAILFORGE_QLD_DES_ALERTS_URL` and `TRAILFORGE_NT_SECURENT_URL` overrides select one
+upstream dataset per feed. Each configured endpoint has its own snapshot and sync history.
+Changing the endpoint retains alerts from the previous one. A successful poll clears missing
+records from its own snapshot. The schema upgrade retains historical QLD and NT alerts whose
+original dataset cannot be determined and shows them as stale.
+
+Offline fixture sync reads the HTTP feeds listed in the file and refreshes OSM access from the
+local track database when selected. An explicit empty feed clears its fixture records. Live alerts
+and live feed health use independent snapshots. The committed sample fixture covers three HTTP
+feeds. Use offline fixtures with a test database.
+
+The feed reader limits both transferred and decoded responses to 10 MiB. VIC seasonal closure
+pages are collected within the same decoded budget before reconciliation. Oversized or reported
+incomplete snapshots leave the last successful snapshot intact. Alerts covering more than
+5,000 km² are matched by polygon intersection when loading track and route advice to avoid
+creating links across an entire region.
+
 ## Data Sources & Licensing
 
 | Source | Coverage | License & Attribution |
