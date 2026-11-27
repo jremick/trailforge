@@ -1,11 +1,13 @@
 <div align="center">
 
+<a href="docs/images/banner.png"><img src="docs/images/banner.png" alt="TrailForge — Self-Hosted Pan-Australia 4WD Mapping, Live Track Grading & Trail Intelligence Platform" width="100%" /></a>
+
 # TrailForge
 
 **Open-source, self-hostable 4WD & off-road mapping, live track-grading, multi-track route planning, and trail-intelligence platform across all 8 Australian states & territories (`VIC`, `NSW`, `ACT`, `TAS`, `QLD`, `WA`, `SA`, `NT`).**
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-[![Release: v1.2.0](https://img.shields.io/badge/Release-v1.2.0-16a34a)](CHANGELOG.md)
+[![Release: v1.2.1](https://img.shields.io/badge/Release-v1.2.1-16a34a)](CHANGELOG.md)
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![PostGIS 3.4 + PMTiles](https://img.shields.io/badge/PostGIS-3.4%20%2B%20PMTiles-336791?logo=postgresql&logoColor=white)](Dockerfile)
 [![MapLibre GL JS 6](https://img.shields.io/badge/MapLibre%20GL%20JS-6-396CB2?logo=maplibre&logoColor=white)](web/package.json)

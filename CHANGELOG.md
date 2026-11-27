@@ -5,6 +5,15 @@ All notable changes to **TrailForge** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-11-27
+
+Patch release ensuring idempotent upgrades from `v1.1.x` instances that already have manual `pg_trgm` or operational indexes present (publishing `:v1.2.1`, `:v1.2`, and `:latest` multi-arch `linux/amd64` + `linux/arm64` GHCR images).
+
+### Fixed
+- **Idempotent Migration `0008` (`migrations/versions/0008_perf_and_security_indexes.py`):** Added `if_not_exists=True` to all `op.create_index(...)` calls (including `ix_tracks_name_trgm`, `ix_pois_name_trgm`, `ix_capad_parks_name_trgm`, and operational/unique email indexes) and `if_exists=True` / `DROP CONSTRAINT IF EXISTS` to all index and constraint drops so upgrading existing production PostGIS instances never fails with `DuplicateTable` when trigram indexes were previously created out-of-band.
+
+---
+
 ## [1.2.0] - 2026-11-27
 
 Major feature, performance, and security hardening release (publishing `:v1.2.0`, `:v1.2`, and `:latest` multi-arch `linux/amd64` + `linux/arm64` GHCR images) introducing **native AI & Model Context Protocol (MCP) integration**, **self-hosted OAuth 2.1 + PKCE + Personal Access Tokens**, an **interactive SEP-1865 MCP App explorer**, **MapLibre GL JS v6**, **comprehensive PostGIS/API/PWA performance optimizations**, and **deep OWASP/STRIDE & container hardening** across `449` passing offline CI tests (`286` Python/PostGIS + `163` Vitest).

@@ -50,6 +50,7 @@ def upgrade() -> None:
         "track_segment_grades",
         ["segment_id"],
         unique=False,
+        if_not_exists=True,
         postgresql_where=sa.text("is_obstacle_hotspot = true"),
     )
 
@@ -65,6 +66,7 @@ def upgrade() -> None:
         "tracks",
         ["name"],
         unique=False,
+        if_not_exists=True,
         postgresql_using="gin",
         postgresql_ops={"name": "gin_trgm_ops"},
     )
@@ -73,6 +75,7 @@ def upgrade() -> None:
         "pois",
         ["name"],
         unique=False,
+        if_not_exists=True,
         postgresql_using="gin",
         postgresql_ops={"name": "gin_trgm_ops"},
     )
@@ -81,6 +84,7 @@ def upgrade() -> None:
         "capad_parks",
         ["name"],
         unique=False,
+        if_not_exists=True,
         postgresql_using="gin",
         postgresql_ops={"name": "gin_trgm_ops"},
     )
@@ -91,12 +95,14 @@ def upgrade() -> None:
         "condition_reports",
         ["track_id", "status", sa.text("created_at DESC")],
         unique=False,
+        if_not_exists=True,
     )
     op.create_index(
         "ix_condition_reports_photo_url",
         "condition_reports",
         ["photo_url"],
         unique=False,
+        if_not_exists=True,
         postgresql_where=sa.text("photo_url IS NOT NULL"),
     )
     op.create_index(
@@ -104,12 +110,14 @@ def upgrade() -> None:
         "users",
         [sa.text("created_at DESC")],
         unique=False,
+        if_not_exists=True,
     )
     op.create_index(
         "ix_invite_codes_created_at",
         "invite_codes",
         [sa.text("created_at DESC")],
         unique=False,
+        if_not_exists=True,
     )
 
     # 6. Normalize existing invite codes to trimmed uppercase so InviteCode.code == raw_code uses uq index
@@ -124,9 +132,17 @@ def upgrade() -> None:
     )
 
     # 7. Drop redundant indexes duplicating existing primary-key prefixes or unique constraints
-    op.drop_index("ix_invite_codes_code", table_name="invite_codes")
-    op.drop_index("ix_segment_closure_links_segment_id", table_name="segment_closure_links")
-    op.drop_index("ix_usage_metrics_hourly_bucket_hour", table_name="usage_metrics_hourly")
+    op.drop_index("ix_invite_codes_code", table_name="invite_codes", if_exists=True)
+    op.drop_index(
+        "ix_segment_closure_links_segment_id",
+        table_name="segment_closure_links",
+        if_exists=True,
+    )
+    op.drop_index(
+        "ix_usage_metrics_hourly_bucket_hour",
+        table_name="usage_metrics_hourly",
+        if_exists=True,
+    )
 
     # 8. Consolidate uq_users_email + ix_users_lower_email into a single unique lower(email) index
     op.execute(
@@ -138,13 +154,14 @@ def upgrade() -> None:
             """
         )
     )
-    op.drop_index("ix_users_lower_email", table_name="users")
-    op.drop_constraint("uq_users_email", "users", type_="unique")
+    op.drop_index("ix_users_lower_email", table_name="users", if_exists=True)
+    op.execute(sa.text("ALTER TABLE users DROP CONSTRAINT IF EXISTS uq_users_email"))
     op.create_index(
         "uq_users_lower_email",
         "users",
         [sa.text("lower(email)")],
         unique=True,
+        if_not_exists=True,
     )
 
 

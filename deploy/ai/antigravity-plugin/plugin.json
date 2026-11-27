@@ -1,7 +1,7 @@
 {
   "name": "trailforge",
   "displayName": "TrailForge 4WD Trail Intelligence",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Australian 4WD track search, explainable DEM/telemetry grading, live agency closures, rig suitability, multi-track route planning, and interactive maps via TrailForge MCP.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
