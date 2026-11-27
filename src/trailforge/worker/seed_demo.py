@@ -162,7 +162,12 @@ def seed_demo_telemetry(
             match_status="matched",
         ).on_conflict_do_update(
             index_elements=[Trip.id],
-            set_={"contribution_key_id": contribution_key_id(key), "contribution_nonce": nonce},
+            set_={
+                "visibility": "community_anonymous",
+                "community_consent_confirmed": True,
+                "contribution_key_id": contribution_key_id(key),
+                "contribution_nonce": nonce,
+            },
         ))
         obs_base = ref_now - timedelta(days=int(prof["days_ago"]))
         t0 = match_res.matched_segments[0].entry_at

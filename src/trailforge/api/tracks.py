@@ -1019,7 +1019,7 @@ def get_corridor_tracks_geojson(
             )
         )
         etag_hasher.update(
-            f"|{row.segment_id}:{row.seg_updated_at}:{row.effective_grade}:{row.live_computed_at}".encode()
+            f"|{row.segment_id}:{row.seg_updated_at}:{effective_grade}:{row.live_computed_at}".encode()
         )
         features.append(
             {

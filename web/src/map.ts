@@ -920,6 +920,7 @@ export class TrailForgeMap {
       "tf-steep-highlights",
       "tf-tracks-line",
       "tf-unmapped-line",
+      "tf-unmapped-fill",
       "tf-closures-polygon-outline",
       "tf-closures-polygon-fill",
     ].filter((id) => Boolean(this.map.getLayer(id)));
@@ -1123,7 +1124,7 @@ export class TrailForgeMap {
       return;
     }
 
-    if (layerId === "tf-unmapped-line") {
+    if (layerId === "tf-unmapped-line" || layerId === "tf-unmapped-fill") {
       this.map.getCanvas().style.cursor = "pointer";
       updateHoverPopup(
         `<div class="tf-popup-title">Possible Unmapped Track Area</div>
@@ -1304,6 +1305,7 @@ export class TrailForgeMap {
     this.setLayerVis("tf-closures-points", this.currentLayers.closures);
     this.setLayerVis("tf-reports-gate-halo", this.currentLayers.reports);
     this.setLayerVis("tf-reports-points", this.currentLayers.reports);
+    this.setLayerVis("tf-unmapped-fill", this.currentLayers.unmapped);
     this.setLayerVis("tf-unmapped-casing", this.currentLayers.unmapped);
     this.setLayerVis("tf-unmapped-line", this.currentLayers.unmapped);
     this.setLayerVis("tf-hillshade", this.currentLayers.contoursHillshade);

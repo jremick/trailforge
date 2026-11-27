@@ -1,6 +1,6 @@
 # Community telemetry privacy
 
-Trip uploads default to the private logbook. To share a recording, choose community sharing explicitly. Older recorder clients can save their trips, and the logbook prompts the owner to confirm sharing before those trips influence public data. Raw trip details, exports and off-network traces belong to the trip owner.
+Trip uploads default to the private logbook. To share a recording, choose community sharing explicitly. Older mobile recorder clients posting to `/api/trips/mobile-sync` without `confirm_community: true` still save their trips, and the logbook prompts the owner to confirm sharing before those trips influence public data. Direct GPX/JSON uploads via `/api/trips/upload` default to `private` and require selecting `community_anonymous` explicitly. Raw trip details, exports and off-network traces belong to the trip owner.
 
 A public segment grade requires three distinct contributors. The calculation uses each contributor's latest matched traversal on that segment. Vehicle splits and roughness require three contributors in the relevant group. Travel speed and duration are rounded cohort statistics. The last-driven date is the UTC week containing the third most recent traversal. Off-network overlays show only approximate grid cells corroborated by three contributors.
 

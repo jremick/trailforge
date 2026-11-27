@@ -171,6 +171,51 @@ def test_packs_public_base_url_emits_r2_urls_and_default_relative_urls(
     assert r2_summary["bundle_url"] == f"{prefix}/bundle.tar.gz"
     assert r2_summary["vector_pmtiles_url"] == f"{prefix}/vector.pmtiles"
     assert r2_summary["terrain_pmtiles_url"] == f"{prefix}/terrain.pmtiles"
+
+    # Even when a local static_v1 manifest exists on disk (e.g. Railway /data/packs), R2 URLs win
+    alps_dir = tmp_path / "australian-alps"
+    alps_dir.mkdir(parents=True, exist_ok=True)
+    (alps_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "region_id": "australian-alps",
+                "name": region.name,
+                "description": region.description,
+                "region_type": region.region_type,
+                "version": "2026.11.27",
+                "generated_at": "2026-11-27T00:00:00Z",
+                "community_telemetry_policy": "static_v1",
+                "bbox": list(region.bbox),
+                "bounds": list(region.bbox),
+            }
+        ),
+        encoding="utf-8",
+    )
+    hybrid_summary = _build_region_summary(region, tmp_path, published)
+    assert hybrid_summary["status"] == "ready"
+    assert hybrid_summary["manifest_url"] == f"{prefix}/manifest.json"
+    assert hybrid_summary["vector_pmtiles_url"] == f"{prefix}/vector.pmtiles"
+
+    # Stale legacy local manifest falls back to the published static_v1 R2 record
+    (alps_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "region_id": "australian-alps",
+                "name": region.name,
+                "description": region.description,
+                "region_type": region.region_type,
+                "version": "2026.11.20",
+                "generated_at": "2026-11-20T00:00:00Z",
+                "vector_available": True,
+                "bbox": list(region.bbox),
+                "bounds": list(region.bbox),
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale_local_summary = _build_region_summary(region, tmp_path, published)
+    assert stale_local_summary["status"] == "ready"
+    assert stale_local_summary["vector_pmtiles_url"] == f"{prefix}/vector.pmtiles"
     get_settings.cache_clear()
 
 

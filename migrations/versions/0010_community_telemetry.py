@@ -143,20 +143,23 @@ def upgrade() -> None:
     )
     op.execute("""
         WITH eligible AS (
-            SELECT votes.report_id, COUNT(*) FILTER (
-                WHERE votes.vote_type = 'resolved'
-                  AND votes.created_at >= users.created_at + interval '7 days'
-            ) AS eligible_count
-            FROM condition_report_votes AS votes
-            JOIN users ON users.id = votes.user_id
-            GROUP BY votes.report_id
+            SELECT reports.id AS report_id,
+                   COUNT(votes.id) FILTER (
+                       WHERE votes.vote_type = 'resolved'
+                         AND votes.created_at >= users.created_at + interval '7 days'
+                   ) AS eligible_count
+            FROM condition_reports AS reports
+            LEFT JOIN condition_report_votes AS votes ON votes.report_id = reports.id
+            LEFT JOIN users ON users.id = votes.user_id
+            WHERE reports.status != 'hidden'
+            GROUP BY reports.id
         )
         UPDATE condition_reports AS reports
         SET eligible_resolve_count = eligible.eligible_count,
             status = CASE
                 WHEN eligible.eligible_count >= 3 AND eligible.eligible_count > reports.confirm_count
                     THEN 'resolved'
-                WHEN reports.resolve_count > 0 AND reports.status IN ('resolved', 'stale')
+                WHEN reports.status = 'resolved'
                     THEN 'active'
                 ELSE reports.status
             END

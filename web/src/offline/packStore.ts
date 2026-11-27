@@ -403,11 +403,11 @@ export async function downloadRegionalPackToDevice(
     "terrain"
   );
   const vectorUrl = resolvePackAssetUrl(
-    manifest.vector_pmtiles_url ?? region.vector_pmtiles_url,
+    region.vector_pmtiles_url ?? manifest.vector_pmtiles_url,
     vectorCachePath
   );
   const terrainUrl = resolvePackAssetUrl(
-    manifest.terrain_pmtiles_url ?? region.terrain_pmtiles_url,
+    region.terrain_pmtiles_url ?? manifest.terrain_pmtiles_url,
     terrainCachePath
   );
 

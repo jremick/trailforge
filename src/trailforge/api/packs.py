@@ -286,7 +286,8 @@ def _build_region_summary(
     terrain_path = region_dir / TERRAIN_TILE_FILENAME
     public_base = _get_packs_public_base_url()
 
-    if manifest is not None and pack_manifest_is_current(manifest, telemetry_revision):
+    local_current = manifest is not None and pack_manifest_is_current(manifest, telemetry_revision)
+    if local_current and manifest is not None:
         pack_status = "ready"
         version = manifest.version
         generated_at = manifest.generated_at
@@ -302,7 +303,7 @@ def _build_region_summary(
         bounds = manifest.bounds
         attributions = manifest.attributions
     elif (
-        manifest is None
+        not local_current
         and public_base
         and db_row is not None
         and db_row.status == "ready"
@@ -347,7 +348,20 @@ def _build_region_summary(
         bounds = list(region.bbox)
         attributions = list(region.attributions)
 
-    if public_base and manifest is None and pack_status == "ready":
+    active_policy = (
+        manifest.community_telemetry_policy
+        if local_current and manifest is not None
+        else db_row.community_telemetry_policy
+        if db_row is not None and pack_status == "ready"
+        else None
+    )
+    active_revision = (
+        manifest.community_telemetry_revision
+        if local_current and manifest is not None
+        else None
+    )
+
+    if public_base and pack_status == "ready" and active_policy == STATIC_PACK_TELEMETRY_POLICY:
         remote = f"{public_base}/{rid}/{STATIC_PACK_TELEMETRY_POLICY}"
         manifest_url = f"{remote}/{MANIFEST_FILENAME}"
         snapshot_url = f"{remote}/{SNAPSHOT_FILENAME}"
@@ -374,15 +388,8 @@ def _build_region_summary(
         "estimated_size_hint": region.estimated_size_hint,
         "status": pack_status,
         "version": version,
-        "community_telemetry_policy": (
-            manifest.community_telemetry_policy if manifest is not None and pack_status == "ready"
-            else db_row.community_telemetry_policy if db_row is not None and pack_status == "ready"
-            else None
-        ),
-        "community_telemetry_revision": (
-            manifest.community_telemetry_revision
-            if manifest is not None and pack_status == "ready" else None
-        ),
+        "community_telemetry_policy": active_policy,
+        "community_telemetry_revision": active_revision,
         "generated_at": generated_at,
         "total_size_bytes": total_size_bytes,
         "bundle_size_bytes": bundle_size_bytes,

@@ -238,13 +238,17 @@ def discover_sync_artifacts(
     if tiles_dir is not None:
         tdir = Path(tiles_dir).expanduser()
         if tdir.is_dir():
+            static_tiles_current = _manifest_policy_is(
+                tdir / "manifest.json", STATIC_TILE_TELEMETRY_POLICY
+            )
             for filename, content_type, cache_control in TILE_ARTIFACTS:
                 key_filename = filename
+                if (
+                    filename in (VECTOR_PMTILES_FILENAME, "manifest.json")
+                    and not static_tiles_current
+                ):
+                    continue
                 if filename == VECTOR_PMTILES_FILENAME:
-                    if not _manifest_policy_is(
-                        tdir / "manifest.json", STATIC_TILE_TELEMETRY_POLICY
-                    ):
-                        continue
                     key_filename = PUBLIC_VECTOR_PMTILES_FILENAME
                 fpath = tdir / filename
                 if fpath.is_file():
