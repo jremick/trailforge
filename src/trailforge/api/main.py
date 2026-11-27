@@ -32,6 +32,7 @@ from trailforge.api.packs import router as packs_router
 from trailforge.api.preferences import router as preferences_router
 from trailforge.api.reports import router as reports_router
 from trailforge.api.routes import router as routes_router
+from trailforge.api.search import router as search_router
 from trailforge.api.tiles import router as tiles_router
 from trailforge.api.tracks import router as tracks_router
 from trailforge.api.trips import router as trips_router
@@ -185,6 +186,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(health_router)
     application.include_router(tiles_router)
     application.include_router(tracks_router)
+    application.include_router(search_router)
     application.include_router(closures_router)
     application.include_router(grading_router)
     application.include_router(packs_router)

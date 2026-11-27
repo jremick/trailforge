@@ -6,7 +6,7 @@ import importlib.util
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from alembic import command as alembic_command
@@ -17,11 +17,13 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-import trailforge.api.tracks as tracks_api
+import trailforge.api.search as search_api
 from trailforge.api.geocoder import GeocodedPlace
 from trailforge.api.main import create_app
 from trailforge.api.tracks import (
     SearchResultItem,
+    _bbox_midpoint,
+    _db_cache_scope,
     _merge_search_results,
     reset_search_cache,
     search_network,
@@ -96,6 +98,11 @@ class _SpySearchSession:
         if "from capad_parks" in lowered:
             return _SpyResult(self.park_rows)
         return _SpyResult([])
+
+
+def _as_session(spy: _SpySearchSession) -> Session:
+    """Cast the SQL-recording spy to SQLAlchemy Session for offline unit tests."""
+    return cast(Session, spy)
 
 
 def _track_row(
@@ -240,6 +247,40 @@ def test_merge_search_results_budgets_slots_and_ranks_exact_prefix() -> None:
     assert len(small_merged) == 2
     assert small_merged[0].kind == "park"
 
+    # When exact matches already consume part of limit, remaining slot budgets use
+    # `limit - len(selected)` rather than inflating the park/POI reservation cap.
+    exact_tracks = [
+        SearchResultItem(kind="track", id="ex1", name="Alpha", state="VIC"),
+        SearchResultItem(kind="track", id="ex2", name="Alpha", state="NSW"),
+        SearchResultItem(kind="track", id="t3", name="Alpha Ridge", state="VIC"),
+        SearchResultItem(kind="track", id="t4", name="Alpha Spur", state="VIC"),
+    ]
+    extra_parks = [
+        SearchResultItem(kind="park", id="p1", name="Alpha Park 1", state="VIC"),
+        SearchResultItem(kind="park", id="p2", name="Alpha Park 2", state="VIC"),
+        SearchResultItem(kind="park", id="p3", name="Alpha Park 3", state="VIC"),
+    ]
+    extra_pois = [
+        SearchResultItem(kind="poi", id="i1", name="Alpha Hut 1", state="VIC"),
+        SearchResultItem(kind="poi", id="i2", name="Alpha Hut 2", state="VIC"),
+    ]
+    budgeted = _merge_search_results(exact_tracks, extra_pois, extra_parks, term="Alpha", limit=5)
+    assert len(budgeted) == 5
+    # With 2 exact tracks already selected, remaining_budget = 3 so parks & POIs cap at 1 each
+    # and the remaining 1 slot stays reserved for the non-exact track.
+    assert [item.kind for item in budgeted].count("park") == 1
+    assert [item.kind for item in budgeted].count("poi") == 1
+    assert [item.kind for item in budgeted].count("track") == 3
+
+
+def test_bbox_midpoint_rejects_partial_nulls_and_db_cache_scope_falls_back_to_object_id() -> None:
+    assert _bbox_midpoint(148.0, -36.5, 148.2, -36.3) == (148.1, -36.4)
+    assert _bbox_midpoint(148.0, -36.5, 148.2, None) == (None, None)
+    assert _bbox_midpoint(None, -36.5, 148.2, -36.3) == (None, None)
+
+    unbound_session = object()
+    assert _db_cache_scope(cast(Session, unbound_session)) == id(unbound_session)
+
 
 def test_search_network_uses_cached_effective_grade_without_segment_join() -> None:
     reset_search_cache()
@@ -256,7 +297,7 @@ def test_search_network_uses_cached_effective_grade_without_segment_join() -> No
         ],
     )
 
-    resp = search_network(q="Davies", limit=20, db=spy)  # type: ignore[arg-type]
+    resp = search_network(q="Davies", limit=20, db=_as_session(spy))
 
     assert resp.query == "Davies"
     assert resp.total == 4
@@ -300,7 +341,7 @@ def test_search_network_falls_back_only_for_null_effective_grade_and_multi_token
         fallback_rows=[("trk_legacy", 2)],
     )
 
-    resp = search_network(q="davies plain", limit=10, db=spy)  # type: ignore[arg-type]
+    resp = search_network(q="davies plain", limit=10, db=_as_session(spy))
 
     assert resp.total == 2
     by_id = {r.id: r for r in resp.results}
@@ -322,14 +363,14 @@ def test_search_network_falls_back_only_for_null_effective_grade_and_multi_token
 def test_search_network_lru_ttl_cache_and_geocoder_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     reset_search_cache()
     clock = [1000.0]
-    monkeypatch.setattr(tracks_api.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(search_api.time, "monotonic", lambda: clock[0])
 
     shared_engine = object()
     spy1 = _SpySearchSession(
         track_rows=[_track_row("trk_1", "Davies Plain Track Lower", effective_grade="Extreme")],
         engine_sentinel=shared_engine,
     )
-    first = search_network(q="Davies", limit=20, db=spy1)  # type: ignore[arg-type]
+    first = search_network(q="Davies", limit=20, db=_as_session(spy1))
     assert len(spy1.executed_sql) == 3
 
     # Mutating returned response must not poison cached value
@@ -340,18 +381,18 @@ def test_search_network_lru_ttl_cache_and_geocoder_guard(monkeypatch: pytest.Mon
         track_rows=[_track_row("trk_1", "Davies Plain Track Lower", effective_grade="Hard")],
         engine_sentinel=shared_engine,
     )
-    second = search_network(q="  davies  ", limit=20, db=spy2)  # type: ignore[arg-type]
+    second = search_network(q="  davies  ", limit=20, db=_as_session(spy2))
     assert len(spy2.executed_sql) == 1
     assert second.results[0].name == "Davies Plain Track Lower"
     assert second.results[0].grade == "Hard"
 
     # Advancing monotonic clock past TTL expires cache entry
-    clock[0] += tracks_api._SEARCH_CACHE_TTL_SECONDS + 1.0
+    clock[0] += search_api._SEARCH_CACHE_TTL_SECONDS + 1.0
     spy3 = _SpySearchSession(
         track_rows=[_track_row("trk_1", "Davies Plain Track Lower", effective_grade="Hard")],
         engine_sentinel=shared_engine,
     )
-    third = search_network(q="Davies", limit=20, db=spy3)  # type: ignore[arg-type]
+    third = search_network(q="Davies", limit=20, db=_as_session(spy3))
     assert len(spy3.executed_sql) == 3
     assert third.results[0].grade == "Hard"
 
@@ -361,31 +402,37 @@ def test_search_network_lru_ttl_cache_and_geocoder_guard(monkeypatch: pytest.Mon
         track_rows=[_track_row("trk_1", "Davies Plain Track Lower", effective_grade="Medium")],
         engine_sentinel=shared_engine,
     )
-    fourth = search_network(q="Davies", limit=20, db=spy4)  # type: ignore[arg-type]
+    fourth = search_network(q="Davies", limit=20, db=_as_session(spy4))
     assert len(spy4.executed_sql) == 3
     assert fourth.results[0].grade == "Medium"
 
     # LRU eviction keeps recently used entry and evicts oldest entry when capacity exceeded
     reset_search_cache()
-    monkeypatch.setattr(tracks_api, "_SEARCH_CACHE_MAX_ENTRIES", 2)
-    search_network(q="alpha", limit=5, db=_SpySearchSession(engine_sentinel=shared_engine))  # type: ignore[arg-type]
-    search_network(q="beta", limit=5, db=_SpySearchSession(engine_sentinel=shared_engine))  # type: ignore[arg-type]
+    monkeypatch.setattr(search_api, "_SEARCH_CACHE_MAX_ENTRIES", 2)
+    search_network(
+        q="alpha", limit=5, db=_as_session(_SpySearchSession(engine_sentinel=shared_engine))
+    )
+    search_network(
+        q="beta", limit=5, db=_as_session(_SpySearchSession(engine_sentinel=shared_engine))
+    )
     # Touch "alpha" so "beta" becomes least-recently used
     spy_touch = _SpySearchSession(engine_sentinel=shared_engine)
-    search_network(q="alpha", limit=5, db=spy_touch)  # type: ignore[arg-type]
+    search_network(q="alpha", limit=5, db=_as_session(spy_touch))
     assert len(spy_touch.executed_sql) == 0
     # Insert "gamma" -> evicts "beta", keeps "alpha"
-    search_network(q="gamma", limit=5, db=_SpySearchSession(engine_sentinel=shared_engine))  # type: ignore[arg-type]
+    search_network(
+        q="gamma", limit=5, db=_as_session(_SpySearchSession(engine_sentinel=shared_engine))
+    )
     spy_alpha = _SpySearchSession(engine_sentinel=shared_engine)
-    search_network(q="alpha", limit=5, db=spy_alpha)  # type: ignore[arg-type]
+    search_network(q="alpha", limit=5, db=_as_session(spy_alpha))
     assert len(spy_alpha.executed_sql) == 0
     spy_beta = _SpySearchSession(engine_sentinel=shared_engine)
-    search_network(q="beta", limit=5, db=spy_beta)  # type: ignore[arg-type]
+    search_network(q="beta", limit=5, db=_as_session(spy_beta))
     assert len(spy_beta.executed_sql) == 3
 
     # Whitespace-only query short-circuits with zero DB calls
     spy_blank = _SpySearchSession(engine_sentinel=shared_engine)
-    blank = search_network(q="   ", limit=10, db=spy_blank)  # type: ignore[arg-type]
+    blank = search_network(q="   ", limit=10, db=_as_session(spy_blank))
     assert blank.total == 0
     assert len(spy_blank.executed_sql) == 0
 
@@ -408,22 +455,26 @@ def test_search_network_lru_ttl_cache_and_geocoder_guard(monkeypatch: pytest.Mon
             )
         ]
 
-    monkeypatch.setattr(tracks_api, "geocode_au_places", _fake_geocode)
+    monkeypatch.setattr(search_api, "geocode_au_places", _fake_geocode)
     monkeypatch.setenv("TRAILFORGE_ENABLE_GEOCODER", "true")
     get_settings.cache_clear()
 
     # 2-char term must NOT trigger geocoder even with 0 local results
-    search_network(q="Br", limit=10, db=_SpySearchSession(engine_sentinel=shared_engine))  # type: ignore[arg-type]
+    search_network(
+        q="Br", limit=10, db=_as_session(_SpySearchSession(engine_sentinel=shared_engine))
+    )
     assert geocode_calls == []
 
     # Local hit must NOT trigger geocoder
     search_network(
         q="Davies",
         limit=10,
-        db=_SpySearchSession(
-            track_rows=[_track_row("trk_1", "Davies Plain Track Lower")],
-            engine_sentinel=shared_engine,
-        ),  # type: ignore[arg-type]
+        db=_as_session(
+            _SpySearchSession(
+                track_rows=[_track_row("trk_1", "Davies Plain Track Lower")],
+                engine_sentinel=shared_engine,
+            )
+        ),
     )
     assert geocode_calls == []
 
@@ -431,7 +482,7 @@ def test_search_network_lru_ttl_cache_and_geocoder_guard(monkeypatch: pytest.Mon
     geo_resp = search_network(
         q="Bright",
         limit=10,
-        db=_SpySearchSession(engine_sentinel=shared_engine),  # type: ignore[arg-type]
+        db=_as_session(_SpySearchSession(engine_sentinel=shared_engine)),
     )
     assert geocode_calls == ["Bright"]
     assert geo_resp.total == 1

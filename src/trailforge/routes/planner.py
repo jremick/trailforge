@@ -69,13 +69,20 @@ GRADE_SPEED_KMH: Final[dict[str, float]] = {
     "Extreme": 7.0,
 }
 
+_GradeLiteral = Literal["Easy", "Medium", "Hard", "Extreme"]
+
 _GRADE_RANK: Final[dict[str, int]] = {
     "Easy": 1,
     "Medium": 2,
     "Hard": 3,
     "Extreme": 4,
 }
-_RANK_GRADE: Final[dict[int, str]] = {v: k for k, v in _GRADE_RANK.items()}
+_RANK_GRADE: Final[dict[int, _GradeLiteral]] = {
+    1: "Easy",
+    2: "Medium",
+    3: "Hard",
+    4: "Extreme",
+}
 
 _WET_RANK: Final[dict[ApiWetRiskLiteral, int]] = {
     "dry": 0,
@@ -739,15 +746,73 @@ def plan_route_with_geometry(
         raise
 
 
-def _plan_route_with_geometry_impl(
-    session: Session,
+@dataclass
+class _RouteInputs:
+    cleaned_ids: list[str]
+    unique_ids: list[str]
+    norm_waypoints: list[RouteWaypoint]
+    resolved_cap_class: CapabilityClassLiteral | None
+    resolved_veh_name: str | None
+    resolved_has_snorkel: bool | None
+
+
+@dataclass
+class _RouteContext:
+    tracks_by_id: dict[str, Track]
+    segment_ids: list[str]
+    track_geom_map: dict[str, _TrackGeometryData]
+    live_map: dict[str, dict[str, Any]]
+    closures_map: dict[str, dict[str, Any]]
+    reports_by_track: dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]]
+    ww_by_track: dict[str, list[Any]]
+
+
+@dataclass
+class _AssembledLegs:
+    legs: list[RouteLegSummary]
+    leg_gaps: list[RouteLegGap]
+    oriented_tracks: list[OrientedLegTrack]
+    raw_profile_points: list[RouteElevationPoint]
+    waterway_crossings: list[RouteWaterwayCrossing]
+    geojson_features: list[dict[str, Any]]
+    cum_dist_m: float
+    total_duration_min: float
+    total_elev_gain_m: float
+    total_elev_loss_m: float
+    route_min_elev: float | None
+    route_max_elev: float | None
+    route_max_slope: float | None
+    route_sustained_slope: float | None
+    worst_grade_rank: int
+    worst_score: float
+    worst_surface: str
+    worst_wet_rank: int
+    worst_closure_status: str
+    any_4wd_only: bool
+    any_unbridged_perennial: bool
+    fallback_unbridged_count: int
+    states_set: set[str]
+    has_osm_source: bool
+    bbox: list[float]
+
+
+@dataclass
+class _RouteOverlays:
+    closures_list: list[dict[str, Any]]
+    condition_reports: list[dict[str, Any]]
+    community_gate_warnings: list[dict[str, Any]]
+    capad_parks: list[ParkSummary]
+    nearby_pois: list[PoiResponse]
+
+
+def _resolve_route_inputs(
     track_ids: Sequence[str],
     *,
-    vehicle_class: str | None = None,
-    vehicle_profile: VehicleProfile | None = None,
-    waypoints: Sequence[RouteWaypoint | dict[str, Any]] | None = None,
-    name: str | None = None,
-) -> tuple[PlannedRouteAnalysis, list[OrientedLegTrack]]:
+    vehicle_class: str | None,
+    vehicle_profile: VehicleProfile | None,
+    waypoints: Sequence[RouteWaypoint | dict[str, Any]] | None,
+    name: str | None,
+) -> _RouteInputs:
     if not isinstance(track_ids, (list, tuple)):
         raise ValueError("track_ids must be a list of canonical track IDs")
     cleaned_ids = [str(tid).strip() for tid in track_ids]
@@ -757,13 +822,10 @@ def _plan_route_with_geometry_impl(
         raise ValueError(f"Route cannot exceed {MAX_ROUTE_TRACKS} tracks")
     if any(not tid for tid in cleaned_ids):
         raise ValueError("track_ids cannot contain blank entries")
-
     if name is not None and not name.strip():
         raise ValueError("Route name cannot be blank")
 
     norm_waypoints = _normalize_waypoints(waypoints)
-
-    # Resolve vehicle capability context (explicit vehicle_class overrides vehicle_profile)
     resolved_cap_class: CapabilityClassLiteral | None = None
     resolved_veh_name: str | None = None
     resolved_has_snorkel: bool | None = None
@@ -779,9 +841,21 @@ def _plan_route_with_geometry_impl(
         resolved_veh_name = vehicle_profile.name
         resolved_has_snorkel = bool(vehicle_profile.has_snorkel)
 
-    unique_ids = list(dict.fromkeys(cleaned_ids))
+    return _RouteInputs(
+        cleaned_ids=cleaned_ids,
+        unique_ids=list(dict.fromkeys(cleaned_ids)),
+        norm_waypoints=norm_waypoints,
+        resolved_cap_class=resolved_cap_class,
+        resolved_veh_name=resolved_veh_name,
+        resolved_has_snorkel=resolved_has_snorkel,
+    )
 
-    # 1. Load canonical tracks and verify every requested ID exists & is active
+
+def _load_route_context(
+    session: Session,
+    cleaned_ids: Sequence[str],
+    unique_ids: Sequence[str],
+) -> _RouteContext:
     track_rows = session.execute(
         select(Track)
         .where(Track.track_id.in_(unique_ids), Track.is_active.is_(True))
@@ -792,7 +866,6 @@ def _plan_route_with_geometry_impl(
     if missing:
         raise TrackNotFoundError(missing)
 
-    # 2. Enforce budgets including repeated legs before loading the full segment rows.
     segment_ids = _bounded_route_segment_ids(session, cleaned_ids)
     raw_seg_rows = session.execute(
         select(
@@ -826,12 +899,11 @@ def _plan_route_with_geometry_impl(
         if seg.track_id is not None and seg.track_id in segs_by_track:
             segs_by_track[seg.track_id].append((seg, geom_json, grd))
 
-    track_geom_map: dict[str, _TrackGeometryData] = {
+    track_geom_map = {
         tid: _stitch_single_track(tracks_by_id[tid], segs_by_track[tid])
         for tid in unique_ids
     }
 
-    # 3. Bulk-load live grading summaries, official closures, and community condition reports
     live_map = get_live_summaries_for_tracks(session, unique_ids)
     closures_map = get_closures_for_track_ids(
         session, unique_ids, max_results=_MAX_ROUTE_SAFETY_ITEMS
@@ -847,18 +919,6 @@ def _plan_route_with_geometry_impl(
         for tid in unique_ids
     }
 
-    # 4. Optimize per-leg orientation (start/end jump minimization via 2-state DP)
-    leg_endpoints: list[tuple[tuple[float, float], tuple[float, float]] | None] = []
-    for tid in cleaned_ids:
-        coords = track_geom_map[tid].coords_fwd
-        if len(coords) >= 2:
-            leg_endpoints.append(((coords[0][0], coords[0][1]), (coords[-1][0], coords[-1][1])))
-        else:
-            leg_endpoints.append(None)
-
-    reversals, gaps_from_prev = optimize_leg_orientations(leg_endpoints)
-
-    # 5. Load PostGIS waterway crossings for all segments of the route's tracks
     ww_rows = session.execute(
         select(
             SourceWaterway.source_feature_id,
@@ -896,7 +956,112 @@ def _plan_route_with_geometry_impl(
         if row.track_id in ww_by_track:
             ww_by_track[row.track_id].append(row)
 
-    # 6. Stitch legs in order, computing cumulative metrics, profile, crossings, and GeoJSON
+    return _RouteContext(
+        tracks_by_id=tracks_by_id,
+        segment_ids=segment_ids,
+        track_geom_map=track_geom_map,
+        live_map=live_map,
+        closures_map=closures_map,
+        reports_by_track=reports_by_track,
+        ww_by_track=ww_by_track,
+    )
+
+
+def _append_leg_profile_points(
+    raw_profile_points: list[RouteElevationPoint],
+    *,
+    tg: _TrackGeometryData,
+    tid: str,
+    track_name: str,
+    leg_grade: str,
+    leg_idx: int,
+    rev: bool,
+    gap_m: float,
+    leg_start_dist: float,
+) -> None:
+    if not tg.profile_fwd:
+        return
+    span = tg.profile_fwd[-1].local_dist_m
+    ordered_prof = (
+        [
+            _RawProfileSample(
+                local_dist_m=max(0.0, span - p.local_dist_m),
+                elev_m=p.elev_m,
+                slope_deg=p.slope_deg,
+                grade=p.grade,
+            )
+            for p in reversed(tg.profile_fwd)
+        ]
+        if rev
+        else tg.profile_fwd
+    )
+    for p_idx, sample in enumerate(ordered_prof):
+        if leg_idx > 0 and p_idx == 0 and raw_profile_points and gap_m <= LEG_GAP_THRESHOLD_M:
+            continue
+        raw_profile_points.append(
+            RouteElevationPoint(
+                dist_m=round(leg_start_dist + sample.local_dist_m, 1),
+                elev_m=round(sample.elev_m, 2),
+                slope_deg=sample.slope_deg,
+                grade=sample.grade or leg_grade,
+                track_id=tid,
+                track_name=track_name,
+            )
+        )
+
+
+def _collect_leg_crossings(
+    ww_rows: Sequence[Any],
+    *,
+    tg: _TrackGeometryData,
+    tid: str,
+    track_name: str,
+    rev: bool,
+    leg_start_dist: float,
+) -> tuple[list[RouteWaterwayCrossing], bool]:
+    seen_leg_crossings: dict[tuple[str, bool], RouteWaterwayCrossing] = {}
+    has_unbridged_perennial = False
+    for ww_row in ww_rows:
+        seg_mid = tg.seg_mid_dist_fwd.get(ww_row.segment_id, 0.0)
+        in_leg_dist = max(0.0, tg.length_m - seg_mid) if rev else seg_mid
+        cum_crossing_dist = round(leg_start_dist + in_leg_dist, 1)
+        is_perennial = str(ww_row.perenniality).strip().lower() == "perennial"
+        if is_perennial and not ww_row.is_bridged:
+            has_unbridged_perennial = True
+        ckey = (str(ww_row.source_feature_id), bool(ww_row.is_bridged))
+        if ckey not in seen_leg_crossings or cum_crossing_dist < seen_leg_crossings[ckey].dist_m:
+            seen_leg_crossings[ckey] = RouteWaterwayCrossing(
+                name=ww_row.name or "Unnamed watercourse",
+                waterway_type=ww_row.feature_type,
+                perennial=is_perennial,
+                bridged=bool(ww_row.is_bridged),
+                dist_m=cum_crossing_dist,
+                track_id=tid,
+                track_name=track_name,
+                lon=round(float(ww_row.seg_lon), 6) if ww_row.seg_lon is not None else None,
+                lat=round(float(ww_row.seg_lat), 6) if ww_row.seg_lat is not None else None,
+            )
+    return (
+        sorted(seen_leg_crossings.values(), key=lambda c: (c.dist_m, c.name)),
+        has_unbridged_perennial,
+    )
+
+
+def _assemble_route_legs(
+    cleaned_ids: Sequence[str],
+    ctx: _RouteContext,
+    norm_waypoints: Sequence[RouteWaypoint],
+) -> _AssembledLegs:
+    leg_endpoints: list[tuple[tuple[float, float], tuple[float, float]] | None] = []
+    for tid in cleaned_ids:
+        coords = ctx.track_geom_map[tid].coords_fwd
+        if len(coords) >= 2:
+            leg_endpoints.append(((coords[0][0], coords[0][1]), (coords[-1][0], coords[-1][1])))
+        else:
+            leg_endpoints.append(None)
+
+    reversals, gaps_from_prev = optimize_leg_orientations(leg_endpoints)
+
     legs: list[RouteLegSummary] = []
     leg_gaps: list[RouteLegGap] = []
     oriented_tracks: list[OrientedLegTrack] = []
@@ -923,78 +1088,73 @@ def _plan_route_with_geometry_impl(
     fallback_unbridged_count = 0
     states_set: set[str] = set()
     has_osm_source = False
-
-    min_lon = math.inf
-    min_lat = math.inf
-    max_lon = -math.inf
-    max_lat = -math.inf
+    min_lon, min_lat, max_lon, max_lat = math.inf, math.inf, -math.inf, -math.inf
 
     for idx, tid in enumerate(cleaned_ids):
-        tg = track_geom_map[tid]
+        tg = ctx.track_geom_map[tid]
         trk = tg.track
         rev = reversals[idx]
         gap_m = gaps_from_prev[idx]
 
-        live_s = live_map.get(tid, {})
+        live_s = ctx.live_map.get(tid, {})
         live_grade: str | None = live_s.get("live_grade")
-        live_score: float | None = (
-            float(live_s["live_score"]) if live_s.get("live_score") is not None else None
-        )
+        live_score = float(live_s["live_score"]) if live_s.get("live_score") is not None else None
         leg_grade = live_grade or tg.effective_grade_from_segs or tg.baseline_grade
-        leg_score = round(
-            live_score if live_score is not None else tg.baseline_score,
-            1,
-        )
+        leg_score = round(live_score if live_score is not None else tg.baseline_score, 1)
 
-        # Wet risk from live rainfall_context or segment grades
         rain_ctx = live_s.get("rainfall_context") or {}
-        if isinstance(rain_ctx, dict) and rain_ctx.get("wet_risk_level"):
-            leg_wet = db_to_api_wet_risk(str(rain_ctx["wet_risk_level"]))
-        else:
-            leg_wet = tg.wet_risk_level
+        leg_wet = (
+            db_to_api_wet_risk(str(rain_ctx["wet_risk_level"]))
+            if isinstance(rain_ctx, dict) and rain_ctx.get("wet_risk_level")
+            else tg.wet_risk_level
+        )
         worst_wet_rank = max(
             worst_wet_rank,
             _WET_RANK.get(leg_wet, 0),
             _WET_RANK.get(tg.wet_risk_level, 0),
         )
 
-        # Closure status & community gate count for this leg
-        c_entry = closures_map.get(tid, {"closure_status": "open", "active_closures": []})
+        c_entry = ctx.closures_map.get(tid, {"closure_status": "open", "active_closures": []})
         c_status = str(c_entry.get("closure_status", "open"))
         if _CLOSURE_STATUS_RANK.get(c_status, 0) > worst_closure_rank:
             worst_closure_rank = _CLOSURE_STATUS_RANK.get(c_status, 0)
             worst_closure_status = c_status
 
-        _, leg_gate_warnings = reports_by_track.get(tid, ([], []))
+        _, leg_gate_warnings = ctx.reports_by_track.get(tid, ([], []))
 
-        # Speed & duration: prefer live telemetry speed, else terrain-grade heuristic
         live_speed = live_s.get("avg_speed_kmh")
-        if live_speed is not None and float(live_speed) > 0.5:
-            speed_kmh = float(live_speed)
-        else:
-            speed_kmh = GRADE_SPEED_KMH.get(leg_grade, 18.0)
+        speed_kmh = (
+            float(live_speed)
+            if live_speed is not None and float(live_speed) > 0.5
+            else GRADE_SPEED_KMH.get(leg_grade, 18.0)
+        )
         leg_duration_min = round((tg.length_m / 1000.0) / speed_kmh * 60.0, 1)
         total_duration_min += leg_duration_min
 
-        # Orientation-aware coordinates, elevation gain/loss, profile, and crossings
         coords_oriented = list(reversed(tg.coords_fwd)) if rev else list(tg.coords_fwd)
-        leg_gain = tg.elev_loss_fwd_m if rev else tg.elev_gain_fwd_m
-        leg_loss = tg.elev_gain_fwd_m if rev else tg.elev_loss_fwd_m
-        total_elev_gain_m += leg_gain
-        total_elev_loss_m += leg_loss
+        total_elev_gain_m += tg.elev_loss_fwd_m if rev else tg.elev_gain_fwd_m
+        total_elev_loss_m += tg.elev_gain_fwd_m if rev else tg.elev_loss_fwd_m
 
-        if tg.elev_min_m is not None and (route_min_elev is None or tg.elev_min_m < route_min_elev):
-            route_min_elev = tg.elev_min_m
-        if tg.elev_max_m is not None and (route_max_elev is None or tg.elev_max_m > route_max_elev):
-            route_max_elev = tg.elev_max_m
-        if tg.max_slope_deg is not None and (
-            route_max_slope is None or tg.max_slope_deg > route_max_slope
-        ):
-            route_max_slope = tg.max_slope_deg
-        if tg.sustained_slope_deg is not None and (
-            route_sustained_slope is None or tg.sustained_slope_deg > route_sustained_slope
-        ):
-            route_sustained_slope = tg.sustained_slope_deg
+        if tg.elev_min_m is not None:
+            route_min_elev = (
+                tg.elev_min_m if route_min_elev is None else min(route_min_elev, tg.elev_min_m)
+            )
+        if tg.elev_max_m is not None:
+            route_max_elev = (
+                tg.elev_max_m if route_max_elev is None else max(route_max_elev, tg.elev_max_m)
+            )
+        if tg.max_slope_deg is not None:
+            route_max_slope = (
+                tg.max_slope_deg
+                if route_max_slope is None
+                else max(route_max_slope, tg.max_slope_deg)
+            )
+        if tg.sustained_slope_deg is not None:
+            route_sustained_slope = (
+                tg.sustained_slope_deg
+                if route_sustained_slope is None
+                else max(route_sustained_slope, tg.sustained_slope_deg)
+            )
 
         if _SURFACE_RANK.get(tg.worst_surface, 0) > _SURFACE_RANK.get(worst_surface, 0):
             worst_surface = tg.worst_surface
@@ -1004,89 +1164,40 @@ def _plan_route_with_geometry_impl(
             int(trk.waterway_crossing_count or 0), tg.unbridged_seg_crossings
         )
         has_osm_source = has_osm_source or bool(trk.has_osm_source)
-        for st_part in trk.state.split("/"):
-            st_clean = st_part.strip()
-            if st_clean:
-                states_set.add(st_clean)
+        states_set.update(part.strip() for part in trk.state.split("/") if part.strip())
 
-        g_rank = _GRADE_RANK.get(leg_grade, 2)
-        if g_rank > worst_grade_rank:
-            worst_grade_rank = g_rank
-        if leg_score > worst_score:
-            worst_score = leg_score
+        worst_grade_rank = max(worst_grade_rank, _GRADE_RANK.get(leg_grade, 2))
+        worst_score = max(worst_score, leg_score)
 
         leg_start_dist = cum_dist_m
         leg_end_dist = cum_dist_m + tg.length_m
-
-        # Stitch continuous elevation profile for this leg
-        if tg.profile_fwd:
-            span = tg.profile_fwd[-1].local_dist_m
-            ordered_prof = (
-                [
-                    _RawProfileSample(
-                        local_dist_m=max(0.0, span - p.local_dist_m),
-                        elev_m=p.elev_m,
-                        slope_deg=p.slope_deg,
-                        grade=p.grade,
-                    )
-                    for p in reversed(tg.profile_fwd)
-                ]
-                if rev
-                else tg.profile_fwd
-            )
-            for p_idx, sample in enumerate(ordered_prof):
-                if idx > 0 and p_idx == 0 and raw_profile_points and gap_m <= LEG_GAP_THRESHOLD_M:
-                    continue
-                raw_profile_points.append(
-                    RouteElevationPoint(
-                        dist_m=round(leg_start_dist + sample.local_dist_m, 1),
-                        elev_m=round(sample.elev_m, 2),
-                        slope_deg=sample.slope_deg,
-                        grade=sample.grade or leg_grade,
-                        track_id=tid,
-                        track_name=trk.name,
-                    )
-                )
-
-        # Stitch waterway crossings with cumulative route dist_m
-        seen_leg_crossings: dict[tuple[str, bool], RouteWaterwayCrossing] = {}
-        for ww_row in ww_by_track.get(tid, []):
-            seg_mid = tg.seg_mid_dist_fwd.get(ww_row.segment_id, 0.0)
-            in_leg_dist = max(0.0, tg.length_m - seg_mid) if rev else seg_mid
-            cum_crossing_dist = round(leg_start_dist + in_leg_dist, 1)
-            is_perennial = str(ww_row.perenniality).strip().lower() == "perennial"
-            if is_perennial and not ww_row.is_bridged:
-                any_unbridged_perennial = True
-            ckey = (str(ww_row.source_feature_id), bool(ww_row.is_bridged))
-            if (
-                ckey not in seen_leg_crossings
-                or cum_crossing_dist < seen_leg_crossings[ckey].dist_m
-            ):
-                seen_leg_crossings[ckey] = RouteWaterwayCrossing(
-                    name=ww_row.name or "Unnamed watercourse",
-                    waterway_type=ww_row.feature_type,
-                    perennial=is_perennial,
-                    bridged=bool(ww_row.is_bridged),
-                    dist_m=cum_crossing_dist,
-                    track_id=tid,
-                    track_name=trk.name,
-                    lon=round(float(ww_row.seg_lon), 6) if ww_row.seg_lon is not None else None,
-                    lat=round(float(ww_row.seg_lat), 6) if ww_row.seg_lat is not None else None,
-                )
-        waterway_crossings.extend(
-            sorted(seen_leg_crossings.values(), key=lambda c: (c.dist_m, c.name))
+        _append_leg_profile_points(
+            raw_profile_points,
+            tg=tg,
+            tid=tid,
+            track_name=trk.name,
+            leg_grade=leg_grade,
+            leg_idx=idx,
+            rev=rev,
+            gap_m=gap_m,
+            leg_start_dist=leg_start_dist,
         )
+        leg_crossings, leg_perennial = _collect_leg_crossings(
+            ctx.ww_by_track.get(tid, []),
+            tg=tg,
+            tid=tid,
+            track_name=trk.name,
+            rev=rev,
+            leg_start_dist=leg_start_dist,
+        )
+        any_unbridged_perennial = any_unbridged_perennial or leg_perennial
+        waterway_crossings.extend(leg_crossings)
 
-        # Update bbox bounds from leg coordinates
         for lon, lat, _ele in coords_oriented:
-            if lon < min_lon:
-                min_lon = lon
-            if lon > max_lon:
-                max_lon = lon
-            if lat < min_lat:
-                min_lat = lat
-            if lat > max_lat:
-                max_lat = lat
+            min_lon = min(min_lon, lon)
+            max_lon = max(max_lon, lon)
+            min_lat = min(min_lat, lat)
+            max_lat = max(max_lat, lat)
 
         if idx > 0 and gap_m > LEG_GAP_THRESHOLD_M:
             prev_tid = cleaned_ids[idx - 1]
@@ -1094,7 +1205,7 @@ def _plan_route_with_geometry_impl(
                 RouteLegGap(
                     from_track_id=prev_tid,
                     to_track_id=tid,
-                    from_track_name=tracks_by_id[prev_tid].name,
+                    from_track_name=ctx.tracks_by_id[prev_tid].name,
                     to_track_name=trk.name,
                     gap_m=gap_m,
                 )
@@ -1120,7 +1231,6 @@ def _plan_route_with_geometry_impl(
                 end_dist_m=round(leg_end_dist, 1),
             )
         )
-
         oriented_tracks.append(
             OrientedLegTrack(
                 index=idx,
@@ -1136,7 +1246,6 @@ def _plan_route_with_geometry_impl(
                 coords_lonlat_ele=coords_oriented,
             )
         )
-
         if len(coords_oriented) >= 2:
             geojson_features.append(
                 {
@@ -1164,29 +1273,66 @@ def _plan_route_with_geometry_impl(
                     },
                 }
             )
-
         cum_dist_m = leg_end_dist
 
-    # Include custom waypoints in bbox if present
     for wp in norm_waypoints:
         min_lon = min(min_lon, wp.lon)
         max_lon = max(max_lon, wp.lon)
         min_lat = min(min_lat, wp.lat)
         max_lat = max(max_lat, wp.lat)
 
-    # 7. Deduplicate official closures across all legs & enrich with optional centroid coords
+    bbox = (
+        [round(min_lon, 6), round(min_lat, 6), round(max_lon, 6), round(max_lat, 6)]
+        if math.isfinite(min_lon) and math.isfinite(min_lat)
+        else [0.0, 0.0, 0.0, 0.0]
+    )
+    waterway_crossings.sort(key=lambda c: (c.dist_m, c.name))
+
+    return _AssembledLegs(
+        legs=legs,
+        leg_gaps=leg_gaps,
+        oriented_tracks=oriented_tracks,
+        raw_profile_points=raw_profile_points,
+        waterway_crossings=waterway_crossings,
+        geojson_features=geojson_features,
+        cum_dist_m=cum_dist_m,
+        total_duration_min=total_duration_min,
+        total_elev_gain_m=total_elev_gain_m,
+        total_elev_loss_m=total_elev_loss_m,
+        route_min_elev=route_min_elev,
+        route_max_elev=route_max_elev,
+        route_max_slope=route_max_slope,
+        route_sustained_slope=route_sustained_slope,
+        worst_grade_rank=worst_grade_rank,
+        worst_score=worst_score,
+        worst_surface=worst_surface,
+        worst_wet_rank=worst_wet_rank,
+        worst_closure_status=worst_closure_status,
+        any_4wd_only=any_4wd_only,
+        any_unbridged_perennial=any_unbridged_perennial,
+        fallback_unbridged_count=fallback_unbridged_count,
+        states_set=states_set,
+        has_osm_source=has_osm_source,
+        bbox=bbox,
+    )
+
+
+def _load_route_overlays(
+    session: Session,
+    unique_ids: Sequence[str],
+    ctx: _RouteContext,
+) -> _RouteOverlays:
     dedup_closures: dict[int, dict[str, Any]] = {}
     for tid in unique_ids:
-        entry = closures_map.get(tid, {})
+        entry = ctx.closures_map.get(tid, {})
         for c in entry.get("active_closures") or []:
             cid = int(c["closure_id"])
             if cid not in dedup_closures:
                 c_copy = dict(c)
                 c_copy["affected_track_ids"] = [tid]
                 dedup_closures[cid] = c_copy
-            else:
-                if tid not in dedup_closures[cid]["affected_track_ids"]:
-                    dedup_closures[cid]["affected_track_ids"].append(tid)
+            elif tid not in dedup_closures[cid]["affected_track_ids"]:
+                dedup_closures[cid]["affected_track_ids"].append(tid)
 
     if dedup_closures:
         closure_coord_rows = session.execute(
@@ -1204,13 +1350,10 @@ def _plan_route_with_geometry_impl(
                 dedup_closures[int(cid)]["lon"] = round(float(clon), 6)
                 dedup_closures[int(cid)]["lat"] = round(float(clat), 6)
 
-    closures_list = list(dedup_closures.values())
-
-    # 8. Deduplicate community condition reports and gate warnings across all legs
     dedup_reports: dict[str, dict[str, Any]] = {}
     dedup_gate_warnings: dict[str, dict[str, Any]] = {}
     for tid in unique_ids:
-        reps, gates = reports_by_track.get(tid, ([], []))
+        reps, gates = ctx.reports_by_track.get(tid, ([], []))
         for rep in reps:
             dedup_reports.setdefault(str(rep["id"]), rep)
         for gw in gates:
@@ -1227,22 +1370,21 @@ def _plan_route_with_geometry_impl(
         reverse=True,
     )
 
-    # 9. Intersecting CAPAD parks & nearby POIs within 1,500 m of combined route segments
     route_geometry = (
         select(func.ST_Collect(TrackSegment.geom).label("geom"))
-        .where(TrackSegment.segment_id.in_(segment_ids), TrackSegment.is_active.is_(True))
+        .where(TrackSegment.segment_id.in_(ctx.segment_ids), TrackSegment.is_active.is_(True))
         .subquery("route_geometry")
     )
 
     all_park_ids: set[int] = set()
-    for tg in track_geom_map.values():
+    for tg in ctx.track_geom_map.values():
         all_park_ids.update(tg.park_ids)
     if len(all_park_ids) > _MAX_ROUTE_SAFETY_ITEMS:
         raise RouteWorkBudgetExceeded()
 
     parks_by_id: dict[int, CAPADPark] = {}
     if all_park_ids:
-        park_objs = (
+        for pk in (
             session.execute(
                 select(CAPADPark)
                 .where(CAPADPark.id.in_(all_park_ids))
@@ -1250,18 +1392,16 @@ def _plan_route_with_geometry_impl(
             )
             .scalars()
             .all()
-        )
-        for pk in park_objs:
+        ):
             parks_by_id[pk.id] = pk
 
-    intersecting_parks = session.execute(
+    for pk in session.execute(
         select(CAPADPark)
         .join(route_geometry, func.ST_Intersects(CAPADPark.geom, route_geometry.c.geom))
         .options(defer(CAPADPark.geom))
         .order_by(CAPADPark.name.asc())
         .limit(_MAX_ROUTE_SAFETY_ITEMS + 1)
-    ).scalars().all()
-    for pk in intersecting_parks:
+    ).scalars().all():
         parks_by_id.setdefault(pk.id, pk)
     if len(parks_by_id) > _MAX_ROUTE_SAFETY_ITEMS:
         raise RouteWorkBudgetExceeded()
@@ -1332,24 +1472,36 @@ def _plan_route_with_geometry_impl(
             )
         )
 
-    # 10. Safety summary & consolidated warnings
-    route_wet_risk: ApiWetRiskLiteral = _RANK_WET.get(worst_wet_rank, "dry")
-    unbridged_from_ww = sum(1 for c in waterway_crossings if not c.bridged)
-    unbridged_crossings_count = max(unbridged_from_ww, fallback_unbridged_count)
+    return _RouteOverlays(
+        closures_list=list(dedup_closures.values()),
+        condition_reports=condition_reports,
+        community_gate_warnings=community_gate_warnings,
+        capad_parks=capad_parks,
+        nearby_pois=nearby_pois,
+    )
+
+
+def _build_route_safety_summary(
+    assembled: _AssembledLegs,
+    overlays: _RouteOverlays,
+) -> tuple[RouteSafetySummary, int, ApiWetRiskLiteral]:
+    route_wet_risk: ApiWetRiskLiteral = _RANK_WET.get(assembled.worst_wet_rank, "dry")
+    unbridged_from_ww = sum(1 for c in assembled.waterway_crossings if not c.bridged)
+    unbridged_crossings_count = max(unbridged_from_ww, assembled.fallback_unbridged_count)
 
     has_blocking_closure = any(
-        leg.closure_status in ("closed", "seasonal") for leg in legs
+        leg.closure_status in ("closed", "seasonal") for leg in assembled.legs
     ) or any(
         c.get("closure_type") in ("closed", "seasonal")
         or (c.get("closure_type") == "incident" and c.get("severity") == "critical")
-        for c in closures_list
+        for c in overlays.closures_list
     )
 
     safety_warnings: list[str] = []
     if has_blocking_closure:
         blocking_titles = [
             str(c.get("title") or "Official Closure")
-            for c in closures_list
+            for c in overlays.closures_list
             if c.get("closure_type") in ("closed", "seasonal")
             or (c.get("closure_type") == "incident" and c.get("severity") == "critical")
         ]
@@ -1359,32 +1511,29 @@ def _plan_route_with_geometry_impl(
             if blocking_titles
             else "One or more legs have an active blocking closure — do not enter."
         )
-    elif closures_list:
+    elif overlays.closures_list:
         safety_warnings.append(
-            f"{len(closures_list)} official access/advisory alert(s) affect this route."
+            f"{len(overlays.closures_list)} official access/advisory alert(s) affect this route."
         )
 
-    if community_gate_warnings:
+    if overlays.community_gate_warnings:
         safety_warnings.append(
-            f"{len(community_gate_warnings)} community locked-gate / private-property "
+            f"{len(overlays.community_gate_warnings)} community locked-gate / private-property "
             "warning(s) reported along route."
         )
-
-    if leg_gaps:
-        max_gap = max(g.gap_m for g in leg_gaps)
+    if assembled.leg_gaps:
+        max_gap = max(g.gap_m for g in assembled.leg_gaps)
         safety_warnings.append(
-            f"{len(leg_gaps)} non-contiguous leg gap(s) detected "
+            f"{len(assembled.leg_gaps)} non-contiguous leg gap(s) detected "
             f"(largest {max_gap / 1000.0:.2f} km)."
         )
-
     if route_wet_risk in ("wet", "heavy_rain"):
         label = "Heavy rain" if route_wet_risk == "heavy_rain" else "Wet conditions"
         safety_warnings.append(
             f"{label} over the past 72 h — expect slick clay/mud and elevated creek crossings."
         )
-
     if unbridged_crossings_count > 0:
-        if any_unbridged_perennial:
+        if assembled.any_unbridged_perennial:
             safety_warnings.append(
                 f"{unbridged_crossings_count} unbridged waterway crossing(s) including perennial "
                 "river/creek — walk and check depth before crossing."
@@ -1395,79 +1544,111 @@ def _plan_route_with_geometry_impl(
             )
 
     impassable_reports = [
-        r for r in condition_reports if str(r.get("severity") or "").lower() == "impassable"
+        r
+        for r in overlays.condition_reports
+        if str(r.get("severity") or "").lower() == "impassable"
     ]
     if impassable_reports:
         safety_warnings.append(
             f"{len(impassable_reports)} active community report(s) marked impassable along route."
         )
 
-    safety_summary = RouteSafetySummary(
+    summary = RouteSafetySummary(
         has_blocking_closure=has_blocking_closure,
-        closure_count=len(closures_list),
-        gate_warning_count=len(community_gate_warnings),
-        active_report_count=len(condition_reports),
+        closure_count=len(overlays.closures_list),
+        gate_warning_count=len(overlays.community_gate_warnings),
+        active_report_count=len(overlays.condition_reports),
         unbridged_crossings=unbridged_crossings_count,
         wet_risk_level=route_wet_risk,
         warnings=safety_warnings,
     )
+    return summary, unbridged_crossings_count, route_wet_risk
 
-    # 11. Worst grade & personalized rig suitability
-    worst_grade = _RANK_GRADE.get(worst_grade_rank, "Medium")
-    worst_score_rounded = round(float(worst_score), 1)
 
-    suitability: TrackSuitability | None = None
-    if resolved_cap_class is not None:
-        suitability = evaluate_track_suitability(
-            grade=worst_grade,  # type: ignore[arg-type]
-            capability_class=resolved_cap_class,
-            vehicle_name=resolved_veh_name,
-            max_slope_deg=route_max_slope,
-            waterway_crossing_count=unbridged_crossings_count,
-            has_perennial_crossing=any_unbridged_perennial,
-            is_4wd_only=any_4wd_only,
-            has_snorkel=resolved_has_snorkel,
-            wet_risk_level=_wet_for_suitability(route_wet_risk),
-            surface_class=worst_surface,
-            closure_status=worst_closure_status,
+def _evaluate_route_suitability(
+    inputs: _RouteInputs,
+    assembled: _AssembledLegs,
+    overlays: _RouteOverlays,
+    *,
+    worst_grade: _GradeLiteral,
+    unbridged_crossings_count: int,
+    route_wet_risk: ApiWetRiskLiteral,
+) -> TrackSuitability | None:
+    if inputs.resolved_cap_class is None:
+        return None
+    suitability = evaluate_track_suitability(
+        grade=worst_grade,
+        capability_class=inputs.resolved_cap_class,
+        vehicle_name=inputs.resolved_veh_name,
+        max_slope_deg=assembled.route_max_slope,
+        waterway_crossing_count=unbridged_crossings_count,
+        has_perennial_crossing=assembled.any_unbridged_perennial,
+        is_4wd_only=assembled.any_4wd_only,
+        has_snorkel=inputs.resolved_has_snorkel,
+        wet_risk_level=_wet_for_suitability(route_wet_risk),
+        surface_class=assembled.worst_surface,
+        closure_status=assembled.worst_closure_status,
+    )
+    if overlays.community_gate_warnings and not any(
+        "gate" in w.lower() for w in suitability.warnings
+    ):
+        suitability = suitability.model_copy(
+            update={
+                "warnings": [
+                    *suitability.warnings,
+                    f"{len(overlays.community_gate_warnings)} community locked-gate / "
+                    "private-property warning(s) reported on this route.",
+                ]
+            }
         )
-        if community_gate_warnings and not any(
-            "gate" in w.lower() for w in suitability.warnings
-        ):
-            suitability = suitability.model_copy(
-                update={
-                    "warnings": [
-                        *suitability.warnings,
-                        f"{len(community_gate_warnings)} community locked-gate / private-property "
-                        "warning(s) reported on this route.",
-                    ]
-                }
-            )
+    return suitability
 
-    # 12. Downsample elevation profile cleanly to <= 600 points
-    elevation_profile = downsample_elevation_profile(
-        raw_profile_points, max_points=MAX_PROFILE_POINTS
+
+def _plan_route_with_geometry_impl(
+    session: Session,
+    track_ids: Sequence[str],
+    *,
+    vehicle_class: str | None = None,
+    vehicle_profile: VehicleProfile | None = None,
+    waypoints: Sequence[RouteWaypoint | dict[str, Any]] | None = None,
+    name: str | None = None,
+) -> tuple[PlannedRouteAnalysis, list[OrientedLegTrack]]:
+    inputs = _resolve_route_inputs(
+        track_ids,
+        vehicle_class=vehicle_class,
+        vehicle_profile=vehicle_profile,
+        waypoints=waypoints,
+        name=name,
+    )
+    ctx = _load_route_context(session, inputs.cleaned_ids, inputs.unique_ids)
+    assembled = _assemble_route_legs(inputs.cleaned_ids, ctx, inputs.norm_waypoints)
+    overlays = _load_route_overlays(session, inputs.unique_ids, ctx)
+    safety_summary, unbridged_crossings_count, route_wet_risk = _build_route_safety_summary(
+        assembled, overlays
     )
 
-    # 13. Derive display name, bbox, start/end coordinates, and GridForge CLI
+    worst_grade: _GradeLiteral = _RANK_GRADE.get(assembled.worst_grade_rank, "Medium")
+    worst_score_rounded = round(float(assembled.worst_score), 1)
+    suitability = _evaluate_route_suitability(
+        inputs,
+        assembled,
+        overlays,
+        worst_grade=worst_grade,
+        unbridged_crossings_count=unbridged_crossings_count,
+        route_wet_risk=route_wet_risk,
+    )
+
+    elevation_profile = downsample_elevation_profile(
+        assembled.raw_profile_points, max_points=MAX_PROFILE_POINTS
+    )
     if name is not None and name.strip():
         route_name = name.strip()
-    elif len(legs) == 1:
-        route_name = legs[0].name
+    elif len(assembled.legs) == 1:
+        route_name = assembled.legs[0].name
     else:
-        route_name = f"{legs[0].name} → {legs[-1].name}"
+        route_name = f"{assembled.legs[0].name} → {assembled.legs[-1].name}"
 
-    if math.isfinite(min_lon) and math.isfinite(min_lat):
-        bbox = [
-            round(min_lon, 6),
-            round(min_lat, 6),
-            round(max_lon, 6),
-            round(max_lat, 6),
-        ]
-    else:
-        bbox = [0.0, 0.0, 0.0, 0.0]
-
-    non_empty_tracks = [ot for ot in oriented_tracks if ot.coords_lonlat_ele]
+    non_empty_tracks = [ot for ot in assembled.oriented_tracks if ot.coords_lonlat_ele]
     start_coord = (
         [
             round(non_empty_tracks[0].coords_lonlat_ele[0][0], 6),
@@ -1485,52 +1666,58 @@ def _plan_route_with_geometry_impl(
         else None
     )
 
-    waterway_crossings.sort(key=lambda c: (c.dist_m, c.name))
-
     analysis = PlannedRouteAnalysis(
         name=route_name,
-        track_ids=cleaned_ids,
-        states=sorted(states_set),
-        total_length_m=round(cum_dist_m, 1),
-        est_duration_min=round(total_duration_min, 1),
-        min_elev_m=round(route_min_elev, 1) if route_min_elev is not None else None,
-        max_elev_m=round(route_max_elev, 1) if route_max_elev is not None else None,
-        elev_gain_m=round(total_elev_gain_m, 1),
-        elev_loss_m=round(total_elev_loss_m, 1),
-        max_slope_deg=round(route_max_slope, 1) if route_max_slope is not None else None,
+        track_ids=inputs.cleaned_ids,
+        states=sorted(assembled.states_set),
+        total_length_m=round(assembled.cum_dist_m, 1),
+        est_duration_min=round(assembled.total_duration_min, 1),
+        min_elev_m=(
+            round(assembled.route_min_elev, 1) if assembled.route_min_elev is not None else None
+        ),
+        max_elev_m=(
+            round(assembled.route_max_elev, 1) if assembled.route_max_elev is not None else None
+        ),
+        elev_gain_m=round(assembled.total_elev_gain_m, 1),
+        elev_loss_m=round(assembled.total_elev_loss_m, 1),
+        max_slope_deg=(
+            round(assembled.route_max_slope, 1) if assembled.route_max_slope is not None else None
+        ),
         sustained_slope_deg=(
-            round(route_sustained_slope, 1) if route_sustained_slope is not None else None
+            round(assembled.route_sustained_slope, 1)
+            if assembled.route_sustained_slope is not None
+            else None
         ),
         worst_grade=worst_grade,
         worst_score=worst_score_rounded,
         effective_grade=worst_grade,
         suitability=suitability,
         safety_summary=safety_summary,
-        closures=closures_list,
-        community_gate_warnings=community_gate_warnings,
-        condition_reports=condition_reports,
-        waterway_crossings=waterway_crossings,
-        nearby_pois=nearby_pois,
-        capad_parks=capad_parks,
+        closures=overlays.closures_list,
+        community_gate_warnings=overlays.community_gate_warnings,
+        condition_reports=overlays.condition_reports,
+        waterway_crossings=assembled.waterway_crossings,
+        nearby_pois=overlays.nearby_pois,
+        capad_parks=overlays.capad_parks,
         elevation_profile=elevation_profile,
-        legs=legs,
-        leg_gaps=leg_gaps,
-        waypoints=norm_waypoints,
-        bbox=bbox,
+        legs=assembled.legs,
+        leg_gaps=assembled.leg_gaps,
+        waypoints=inputs.norm_waypoints,
+        bbox=assembled.bbox,
         start_coord=start_coord,
         end_coord=end_coord,
         geometry={
             "type": "FeatureCollection",
-            "features": geojson_features,
+            "features": assembled.geojson_features,
         },
         gridforge_cli=build_gridforge_cli(route_name),
-        has_osm_source=has_osm_source,
+        has_osm_source=assembled.has_osm_source,
         attributions=list(ROUTE_ATTRIBUTIONS),
     )
 
     if len(analysis.model_dump_json().encode("utf-8")) > _MAX_ROUTE_ANALYSIS_BYTES:
         raise RouteWorkBudgetExceeded()
-    return analysis, oriented_tracks
+    return analysis, assembled.oriented_tracks
 
 
 def summarize_saved_routes(
