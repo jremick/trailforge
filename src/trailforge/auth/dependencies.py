@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from urllib.parse import urlsplit
 
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
@@ -194,6 +195,54 @@ def get_scoped_read_user(request: Request, db: Session = Depends(get_db)) -> Use
 def get_scoped_write_user(request: Request, db: Session = Depends(get_db)) -> User:
     """Allow a session or delegated access to a consented saved-item write operation."""
     return _require_route_user(request, db, delegated_scope=SCOPE_WRITE)
+
+
+def _require_browser_queue_account(request: Request) -> None:
+    """Require cookie and identifiable browser writers to name the originating account."""
+    if request.headers.get("x-trailforge-account"):
+        return
+    bearer = extract_bearer_token(request)
+    if bearer is None or _is_web_session_bearer(request, bearer):
+        raise HTTPException(
+            status_code=status.HTTP_428_PRECONDITION_REQUIRED,
+            detail="Refresh TrailForge before saving to your account",
+        )
+
+
+def _is_web_session_bearer(request: Request, bearer: str) -> bool:
+    if bearer.startswith((PAT_PREFIX, OAUTH_ACCESS_PREFIX)):
+        return False
+    if request.headers.get("sec-fetch-mode") != "cors" or request.headers.get(
+        "sec-fetch-site"
+    ) not in {"same-origin", "same-site", "cross-site"}:
+        return False
+    try:
+        origin = urlsplit(request.headers.get("origin", ""))
+    except ValueError:
+        return False
+    # Capacitor uses capacitor://localhost on iOS and https://localhost on
+    # Android. Those origins and terminal/service clients retain bearer access.
+    return (
+        origin.scheme in {"http", "https"}
+        and bool(origin.hostname)
+        and origin.hostname not in {"localhost", "127.0.0.1", "::1"}
+    )
+
+
+def require_browser_queue_owner(
+    request: Request, user: User = Depends(get_current_user)
+) -> User:
+    """Keep full-session writes while requiring account binding for browser requests."""
+    _require_browser_queue_account(request)
+    return user
+
+
+def require_browser_queue_write_owner(
+    request: Request, user: User = Depends(get_scoped_write_user)
+) -> User:
+    """Keep consented bearer writes while requiring account binding for browser requests."""
+    _require_browser_queue_account(request)
+    return user
 
 
 require_user = get_current_user

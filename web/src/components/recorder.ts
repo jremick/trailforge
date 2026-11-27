@@ -116,6 +116,7 @@ export class InCabRecorderHud {
   private isSimulating = false;
   private savingTrip = false;
   private errorMsg: string | null = null;
+  private captureEpoch = 0;
 
   private vehicles: VehicleProfileItem[] = [];
   private isOnline = true;
@@ -135,27 +136,46 @@ export class InCabRecorderHud {
     isOnline: boolean;
     isAuthenticated: boolean;
   }): void {
+    const changed = this.vehicles !== ctx.vehicles || this.isOnline !== ctx.isOnline ||
+      this.isAuthenticated !== ctx.isAuthenticated;
     this.vehicles = ctx.vehicles;
     this.isOnline = ctx.isOnline;
     this.isAuthenticated = ctx.isAuthenticated;
-    if (this.phase === "stopped" && this.expanded) {
+    if (changed && this.phase === "stopped" && this.expanded) {
       this.render();
     }
   }
 
-  private async ensureImuCapture(silent: boolean): Promise<ImuCaptureHandle> {
+  resetForAccountChange(): void {
+    this.vehicles = [];
+    this.isAuthenticated = false;
+    this.expanded = false;
+    this.wakeLockEnabled = false;
+    this.wakeLockStatus = "off";
+    this.discardRecording();
+    void releaseKeepAwake().catch(() => undefined);
+  }
+
+  private async ensureImuCapture(silent: boolean): Promise<ImuCaptureHandle | null> {
     if (this.imuHandle) return this.imuHandle;
+    const epoch = this.captureEpoch;
     const handle = await startHighRateImuCapture({
       maxSamples: 1500,
       sampleRateHz: 50,
       metricsIntervalMs: 250,
       onMetrics: (metrics) => {
+        if (epoch !== this.captureEpoch) return;
         this.imuMetrics = metrics;
         if (this.expanded && this.phase === "recording") {
           this.patchLiveMetricsInPlace();
         }
       },
     });
+    if (epoch !== this.captureEpoch) {
+      handle.clear();
+      await handle.stop();
+      return null;
+    }
     this.imuHandle = handle;
     this.motionEnabled = true;
     if (!silent) {
@@ -170,35 +190,33 @@ export class InCabRecorderHud {
   }
 
   private async stopImuCapture(clearBuffer: boolean): Promise<void> {
-    if (this.imuHandle) {
-      await this.imuHandle.stop();
-      if (clearBuffer) {
-        this.imuHandle.clear();
-        this.imuMetrics = { ...EMPTY_IMU_METRICS };
-      }
-      this.imuHandle = null;
-    } else if (clearBuffer) {
+    const handle = this.imuHandle;
+    this.imuHandle = null;
+    this.motionEnabled = false;
+    if (clearBuffer) {
+      handle?.clear();
       this.imuMetrics = { ...EMPTY_IMU_METRICS };
     }
-    this.motionEnabled = false;
+    await handle?.stop();
   }
 
   private async startGpsRecording(): Promise<void> {
+    const epoch = this.captureEpoch;
     await this.stopTimersAndWatchers();
+    if (epoch !== this.captureEpoch) return;
     this.errorMsg = null;
     this.isSimulating = false;
     this.phase = "recording";
     this.expanded = true;
 
-    if (!this.imuHandle) {
-      await this.ensureImuCapture(true);
-    }
+    if (!this.imuHandle) await this.ensureImuCapture(true);
+    if (epoch !== this.captureEpoch) return;
 
     const handle = await startBackgroundLocationWatch({
       enableHighAccuracy: true,
       distanceFilterM: 5,
       onLocation: (loc) => {
-        if (this.phase !== "recording") return;
+        if (epoch !== this.captureEpoch || this.phase !== "recording") return;
         const latestImu = this.imuHandle?.getMetrics() ?? this.imuMetrics;
         this.imuMetrics = latestImu;
         const pt: RecordedBreadcrumbPoint = {
@@ -215,11 +233,16 @@ export class InCabRecorderHud {
         this.appendPoint(pt);
       },
       onError: (msg) => {
+        if (epoch !== this.captureEpoch) return;
         this.errorMsg = `GPS warning: ${msg} (you can use Simulate Drive on desktop)`;
         this.render();
       },
     });
 
+    if (epoch !== this.captureEpoch) {
+      await handle.stop();
+      return;
+    }
     this.locationHandle = handle;
     this.isNativeBackgroundGps = handle.isNativeBackground;
     this.render();
@@ -232,7 +255,9 @@ export class InCabRecorderHud {
   }
 
   private async startSimulatedDrive(): Promise<void> {
+    const epoch = this.captureEpoch;
     await this.stopTimersAndWatchers();
+    if (epoch !== this.captureEpoch) return;
     this.errorMsg = null;
     this.isSimulating = true;
     this.isNativeBackgroundGps = false;
@@ -240,6 +265,7 @@ export class InCabRecorderHud {
     this.expanded = true;
 
     const imu = await this.ensureImuCapture(true);
+    if (!imu || epoch !== this.captureEpoch) return;
 
     if (
       this.points.length === 0 ||
@@ -253,7 +279,7 @@ export class InCabRecorderHud {
     }
 
     const pushNext = (): void => {
-      if (this.phase !== "recording") return;
+      if (epoch !== this.captureEpoch || this.phase !== "recording") return;
       const wp = SIMULATED_HIGH_COUNTRY_WAYPOINTS[this.simIndex];
       if (!wp) {
         void this.stopRecording();
@@ -300,8 +326,10 @@ export class InCabRecorderHud {
 
   private async pauseRecording(): Promise<void> {
     if (this.phase !== "recording") return;
+    const epoch = this.captureEpoch;
     this.phase = "paused";
     await this.stopTimersAndWatchers();
+    if (epoch !== this.captureEpoch) return;
     this.flushMapPointsNow();
     this.render();
   }
@@ -316,15 +344,17 @@ export class InCabRecorderHud {
   }
 
   private async stopRecording(): Promise<void> {
+    const epoch = this.captureEpoch;
     await this.stopTimersAndWatchers();
+    if (epoch !== this.captureEpoch) return;
     this.flushMapPointsNow();
     // Snapshot collected IMU samples & metrics for mobile-sync while releasing live listeners
     if (this.imuHandle) {
       this.imuMetrics = this.imuHandle.getMetrics();
       this.recordedImuSamples = this.imuHandle.getSamples();
-      await this.imuHandle.stop();
-      this.imuHandle = null;
+      await this.stopImuCapture(false);
     }
+    if (epoch !== this.captureEpoch) return;
     this.motionEnabled = false;
     if (this.points.length > 0) {
       this.phase = "stopped";
@@ -335,18 +365,20 @@ export class InCabRecorderHud {
     this.render();
   }
 
-  private async discardRecording(): Promise<void> {
-    await this.stopTimersAndWatchers();
-    await this.stopImuCapture(true);
+  private discardRecording(): void {
+    this.captureEpoch += 1;
+    this.phase = "idle";
+    void this.stopTimersAndWatchers().catch(() => undefined);
+    void this.stopImuCapture(true).catch(() => undefined);
     this.recordedImuSamples = [];
     this.points = [];
     this.resetRunningStats();
     this.backtrackActive = false;
-    this.phase = "idle";
     this.simIndex = 0;
     this.isSimulating = false;
     this.isNativeBackgroundGps = false;
     this.errorMsg = null;
+    this.savingTrip = false;
     this.callbacks.onPointsChanged([], false);
     this.render();
   }
@@ -559,11 +591,8 @@ export class InCabRecorderHud {
   }
 
   private async stopTimersAndWatchers(): Promise<void> {
-    if (this.locationHandle) {
-      const handle = this.locationHandle;
-      this.locationHandle = null;
-      await handle.stop();
-    }
+    const handle = this.locationHandle;
+    this.locationHandle = null;
     if (this.simTimerId !== null) {
       window.clearInterval(this.simTimerId);
       this.simTimerId = null;
@@ -572,22 +601,29 @@ export class InCabRecorderHud {
       window.clearTimeout(this.mapPublishTimerId);
       this.mapPublishTimerId = null;
     }
+    await handle?.stop();
   }
 
   private async toggleWakeLock(): Promise<void> {
+    const epoch = this.captureEpoch;
     if (this.wakeLockEnabled) {
       this.wakeLockEnabled = false;
       this.wakeLockStatus = "off";
       await releaseKeepAwake();
-      this.render();
+      if (epoch === this.captureEpoch) this.render();
       return;
     }
 
     const result = await requestKeepAwake(undefined, () => {
+      if (epoch !== this.captureEpoch) return;
       this.wakeLockEnabled = false;
       this.wakeLockStatus = "off";
       this.render();
     });
+    if (epoch !== this.captureEpoch) {
+      if (result.active) await releaseKeepAwake();
+      return;
+    }
 
     if (result.active) {
       this.wakeLockEnabled = true;
@@ -611,13 +647,14 @@ export class InCabRecorderHud {
   }
 
   private async toggleMotionSensor(): Promise<void> {
+    const epoch = this.captureEpoch;
     if (this.motionEnabled) {
       await this.stopImuCapture(false);
-      this.render();
+      if (epoch === this.captureEpoch) this.render();
       return;
     }
     await this.ensureImuCapture(false);
-    this.render();
+    if (epoch === this.captureEpoch) this.render();
   }
 
   private exportRecorded(format: "gpx" | "geojson"): void {
@@ -764,8 +801,8 @@ export class InCabRecorderHud {
               <label class="tf-field">
                 <span class="tf-label">Visibility</span>
                 <select class="tf-select" name="rec_visibility">
-                  <option value="community_anonymous" selected>Anonymous Community</option>
-                  <option value="private">Private Only</option>
+                  <option value="private" selected>Private Only</option>
+                  <option value="community_anonymous">Anonymous Community</option>
                 </select>
               </label>
             </div>
@@ -784,16 +821,17 @@ export class InCabRecorderHud {
                   </label>`
                 : ""
             }
+            ${this.isAuthenticated ? "" : `<p class="tf-inspector-muted">Sign in before recording to sync trips. Export this recording as GPX or GeoJSON.</p>`}
             <div class="tf-btn-row">
-              <button type="submit" class="tf-btn-primary" ${this.savingTrip ? "disabled" : ""}>
+              ${this.isAuthenticated ? `<button type="submit" class="tf-btn-primary" ${this.savingTrip ? "disabled" : ""}>
                 ${
                   this.savingTrip
                     ? "Syncing…"
-                    : this.isOnline && this.isAuthenticated
+                    : this.isOnline
                       ? "↑ Mobile Sync"
                       : "⧖ Queue Offline"
                 }
-              </button>
+              </button>` : ""}
               <button type="button" class="tf-mini-btn" data-rec-export="gpx">⬇ GPX</button>
               <button type="button" class="tf-mini-btn" data-rec-export="geojson">⬇ GeoJSON</button>
             </div>
@@ -964,6 +1002,8 @@ export class InCabRecorderHud {
       .querySelector<HTMLFormElement>("[data-role='rec-save-form']")
       ?.addEventListener("submit", (e) => {
         e.preventDefault();
+        if (!this.isAuthenticated || this.savingTrip) return;
+        const epoch = this.captureEpoch;
         const form = e.currentTarget as HTMLFormElement;
         const fd = new FormData(form);
         const name = String(fd.get("rec_trip_name") ?? "").trim() || "Recorded Trip";
@@ -974,10 +1014,9 @@ export class InCabRecorderHud {
           this.render();
           return;
         }
-        const visibility = (String(fd.get("rec_visibility") ?? "community_anonymous") ===
-        "private"
-          ? "private"
-          : "community_anonymous") as TripVisibility;
+        const visibility: TripVisibility = fd.get("rec_visibility") === "community_anonymous"
+          ? "community_anonymous"
+          : "private";
         const vehicleProfileId = String(fd.get("rec_vehicle_id") ?? "").trim() || null;
 
         this.savingTrip = true;
@@ -999,14 +1038,16 @@ export class InCabRecorderHud {
             privacy_trim_m: trimCheck.value,
             vehicle_profile_id: vehicleProfileId,
           })
-          .then(async () => {
-            await this.discardRecording();
+          .then(() => {
+            if (epoch === this.captureEpoch) this.discardRecording();
           })
           .catch((err) => {
+            if (epoch !== this.captureEpoch) return;
             this.errorMsg =
               err instanceof Error ? err.message : "Failed to save recorded trip";
           })
           .finally(() => {
+            if (epoch !== this.captureEpoch) return;
             this.savingTrip = false;
             this.render();
           });

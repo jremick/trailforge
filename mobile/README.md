@@ -130,8 +130,9 @@ When recording via the **In-Cab Breadcrumb Recorder**:
    - Computes live gravity-removed `roughness_rms`, `roughness_p95`, rock-ledge `shock_event_count` (peaks `> 0.8g` dynamic jolt or `> 1.8g` total), and `max_pitch_deg` / `max_roll_deg`.
    - Drives the live **4WD Clinometer** warning states: **Caution Amber** (`>= 15°`) and **Hazard Red** (`>= 25°`).
 3. **Sync & Privacy Guardrails:**
-   - Completed drives upload via `POST /api/trips/mobile-sync` with `{ name, points, imu_samples, recording_source, privacy_trim_m >= 250, visibility }`.
-   - If the server is unreachable (no mobile reception in the bush), the entire session — including `imu_samples` and `recording_source` — is persisted into the local IndexedDB Sync Queue and flushed idempotently on reconnect.
+   - Completed drives upload via `POST /api/trips/mobile-sync`. The recorder starts with private visibility and includes `confirm_community` when you select community sharing.
+   - Signed-in drives with no connection queue in IndexedDB under the originating account and sync when that account reconnects. Signed-out recordings can be exported from the recorder. The app leaves older, unassigned queue entries and pins outside account sync.
+   - Refresh open browser and installed PWA tabs after updating. Cookie-authenticated or identifiable browser session writes from an older bundle can receive HTTP 428 until it refreshes. Native and terminal bearer clients keep their existing authentication flow.
    - **Privacy by design:** Both GPS breadcrumbs **and** IMU samples falling within the mandatory start/end `>= 250 m` privacy trim buffer are discarded before any anonymized community telemetry is computed.
 
 ---

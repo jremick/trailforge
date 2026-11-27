@@ -19,6 +19,7 @@ from trailforge.auth.dependencies import (
     get_current_user,
     get_scoped_read_user,
     get_scoped_write_user,
+    require_browser_queue_write_owner,
 )
 from trailforge.db.models import (
     POI,
@@ -493,7 +494,7 @@ def list_pins(
 @router.post("/pins", response_model=PinResponse, status_code=status.HTTP_201_CREATED)
 def create_pin(
     payload: PinCreateRequest,
-    user: User = Depends(get_scoped_write_user),
+    user: User = Depends(require_browser_queue_write_owner),
     db: Session = Depends(get_db),
 ) -> PinResponse:
     """Create a personal waypoint/camp/hazard pin persisted in PostGIS."""

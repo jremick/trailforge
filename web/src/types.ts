@@ -531,6 +531,7 @@ export interface UserFavoriteItem {
 export interface UserPinInput {
   name: string;
   category: PinCategory;
+  client_uuid?: string | null;
   notes?: string | null;
   lon: number;
   lat: number;
@@ -618,6 +619,7 @@ export interface MobileTripSyncPayload extends TripUploadJsonPayload {
   imu_samples?: ImuSample[];
   client_session_id?: string | null;
   recording_source?: MobileRecordingSource;
+  confirm_community?: boolean;
 }
 
 export interface TripMatchedSegment {
@@ -634,6 +636,7 @@ export interface TripItem {
   id?: string;
   name: string;
   visibility: TripVisibility;
+  community_consent_pending?: boolean;
   vehicle_profile_id?: string | null;
   vehicle_class?: string | null;
   vehicle_capability_class?: string | null;
@@ -787,6 +790,8 @@ export type PackBuildStatus = "ready" | "not_built" | "building" | "failed" | st
 
 export interface OfflinePackRegionItem {
   region_id: string;
+  community_telemetry_policy?: string | null;
+  community_telemetry_revision?: string | null;
   name: string;
   description: string;
   category?: "region" | "state" | string;
@@ -823,6 +828,8 @@ export interface OfflinePackFileEntry {
 
 export interface OfflinePackManifest {
   region_id: string;
+  community_telemetry_policy?: string | null;
+  community_telemetry_revision?: string | null;
   name?: string;
   version?: string;
   generated_at?: string;
@@ -890,7 +897,7 @@ export type SyncQueueItem =
       kind: "trip";
       created_at: string;
       label: string;
-      payload: TripUploadJsonPayload;
+      payload: MobileTripSyncPayload;
       last_error?: string | null;
     }
   | {
@@ -907,7 +914,6 @@ export type SyncQueueItem =
       created_at: string;
       label: string;
       payload: UserPinInput;
-      local_pin_id?: string | null;
       last_error?: string | null;
     };
 
@@ -968,6 +974,7 @@ export interface BaselineBreakdown {
 export interface ElevationProfilePoint {
   dist_m: number;
   elev_m: number;
+  section_id?: number;
   slope_deg?: number | null;
   segment_id?: string | null;
   grade?: string | null;

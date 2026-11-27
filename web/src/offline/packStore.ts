@@ -18,7 +18,6 @@ import type {
   PoiItem,
   TileManifestResponse,
   TrackInspectorDetail,
-  UserPinItem,
 } from "../types";
 import { verifySha256Hex } from "./rangeSlice";
 
@@ -74,19 +73,18 @@ export class MemoryOfflineBackend implements OfflineKvBackend {
 class IndexedDbOfflineBackend implements OfflineKvBackend {
   private dbPromise: Promise<IDBDatabase> | null = null;
 
+  constructor(
+    private readonly name: string = OFFLINE_DB_NAME,
+    private readonly stores: readonly OfflineStoreName[] = ["packs", "snapshots"]
+  ) {}
+
   private open(): Promise<IDBDatabase> {
     if (this.dbPromise) return this.dbPromise;
     this.dbPromise = new Promise((resolve, reject) => {
-      const req = indexedDB.open(OFFLINE_DB_NAME, OFFLINE_DB_VERSION);
+      const req = indexedDB.open(this.name, OFFLINE_DB_VERSION);
       req.onupgradeneeded = () => {
         const db = req.result;
-        const stores: OfflineStoreName[] = [
-          "packs",
-          "snapshots",
-          "offline_pins",
-          "sync_queue",
-        ];
-        for (const name of stores) {
+        for (const name of this.stores) {
           if (!db.objectStoreNames.contains(name)) {
             db.createObjectStore(name);
           }
@@ -141,6 +139,7 @@ class IndexedDbOfflineBackend implements OfflineKvBackend {
 }
 
 let activeBackend: OfflineKvBackend | null = null;
+const privateBackends = new Map<string, OfflineKvBackend>();
 let memoryActivePackId: string | null = null;
 // In-memory cache of deserialized offline pack snapshots so rapid search keystrokes and
 // track clicks do not structured-clone multi-MB IndexedDB objects on every interaction.
@@ -214,10 +213,28 @@ export function getOfflineBackend(): OfflineKvBackend {
   return activeBackend;
 }
 
+export function getPrivateOfflineBackend(ownerId: string): OfflineKvBackend {
+  if (!ownerId) throw new Error("A signed-in account is required for offline sync");
+  let backend = privateBackends.get(ownerId);
+  if (!backend) {
+    // The old origin-wide queue and pins have no provable owner. Only account
+    // databases are opened here, so old bundles cannot read new private work either.
+    backend = typeof indexedDB === "undefined"
+      ? new MemoryOfflineBackend()
+      : new IndexedDbOfflineBackend(
+          `trailforge-account-v1:${encodeURIComponent(ownerId)}`,
+          ["sync_queue"]
+        );
+    privateBackends.set(ownerId, backend);
+  }
+  return backend;
+}
+
 export function setOfflineBackendForTesting(
   backend: OfflineKvBackend | null
 ): void {
   activeBackend = backend;
+  privateBackends.clear();
   memoryActivePackId = null;
   clearSnapshotMemCache();
 }
@@ -355,6 +372,12 @@ export async function downloadRegionalPackToDevice(
     throw new Error(`Manifest fetch failed (HTTP ${manifestRes.status})`);
   }
   const manifest = (await manifestRes.json()) as OfflinePackManifest;
+  if (region.community_telemetry_policy && (
+    manifest.community_telemetry_policy !== region.community_telemetry_policy ||
+    (manifest.community_telemetry_revision ?? null) !== (region.community_telemetry_revision ?? null)
+  )) {
+    throw new Error("Pack contents have changed. Refresh the catalog and try the download again.");
+  }
 
   onProgress?.({ stage: "Downloading offline track & POI snapshot…", pct: 32 });
   const snapRes = await fetch(snapshotUrl, { cache: "no-store" });
@@ -743,23 +766,6 @@ export async function searchOfflineSnapshots(
     total: results.length,
     results: sliced,
   };
-}
-
-/* ---------- Offline Personal Pins (drop pins 100% offline) ---------- */
-
-export async function saveOfflinePin(pin: UserPinItem): Promise<void> {
-  await getOfflineBackend().put("offline_pins", pin.id, pin);
-}
-
-export async function listOfflinePins(): Promise<UserPinItem[]> {
-  const rows = await getOfflineBackend().getAll<UserPinItem>("offline_pins");
-  return rows.sort((a, b) =>
-    (b.created_at ?? "").localeCompare(a.created_at ?? "")
-  );
-}
-
-export async function deleteOfflinePin(pinId: string): Promise<void> {
-  await getOfflineBackend().delete("offline_pins", pinId);
 }
 
 export function formatByteSize(bytes: number | null | undefined): string {

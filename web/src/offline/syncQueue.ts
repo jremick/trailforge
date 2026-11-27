@@ -1,10 +1,11 @@
 import type {
   ConditionReportCreateInput,
+  MobileTripSyncPayload,
   SyncQueueItem,
-  TripUploadJsonPayload,
   UserPinInput,
+  UserPinItem,
 } from "../types";
-import { getOfflineBackend } from "./packStore";
+import { getPrivateOfflineBackend } from "./packStore";
 
 export function generateClientUuid(): string {
   if (
@@ -21,18 +22,21 @@ export function generateClientUuid(): string {
   });
 }
 
-export async function listSyncQueue(): Promise<SyncQueueItem[]> {
-  const items = await getOfflineBackend().getAll<SyncQueueItem>("sync_queue");
+export async function listSyncQueue(ownerId: string): Promise<SyncQueueItem[]> {
+  const items = await getPrivateOfflineBackend(ownerId).getAll<SyncQueueItem>("sync_queue");
   return items.sort((a, b) => a.created_at.localeCompare(b.created_at));
 }
 
-export async function getSyncQueueCount(): Promise<number> {
-  const items = await listSyncQueue();
-  return items.length;
+export function pinsFromSyncQueue(items: readonly SyncQueueItem[]): UserPinItem[] {
+  return items
+    .filter((item) => item.kind === "pin")
+    .map((item) => ({ ...item.payload, id: item.id, created_at: item.created_at }))
+    .reverse();
 }
 
 export async function enqueueOfflineTrip(
-  payload: TripUploadJsonPayload
+  ownerId: string,
+  payload: MobileTripSyncPayload
 ): Promise<SyncQueueItem> {
   const clientUuid =
     payload.client_uuid ?? payload.client_session_id ?? generateClientUuid();
@@ -48,11 +52,12 @@ export async function enqueueOfflineTrip(
     },
     last_error: null,
   };
-  await getOfflineBackend().put("sync_queue", item.id, item);
+  await getPrivateOfflineBackend(ownerId).put("sync_queue", item.id, item);
   return item;
 }
 
 export async function enqueueOfflineReport(
+  ownerId: string,
   payload: Omit<ConditionReportCreateInput, "photo">
 ): Promise<SyncQueueItem> {
   const clientUuid = payload.client_uuid ?? generateClientUuid();
@@ -64,41 +69,40 @@ export async function enqueueOfflineReport(
     payload: { ...payload, client_uuid: clientUuid },
     last_error: null,
   };
-  await getOfflineBackend().put("sync_queue", item.id, item);
+  await getPrivateOfflineBackend(ownerId).put("sync_queue", item.id, item);
   return item;
 }
 
 export async function enqueueOfflinePin(
-  payload: UserPinInput,
-  localPinId?: string | null
+  ownerId: string,
+  payload: UserPinInput
 ): Promise<SyncQueueItem> {
-  const id = `pin:${generateClientUuid()}`;
+  const clientUuid = payload.client_uuid ?? generateClientUuid();
   const item: SyncQueueItem = {
-    id,
+    id: `offline-pin-${clientUuid}`,
     kind: "pin",
     created_at: new Date().toISOString(),
     label: `Pin: ${payload.name}`,
-    payload,
-    local_pin_id: localPinId ?? null,
+    payload: { ...payload, client_uuid: clientUuid },
     last_error: null,
   };
-  await getOfflineBackend().put("sync_queue", item.id, item);
+  await getPrivateOfflineBackend(ownerId).put("sync_queue", item.id, item);
   return item;
 }
 
-export async function removeSyncQueueItem(id: string): Promise<void> {
-  await getOfflineBackend().delete("sync_queue", id);
+export async function deleteQueuedPin(ownerId: string, id: string): Promise<void> {
+  // A pending pin is the queue entry itself, so deleting it also cancels sync.
+  if (id.startsWith("offline-pin-")) {
+    await getPrivateOfflineBackend(ownerId).delete("sync_queue", id);
+  }
 }
 
 export interface SyncQueueHandlers {
-  syncTrip: (payload: TripUploadJsonPayload) => Promise<void>;
+  syncTrip: (payload: MobileTripSyncPayload) => Promise<void>;
   syncReport: (
     payload: Omit<ConditionReportCreateInput, "photo">
   ) => Promise<void>;
-  syncPin: (
-    payload: UserPinInput,
-    localPinId?: string | null
-  ) => Promise<void>;
+  syncPin: (payload: UserPinInput) => Promise<void>;
 }
 
 export interface SyncFlushResult {
@@ -113,41 +117,50 @@ export interface SyncFlushResult {
  * Retains failed items cleanly for retry; marks `authRequired` if HTTP 401 occurs.
  */
 export async function flushSyncQueue(
+  ownerId: string,
+  signal: AbortSignal,
   handlers: SyncQueueHandlers
 ): Promise<SyncFlushResult> {
-  const items = await listSyncQueue();
+  const backend = getPrivateOfflineBackend(ownerId);
+  const items = await listSyncQueue(ownerId);
   let synced = 0;
   let failed = 0;
   let authRequired = false;
 
   for (const item of items) {
+    if (signal.aborted) break;
+    // A pin may have been deleted while an earlier item was syncing.
+    const pending = await backend.get<SyncQueueItem>("sync_queue", item.id);
+    if (signal.aborted) break;
+    if (!pending) continue;
     try {
-      if (item.kind === "trip") {
-        await handlers.syncTrip(item.payload);
-      } else if (item.kind === "report") {
-        await handlers.syncReport(item.payload);
-      } else if (item.kind === "pin") {
-        await handlers.syncPin(item.payload, item.local_pin_id);
+      if (pending.kind === "trip") {
+        await handlers.syncTrip(pending.payload);
+      } else if (pending.kind === "report") {
+        await handlers.syncReport(pending.payload);
+      } else if (pending.kind === "pin") {
+        await handlers.syncPin(pending.payload);
       }
-      await removeSyncQueueItem(item.id);
+      await backend.delete("sync_queue", item.id);
       synced += 1;
     } catch (err) {
+      if (signal.aborted) break;
       failed += 1;
       const status =
         err && typeof err === "object" && "status" in err
           ? Number((err as { status: unknown }).status)
           : null;
-      if (status === 401 || status === 403) {
-        authRequired = true;
-      }
       const message = err instanceof Error ? err.message : "Sync failed";
-      await getOfflineBackend().put("sync_queue", item.id, {
-        ...item,
+      authRequired = status === 401 || status === 403 ||
+        (status === 409 && message === "The signed-in account has changed");
+      await backend.put("sync_queue", item.id, {
+        ...pending,
         last_error: message,
       });
+      if (authRequired) break;
     }
   }
 
-  const remaining = await getSyncQueueCount();
+  const remaining = (await listSyncQueue(ownerId)).length;
   return { synced, failed, remaining, authRequired };
 }

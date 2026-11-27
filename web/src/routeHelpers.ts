@@ -889,8 +889,9 @@ export function planRouteOffline(
       }
     }
 
-    // Cumulative waterway crossings
-    for (const cr of norm.crossings) {
+    // The offline planner orients the original leg geometry. Use distances from
+    // that same track order, which can differ from the inspector's mapped sections.
+    for (const cr of detail.waterway_crossings ?? norm.crossings) {
       const localDist =
         typeof cr.dist_m === "number"
           ? reversed
@@ -903,13 +904,13 @@ export function planRouteOffline(
       });
     }
 
-    // Cumulative elevation profile
+    const profile = detail.elevation_profile?.length ? detail.elevation_profile : norm.profile;
     const legProf = reversed
-      ? [...norm.profile].reverse().map((p) => ({
+      ? [...profile].reverse().map((p) => ({
           ...p,
           dist_m: Math.max(0, lengthM - p.dist_m),
         }))
-      : norm.profile;
+      : profile;
     for (const p of legProf) {
       combinedProfile.push({
         dist_m: Math.round(cumulativeDistM + p.dist_m),

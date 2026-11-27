@@ -100,6 +100,7 @@ export class TrackInspectorDrawer {
   private showReportForm = false;
   private reportSubmitting = false;
   private reportError: string | null = null;
+  private reportEpoch = 0;
   private context: TrackInspectorContext = {
     snowLineElevationM: 1000,
     activeVehicleClass: "Stock 4WD",
@@ -225,10 +226,19 @@ export class TrackInspectorDrawer {
   close(): void {
     this.isOpen = false;
     this.currentDetail = null;
-    this.showReportForm = false;
-    this.reportError = null;
+    this.resetReportForm();
     this.elevationModal.close();
     this.root.setAttribute("aria-hidden", "true");
+    this.root.replaceChildren();
+  }
+
+  resetReportForm(): void {
+    this.reportEpoch += 1;
+    this.showReportForm = false;
+    this.reportError = null;
+    this.reportSubmitting = false;
+    this.context.pickedReportCoords = null;
+    if (this.isOpen && this.currentDetail) this.renderDetail(this.currentDetail);
   }
 
   private renderEmpty(): void {
@@ -1001,6 +1011,7 @@ export class TrackInspectorDrawer {
           <div class="tf-elev-chart-wrap ${norm.profile.length >= 2 ? "expandable" : ""}" ${norm.profile.length >= 2 ? 'data-role="expand-elevation-chart" title="Click to open large interactive elevation profile"' : ""}>
             ${chart.svgHtml}
           </div>
+          ${norm.hasMultipleCourseSections ? `<p class="tf-inspector-muted">Distance combines the mapped track sections. Check the map for junctions and gaps.</p>` : ""}
         </section>
 
         <section class="tf-insp-section">
@@ -1157,6 +1168,7 @@ export class TrackInspectorDrawer {
         }
 
         const coords = this.resolveDefaultReportCoords(detail);
+        const epoch = this.reportEpoch;
         this.reportSubmitting = true;
         this.reportError = null;
         this.renderDetail(detail);
@@ -1172,14 +1184,17 @@ export class TrackInspectorDrawer {
             photo,
           })
           .then(() => {
+            if (epoch !== this.reportEpoch) return;
             this.showReportForm = false;
             this.reportError = null;
           })
           .catch((err) => {
+            if (epoch !== this.reportEpoch) return;
             this.reportError =
               err instanceof Error ? err.message : "Failed to submit report";
           })
           .finally(() => {
+            if (epoch !== this.reportEpoch) return;
             this.reportSubmitting = false;
             if (this.currentDetail) {
               this.renderDetail(this.currentDetail);

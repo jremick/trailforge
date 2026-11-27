@@ -118,7 +118,7 @@ function defaultVehicleDraft(): VehicleProfileInput {
 export class RigAccountPanel {
   private readonly root: HTMLElement;
   private readonly callbacks: AccountPanelCallbacks;
-  private readonly aiTokens = new AiTokensSection();
+  private aiTokens: AiTokensSection;
   private isOpen = false;
   private activeTab: AccountPanelTab = "rig";
   private authMode: "login" | "register" = "login";
@@ -128,6 +128,7 @@ export class RigAccountPanel {
   private vehicleDraft: VehicleProfileInput = defaultVehicleDraft();
   private formError: string | null = null;
   private busy = false;
+  private accountEpoch = 0;
   private state: AccountPanelState;
 
   constructor(
@@ -137,6 +138,7 @@ export class RigAccountPanel {
   ) {
     this.root = container;
     this.state = initialState;
+    this.aiTokens = new AiTokensSection({ ownerId: initialState.user?.id });
     this.callbacks = callbacks;
     this.root.className = "tf-account-panel";
     this.root.setAttribute(
@@ -165,10 +167,20 @@ export class RigAccountPanel {
   }
 
   updateState(next: AccountPanelState): void {
-    const signedOut = this.state.user !== null && next.user === null;
+    const changedAccount = this.state.user?.id !== next.user?.id;
     this.state = next;
-    if (signedOut) {
+    if (changedAccount) {
+      this.accountEpoch += 1;
       this.aiTokens.reset();
+      this.aiTokens = new AiTokensSection({ ownerId: next.user?.id });
+      this.activeTab = next.user ? "rig" : "account";
+      this.tripInputMode = "gpx";
+      this.showVehicleForm = false;
+      this.editingVehicleId = null;
+      this.vehicleDraft = defaultVehicleDraft();
+      this.formError = null;
+      this.busy = false;
+      this.root.replaceChildren();
     }
     if (this.isOpen) {
       this.render();
@@ -436,6 +448,7 @@ export class RigAccountPanel {
             .map((t) => {
               const tid = getTripId(t);
               const vis = formatTripVisibility(t.visibility);
+              const sharingPending = Boolean(t.community_consent_pending);
               const nextVis: TripVisibility =
                 t.visibility === "community_anonymous"
                   ? "private"
@@ -451,16 +464,18 @@ export class RigAccountPanel {
                         ${escapeHtml(rigLabel)} · ${t.matched_segment_count ?? 0} segs · ${escapeHtml(formatMatchConfidence(t.avg_match_confidence))} · ${escapeHtml(formatTrimmedDistance(t.raw_length_m, t.trimmed_length_m))}
                       </div>
                     </div>
-                    <span class="tf-pill ${vis.tone === "community" ? "tf-pill-ice" : ""}">${escapeHtml(vis.shortLabel)}</span>
+                    <span class="tf-pill ${!sharingPending && vis.tone === "community" ? "tf-pill-ice" : ""}">${sharingPending ? "Sharing paused" : escapeHtml(vis.shortLabel)}</span>
                   </div>
+                  ${sharingPending ? `<p class="tf-inspector-muted">Confirm to contribute de-identified segment metrics from this trip.</p>` : ""}
                   <div class="tf-vehicle-actions">
+                    ${sharingPending ? `<button type="button" class="tf-mini-btn" data-toggle-trip-vis="${escapeHtml(tid)}" data-next-vis="community_anonymous">Confirm community sharing</button>` : ""}
                     <button
                       type="button"
                       class="tf-mini-btn"
                       data-toggle-trip-vis="${escapeHtml(tid)}"
                       data-next-vis="${nextVis}"
                       title="${nextVis === "private" ? "Immediately revoke anonymized observations from public telemetry" : "Publish anonymized segment traversals (zero user ID)"}"
-                    >${nextVis === "private" ? "Make Private" : "Share Anon"}</button>
+                    >${nextVis === "private" ? "Make Private" : "Share anonymously"}</button>
                     <button type="button" class="tf-mini-btn" data-export-trip="${escapeHtml(tid)}" data-export-fmt="gpx">GPX</button>
                     <button type="button" class="tf-mini-btn" data-export-trip="${escapeHtml(tid)}" data-export-fmt="geojson">GeoJSON</button>
                     <button type="button" class="tf-mini-btn danger" data-delete-trip="${escapeHtml(tid)}">Delete</button>
@@ -594,7 +609,7 @@ export class RigAccountPanel {
       <section class="tf-insp-section">
         <div class="tf-insp-sec-head">
           <h3>Personal Map Pins</h3>
-          <span class="mono tf-insp-meta">${pins.length}${user ? "" : " (Offline Local)"}</span>
+          <span class="mono tf-insp-meta">${pins.length}${user ? "" : " in this tab"}</span>
         </div>
 
         <button type="button" class="tf-btn-secondary ${pinDropActive ? "active-drop" : ""}" data-role="toggle-pin-drop">
@@ -645,7 +660,7 @@ export class RigAccountPanel {
             <h3>Favorites &amp; Cloud Sync</h3>
             <span class="mono tf-insp-meta">Optional Account</span>
           </div>
-          <p class="tf-inspector-muted">Personal pins above work 100% offline in browser storage. Sign in to save favorite VIC/NSW tracks and sync pins across devices.</p>
+          <p class="tf-inspector-muted">Guest pins are cleared when this tab closes or you sign in. Sign in before dropping pins to save them to your account, including while offline.</p>
           <p class="tf-inspector-muted">Individual track GPX/GeoJSON exports work directly in the Track Inspector and In-Cab Recorder without an account.</p>
           <button type="button" class="tf-btn-primary" data-jump-tab="account">${escapeHtml(getRegistrationUiState(this.state.authConfig.registration_mode).ctaLabel)}</button>
         </section>
@@ -917,19 +932,13 @@ export class RigAccountPanel {
           } else {
             await this.callbacks.onLogin(email, password);
           }
-          this.activeTab = "rig";
         });
       });
 
     this.root
       .querySelector<HTMLButtonElement>("[data-role='logout-btn']")
       ?.addEventListener("click", () => {
-        void this.runAsync(async () => {
-          await this.callbacks.onLogout();
-          this.aiTokens.reset();
-          this.showVehicleForm = false;
-          this.editingVehicleId = null;
-        });
+        void this.runAsync(() => this.callbacks.onLogout());
       });
 
     const aiMount = this.root.querySelector<HTMLElement>(
@@ -1145,8 +1154,10 @@ export class RigAccountPanel {
         e.preventDefault();
         const payload = readDraft();
         const editId = this.editingVehicleId;
+        const epoch = this.accountEpoch;
         void this.runAsync(async () => {
           await this.callbacks.onSaveVehicle(payload, editId);
+          if (epoch !== this.accountEpoch) return;
           this.showVehicleForm = false;
           this.editingVehicleId = null;
           this.vehicleDraft = defaultVehicleDraft();
@@ -1230,16 +1241,20 @@ export class RigAccountPanel {
   }
 
   private async runAsync(task: () => Promise<void>): Promise<void> {
+    if (this.busy) return;
+    const epoch = this.accountEpoch;
     this.busy = true;
     this.formError = null;
     this.render();
     try {
       await task();
     } catch (err) {
-      this.formError = formatFriendlyApiError(err, "Operation failed");
+      if (epoch === this.accountEpoch) this.formError = formatFriendlyApiError(err, "Operation failed");
     } finally {
-      this.busy = false;
-      this.render();
+      if (epoch === this.accountEpoch) {
+        this.busy = false;
+        if (this.isOpen) this.render();
+      }
     }
   }
 }
