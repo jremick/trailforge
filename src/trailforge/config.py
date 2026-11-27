@@ -99,6 +99,12 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("TRAILFORGE_PRIVACY_SECRET", "PRIVACY_SECRET_KEY"),
         description="HMAC secret used to derive revocable telemetry contribution hashes.",
     )
+    previous_privacy_secret_keys: list[str] = Field(
+        default_factory=list,
+        validation_alias="TRAILFORGE_PREVIOUS_PRIVACY_SECRETS",
+        repr=False,
+        description="JSON array of retained privacy keys during contribution key rotation.",
+    )
     auth_token_ttl_seconds: int = Field(default=60 * 60 * 24 * 14, ge=300)
     auth_cookie_name: str = Field(default="tf_session")
     auth_cookie_secure: bool = Field(default=False)

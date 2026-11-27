@@ -28,7 +28,8 @@ from typing import Any, Final
 from geoalchemy2.shape import from_shape
 from pydantic import BaseModel, Field
 from shapely.geometry import box
-from sqlalchemy import func, or_, select
+from sqlalchemy import Text, any_, bindparam, func, or_, select
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -39,17 +40,25 @@ from trailforge.db.models import (
     ClosureAlert,
     ConditionReport,
     OfflinePack,
+    OfflinePackTelemetryRevision,
     SegmentClosureLink,
     Track,
     TrackSegment,
     TrackSegmentGrade,
 )
 from trailforge.feeds.queries import list_closures
+from trailforge.grading.live import LIVE_FORMULA_VERSION, MIN_PUBLIC_CONTRIBUTORS
 from trailforge.ingestion.terrain import read_raster_bounds
-from trailforge.packs.catalog import PACK_ATTRIBUTIONS, PackRegionSpec, get_pack_region
+from trailforge.packs.catalog import (
+    PACK_ATTRIBUTIONS,
+    PACK_REGIONS,
+    PackRegionSpec,
+    get_pack_region,
+)
 from trailforge.reports.queries import list_reports
 from trailforge.tiles.builder import (
     DEFAULT_SNOWLINE_BANDS_M,
+    STATIC_TILE_TELEMETRY_POLICY,
     TERRAIN_PMTILES_FILENAME,
     VECTOR_PMTILES_FILENAME,
     build_tiles,
@@ -61,6 +70,7 @@ MANIFEST_FILENAME: Final[str] = "manifest.json"
 SNAPSHOT_FILENAME: Final[str] = "snapshot.json"
 VECTOR_TILE_FILENAME: Final[str] = "vector.pmtiles"
 TERRAIN_TILE_FILENAME: Final[str] = "terrain.pmtiles"
+STATIC_PACK_TELEMETRY_POLICY: Final[str] = "static_v1"
 BUNDLE_FILENAME: Final[str] = "bundle.tar.gz"
 
 _HASH_CHUNK_BYTES: Final[int] = 65_536
@@ -86,6 +96,8 @@ class PackManifest(BaseModel):
     region_type: str
     version: str
     generated_at: str
+    community_telemetry_policy: str | None = None
+    community_telemetry_revision: uuid.UUID | None = None
     bbox: list[float] = Field(..., min_length=4, max_length=4)
     bounds: list[float] = Field(..., min_length=4, max_length=4)
     utm_zones: list[str] = Field(default_factory=list)
@@ -121,6 +133,70 @@ class PackBuildResult(BaseModel):
     terrain_pmtiles_path: Path | None = None
     manifest_sha256: str
     manifest: PackManifest
+
+
+def get_pack_telemetry_revision(session: Session, region_id: str) -> uuid.UUID | None:
+    return session.scalar(
+        select(OfflinePackTelemetryRevision.revision)
+        .where(OfflinePackTelemetryRevision.region_id == region_id)
+    )
+
+
+def _is_current_static_vector(path: Path) -> bool:
+    try:
+        manifest = json.loads(path.with_name("manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return (
+        isinstance(manifest, dict)
+        and manifest.get("community_telemetry_policy") == STATIC_TILE_TELEMETRY_POLICY
+    )
+
+
+def pack_manifest_is_current(manifest: PackManifest, revision: uuid.UUID | None) -> bool:
+    if manifest.community_telemetry_policy == LIVE_FORMULA_VERSION:
+        return manifest.community_telemetry_revision == revision
+    if manifest.community_telemetry_policy == STATIC_PACK_TELEMETRY_POLICY:
+        return True
+    # A legacy pack with no grades or vector tiles cannot contain trip telemetry.
+    return (
+        not manifest.vector_available
+        and VECTOR_TILE_FILENAME not in manifest.files
+        and all(manifest.counts.get(key) == 0 for key in ("tracks", "segments", "hotspots"))
+    )
+
+
+def invalidate_pack_telemetry(
+    session: Session, *, segment_ids: list[str], track_ids: list[str]
+) -> None:
+    """Invalidate regional files that may contain a withdrawn contribution's aggregates."""
+    if not segment_ids:
+        return
+    segments = bindparam("segment_ids", segment_ids, type_=ARRAY(Text()))
+    tracks = bindparam("track_ids", track_ids, type_=ARRAY(Text()))
+    affected_regions: list[str] = []
+    for region in PACK_REGIONS.values():
+        bounds = func.ST_MakeEnvelope(*region.bbox, 4326)
+        segment_hit = select(TrackSegment.segment_id).where(
+            TrackSegment.segment_id == any_(segments),
+            func.ST_Intersects(TrackSegment.geom, bounds),
+        ).exists()
+        track_hit = select(Track.track_id).where(
+            Track.track_id == any_(tracks),
+            func.ST_Intersects(Track.bbox_geom, bounds),
+        ).exists()
+        if session.scalar(select(or_(segment_hit, track_hit))):
+            affected_regions.append(region.region_id)
+    if affected_regions:
+        replacement = uuid.uuid4()
+        session.execute(
+            pg_insert(OfflinePackTelemetryRevision)
+            .values([{"region_id": rid, "revision": replacement} for rid in affected_regions])
+            .on_conflict_do_update(
+                index_elements=[OfflinePackTelemetryRevision.region_id],
+                set_={"revision": replacement},
+            )
+        )
 
 
 def get_packs_dir(override: Path | str | None = None) -> Path:
@@ -319,6 +395,7 @@ def _write_region_snapshot_streaming(
     *,
     version: str,
     generated_at: str,
+    include_community: bool = True,
 ) -> dict[str, int]:
     """Stream a complete offline region snapshot JSON directly to disk (O(1) item memory)."""
     # Local import avoids circular imports with api/tracks
@@ -388,7 +465,9 @@ def _write_region_snapshot_streaming(
         written_tracks = 0
         for start in range(0, len(track_ids), batch_size):
             chunk_ids = track_ids[start : start + batch_size]
-            details = get_track_details_batch(session, chunk_ids)
+            details = get_track_details_batch(
+                session, chunk_ids, include_community=include_community
+            )
             for detail in details:
                 track_dict = detail.model_dump(mode="json")
                 if written_tracks > 0:
@@ -544,6 +623,9 @@ def _write_region_snapshot_streaming(
                 TrackSegment.is_active.is_(True),
                 func.ST_Intersects(TrackSegment.geom, env_geom),
                 TrackSegmentGrade.is_obstacle_hotspot.is_(True),
+                TrackSegmentGrade.sample_count >= MIN_PUBLIC_CONTRIBUTORS,
+                TrackSegmentGrade.live_breakdown["version"].astext == LIVE_FORMULA_VERSION,
+                include_community,
             )
             .order_by(TrackSegment.track_id.asc(), TrackSegment.segment_seq.asc().nullslast())
         )
@@ -683,6 +765,8 @@ def _upsert_offline_pack_row(
     size_bytes: int,
     sha256_hex: str | None,
     built_at: datetime,
+    telemetry_revision: uuid.UUID | None = None,
+    telemetry_policy: str = LIVE_FORMULA_VERSION,
 ) -> None:
     bbox_poly = from_shape(box(*region.bbox), srid=4326)
     stmt = (
@@ -700,6 +784,8 @@ def _upsert_offline_pack_row(
             size_bytes=size_bytes,
             sha256=sha256_hex,
             attributions=list(region.attributions),
+            community_telemetry_policy=telemetry_policy,
+            community_telemetry_revision=telemetry_revision,
             status=status_val,
             built_at=built_at,
         )
@@ -717,6 +803,8 @@ def _upsert_offline_pack_row(
                 "size_bytes": size_bytes,
                 "sha256": sha256_hex,
                 "attributions": list(region.attributions),
+                "community_telemetry_policy": telemetry_policy,
+                "community_telemetry_revision": telemetry_revision,
                 "status": status_val,
                 "built_at": built_at,
             },
@@ -737,6 +825,7 @@ def build_regional_pack(
     prebuilt_vector_pmtiles: Path | str | None = None,
     prebuilt_terrain_pmtiles: Path | str | None = None,
     prebuilt_tile_bounds: list[float] | None = None,
+    static_only: bool = False,
 ) -> PackBuildResult:
     """Build a regional offline pack streaming disk-to-disk and record it in ``offline_packs``."""
     region = get_pack_region(region_id)
@@ -746,6 +835,11 @@ def build_regional_pack(
     now = datetime.now(UTC)
     resolved_version = version or now.strftime("%Y.%m.%d")
     generated_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    static_only = static_only or bool(get_settings().packs_public_base_url.strip())
+    policy = STATIC_PACK_TELEMETRY_POLICY if static_only else LIVE_FORMULA_VERSION
+    telemetry_revision = None if static_only else get_pack_telemetry_revision(
+        session, region.region_id
+    )
 
     staging_dir = packs_root / f".{region.region_id}.staging-{uuid.uuid4().hex[:8]}"
     staging_dir.mkdir(parents=True, exist_ok=True)
@@ -763,6 +857,7 @@ def build_regional_pack(
             staged_snapshot,
             version=resolved_version,
             generated_at=generated_at,
+            include_community=not static_only,
         )
 
         # 2. Reuse pre-built region PMTiles if supplied, otherwise build region-clipped PMTiles
@@ -784,6 +879,7 @@ def build_regional_pack(
                 prebuilt_vec is not None
                 and prebuilt_vec.is_file()
                 and prebuilt_vec.stat().st_size > 0
+                and _is_current_static_vector(prebuilt_vec)
             ):
                 shutil.copy2(prebuilt_vec, staging_dir / VECTOR_TILE_FILENAME)
                 vector_available = True
@@ -853,6 +949,8 @@ def build_regional_pack(
             attributions=list(region.attributions),
         )
 
+        manifest.community_telemetry_policy = policy
+        manifest.community_telemetry_revision = telemetry_revision
         staged_manifest = staging_dir / MANIFEST_FILENAME
         staged_manifest.write_text(manifest.model_dump_json(indent=2) + "\n", encoding="utf-8")
 
@@ -883,6 +981,8 @@ def build_regional_pack(
         manifest_sha256 = _sha256_file(staged_manifest)
 
         # 6. Atomically promote staging directory to <packs_root>/<region_id>
+        if not static_only and get_pack_telemetry_revision(session, rid) != telemetry_revision:
+            raise RuntimeError("Community contributions changed during the pack build. Retry.")
         target_dir = packs_root / rid
         _promote_staging_dir(staging_dir, target_dir)
 
@@ -898,6 +998,8 @@ def build_regional_pack(
             size_bytes=manifest.total_size_bytes,
             sha256_hex=manifest_sha256,
             built_at=now,
+            telemetry_revision=telemetry_revision,
+            telemetry_policy=policy,
         )
 
         return PackBuildResult(

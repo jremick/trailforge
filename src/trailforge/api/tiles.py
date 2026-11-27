@@ -26,7 +26,12 @@ from trailforge.ingestion.connectors.base import (
     ATTRIBUTION_OSM,
     ATTRIBUTION_VIC_DEECA,
 )
-from trailforge.tiles.builder import VECTOR_LAYER_ORDER
+from trailforge.tiles.builder import (
+    PUBLIC_VECTOR_PMTILES_FILENAME,
+    STATIC_TILE_TELEMETRY_POLICY,
+    VECTOR_LAYER_ORDER,
+    VECTOR_PMTILES_FILENAME,
+)
 
 router = APIRouter(prefix="/api/tiles", tags=["tiles"])
 
@@ -56,6 +61,14 @@ def get_tiles_dir() -> Path:
     return Path(get_settings().tiles_dir)
 
 
+def _load_tiles_manifest(tiles_dir: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads((tiles_dir / "manifest.json").read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
 def _resolve_allowed_pmtiles(tiles_dir: Path, filename: str) -> Path:
     """Validate filename against strict allowlist and ensure no path traversal."""
     if filename not in ALLOWED_PMTILES:
@@ -70,6 +83,11 @@ def _resolve_allowed_pmtiles(tiles_dir: Path, filename: str) -> Path:
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"PMTiles archive {filename!r} has not been generated yet",
         )
+    if filename == VECTOR_PMTILES_FILENAME and (
+        _load_tiles_manifest(base_dir).get("community_telemetry_policy")
+        != STATIC_TILE_TELEMETRY_POLICY
+    ):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Vector archive needs to be rebuilt")
     return target
 
 
@@ -164,10 +182,14 @@ def get_tiles_manifest(
 
     vector_path = tiles_dir / "trailforge_vector.pmtiles"
     terrain_path = tiles_dir / "trailforge_terrain.pmtiles"
-    manifest_path = tiles_dir / "manifest.json"
+    disk_manifest = _load_tiles_manifest(tiles_dir)
+    local_vector_current = (
+        vector_path.is_file()
+        and disk_manifest.get("community_telemetry_policy") == STATIC_TILE_TELEMETRY_POLICY
+    )
 
     default_vector_url = (
-        f"{public_base}/trailforge_vector.pmtiles"
+        f"{public_base}/{PUBLIC_VECTOR_PMTILES_FILENAME}"
         if cdn_offload
         else "/api/tiles/trailforge_vector.pmtiles"
     )
@@ -193,13 +215,7 @@ def get_tiles_manifest(
         "attributions": list(DEFAULT_ATTRIBUTIONS),
     }
 
-    if manifest_path.is_file():
-        try:
-            disk_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if isinstance(disk_manifest, dict):
-                payload.update(disk_manifest)
-        except (OSError, json.JSONDecodeError):
-            pass
+    payload.update(disk_manifest)
 
     # Always reflect live disk/CDN availability & canonical URLs
     payload["vector_url"] = default_vector_url
@@ -213,7 +229,7 @@ def get_tiles_manifest(
             if isinstance(disk_basemap, str) and disk_basemap.strip()
             else None
         )
-    payload["vector_available"] = vector_path.is_file() or cdn_offload
+    payload["vector_available"] = local_vector_current or cdn_offload
     payload["terrain_available"] = terrain_path.is_file() or cdn_offload
     payload["cdn_offload"] = cdn_offload
     if payload["vector_available"] and not payload.get("layers"):

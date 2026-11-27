@@ -49,6 +49,7 @@ services:
       SNOW_LINE_DEFAULT_M: ${SNOW_LINE_DEFAULT_M:-1000}
       AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:-trailforge-dev-secret-change-in-production}
       TRAILFORGE_PRIVACY_SECRET: ${TRAILFORGE_PRIVACY_SECRET:-trailforge-dev-privacy-secret-change-in-production}
+      TRAILFORGE_PREVIOUS_PRIVACY_SECRETS: "${TRAILFORGE_PREVIOUS_PRIVACY_SECRETS:-[]}"
       AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
       TRAILFORGE_ENABLE_LIVE_FEEDS: ${TRAILFORGE_ENABLE_LIVE_FEEDS:-false}
       # Public instance hardening (keep 'open' in local dev; use 'invite_only' on public hosts)
@@ -117,6 +118,7 @@ services:
       WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-30}
       PRIVACY_TRIM_METERS: ${PRIVACY_TRIM_METERS:-250}
       TRAILFORGE_PRIVACY_SECRET: ${TRAILFORGE_PRIVACY_SECRET:-trailforge-dev-privacy-secret-change-in-production}
+      TRAILFORGE_PREVIOUS_PRIVACY_SECRETS: "${TRAILFORGE_PREVIOUS_PRIVACY_SECRETS:-[]}"
       TRAILFORGE_ENABLE_LIVE_FEEDS: ${TRAILFORGE_ENABLE_LIVE_FEEDS:-false}
       TILES_DIR: ${TILES_DIR:-/data/tiles}
       PACKS_DIR: ${PACKS_DIR:-/data/packs}

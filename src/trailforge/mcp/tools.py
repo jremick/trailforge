@@ -116,6 +116,7 @@ from trailforge.routes.planner import (
     slugify_route_name,
     summarize_saved_routes,
 )
+from trailforge.tiles.builder import PUBLIC_VECTOR_PMTILES_FILENAME
 from trailforge.vehicles.classifier import (
     VALID_CAPABILITY_CLASSES,
     CapabilityClassLiteral,
@@ -721,7 +722,7 @@ def _build_tile_config(public_base_url: str) -> TileConfig | None:
     tiles_base = str(getattr(cfg, "tiles_public_base_url", "") or "").strip().rstrip("/")
     if tiles_base:
         return TileConfig(
-            vector_pmtiles_url=f"{tiles_base}/trailforge_vector.pmtiles",
+            vector_pmtiles_url=f"{tiles_base}/{PUBLIC_VECTOR_PMTILES_FILENAME}",
             terrain_pmtiles_url=f"{tiles_base}/trailforge_terrain.pmtiles",
             basemap_raster_url=None,
         )

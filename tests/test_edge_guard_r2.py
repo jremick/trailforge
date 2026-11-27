@@ -1152,7 +1152,9 @@ def test_tiles_manifest_r2_cdn_offload_and_local_fallback(
         assert r_cdn.status_code == 200
         body = r_cdn.json()
         assert body["cdn_offload"] is True
-        assert body["vector_url"] == "https://tiles.example.com/trailforge_vector.pmtiles"
+        assert body["vector_url"] == (
+            "https://tiles.example.com/trailforge_vector_baseline_weather_v1.pmtiles"
+        )
         assert body["terrain_url"] == "https://tiles.example.com/trailforge_terrain.pmtiles"
         assert body["vector_available"] is True
         assert body["terrain_available"] is True
@@ -1241,13 +1243,21 @@ def test_r2_sync_mock_http_streaming_etag_skip_and_cli_dry_run(tmp_path: Path) -
     tile_files = {
         "trailforge_vector.pmtiles": b"PMTilesVEC" + b"\x01" * 1024,
         "trailforge_terrain.pmtiles": b"PMTilesTER" + b"\x02" * 512,
-        "manifest.json": b'{"version":"1.1.0","bounds":[148.0,-36.7,148.2,-36.5]}\n',
+        "manifest.json": json.dumps({
+            "version": "1.1.0",
+            "bounds": [148.0, -36.7, 148.2, -36.5],
+            "community_telemetry_policy": "baseline_weather_v1",
+        }).encode(),
     }
     for fname, blob in tile_files.items():
         (tiles_dir / fname).write_bytes(blob)
 
     pack_files = {
-        "manifest.json": b'{"region_id":"australian-alps","version":"2026.11.26"}\n',
+        "manifest.json": json.dumps({
+            "region_id": "australian-alps",
+            "version": "2026.11.26",
+            "community_telemetry_policy": "static_v1",
+        }).encode(),
         "snapshot.json": b'{"tracks":[]}\n',
         "vector.pmtiles": b"PMTilesPACKV" + b"\x03" * 256,
         "terrain.pmtiles": b"PMTilesPACKT" + b"\x04" * 256,
@@ -1281,6 +1291,7 @@ def test_r2_sync_mock_http_streaming_etag_skip_and_cli_dry_run(tmp_path: Path) -
                 headers={
                     "Content-Length": str(len(obj["body"])),
                     "ETag": f'"{obj["md5"]}"',
+                    "Cache-Control": obj["cache_control"],
                 },
             )
         if request.method == "PUT":
@@ -1313,24 +1324,25 @@ def test_r2_sync_mock_http_streaming_etag_skip_and_cli_dry_run(tmp_path: Path) -
         assert res1["uploaded"] == 8
         assert res1["skipped"] == 0
 
-        assert stored_objects["trailforge_vector.pmtiles"]["content_type"] == (
+        vector_key = "trailforge_vector_baseline_weather_v1.pmtiles"
+        assert stored_objects[vector_key]["content_type"] == (
             "application/vnd.pmtiles"
         )
-        assert stored_objects["trailforge_vector.pmtiles"]["cache_control"] == (
+        assert stored_objects[vector_key]["cache_control"] == (
             "public, max-age=86400"
         )
-        assert stored_objects["trailforge_vector.pmtiles"]["body"] == (
+        assert stored_objects[vector_key]["body"] == (
             tile_files["trailforge_vector.pmtiles"]
         )
         assert stored_objects["manifest.json"]["content_type"] == "application/json"
         assert stored_objects["manifest.json"]["cache_control"] == "public, max-age=300"
-        assert stored_objects["australian-alps/bundle.tar.gz"]["content_type"] == (
+        assert stored_objects["australian-alps/static_v1/bundle.tar.gz"]["content_type"] == (
             "application/gzip"
         )
-        assert stored_objects["australian-alps/bundle.tar.gz"]["cache_control"] == (
-            "public, max-age=86400"
+        assert stored_objects["australian-alps/static_v1/bundle.tar.gz"]["cache_control"] == (
+            "no-store"
         )
-        assert stored_objects["australian-alps/vector.pmtiles"]["content_type"] == (
+        assert stored_objects["australian-alps/static_v1/vector.pmtiles"]["content_type"] == (
             "application/vnd.pmtiles"
         )
 
@@ -1350,7 +1362,7 @@ def test_r2_sync_mock_http_streaming_etag_skip_and_cli_dry_run(tmp_path: Path) -
         assert all(method == "HEAD" for method, _ in recorded_calls)
 
         # 3. Same-length content mutation triggers single re-upload via MD5 ETag mismatch
-        updated_manifest = b'{"version":"1.1.1","bounds":[148.0,-36.7,148.2,-36.5]}\n'
+        updated_manifest = tile_files["manifest.json"].replace(b"1.1.0", b"1.1.1")
         assert len(updated_manifest) == len(tile_files["manifest.json"])
         (tiles_dir / "manifest.json").write_bytes(updated_manifest)
         res3 = r2_sync.sync_to_r2(
@@ -1408,8 +1420,8 @@ def test_r2_sync_mock_http_streaming_etag_skip_and_cli_dry_run(tmp_path: Path) -
     assert cli_summary["total_files"] == 8
     assert cli_summary["planned"] == 8
     keys = {item["object_key"] for item in cli_summary["items"]}
-    assert "trailforge_vector.pmtiles" in keys
-    assert "australian-alps/bundle.tar.gz" in keys
+    assert "trailforge_vector_baseline_weather_v1.pmtiles" in keys
+    assert "australian-alps/static_v1/bundle.tar.gz" in keys
 
 
 # -----------------------------------------------------------------------------

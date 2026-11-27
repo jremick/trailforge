@@ -140,6 +140,7 @@ def test_packs_public_base_url_emits_r2_urls_and_default_relative_urls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from trailforge.api.packs import _build_region_summary
+    from trailforge.db.models import OfflinePack
     from trailforge.packs.catalog import get_pack_region
 
     region = get_pack_region("australian-alps")
@@ -158,18 +159,18 @@ def test_packs_public_base_url_emits_r2_urls_and_default_relative_urls(
 
     monkeypatch.setenv("PACKS_PUBLIC_BASE_URL", "https://packs.example.com/")
     get_settings.cache_clear()
-    r2_summary = _build_region_summary(region, tmp_path, None)
-    assert r2_summary["manifest_url"] == "https://packs.example.com/australian-alps/manifest.json"
-    assert r2_summary["snapshot_url"] == "https://packs.example.com/australian-alps/snapshot.json"
-    assert r2_summary["bundle_url"] == "https://packs.example.com/australian-alps/bundle.tar.gz"
-    assert (
-        r2_summary["vector_pmtiles_url"]
-        == "https://packs.example.com/australian-alps/vector.pmtiles"
+    assert _build_region_summary(region, tmp_path, None)["status"] == "not_built"
+    published = OfflinePack(
+        status="ready", version="test", community_telemetry_policy="static_v1",
     )
-    assert (
-        r2_summary["terrain_pmtiles_url"]
-        == "https://packs.example.com/australian-alps/terrain.pmtiles"
-    )
+    r2_summary = _build_region_summary(region, tmp_path, published)
+    assert r2_summary["status"] == "ready"
+    prefix = "https://packs.example.com/australian-alps/static_v1"
+    assert r2_summary["manifest_url"] == f"{prefix}/manifest.json"
+    assert r2_summary["snapshot_url"] == f"{prefix}/snapshot.json"
+    assert r2_summary["bundle_url"] == f"{prefix}/bundle.tar.gz"
+    assert r2_summary["vector_pmtiles_url"] == f"{prefix}/vector.pmtiles"
+    assert r2_summary["terrain_pmtiles_url"] == f"{prefix}/terrain.pmtiles"
     get_settings.cache_clear()
 
 

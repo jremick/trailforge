@@ -67,6 +67,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Export snapshot, manifest, and bundle without building PMTiles.",
     )
+    parser.add_argument(
+        "--static-only",
+        action="store_true",
+        help="Exclude community-trip telemetry from a pack intended for public CDN hosting.",
+    )
     return parser
 
 
@@ -88,6 +93,7 @@ def main(argv: list[str] | None = None) -> int:
                     dem_path=args.dem,
                     version=args.version,
                     skip_tiles=args.skip_tiles,
+                    static_only=args.static_only,
                 )
                 results_summary.append(
                     {

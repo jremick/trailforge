@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import sys
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -19,11 +20,19 @@ from typing import Any
 from geoalchemy2.shape import from_shape
 from shapely.geometry import Point
 from sqlalchemy import delete, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from trailforge.db.models import TelemetryObservation, TrackSegment
+from trailforge.config import get_settings
+from trailforge.db.models import TelemetryObservation, TrackSegment, Trip, User
 from trailforge.db.session import get_engine
-from trailforge.matching import PostGISHMMMatcher, parse_gpx, trim_privacy_buffer
+from trailforge.matching import (
+    PostGISHMMMatcher,
+    compute_contribution_hash,
+    parse_gpx,
+    trim_privacy_buffer,
+)
+from trailforge.matching.contribution_keys import contribution_key_id, trip_contribution_hash
 
 _DEMO_PROFILES: tuple[dict[str, Any], ...] = (
     {
@@ -118,8 +127,43 @@ def seed_demo_telemetry(
     )
 
     inserted = 0
+    key = get_settings().privacy_secret_key
+    canonical_geom = session.scalar(select(TrackSegment.geom).where(
+        TrackSegment.segment_id == match_res.matched_segments[0].segment_id
+    ))
     for prof in _DEMO_PROFILES:
-        chash = _demo_hash(prof["tag"])
+        user_id = uuid.uuid5(uuid.NAMESPACE_URL, f"trailforge:demo:driver:{prof['tag']}")
+        trip_id = uuid.uuid5(uuid.NAMESPACE_URL, f"trailforge:demo:trip:{prof['tag']}")
+        nonce = uuid.uuid5(uuid.NAMESPACE_URL, f"trailforge:demo:nonce:{prof['tag']}")
+        chash = compute_contribution_hash(key, trip_id, nonce)
+        prior_trip = session.get(Trip, trip_id)
+        if prior_trip is not None:
+            session.execute(delete(TelemetryObservation).where(
+                TelemetryObservation.contribution_hash == trip_contribution_hash(prior_trip)
+            ))
+        # Synthetic accounts cannot sign in. Their logbook placeholder is public canonical
+        # geometry, so passing a custom demo input never adds a raw GPS trace to the logbook.
+        session.execute(pg_insert(User).values(
+            id=user_id,
+            email=f"demo-{prof['tag']}@example.invalid",
+            display_name="Synthetic Demo Driver",
+            password_hash="disabled",
+            is_active=False,
+        ).on_conflict_do_nothing(index_elements=[User.id]))
+        session.execute(pg_insert(Trip).values(
+            id=trip_id,
+            user_id=user_id,
+            visibility="community_anonymous",
+            contribution_key_id=contribution_key_id(key),
+            contribution_nonce=nonce,
+            community_consent_confirmed=True,
+            vehicle_capability_class=prof["vehicle_class"],
+            raw_geom=canonical_geom,
+            match_status="matched",
+        ).on_conflict_do_update(
+            index_elements=[Trip.id],
+            set_={"contribution_key_id": contribution_key_id(key), "contribution_nonce": nonce},
+        ))
         obs_base = ref_now - timedelta(days=int(prof["days_ago"]))
         t0 = match_res.matched_segments[0].entry_at
 

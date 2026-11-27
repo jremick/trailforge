@@ -6,6 +6,7 @@ import json
 import os
 import re
 import threading
+import uuid
 from collections.abc import Iterator
 from datetime import UTC
 from pathlib import Path
@@ -19,17 +20,20 @@ from sqlalchemy.orm import Session
 
 from trailforge.auth.dependencies import require_admin
 from trailforge.config import get_settings
-from trailforge.db.models import OfflinePack, User
+from trailforge.db.models import OfflinePack, OfflinePackTelemetryRevision, User
 from trailforge.db.session import get_db
 from trailforge.packs.builder import (
     BUNDLE_FILENAME,
     MANIFEST_FILENAME,
     SNAPSHOT_FILENAME,
+    STATIC_PACK_TELEMETRY_POLICY,
     TERRAIN_TILE_FILENAME,
     VECTOR_TILE_FILENAME,
     build_regional_pack,
+    get_pack_telemetry_revision,
     get_packs_dir,
     load_pack_manifest,
+    pack_manifest_is_current,
 )
 from trailforge.packs.catalog import (
     PACK_REGIONS,
@@ -174,6 +178,14 @@ def _resolve_pack_tile(packs_dir: Path, region_id: str, filename: str) -> Path:
     return _resolve_pack_file(packs_dir, region_id, filename)
 
 
+def _require_current_pack(packs_dir: Path, region_id: str, db: Session) -> None:
+    manifest = load_pack_manifest(packs_dir, region_id)
+    if manifest is None or not pack_manifest_is_current(
+        manifest, get_pack_telemetry_revision(db, region_id)
+    ):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Pack needs to be rebuilt")
+
+
 def _compute_etag(file_path: Path) -> tuple[str, int]:
     st = file_path.stat()
     etag = f'"{st.st_size:x}-{st.st_mtime_ns:x}"'
@@ -264,6 +276,7 @@ def _build_region_summary(
     region: PackRegionSpec,
     packs_dir: Path,
     db_row: OfflinePack | None,
+    telemetry_revision: uuid.UUID | None = None,
 ) -> dict[str, Any]:
     rid = region.region_id
     manifest = load_pack_manifest(packs_dir, rid)
@@ -273,7 +286,7 @@ def _build_region_summary(
     terrain_path = region_dir / TERRAIN_TILE_FILENAME
     public_base = _get_packs_public_base_url()
 
-    if manifest is not None:
+    if manifest is not None and pack_manifest_is_current(manifest, telemetry_revision):
         pack_status = "ready"
         version = manifest.version
         generated_at = manifest.generated_at
@@ -288,7 +301,13 @@ def _build_region_summary(
         terrain_available = terrain_path.is_file()
         bounds = manifest.bounds
         attributions = manifest.attributions
-    elif public_base and db_row is not None and db_row.status == "ready":
+    elif (
+        manifest is None
+        and public_base
+        and db_row is not None
+        and db_row.status == "ready"
+        and db_row.community_telemetry_policy == STATIC_PACK_TELEMETRY_POLICY
+    ):
         pack_status = "ready"
         version = db_row.version
         generated_at = (
@@ -328,12 +347,13 @@ def _build_region_summary(
         bounds = list(region.bbox)
         attributions = list(region.attributions)
 
-    if public_base:
-        manifest_url = f"{public_base}/{rid}/{MANIFEST_FILENAME}"
-        snapshot_url = f"{public_base}/{rid}/{SNAPSHOT_FILENAME}"
-        bundle_url = f"{public_base}/{rid}/{BUNDLE_FILENAME}"
-        vector_pmtiles_url = f"{public_base}/{rid}/{VECTOR_TILE_FILENAME}"
-        terrain_pmtiles_url = f"{public_base}/{rid}/{TERRAIN_TILE_FILENAME}"
+    if public_base and manifest is None and pack_status == "ready":
+        remote = f"{public_base}/{rid}/{STATIC_PACK_TELEMETRY_POLICY}"
+        manifest_url = f"{remote}/{MANIFEST_FILENAME}"
+        snapshot_url = f"{remote}/{SNAPSHOT_FILENAME}"
+        bundle_url = f"{remote}/{BUNDLE_FILENAME}"
+        vector_pmtiles_url = f"{remote}/{VECTOR_TILE_FILENAME}"
+        terrain_pmtiles_url = f"{remote}/{TERRAIN_TILE_FILENAME}"
     else:
         manifest_url = f"/api/packs/{rid}/{MANIFEST_FILENAME}"
         snapshot_url = f"/api/packs/{rid}/{SNAPSHOT_FILENAME}"
@@ -354,6 +374,15 @@ def _build_region_summary(
         "estimated_size_hint": region.estimated_size_hint,
         "status": pack_status,
         "version": version,
+        "community_telemetry_policy": (
+            manifest.community_telemetry_policy if manifest is not None and pack_status == "ready"
+            else db_row.community_telemetry_policy if db_row is not None and pack_status == "ready"
+            else None
+        ),
+        "community_telemetry_revision": (
+            manifest.community_telemetry_revision
+            if manifest is not None and pack_status == "ready" else None
+        ),
         "generated_at": generated_at,
         "total_size_bytes": total_size_bytes,
         "bundle_size_bytes": bundle_size_bytes,
@@ -380,8 +409,14 @@ def list_packs(
     rows_by_id = {
         row.pack_id: row for row in db.execute(select(OfflinePack)).scalars().all()
     }
+    revisions = dict(db.execute(select(
+        OfflinePackTelemetryRevision.region_id, OfflinePackTelemetryRevision.revision
+    )).all())
     regions = [
-        _build_region_summary(region, packs_dir, rows_by_id.get(region.region_id))
+        _build_region_summary(
+            region, packs_dir, rows_by_id.get(region.region_id),
+            revisions.get(region.region_id),
+        )
         for region in list_pack_regions()
     ]
     return {"regions": regions}
@@ -416,7 +451,9 @@ def build_pack_endpoint(
             skip_tiles=req.skip_tiles,
         )
         db_row = db.get(OfflinePack, region.region_id)
-        summary = _build_region_summary(region, packs_dir, db_row)
+        summary = _build_region_summary(
+            region, packs_dir, db_row, get_pack_telemetry_revision(db, region.region_id)
+        )
         summary["manifest_sha256"] = result.manifest_sha256
         summary["manifest"] = result.manifest.model_dump(mode="json")
         return summary
@@ -428,13 +465,15 @@ def build_pack_endpoint(
 def get_pack_manifest_endpoint(
     region_id: str,
     packs_dir: Path = Depends(get_packs_dir_dep),
+    db: Session = Depends(get_db),
 ) -> JSONResponse:
     """Return a built regional pack's ``manifest.json`` with SHA-256 checksums & attributions."""
     manifest_path = _resolve_pack_file(packs_dir, region_id, MANIFEST_FILENAME)
+    _require_current_pack(packs_dir, _validate_region_id(region_id).region_id, db)
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     return JSONResponse(
         content=payload,
-        headers={"Cache-Control": "no-cache"},
+        headers={"Cache-Control": "no-store"},
     )
 
 
@@ -443,13 +482,15 @@ def get_pack_snapshot_endpoint(
     region_id: str,
     request: Request,
     packs_dir: Path = Depends(get_packs_dir_dep),
+    db: Session = Depends(get_db),
 ) -> Response:
     """Stream a built regional pack's compact offline ``snapshot.json`` with ETag/304 support."""
     snapshot_path = _resolve_pack_file(packs_dir, region_id, SNAPSHOT_FILENAME)
+    _require_current_pack(packs_dir, _validate_region_id(region_id).region_id, db)
     etag, file_size = _compute_etag(snapshot_path)
     headers = {
         "ETag": etag,
-        "Cache-Control": "public, max-age=300",
+        "Cache-Control": "no-store",
     }
     if_none_match = (request.headers.get("if-none-match") or "").strip()
     if if_none_match and (if_none_match == etag or if_none_match == f"W/{etag}"):
@@ -470,14 +511,17 @@ def head_pack_pmtiles(
     filename: str,
     request: Request,
     packs_dir: Path = Depends(get_packs_dir_dep),
+    db: Session = Depends(get_db),
 ) -> Response:
     """Return Range-capable metadata headers for a regional pack's PMTiles archive."""
     target = _resolve_pack_tile(packs_dir, region_id, filename)
+    if filename == VECTOR_TILE_FILENAME:
+        _require_current_pack(packs_dir, _validate_region_id(region_id).region_id, db)
     etag, file_size = _compute_etag(target)
     headers = {
         "Accept-Ranges": "bytes",
         "ETag": etag,
-        "Cache-Control": "public, max-age=300",
+        "Cache-Control": "no-store" if filename == VECTOR_TILE_FILENAME else "public, max-age=300",
         "Content-Type": "application/vnd.pmtiles",
         "Content-Length": str(file_size),
     }
@@ -501,15 +545,18 @@ def get_pack_pmtiles(
     filename: str,
     request: Request,
     packs_dir: Path = Depends(get_packs_dir_dep),
+    db: Session = Depends(get_db),
 ) -> Response:
     """Stream full or RFC 9110 byte-range sliced regional pack PMTiles archive."""
     target = _resolve_pack_tile(packs_dir, region_id, filename)
+    if filename == VECTOR_TILE_FILENAME:
+        _require_current_pack(packs_dir, _validate_region_id(region_id).region_id, db)
     etag, file_size = _compute_etag(target)
 
     base_headers = {
         "Accept-Ranges": "bytes",
         "ETag": etag,
-        "Cache-Control": "public, max-age=300",
+        "Cache-Control": "no-store" if filename == VECTOR_TILE_FILENAME else "public, max-age=300",
     }
 
     range_header = request.headers.get("range")
@@ -547,10 +594,12 @@ def get_pack_pmtiles(
 def get_pack_bundle_endpoint(
     region_id: str,
     packs_dir: Path = Depends(get_packs_dir_dep),
+    db: Session = Depends(get_db),
 ) -> StreamingResponse:
     """Stream a built regional pack's downloadable ``bundle.tar.gz`` archive."""
     region = _validate_region_id(region_id)
     bundle_path = _resolve_pack_file(packs_dir, region.region_id, BUNDLE_FILENAME)
+    _require_current_pack(packs_dir, region.region_id, db)
     etag, file_size = _compute_etag(bundle_path)
     return StreamingResponse(
         _stream_file_slice(bundle_path, 0, file_size),
@@ -561,6 +610,6 @@ def get_pack_bundle_endpoint(
             "Content-Disposition": (
                 f'attachment; filename="trailforge-pack-{region.region_id}.tar.gz"'
             ),
-            "Cache-Control": "public, max-age=300",
+            "Cache-Control": "no-store",
         },
     )

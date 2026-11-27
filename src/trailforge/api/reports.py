@@ -44,6 +44,7 @@ from trailforge.db.models import (
 from trailforge.db.session import get_db
 from trailforge.reports.decay import (
     DEFAULT_SEVERITY_BY_TYPE,
+    MIN_RESOLVE_ACCOUNT_AGE,
     ReportSeverityLiteral,
     ReportTypeLiteral,
     build_osm_links,
@@ -549,6 +550,7 @@ def vote_on_report(
     report = db.execute(
         select(ConditionReport)
         .where(ConditionReport.id == rid, ConditionReport.status != "hidden")
+        .with_for_update(key_share=True)
         .limit(1)
     ).scalar_one_or_none()
     if report is None:
@@ -598,14 +600,18 @@ def vote_on_report(
             db.flush()
 
     votes = db.execute(
-        select(ConditionReportVote.vote_type, ConditionReportVote.created_at).where(
-            ConditionReportVote.report_id == rid
-        )
+        select(ConditionReportVote.vote_type, ConditionReportVote.created_at, User.created_at)
+        .join(User, User.id == ConditionReportVote.user_id)
+        .where(ConditionReportVote.report_id == rid)
     ).all()
 
-    confirm_count = sum(1 for vtype, _ in votes if vtype == "confirm")
-    resolved_count = sum(1 for vtype, _ in votes if vtype == "resolved")
-    confirm_timestamps = [ts for vtype, ts in votes if vtype == "confirm" and ts is not None]
+    confirm_timestamps = [ts for vtype, ts, _ in votes if vtype == "confirm"]
+    confirm_count = len(confirm_timestamps)
+    resolved_count = sum(1 for vtype, _, _ in votes if vtype == "resolved")
+    eligible_resolve_count = sum(
+        1 for vtype, ts, joined_at in votes
+        if vtype == "resolved" and ts - joined_at >= MIN_RESOLVE_ACCOUNT_AGE
+    )
     last_confirmed_at = max(confirm_timestamps) if confirm_timestamps else None
 
     created_ref = report.created_at
@@ -627,13 +633,14 @@ def vote_on_report(
         created_at=base_ts,
         last_confirmed_at=last_confirmed_at,
         confirm_count=confirm_count,
-        resolved_count=resolved_count,
+        resolved_count=eligible_resolve_count,
         status="active",
         now=now,
     )
 
     report.confirm_count = confirm_count
     report.resolve_count = resolved_count
+    report.eligible_resolve_count = eligible_resolve_count
     report.decay_score = decay.freshness_score
     report.status = decay.effective_status
     report.expires_at = compute_expires_at(report.report_type, last_confirmed_at or base_ts)

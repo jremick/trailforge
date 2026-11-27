@@ -26,6 +26,12 @@ from urllib.parse import quote, urlsplit
 import httpx
 
 from trailforge.config import get_settings
+from trailforge.packs.builder import STATIC_PACK_TELEMETRY_POLICY
+from trailforge.tiles.builder import (
+    PUBLIC_VECTOR_PMTILES_FILENAME,
+    STATIC_TILE_TELEMETRY_POLICY,
+    VECTOR_PMTILES_FILENAME,
+)
 
 EMPTY_PAYLOAD_SHA256: Final[str] = (
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -36,17 +42,17 @@ DEFAULT_R2_SERVICE: Final[str] = "s3"
 _STREAM_CHUNK_BYTES: Final[int] = 65_536
 
 TILE_ARTIFACTS: Final[tuple[tuple[str, str, str], ...]] = (
-    ("trailforge_vector.pmtiles", "application/vnd.pmtiles", "public, max-age=86400"),
+    (VECTOR_PMTILES_FILENAME, "application/vnd.pmtiles", "public, max-age=86400"),
     ("trailforge_terrain.pmtiles", "application/vnd.pmtiles", "public, max-age=86400"),
     ("manifest.json", "application/json", "public, max-age=300"),
 )
 
 PACK_ARTIFACTS: Final[tuple[tuple[str, str, str], ...]] = (
-    ("manifest.json", "application/json", "public, max-age=300"),
-    ("snapshot.json", "application/json", "public, max-age=300"),
-    ("vector.pmtiles", "application/vnd.pmtiles", "public, max-age=86400"),
+    ("manifest.json", "application/json", "no-store"),
+    ("snapshot.json", "application/json", "no-store"),
+    ("vector.pmtiles", "application/vnd.pmtiles", "no-store"),
     ("terrain.pmtiles", "application/vnd.pmtiles", "public, max-age=86400"),
-    ("bundle.tar.gz", "application/gzip", "public, max-age=86400"),
+    ("bundle.tar.gz", "application/gzip", "no-store"),
 )
 
 
@@ -210,6 +216,14 @@ def _join_key(prefix: str, key: str) -> str:
     return f"{clean_prefix}/{clean_key}" if clean_prefix else clean_key
 
 
+def _manifest_policy_is(path: Path, expected: str) -> bool:
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        return isinstance(manifest, dict) and manifest.get("community_telemetry_policy") == expected
+    except (OSError, ValueError):
+        return False
+
+
 def discover_sync_artifacts(
     *,
     tiles_dir: Path | str | None = None,
@@ -225,12 +239,19 @@ def discover_sync_artifacts(
         tdir = Path(tiles_dir).expanduser()
         if tdir.is_dir():
             for filename, content_type, cache_control in TILE_ARTIFACTS:
+                key_filename = filename
+                if filename == VECTOR_PMTILES_FILENAME:
+                    if not _manifest_policy_is(
+                        tdir / "manifest.json", STATIC_TILE_TELEMETRY_POLICY
+                    ):
+                        continue
+                    key_filename = PUBLIC_VECTOR_PMTILES_FILENAME
                 fpath = tdir / filename
                 if fpath.is_file():
                     artifacts.append(
                         R2SyncArtifact(
                             local_path=fpath,
-                            object_key=_join_key(tiles_prefix, filename),
+                            object_key=_join_key(tiles_prefix, key_filename),
                             content_type=content_type,
                             cache_control=cache_control,
                             size_bytes=int(fpath.stat().st_size),
@@ -251,13 +272,20 @@ def discover_sync_artifacts(
                 if not rdir.is_dir():
                     continue
                 rid = rdir.name
+                current_policy = _manifest_policy_is(
+                    rdir / "manifest.json", STATIC_PACK_TELEMETRY_POLICY
+                )
                 for filename, content_type, cache_control in PACK_ARTIFACTS:
+                    if not current_policy and filename != "terrain.pmtiles":
+                        continue
                     fpath = rdir / filename
                     if fpath.is_file():
                         artifacts.append(
                             R2SyncArtifact(
                                 local_path=fpath,
-                                object_key=_join_key(packs_prefix, f"{rid}/{filename}"),
+                                object_key=_join_key(
+                                    packs_prefix, f"{rid}/{STATIC_PACK_TELEMETRY_POLICY}/{filename}"
+                                ),
                                 content_type=content_type,
                                 cache_control=cache_control,
                                 size_bytes=int(fpath.stat().st_size),
@@ -273,6 +301,8 @@ def _remote_matches_local(
 ) -> bool:
     """Return True when remote R2 object metadata proves the artifact is unchanged."""
     if head_resp.status_code != 200:
+        return False
+    if head_resp.headers.get("cache-control") != artifact.cache_control:
         return False
 
     raw_len = head_resp.headers.get("content-length")

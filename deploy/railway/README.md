@@ -207,7 +207,7 @@ Verify R2 serves HTTP `206 Partial Content` with CORS headers:
 curl -sSI \
   -H "Origin: https://trails.example.com" \
   -H "Range: bytes=0-127" \
-  "https://tiles.example.com/trailforge_vector.pmtiles"
+  "https://tiles.example.com/trailforge_vector_baseline_weather_v1.pmtiles"
 ```
 
 Confirm `HTTP/2 206`, `access-control-allow-origin: https://trails.example.com`, `content-range:`, `accept-ranges: bytes`, and `etag:` appear in the response.

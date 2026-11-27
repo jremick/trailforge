@@ -265,9 +265,7 @@ def test_checkpoint_c_full_v1_pipeline_end_to_end(
                 assert det["sample_count"] >= 6
                 assert det["avg_speed_kmh"] is not None and det["avg_speed_kmh"] > 0
                 assert det["est_duration_min"] is not None and det["est_duration_min"] > 0
-                assert det["vehicle_class_split"]["Touring 4WD"]["count"] > 0
-                assert det["vehicle_class_split"]["Stock 4WD"]["count"] > 0
-                assert det["vehicle_class_split"]["Modified 4WD"]["count"] > 0
+                assert all(cell["count"] == 0 for cell in det["vehicle_class_split"].values())
                 assert det["rainfall_context"]["wet_risk_level"] == "wet"
                 assert "Open-Meteo" in det["rainfall_context"]["attribution"]
                 assert len(det["obstacle_hotspots"]) >= 1

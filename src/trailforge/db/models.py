@@ -17,6 +17,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Computed,
     Date,
     DateTime,
     Double,
@@ -1130,6 +1131,7 @@ class Trip(Base):
             name="match_status_valid",
         ),
         UniqueConstraint("user_id", "client_uuid", name="uq_trips_user_client_uuid"),
+        Index("ix_trips_contribution_key_id", "contribution_key_id"),
         Index("ix_trips_raw_geom", "raw_geom", postgresql_using="gist"),
         Index("ix_trips_trimmed_geom", "trimmed_geom", postgresql_using="gist"),
         Index("ix_trips_user_created", "user_id", text("created_at DESC")),
@@ -1154,6 +1156,10 @@ class Trip(Base):
     )
     contribution_nonce: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), nullable=False, server_default=text("gen_random_uuid()")
+    )
+    contribution_key_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    community_consent_confirmed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
     )
     raw_geom: Mapped[Any] = mapped_column(
         Geometry("LINESTRING", srid=4326, spatial_index=False), nullable=False, deferred=True
@@ -1258,6 +1264,12 @@ class UnmappedTrackCandidate(Base):
         Index("ix_unmapped_track_candidates_geom", "geom", postgresql_using="gist"),
         Index("ix_unmapped_track_candidates_contribution_hash", "contribution_hash"),
         Index("ix_unmapped_track_candidates_status_cluster", "status", "cluster_key"),
+        Index(
+            "ix_unmapped_track_candidates_public_recent",
+            text("created_at DESC"),
+            text("id DESC"),
+            postgresql_where=text("status <> 'rejected'"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -1269,6 +1281,18 @@ class UnmappedTrackCandidate(Base):
     length_m: Mapped[float] = mapped_column(Double, nullable=False)
     observed_date: Mapped[date] = mapped_column(Date, nullable=False)
     cluster_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    public_cell_lon: Mapped[float] = mapped_column(
+        Double, Computed(
+            "ST_X(ST_SnapToGrid(ST_LineInterpolatePoint(geom, 0.5), 0.02))", persisted=True
+        ),
+        nullable=False,
+    )
+    public_cell_lat: Mapped[float] = mapped_column(
+        Double, Computed(
+            "ST_Y(ST_SnapToGrid(ST_LineInterpolatePoint(geom, 0.5), 0.02))", persisted=True
+        ),
+        nullable=False,
+    )
     status: Mapped[str] = mapped_column(
         Text, nullable=False, server_default=text("'pending_review'")
     )
@@ -1341,6 +1365,9 @@ class ConditionReport(Base):
     )
     confirm_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     resolve_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    eligible_resolve_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
     decay_score: Mapped[float] = mapped_column(Double, nullable=False, server_default=text("1.0"))
     osm_edit_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     observed_at: Mapped[datetime] = mapped_column(
@@ -1446,10 +1473,23 @@ class OfflinePack(Base):
     attributions: Mapped[list[Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )
+    community_telemetry_policy: Mapped[str | None] = mapped_column(Text, nullable=True)
+    community_telemetry_revision: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'building'"))
     built_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class OfflinePackTelemetryRevision(Base):
+    """Latest community withdrawal affecting a pack region, including unbuilt regions."""
+
+    __tablename__ = "offline_pack_telemetry_revisions"
+
+    region_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    revision: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
 
 
 class PlannedRoute(Base):
@@ -1498,6 +1538,7 @@ __all__ = [
     "OAuthClient",
     "OAuthToken",
     "OfflinePack",
+    "OfflinePackTelemetryRevision",
     "POI",
     "PersonalAccessToken",
     "PlannedRoute",

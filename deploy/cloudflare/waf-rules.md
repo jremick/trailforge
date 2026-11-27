@@ -107,7 +107,7 @@ Open **Cloudflare Dashboard -> Caching -> Cache Rules -> Create rule**:
   ```
 - **Cache eligibility:** `Eligible for cache`
 - **Edge TTL:** `Use cache-control header if present, bypass cache if not`
-  *(TrailForge's `python -m trailforge.packs.r2_sync` sets `Cache-Control: public, max-age=86400` on `*.pmtiles` and `*.tar.gz`, and `Cache-Control: public, max-age=300` on `manifest.json` / `snapshot.json`.)*
+  The sync command caches the baseline vector and terrain archives and sends `Cache-Control: no-store` for regional pack metadata and bundles. Rebuild and replace legacy objects as described in [Community telemetry privacy](../../docs/COMMUNITY_PRIVACY.md).
 - **Browser TTL:** `Respect origin`
 
 ### 3.3 Protect Binary `Range` / `206 Partial Content` Integrity
@@ -118,7 +118,7 @@ Open **Cloudflare Dashboard -> Caching -> Cache Rules -> Create rule**:
    curl -sSI \
      -H "Origin: https://trails.example.com" \
      -H "Range: bytes=0-127" \
-     "https://tiles.example.com/trailforge_vector.pmtiles"
+     "https://tiles.example.com/trailforge_vector_baseline_weather_v1.pmtiles"
    ```
    Expected response headers:
    - `HTTP/2 206`

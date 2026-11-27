@@ -1125,13 +1125,9 @@ export class TrailForgeMap {
 
     if (layerId === "tf-unmapped-line") {
       this.map.getCanvas().style.cursor = "pointer";
-      const count =
-        typeof props.observation_count === "number"
-          ? `${props.observation_count} trace${props.observation_count === 1 ? "" : "s"}`
-          : "Anonymized spur";
       updateHoverPopup(
-        `<div class="tf-popup-title">Unmapped Track Candidate</div>
-         <div class="tf-popup-meta">${escapeHtml(count)} · Off-network telemetry</div>`
+        `<div class="tf-popup-title">Possible Unmapped Track Area</div>
+         <div class="tf-popup-meta">Approximate area · Community telemetry</div>`
       );
       return;
     }
