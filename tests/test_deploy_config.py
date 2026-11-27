@@ -213,6 +213,17 @@ def test_release_images_workflow_multiarch_oci_and_prerelease_guard() -> None:
         assert "type=gha" in str(build_with["cache-from"])
         assert "type=gha" in str(build_with["cache-to"])
 
+    # Optional Railway instant redeploy job: stable releases only, secret-gated, no hardcoded IDs
+    assert "deploy-railway" in jobs
+    deploy_job = jobs["deploy-railway"]
+    assert set(deploy_job["needs"]) == {"resolve-tag", "build-backend"}
+    assert "needs.resolve-tag.outputs.is_stable == 'true'" in str(deploy_job["if"])
+    deploy_step = deploy_job["steps"][0]
+    assert deploy_step["env"]["RAILWAY_TOKEN"] == "${{ secrets.RAILWAY_TOKEN }}"
+    deploy_run = str(deploy_step["run"])
+    assert 'if [ -z "${RAILWAY_TOKEN}" ]' in deploy_run
+    assert 'railway redeploy --service "${svc}" --from-source --yes' in deploy_run
+
 
 @requires_repo_checkout
 def test_deploy_kit_files_https_range_and_upload_limits() -> None:

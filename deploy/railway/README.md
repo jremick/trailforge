@@ -120,6 +120,13 @@ For both options:
 4. Copy the shared variables from `api` (`DATABASE_URL`, `TRAILFORGE_PRIVACY_SECRET`, `TRAILFORGE_ENABLE_LIVE_FEEDS=true`, `TRAILFORGE_ENABLED_STATES`, `WORKER_POLL_SECONDS=60`, `PRIVACY_TRIM_METERS=250`, `GDAL_CACHEMAX=192`, `OMP_THREAD_LIMIT=1`).
 5. A persistent volume on `worker` is **optional** when `PMTiles` and offline packs are built from `api`/CLI and served via Cloudflare R2.
 
+### Automatic Updates on Stable Releases (GHCR `:latest`)
+
+When running `api` and `worker` on `ghcr.io/jremick/trailforge-backend:latest`, you can keep Railway updated automatically whenever a stable `v*` release tag finishes publishing to GHCR:
+
+- **Option 1 — Instant CI Redeploy (Recommended):** Create a project-scoped **Project Token** in Railway (**Project Settings → Tokens**, scoped to `production`) and add it to your GitHub repository as the **`RAILWAY_TOKEN`** Actions secret. After each stable `v*` tag pushes `:latest`, [`.github/workflows/release-images.yml`](../../.github/workflows/release-images.yml) automatically triggers `railway redeploy --from-source --yes` on `api` and `worker` (override service names via the optional `RAILWAY_SERVICES` repository variable; pre-release tags never trigger production redeploys).
+- **Option 2 — Railway Image Auto Updates:** In Railway Dashboard (**Service Settings → Source → Configure Auto Updates**) on `api` and `worker`, enable Image Auto Updates and pick a UTC maintenance window so Railway polls GHCR for new `:latest` digests and snapshots `/data` automatically before redeploying.
+
 ---
 
 ## Step 3: Configure Cloudflare R2, Pages Proxy & WAF

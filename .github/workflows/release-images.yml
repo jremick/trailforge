@@ -173,3 +173,29 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=trailforge-web
           cache-to: type=gha,mode=max,scope=trailforge-web
+
+  deploy-railway:
+    name: Trigger Railway Production Redeploy (Optional)
+    needs: [resolve-tag, build-backend]
+    if: ${{ needs.resolve-tag.outputs.is_stable == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Redeploy Railway backend services from latest GHCR image
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          RAILWAY_SERVICES: ${{ vars.RAILWAY_SERVICES || 'api worker' }}
+        run: |
+          if [ -z "${RAILWAY_TOKEN}" ]; then
+            echo "RAILWAY_TOKEN secret is not configured; skipping automatic Railway redeploy."
+            exit 0
+          fi
+
+          bash <(curl -fsSL https://railway.com/install.sh)
+          export PATH="${HOME}/.railway/bin:${HOME}/.local/bin:/usr/local/bin:${PATH}"
+
+          # Normalize commas/whitespace into space-separated service names (default: api worker)
+          SERVICES="$(printf '%s' "${RAILWAY_SERVICES}" | tr ',' ' ')"
+          for svc in ${SERVICES}; do
+            echo "Triggering Railway redeploy from latest image for service: ${svc}"
+            railway redeploy --service "${svc}" --from-source --yes
+          done
