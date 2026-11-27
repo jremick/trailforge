@@ -15,7 +15,11 @@ from shapely.geometry import Point
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
-from trailforge.auth.dependencies import get_current_user
+from trailforge.auth.dependencies import (
+    get_current_user,
+    get_scoped_read_user,
+    get_scoped_write_user,
+)
 from trailforge.db.models import (
     POI,
     Track,
@@ -299,7 +303,7 @@ def _build_export_track_data(
 def list_favorites(
     limit: int = Query(default=200, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_scoped_read_user),
     db: Session = Depends(get_db),
 ) -> list[FavoriteResponse]:
     """List the signed-in user's saved favorite tracks."""
@@ -357,7 +361,7 @@ def list_favorites(
 @router.post("/favorites", response_model=FavoriteResponse, status_code=status.HTTP_201_CREATED)
 def add_favorite(
     payload: FavoriteCreateRequest,
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_scoped_write_user),
     db: Session = Depends(get_db),
 ) -> FavoriteResponse:
     """Save a canonical track to the signed-in user's favorites (idempotent)."""
@@ -468,7 +472,7 @@ def _pin_to_response(pin: UserPin, lon: float, lat: float) -> PinResponse:
 def list_pins(
     limit: int = Query(default=200, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_scoped_read_user),
     db: Session = Depends(get_db),
 ) -> list[PinResponse]:
     """List the signed-in user's personal map pins."""
@@ -489,7 +493,7 @@ def list_pins(
 @router.post("/pins", response_model=PinResponse, status_code=status.HTTP_201_CREATED)
 def create_pin(
     payload: PinCreateRequest,
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_scoped_write_user),
     db: Session = Depends(get_db),
 ) -> PinResponse:
     """Create a personal waypoint/camp/hazard pin persisted in PostGIS."""
@@ -525,7 +529,7 @@ def create_pin(
 def update_pin(
     pin_id: str,
     payload: PinUpdateRequest,
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_scoped_write_user),
     db: Session = Depends(get_db),
 ) -> PinResponse:
     """Update an owned personal pin."""

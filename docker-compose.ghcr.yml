@@ -51,17 +51,32 @@ services:
     image: ghcr.io/jremick/trailforge-backend:${TRAILFORGE_IMAGE_TAG:-latest}
     command:
       - sh
-      - -c
-      - alembic upgrade head && exec uvicorn trailforge.api.main:app --host 0.0.0.0 --port 8000
+      - -ec
+      - |
+        python - <<'PY'
+        import os
+
+        for var, dev_default in (
+            ("AUTH_SECRET_KEY", "trailforge-dev-secret-change-in-production"),
+            ("TRAILFORGE_PRIVACY_SECRET", "trailforge-dev-privacy-secret-change-in-production"),
+        ):
+            key = os.environ[var].strip()
+            if len(key) < 32 or key == dev_default:
+                raise SystemExit(
+                    f"Set {var} to a unique random value of at least 32 characters"
+                )
+        PY
+        alembic upgrade head
+        exec uvicorn trailforge.api.main:app --host 0.0.0.0 --port 8000
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://trailforge:trailforge@db:5432/trailforge}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
       PRIVACY_TRIM_METERS: ${PRIVACY_TRIM_METERS:-250}
       SNOW_LINE_DEFAULT_M: ${SNOW_LINE_DEFAULT_M:-1000}
-      # CHANGE IN PRODUCTION! Generate strong secrets with: openssl rand -hex 32
-      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:-trailforge-dev-secret-change-in-production}
-      TRAILFORGE_PRIVACY_SECRET: ${TRAILFORGE_PRIVACY_SECRET:-trailforge-dev-privacy-secret-change-in-production}
+      # Generate unique random keys with: openssl rand -hex 32
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?Set AUTH_SECRET_KEY to a unique random value}
+      TRAILFORGE_PRIVACY_SECRET: ${TRAILFORGE_PRIVACY_SECRET:?Set TRAILFORGE_PRIVACY_SECRET to a unique random value}
       # Set AUTH_COOKIE_SECURE=true when serving TrailForge behind HTTPS/TLS
       AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
       # Set TRAILFORGE_ENABLE_LIVE_FEEDS=true to sync live VIC/NSW closures & Open-Meteo 72h rainfall
@@ -69,7 +84,6 @@ services:
       # Public instance hardening: keep 'open' for private homelabs, or set 'invite_only' / 'closed'
       # when exposing TrailForge to the public internet.
       TRAILFORGE_REGISTRATION_MODE: ${TRAILFORGE_REGISTRATION_MODE:-open}
-      TRAILFORGE_ADMIN_EMAIL: ${TRAILFORGE_ADMIN_EMAIL:-}
       TRAILFORGE_DEMO_BANNER: ${TRAILFORGE_DEMO_BANNER:-}
       TRAILFORGE_SHOW_STACK_TELEMETRY_PUBLIC: ${TRAILFORGE_SHOW_STACK_TELEMETRY_PUBLIC:-false}
       TRAILFORGE_TRUST_PROXY_HEADERS: ${TRAILFORGE_TRUST_PROXY_HEADERS:-true}
@@ -131,7 +145,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-30}
       PRIVACY_TRIM_METERS: ${PRIVACY_TRIM_METERS:-250}
-      TRAILFORGE_PRIVACY_SECRET: ${TRAILFORGE_PRIVACY_SECRET:-trailforge-dev-privacy-secret-change-in-production}
+      TRAILFORGE_PRIVACY_SECRET: ${TRAILFORGE_PRIVACY_SECRET:?Set TRAILFORGE_PRIVACY_SECRET to a unique random value}
       TRAILFORGE_ENABLE_LIVE_FEEDS: ${TRAILFORGE_ENABLE_LIVE_FEEDS:-false}
       TILES_DIR: ${TILES_DIR:-/data/tiles}
       PACKS_DIR: ${PACKS_DIR:-/data/packs}

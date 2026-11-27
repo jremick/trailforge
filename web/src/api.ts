@@ -71,7 +71,7 @@ import type {
 } from "./types";
 
 export { getApiBaseUrl, resolveApiUrl };
-import { isNativeApp, type RuntimeBridgeEnv } from "./native/bridge";
+import { isNativeApp } from "./native/bridge";
 import {
   slugifyExportFilename,
   triggerClientFileDownload,
@@ -84,12 +84,13 @@ import {
 
 export const AUTH_TOKEN_STORAGE_KEY = "trailforge.access_token";
 
-export interface BearerStorageContext {
-  apiBaseUrl?: string;
-  nativeApp?: boolean;
-  windowObj?: RuntimeBridgeEnv["windowObj"];
-  navigatorObj?: RuntimeBridgeEnv["navigatorObj"];
+export interface AccountRequestOptions {
+  signal?: AbortSignal;
+  ownerId?: string;
+  anonymous?: boolean;
 }
+
+let sessionBearer: string | null = null;
 
 export class ApiError extends Error {
   readonly status: number;
@@ -101,96 +102,54 @@ export class ApiError extends Error {
   }
 }
 
-/**
- * Return `true` ONLY when talking to a cross-origin API (`Boolean(VITE_API_BASE_URL)`)
- * OR running inside a native Capacitor container (`isNativeApp()`).
- *
- * On same-origin browser web (Cloudflare Pages proxy / Docker Nginx), returns `false`
- * so session authentication relies strictly on the `HttpOnly`, `SameSite=Lax` cookie
- * (`credentials: "include"`) with zero bearer tokens written to or read from `localStorage`.
- */
-export function shouldUseBearerStorage(
-  ctx?: BearerStorageContext
-): boolean {
-  const apiBase =
-    ctx?.apiBaseUrl !== undefined
-      ? getApiBaseUrl(ctx.apiBaseUrl)
-      : getApiBaseUrl();
-  if (Boolean(apiBase)) {
+/** Native and cross-origin clients keep a bearer for the lifetime of the app page. */
+export function usesSessionBearer(): boolean {
+  if (isNativeApp()) return true;
+  const apiBase = getApiBaseUrl();
+  if (!apiBase) return false;
+  const location = typeof window === "undefined" ? undefined : window.location;
+  if (!location) return true;
+  try {
+    return new URL(apiBase, location.href).origin !== location.origin;
+  } catch {
     return true;
   }
-  if (ctx?.nativeApp !== undefined) {
-    return ctx.nativeApp;
-  }
-  return isNativeApp(
-    ctx
-      ? { windowObj: ctx.windowObj, navigatorObj: ctx.navigatorObj }
-      : undefined
-  );
 }
 
-/**
- * Purge any legacy `trailforge.access_token` entry left in `localStorage` from
- * earlier versions when running on same-origin browser web.
- */
-export function clearLegacyStoredAuthToken(
-  ctx?: BearerStorageContext
-): boolean {
-  if (shouldUseBearerStorage(ctx)) return false;
+/** Remove a bearer saved by older releases when opening the app on any platform. */
+export function clearLegacyStoredAuthToken(): void {
   try {
-    if (typeof window === "undefined" || !window.localStorage) return false;
-    window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
-    return true;
-  } catch (err) {
-    console.debug("Unable to clear legacy auth token from localStorage:", err);
-    return false;
-  }
-}
-
-export function getStoredAuthToken(ctx?: BearerStorageContext): string | null {
-  if (!shouldUseBearerStorage(ctx)) {
-    return null;
-  }
-  try {
-    if (typeof window === "undefined" || !window.localStorage) return null;
-    const token = window.localStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
-    return token && token.trim() ? token.trim() : null;
-  } catch {
-    return null;
-  }
-}
-
-export function setStoredAuthToken(
-  token: string | null,
-  ctx?: BearerStorageContext
-): void {
-  try {
-    if (typeof window === "undefined" || !window.localStorage) return;
-    if (!shouldUseBearerStorage(ctx)) {
-      window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
-      return;
-    }
-    if (token && token.trim()) {
-      window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token.trim());
-    } else {
-      window.localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    if (typeof window !== "undefined") {
+      window.localStorage?.removeItem(AUTH_TOKEN_STORAGE_KEY);
     }
   } catch {
-    // Ignore storage quota/private-mode errors
+    // Storage may be disabled by the browser.
   }
 }
 
-export const getAccessToken = getStoredAuthToken;
-export const setAccessToken = setStoredAuthToken;
+function acceptSessionToken(token: string): void {
+  clearLegacyStoredAuthToken();
+  sessionBearer = usesSessionBearer() ? token : null;
+}
 
-function buildHeaders(extra?: Record<string, string>): Record<string, string> {
+function accountOptions(options?: AccountRequestOptions | AbortSignal): AccountRequestOptions {
+  return options && "aborted" in options ? { signal: options } : options ?? {};
+}
+
+function buildHeaders(
+  extra?: Record<string, string>,
+  options?: AccountRequestOptions
+): Record<string, string> {
   const headers: Record<string, string> = {
     Accept: "application/json",
     ...(extra ?? {}),
   };
-  const token = getStoredAuthToken();
-  if (token) {
-    headers.Authorization = `Bearer ${token}`;
+  if (options?.anonymous) return headers;
+  if (sessionBearer && usesSessionBearer()) {
+    headers.Authorization = `Bearer ${sessionBearer}`;
+  }
+  if (options?.ownerId) {
+    headers["X-TrailForge-Account"] = options.ownerId;
   }
   return headers;
 }
@@ -224,25 +183,27 @@ async function parseErrorDetail(res: Response): Promise<string> {
   return `HTTP ${res.status} ${res.statusText}`;
 }
 
-function fetchCredentialsMode(): RequestCredentials {
-  return "include";
+function fetchCredentialsMode(options?: AccountRequestOptions): RequestCredentials {
+  return options?.anonymous || usesSessionBearer() ? "omit" : "include";
 }
 
-async function requestJson<T>(
+export async function requestJson<T>(
   url: string,
-  options?: {
+  options?: AccountRequestOptions & {
     method?: string;
     body?: unknown;
-    signal?: AbortSignal;
-  }
+  },
+  fetchImpl: typeof fetch = fetch
 ): Promise<T> {
+  options?.signal?.throwIfAborted();
   const hasBody = options?.body !== undefined;
-  const res = await fetch(resolveApiUrl(url), {
+  const res = await fetchImpl(resolveApiUrl(url), {
     method: options?.method ?? "GET",
     headers: buildHeaders(
-      hasBody ? { "Content-Type": "application/json" } : undefined
+      hasBody ? { "Content-Type": "application/json" } : undefined,
+      options
     ),
-    credentials: fetchCredentialsMode(),
+    credentials: fetchCredentialsMode(options),
     cache: "no-store",
     body: hasBody ? JSON.stringify(options.body) : undefined,
     signal: options?.signal,
@@ -370,11 +331,11 @@ export function fetchParks(signal?: AbortSignal): Promise<ParkTenureItem[]> {
 
 export async function fetchTrackDetail(
   trackId: string,
-  options?: {
+  options?: AccountRequestOptions & {
     vehicleClass?: VehicleCapabilityClass | null;
-    signal?: AbortSignal;
   }
 ): Promise<TrackInspectorDetail> {
+  options?.signal?.throwIfAborted();
   if (shouldPreferOfflinePack()) {
     const offline = await getOfflineTrackDetail(trackId);
     if (offline) return offline;
@@ -386,11 +347,12 @@ export async function fetchTrackDetail(
   const qs = params.toString();
   const url = `/api/tracks/${encodeURIComponent(trackId)}${qs ? `?${qs}` : ""}`;
   try {
-    return await requestJson<TrackInspectorDetail>(url, {
-      signal: options?.signal,
-    });
+    return await requestJson<TrackInspectorDetail>(url, options);
   } catch (err) {
     if (options?.signal?.aborted) throw err;
+    if (err instanceof ApiError && err.status >= 400 && err.status < 500) {
+      throw err;
+    }
     const offline = await getOfflineTrackDetail(trackId);
     if (offline) return offline;
     throw err;
@@ -492,32 +454,36 @@ export async function fetchPublicUiConfig(
 }
 
 export async function fetchUserPreferences(
-  signal?: AbortSignal
+  options?: AccountRequestOptions | AbortSignal
 ): Promise<UserUiPreferencesResponse> {
   const raw = await requestJson<UserUiPreferencesResponse>(
     "/api/user/preferences",
-    { signal }
+    accountOptions(options)
   );
   return normalizeUserUiPreferences(raw);
 }
 
 export async function updateUserPreferences(
-  payload: UserUiPreferencesUpdateInput
+  payload: UserUiPreferencesUpdateInput,
+  options?: AccountRequestOptions
 ): Promise<UserUiPreferencesResponse> {
   const raw = await requestJson<UserUiPreferencesResponse>(
     "/api/user/preferences",
     {
       method: "PUT",
       body: payload,
+      ...options,
     }
   );
   return normalizeUserUiPreferences(raw);
 }
 
-export async function resetUserPreferences(): Promise<UserUiPreferencesResponse> {
+export async function resetUserPreferences(
+  options?: AccountRequestOptions
+): Promise<UserUiPreferencesResponse> {
   const raw = await requestJson<UserUiPreferencesResponse>(
     "/api/user/preferences",
-    { method: "DELETE" }
+    { method: "DELETE", ...options }
   );
   return normalizeUserUiPreferences(raw);
 }
@@ -538,8 +504,20 @@ export async function fetchAuthConfig(
   }
 }
 
-export function fetchAuthMe(signal?: AbortSignal): Promise<AuthMeResponse> {
-  return requestJson<AuthMeResponse>("/api/auth/me", { signal });
+export async function fetchAuthMe(signal?: AbortSignal): Promise<AuthMeResponse> {
+  const currentBearer = sessionBearer;
+  try {
+    const result = await requestJson<AuthMeResponse>("/api/auth/me", { signal });
+    if (!result.authenticated && sessionBearer === currentBearer) {
+      sessionBearer = null;
+    }
+    return result;
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 403 && sessionBearer === currentBearer) {
+      sessionBearer = null;
+    }
+    throw err;
+  }
 }
 
 export async function registerAccount(payload: {
@@ -561,7 +539,7 @@ export async function registerAccount(payload: {
     method: "POST",
     body,
   });
-  setStoredAuthToken(res.access_token);
+  acceptSessionToken(res.access_token);
   return res;
 }
 
@@ -573,115 +551,129 @@ export async function loginAccount(payload: {
     method: "POST",
     body: payload,
   });
-  setStoredAuthToken(res.access_token);
+  acceptSessionToken(res.access_token);
   return res;
 }
 
-export async function logoutAccount(): Promise<void> {
+export async function logoutAccount(options?: AccountRequestOptions): Promise<void> {
+  const currentBearer = sessionBearer;
   try {
-    await requestJson<{ ok: boolean }>("/api/auth/logout", { method: "POST" });
+    await requestJson<{ ok: boolean }>("/api/auth/logout", { method: "POST", ...options });
   } finally {
-    setStoredAuthToken(null);
+    if (sessionBearer === currentBearer) sessionBearer = null;
+    clearLegacyStoredAuthToken();
   }
 }
 
 export async function fetchVehicles(
-  signal?: AbortSignal
+  options?: AccountRequestOptions | AbortSignal
 ): Promise<VehicleProfileItem[]> {
   const data = await requestJson<
     VehicleProfileItem[] | { items: VehicleProfileItem[] }
-  >("/api/vehicles", { signal });
+  >("/api/vehicles", accountOptions(options));
   return Array.isArray(data) ? data : (data.items ?? []);
 }
 
 export function createVehicle(
-  payload: VehicleProfileInput
+  payload: VehicleProfileInput,
+  options?: AccountRequestOptions
 ): Promise<VehicleProfileItem> {
   return requestJson<VehicleProfileItem>("/api/vehicles", {
     method: "POST",
     body: payload,
+    ...options,
   });
 }
 
 export function updateVehicle(
   id: string,
-  payload: Partial<VehicleProfileInput>
+  payload: Partial<VehicleProfileInput>,
+  options?: AccountRequestOptions
 ): Promise<VehicleProfileItem> {
   return requestJson<VehicleProfileItem>(
     `/api/vehicles/${encodeURIComponent(id)}`,
     {
       method: "PATCH",
       body: payload,
+      ...options,
     }
   );
 }
 
-export function deleteVehicle(id: string): Promise<void> {
+export function deleteVehicle(id: string, options?: AccountRequestOptions): Promise<void> {
   return requestJson<void>(`/api/vehicles/${encodeURIComponent(id)}`, {
     method: "DELETE",
+    ...options,
   });
 }
 
-export function activateVehicle(id: string): Promise<VehicleProfileItem> {
+export function activateVehicle(
+  id: string,
+  options?: AccountRequestOptions
+): Promise<VehicleProfileItem> {
   return requestJson<VehicleProfileItem>(
     `/api/vehicles/${encodeURIComponent(id)}/activate`,
-    { method: "POST" }
+    { method: "POST", ...options }
   );
 }
 
 export async function fetchFavorites(
-  signal?: AbortSignal
+  options?: AccountRequestOptions | AbortSignal
 ): Promise<UserFavoriteItem[]> {
   const data = await requestJson<
     UserFavoriteItem[] | { items: UserFavoriteItem[] }
-  >("/api/favorites", { signal });
+  >("/api/favorites", accountOptions(options));
   return Array.isArray(data) ? data : (data.items ?? []);
 }
 
 export function addFavorite(
   trackId: string,
-  notes?: string | null
+  notes?: string | null,
+  options?: AccountRequestOptions
 ): Promise<UserFavoriteItem> {
   return requestJson<UserFavoriteItem>("/api/favorites", {
     method: "POST",
     body: { track_id: trackId, notes: notes ?? null },
+    ...options,
   });
 }
 
-export function removeFavorite(trackId: string): Promise<void> {
+export function removeFavorite(trackId: string, options?: AccountRequestOptions): Promise<void> {
   return requestJson<void>(
     `/api/favorites/${encodeURIComponent(trackId)}`,
-    { method: "DELETE" }
+    { method: "DELETE", ...options }
   );
 }
 
-export async function fetchPins(signal?: AbortSignal): Promise<UserPinItem[]> {
+export async function fetchPins(options?: AccountRequestOptions | AbortSignal): Promise<UserPinItem[]> {
   const data = await requestJson<UserPinItem[] | { items: UserPinItem[] }>(
     "/api/pins",
-    { signal }
+    accountOptions(options)
   );
   return Array.isArray(data) ? data : (data.items ?? []);
 }
 
-export function createPin(payload: UserPinInput): Promise<UserPinItem> {
+export function createPin(payload: UserPinInput, options?: AccountRequestOptions): Promise<UserPinItem> {
   return requestJson<UserPinItem>("/api/pins", {
     method: "POST",
     body: payload,
+    ...options,
   });
 }
 
-export function deletePin(id: string): Promise<void> {
+export function deletePin(id: string, options?: AccountRequestOptions): Promise<void> {
   return requestJson<void>(`/api/pins/${encodeURIComponent(id)}`, {
     method: "DELETE",
+    ...options,
   });
 }
 
 /* ---------- Slice 06 Trips, Telemetry & Unmapped Candidates ---------- */
 
-export async function fetchTrips(signal?: AbortSignal): Promise<TripItem[]> {
+export async function fetchTrips(options?: AccountRequestOptions | AbortSignal): Promise<TripItem[]> {
   const data = await requestJson<TripItem[] | { items: TripItem[] }>(
     "/api/trips",
-    { signal }
+    accountOptions(options)
   );
   return Array.isArray(data) ? data : (data.items ?? []);
 }
@@ -693,8 +685,10 @@ export async function uploadTripGpx(
     vehicle_profile_id?: string | null;
     visibility: TripVisibility;
     privacy_trim_m: number;
-  }
+  },
+  options?: AccountRequestOptions
 ): Promise<TripItem> {
+  options?.signal?.throwIfAborted();
   const form = new FormData();
   form.append("file", file, file.name);
   form.append("name", params.name);
@@ -706,9 +700,10 @@ export async function uploadTripGpx(
 
   const res = await fetch(resolveApiUrl("/api/trips/upload"), {
     method: "POST",
-    headers: buildHeaders(),
-    credentials: fetchCredentialsMode(),
+    headers: buildHeaders(undefined, options),
+    credentials: fetchCredentialsMode(options),
     body: form,
+    signal: options?.signal,
   });
   if (!res.ok) {
     const detail = await parseErrorDetail(res);
@@ -718,11 +713,13 @@ export async function uploadTripGpx(
 }
 
 export function uploadTripJson(
-  payload: TripUploadJsonPayload
+  payload: TripUploadJsonPayload,
+  options?: AccountRequestOptions
 ): Promise<TripItem> {
   return requestJson<TripItem>("/api/trips/upload", {
     method: "POST",
     body: payload,
+    ...options,
   });
 }
 
@@ -732,7 +729,8 @@ export function uploadTripJson(
  * back to `POST /api/trips/upload` when talking to a backend without mobile-sync.
  */
 export async function uploadMobileTripSync(
-  payload: MobileTripSyncPayload
+  payload: MobileTripSyncPayload,
+  options?: AccountRequestOptions
 ): Promise<TripItem> {
   const body: MobileTripSyncPayload = {
     ...payload,
@@ -744,10 +742,12 @@ export async function uploadMobileTripSync(
     return await requestJson<TripItem>("/api/trips/mobile-sync", {
       method: "POST",
       body,
+      ...options,
     });
   } catch (err) {
     if (err instanceof ApiError && (err.status === 404 || err.status === 405)) {
-      return uploadTripJson(payload);
+      options?.signal?.throwIfAborted();
+      return uploadTripJson(payload, options);
     }
     throw err;
   }
@@ -755,17 +755,20 @@ export async function uploadMobileTripSync(
 
 export function updateTrip(
   tripId: string,
-  patch: { name?: string; visibility?: TripVisibility }
+  patch: { name?: string; visibility?: TripVisibility },
+  options?: AccountRequestOptions
 ): Promise<TripItem> {
   return requestJson<TripItem>(`/api/trips/${encodeURIComponent(tripId)}`, {
     method: "PATCH",
     body: patch,
+    ...options,
   });
 }
 
-export function deleteTrip(tripId: string): Promise<void> {
+export function deleteTrip(tripId: string, options?: AccountRequestOptions): Promise<void> {
   return requestJson<void>(`/api/trips/${encodeURIComponent(tripId)}`, {
     method: "DELETE",
+    ...options,
   });
 }
 
@@ -808,8 +811,11 @@ export function fetchRainfallSummary(
 /* ---------- Slice 08 Community Condition Reports & Gate Warnings ---------- */
 
 export async function fetchReportsGeoJson(
-  signal?: AbortSignal
+  options?: AccountRequestOptions | AbortSignal
 ): Promise<FeatureCollection> {
+  const requestOptions = accountOptions(options);
+  const { signal } = requestOptions;
+  signal?.throwIfAborted();
   if (shouldPreferOfflinePack()) {
     const offline = await getOfflineReportsGeoJson();
     if (offline) return offline;
@@ -817,10 +823,13 @@ export async function fetchReportsGeoJson(
   try {
     return await requestJson<FeatureCollection>(
       "/api/reports/geojson?include_resolved=false",
-      { signal }
+      requestOptions
     );
   } catch (err) {
     if (signal?.aborted) throw err;
+    if (err instanceof ApiError && err.status >= 400 && err.status < 500) {
+      throw err;
+    }
     const offline = await getOfflineReportsGeoJson();
     if (offline) return offline;
     throw err;
@@ -828,8 +837,10 @@ export async function fetchReportsGeoJson(
 }
 
 export async function createConditionReport(
-  input: ConditionReportCreateInput
+  input: ConditionReportCreateInput,
+  options?: AccountRequestOptions
 ): Promise<ConditionReportItem> {
+  options?.signal?.throwIfAborted();
   if (input.photo) {
     const form = new FormData();
     form.append("report_type", input.report_type);
@@ -846,9 +857,10 @@ export async function createConditionReport(
 
     const res = await fetch(resolveApiUrl("/api/reports"), {
       method: "POST",
-      headers: buildHeaders(),
-      credentials: fetchCredentialsMode(),
+      headers: buildHeaders(undefined, options),
+      credentials: fetchCredentialsMode(options),
       body: form,
+      signal: options?.signal,
     });
     if (!res.ok) {
       const detail = await parseErrorDetail(res);
@@ -871,6 +883,7 @@ export async function createConditionReport(
       vehicle_class: input.vehicle_class ?? null,
       client_uuid: input.client_uuid ?? null,
     },
+    ...options,
   });
 }
 
@@ -883,11 +896,12 @@ export function fetchPacksCatalog(
 }
 
 export function buildRegionPack(
-  regionId: string
+  regionId: string,
+  options?: AccountRequestOptions
 ): Promise<OfflinePackRegionItem> {
   return requestJson<OfflinePackRegionItem>(
     `/api/packs/${encodeURIComponent(regionId)}/build`,
-    { method: "POST" }
+    { method: "POST", ...options }
   );
 }
 
@@ -913,31 +927,38 @@ export function fetchPackSnapshot(
 
 export function voteConditionReport(
   reportId: string | number,
-  vote: ReportVoteKind
+  vote: ReportVoteKind,
+  options?: AccountRequestOptions
 ): Promise<ConditionReportItem> {
   return requestJson<ConditionReportItem>(
     `/api/reports/${encodeURIComponent(String(reportId))}/vote`,
     {
       method: "POST",
       body: { vote },
+      ...options,
     }
   );
 }
 
 export async function downloadAuthenticatedExport(
   url: string,
-  fallbackFilename: string
+  fallbackFilename: string,
+  options?: AccountRequestOptions
 ): Promise<void> {
+  options?.signal?.throwIfAborted();
   const res = await fetch(resolveApiUrl(url), {
     method: "GET",
-    headers: buildHeaders({ Accept: "*/*" }),
-    credentials: fetchCredentialsMode(),
+    headers: buildHeaders({ Accept: "*/*" }, options),
+    credentials: fetchCredentialsMode(options),
+    cache: "no-store",
+    signal: options?.signal,
   });
   if (!res.ok) {
     const detail = await parseErrorDetail(res);
     throw new ApiError(detail, res.status);
   }
   const blob = await res.blob();
+  options?.signal?.throwIfAborted();
   const disposition = res.headers.get("content-disposition") ?? "";
   const match = /filename="?([^";]+)"?/i.exec(disposition);
   const filename = match?.[1] ?? fallbackFilename;
@@ -959,17 +980,21 @@ export async function downloadAuthenticatedExport(
 
 export async function planRoute(
   payload: RoutePlanRequest,
-  signal?: AbortSignal
+  options?: AccountRequestOptions | AbortSignal
 ): Promise<PlannedRouteAnalysis> {
+  const requestOptions = accountOptions(options);
+  const { signal } = requestOptions;
+  signal?.throwIfAborted();
   if (shouldPreferOfflinePack()) {
     const offline = await planRouteFromOfflineStore(payload);
+    signal?.throwIfAborted();
     if (offline) return offline;
   }
   try {
     return await requestJson<PlannedRouteAnalysis>("/api/routes/plan", {
       method: "POST",
       body: payload,
-      signal,
+      ...requestOptions,
     });
   } catch (err) {
     if (signal?.aborted) throw err;
@@ -977,6 +1002,7 @@ export async function planRoute(
       throw err;
     }
     const offline = await planRouteFromOfflineStore(payload);
+    signal?.throwIfAborted();
     if (offline) return offline;
     throw err;
   }
@@ -985,14 +1011,18 @@ export async function planRoute(
 export async function exportPlannedRoute(
   payload: RoutePlanRequest,
   format: "gpx" | "geojson",
-  offlineFallbackAnalysis?: PlannedRouteAnalysis | null
+  offlineFallbackAnalysis?: PlannedRouteAnalysis | null,
+  options?: AccountRequestOptions
 ): Promise<void> {
+  const signal = options?.signal;
+  signal?.throwIfAborted();
   const fallbackFilename = slugifyExportFilename(
     payload.name?.trim() || "trailforge-route",
     format
   );
 
   const exportOffline = (analysis: PlannedRouteAnalysis): void => {
+    signal?.throwIfAborted();
     if (format === "gpx") {
       triggerClientFileDownload(
         buildRouteClientGpx(analysis),
@@ -1022,12 +1052,13 @@ export async function exportPlannedRoute(
       resolveApiUrl(`/api/routes/plan/export?format=${encodeURIComponent(format)}`),
       {
         method: "POST",
-        headers: buildHeaders({
-          "Content-Type": "application/json",
-          Accept: "*/*",
-        }),
-        credentials: fetchCredentialsMode(),
+        headers: buildHeaders(
+          { "Content-Type": "application/json", Accept: "*/*" },
+          options
+        ),
+        credentials: fetchCredentialsMode(options),
         body: JSON.stringify(payload),
+        signal,
       }
     );
     if (!res.ok) {
@@ -1035,6 +1066,7 @@ export async function exportPlannedRoute(
       throw new ApiError(detail, res.status);
     }
     const blob = await res.blob();
+    signal?.throwIfAborted();
     const disposition = res.headers.get("content-disposition") ?? "";
     const match = /filename="?([^";]+)"?/i.exec(disposition);
     const filename = match?.[1] ?? fallbackFilename;
@@ -1051,6 +1083,7 @@ export async function exportPlannedRoute(
       URL.revokeObjectURL(objectUrl);
     }
   } catch (err) {
+    signal?.throwIfAborted();
     if (err instanceof ApiError && err.status >= 400 && err.status < 500) {
       throw err;
     }
@@ -1065,50 +1098,55 @@ export async function exportPlannedRoute(
 }
 
 export async function listSavedRoutes(
-  signal?: AbortSignal
+  options?: AccountRequestOptions | AbortSignal
 ): Promise<SavedRouteItem[]> {
   const data = await requestJson<
     SavedRouteItem[] | { items?: SavedRouteItem[]; routes?: SavedRouteItem[] }
-  >("/api/routes", { signal });
+  >("/api/routes", accountOptions(options));
   if (Array.isArray(data)) return data;
   return data.items ?? data.routes ?? [];
 }
 
 export function saveRoute(
-  payload: SavedRouteCreateInput
+  payload: SavedRouteCreateInput,
+  options?: AccountRequestOptions
 ): Promise<SavedRouteItem> {
   return requestJson<SavedRouteItem>("/api/routes", {
     method: "POST",
     body: payload,
+    ...options,
   });
 }
 
 export function getSavedRoute(
   id: string,
-  signal?: AbortSignal
+  options?: AccountRequestOptions | AbortSignal
 ): Promise<SavedRouteItem> {
   return requestJson<SavedRouteItem>(
     `/api/routes/${encodeURIComponent(id)}`,
-    { signal }
+    accountOptions(options)
   );
 }
 
 export function updateSavedRoute(
   id: string,
-  patch: SavedRouteUpdateInput
+  patch: SavedRouteUpdateInput,
+  options?: AccountRequestOptions
 ): Promise<SavedRouteItem> {
   return requestJson<SavedRouteItem>(
     `/api/routes/${encodeURIComponent(id)}`,
     {
       method: "PATCH",
       body: patch,
+      ...options,
     }
   );
 }
 
-export function deleteSavedRoute(id: string): Promise<void> {
+export function deleteSavedRoute(id: string, options?: AccountRequestOptions): Promise<void> {
   return requestJson<void>(`/api/routes/${encodeURIComponent(id)}`, {
     method: "DELETE",
+    ...options,
   });
 }
 
@@ -1122,93 +1160,101 @@ export function getSavedRouteExportUrl(
 /* ---------- v1.1.0 Admin Console: Traffic, Invites, Users & Compute Actions ---------- */
 
 export function fetchAdminStats(
-  signal?: AbortSignal
+  options?: AccountRequestOptions | AbortSignal
 ): Promise<AdminStatsResponse> {
-  return requestJson<AdminStatsResponse>("/api/admin/stats", { signal });
+  return requestJson<AdminStatsResponse>("/api/admin/stats", accountOptions(options));
 }
 
 export async function fetchAdminUsers(
-  signal?: AbortSignal
+  options?: AccountRequestOptions | AbortSignal
 ): Promise<AdminUserItem[]> {
   const data = await requestJson<
     AdminUserItem[] | { items?: AdminUserItem[]; users?: AdminUserItem[] }
-  >("/api/admin/users", { signal });
+  >("/api/admin/users", accountOptions(options));
   if (Array.isArray(data)) return data;
   return data.items ?? data.users ?? [];
 }
 
 export function patchAdminUser(
   userId: string,
-  patch: AdminUserPatchInput
+  patch: AdminUserPatchInput,
+  options?: AccountRequestOptions
 ): Promise<AdminUserItem> {
   return requestJson<AdminUserItem>(
     `/api/admin/users/${encodeURIComponent(userId)}`,
     {
       method: "PATCH",
       body: patch,
+      ...options,
     }
   );
 }
 
 export async function fetchAdminInvites(
-  signal?: AbortSignal
+  options?: AccountRequestOptions | AbortSignal
 ): Promise<AdminInviteItem[]> {
   const data = await requestJson<
     AdminInviteItem[] | { items?: AdminInviteItem[]; invites?: AdminInviteItem[] }
-  >("/api/admin/invites", { signal });
+  >("/api/admin/invites", accountOptions(options));
   if (Array.isArray(data)) return data;
   return data.items ?? data.invites ?? [];
 }
 
 export function createAdminInvite(
-  payload: AdminInviteCreateInput
+  payload: AdminInviteCreateInput,
+  options?: AccountRequestOptions
 ): Promise<AdminInviteItem> {
   return requestJson<AdminInviteItem>("/api/admin/invites", {
     method: "POST",
     body: payload,
+    ...options,
   });
 }
 
 export function revokeAdminInvite(
-  inviteId: string
+  inviteId: string,
+  options?: AccountRequestOptions
 ): Promise<AdminInviteItem | void> {
   return requestJson<AdminInviteItem | void>(
     `/api/admin/invites/${encodeURIComponent(inviteId)}`,
-    { method: "DELETE" }
+    { method: "DELETE", ...options }
   );
 }
 
-export function triggerAdminClosuresSync(): Promise<AdminComputeActionResponse> {
+export function triggerAdminClosuresSync(options?: AccountRequestOptions): Promise<AdminComputeActionResponse> {
   return requestJson<AdminComputeActionResponse>("/api/closures/sync", {
     method: "POST",
+    ...options,
   });
 }
 
-export function triggerAdminGradingRecompute(): Promise<AdminComputeActionResponse> {
+export function triggerAdminGradingRecompute(options?: AccountRequestOptions): Promise<AdminComputeActionResponse> {
   return requestJson<AdminComputeActionResponse>("/api/grading/recompute", {
     method: "POST",
+    ...options,
   });
 }
 
 export function fetchAdminUiSettings(
-  signal?: AbortSignal
+  options?: AccountRequestOptions | AbortSignal
 ): Promise<AdminUiSettingsResponse> {
-  return requestJson<AdminUiSettingsResponse>("/api/admin/ui-settings", {
-    signal,
-  });
+  return requestJson<AdminUiSettingsResponse>("/api/admin/ui-settings", accountOptions(options));
 }
 
 export function updateAdminUiSettings(
-  payload: AdminUiSettingsUpdateInput
+  payload: AdminUiSettingsUpdateInput,
+  options?: AccountRequestOptions
 ): Promise<AdminUiSettingsResponse> {
   return requestJson<AdminUiSettingsResponse>("/api/admin/ui-settings", {
     method: "PUT",
     body: payload,
+    ...options,
   });
 }
 
-export function resetAdminUiSettings(): Promise<AdminUiSettingsResponse> {
+export function resetAdminUiSettings(options?: AccountRequestOptions): Promise<AdminUiSettingsResponse> {
   return requestJson<AdminUiSettingsResponse>("/api/admin/ui-settings", {
     method: "DELETE",
+    ...options,
   });
 }

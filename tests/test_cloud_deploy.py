@@ -23,7 +23,6 @@ requires_repo_checkout = pytest.mark.skipif(
 
 HARDENING_ENV_VARS = (
     "TRAILFORGE_REGISTRATION_MODE",
-    "TRAILFORGE_ADMIN_EMAIL",
     "TRAILFORGE_DEMO_BANNER",
     "TRAILFORGE_SHOW_STACK_TELEMETRY_PUBLIC",
     "TRAILFORGE_TRUST_PROXY_HEADERS",
@@ -292,7 +291,7 @@ def test_railway_and_cloudflare_docs_completeness_and_privacy_hygiene() -> None:
         "python -m trailforge.worker.main",
         "Hard Limit",
         "TRAILFORGE_REGISTRATION_MODE=invite_only",
-        "TRAILFORGE_ADMIN_EMAIL",
+        "create-invite --role admin --max-uses 1",
         "AUTH_SECRET_KEY",
         "TRAILFORGE_PRIVACY_SECRET",
         "TRAILFORGE_ORIGIN_SHARED_SECRET",

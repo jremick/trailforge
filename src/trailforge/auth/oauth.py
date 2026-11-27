@@ -84,7 +84,7 @@ _CSRF_DOMAIN_SEP: Final[bytes] = b"trailforge:oauth-csrf:v1"
 _IP_HASH_DOMAIN_SEP: Final[bytes] = b"trailforge:oauth-dcr-ip:v1"
 
 SCOPE_DESCRIPTIONS: Final[dict[str, str]] = {
-    SCOPE_READ: "Read your rigs, saved routes & trip summaries",
+    SCOPE_READ: "Read your rigs, saved routes, pins, favorites & trip summaries",
     SCOPE_WRITE: "Save routes, pins & favorites",
 }
 

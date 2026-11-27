@@ -17,7 +17,9 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
+from geoalchemy2.shape import from_shape
 from pydantic import ValidationError
+from shapely.geometry import LineString
 from sqlalchemy import Engine, select, text
 from sqlalchemy.orm import Session
 
@@ -42,6 +44,7 @@ from trailforge.db.models import (
     PersonalAccessToken,
     PlannedRoute,
     Track,
+    Trip,
     User,
     VehicleProfile,
 )
@@ -554,8 +557,19 @@ def test_full_w1_w2_w3_w4_e2e_oauth_pat_mcp_and_admin_metrics(
             capability_class="Touring 4WD",
             is_default=True,
         )
-        seed_db.add(rig)
+        trip = Trip(
+            user_id=driver.id,
+            vehicle_capability_class="Touring 4WD",
+            title="Private weekend drive",
+            raw_geom=from_shape(LineString([(148.10, -36.55), (148.12, -36.58)]), srid=4326),
+            raw_distance_m=4200.0,
+            match_status="skipped_private",
+        )
+        seed_db.add_all([rig, trip])
         seed_db.commit()
+        trip_path = f"/api/trips/{trip.id}"
+        driver_id = str(driver.id)
+        admin_id = str(admin.id)
 
         track_ids = list(
             seed_db.execute(
@@ -837,7 +851,43 @@ def test_full_w1_w2_w3_w4_e2e_oauth_pat_mcp_and_admin_metrics(
             assert client.get("/api/admin/stats", headers=rw_hdrs).status_code == 403
             assert client.post("/api/auth/logout", headers=ro_hdrs).status_code == 403
             assert client.post("/api/auth/logout", headers=rw_hdrs).status_code == 403
-            assert client.get("/api/auth/me", headers=ro_hdrs).json()["authenticated"] is True
+            assert client.get("/api/auth/me", headers=ro_hdrs).json()["authenticated"] is False
+
+            for scoped_headers in (ro_hdrs, rw_hdrs, oauth_hdrs):
+                trip_list = client.get("/api/trips", headers=scoped_headers)
+                assert trip_list.status_code == 200, trip_list.text
+                summary, = trip_list.json()
+                assert summary["name"] == "Private weekend drive"
+                assert "raw_geojson" not in summary and "trimmed_geojson" not in summary
+                assert summary["matched_segments"] == summary["unmapped_candidates"] == []
+                assert client.get(trip_path, headers=scoped_headers).status_code == 403
+                assert client.get(f"{trip_path}/export", headers=scoped_headers).status_code == 403
+                assert client.get("/api/user/export", headers=scoped_headers).status_code == 403
+                assert client.get("/api/routes", headers=scoped_headers).status_code == 200
+                assert client.delete(trip_path, headers=scoped_headers).status_code == 403
+
+            pin = {"name": "REST Camp", "category": "camp", "lat": -36.58, "lon": 148.12}
+            for scoped_headers in (rw_hdrs, oauth_hdrs):
+                pin_create = client.post("/api/pins", headers=scoped_headers, json=pin)
+                assert pin_create.status_code == 201, pin_create.text
+                pin_path = f"/api/pins/{pin_create.json()['id']}"
+                assert client.delete(pin_path, headers=scoped_headers).status_code == 403
+
+            assert client.get(trip_path, headers=driver_sess_hdrs).json()["raw_geojson"] is not None
+            assert client.get(f"{trip_path}/export", headers=driver_sess_hdrs).status_code == 200
+            admin_sess_hdrs = {"Authorization": f"Bearer {admin_session_tok}"}
+            assert client.get(trip_path, headers=admin_sess_hdrs).status_code == 404
+
+            client.cookies.set(get_settings().auth_cookie_name, driver_session_tok)
+            try:
+                stale_owner = {"X-TrailForge-Account": admin_id, "Origin": "http://testserver"}
+                actual_owner = {"X-TrailForge-Account": driver_id, "Origin": "http://testserver"}
+                assert client.get("/api/trips", headers=stale_owner).status_code == 409
+                assert client.post("/api/pins", headers=stale_owner, json=pin).status_code == 409
+                assert client.post("/api/auth/logout", headers=stale_owner).status_code == 409
+                assert client.post("/api/pins", headers=actual_owner, json=pin).status_code == 201
+            finally:
+                client.cookies.clear()
 
             # Write PAT succeeds on MCP write + REST write
             r_rw_pin = _mcp_post(

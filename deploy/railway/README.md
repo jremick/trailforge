@@ -93,7 +93,6 @@ For both options:
 3. Paste the production variables from [`env.railway.example`](./env.railway.example) into `api -> Variables`, making sure you set:
    - `DATABASE_URL=postgresql+psycopg://${{postgis.POSTGRES_USER}}:${{postgis.POSTGRES_PASSWORD}}@${{postgis.RAILWAY_PRIVATE_DOMAIN}}:5432/${{postgis.POSTGRES_DB}}`
    - `TRAILFORGE_REGISTRATION_MODE=invite_only`
-   - `TRAILFORGE_ADMIN_EMAIL=admin@example.com`
    - `AUTH_SECRET_KEY=<generated-64-hex>`
    - `TRAILFORGE_PRIVACY_SECRET=<generated-64-hex>`
    - `TRAILFORGE_ORIGIN_SHARED_SECRET=<generated-64-hex>` *(blocks direct unauthenticated `*.up.railway.app` access with HTTP 403)*
@@ -215,7 +214,7 @@ Confirm `HTTP/2 206`, `access-control-allow-origin: https://trails.example.com`,
 
 ### 4.3 Create Your First Admin Account & Friend Invite Codes
 
-In `TRAILFORGE_REGISTRATION_MODE=invite_only`, public sign-up cannot bypass invite codes even when `TRAILFORGE_ADMIN_EMAIL` is set. Bootstrap your first admin directly via the **Admin CLI** (`railway ssh --service api`):
+Use the **Admin CLI** to create your first administrator in any registration mode. Open the API container with `railway ssh --service api` and run the following commands.
 
 ```bash
 # Create the first admin account safely via stdin (avoids password exposure in argv/ps)
@@ -239,7 +238,7 @@ python -W error::RuntimeWarning -m trailforge.auth.cli promote \
   --email co-admin@example.com
 ```
 
-*(Alternatively, create a single-use bootstrap invite code with `create-invite --max-uses 1` and register through the Web UI using the email configured in `TRAILFORGE_ADMIN_EMAIL` to auto-promote the first admin.)*
+In `open` or `invite_only` mode, you can issue a single-use administrator invitation with `create-invite --role admin --max-uses 1` and redeem it through the web UI. Registration assigns the role on the invitation. Remove the obsolete `TRAILFORGE_ADMIN_EMAIL` variable from existing deployments. Existing administrators keep their roles.
 
 Once signed in as an admin, open the **Admin** console drawer in the web UI to view 24h/7d traffic, error and `429` counts, `/data/uploads` quota usage, trigger closure/grade syncs, create/revoke friend invites, and suspend or promote accounts.
 

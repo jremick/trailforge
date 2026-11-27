@@ -3,17 +3,14 @@ import {
   AUTH_TOKEN_STORAGE_KEY,
   clearLegacyStoredAuthToken,
   fetchAuthMe,
-  getAccessToken,
-  getStoredAuthToken,
+  fetchReportsGeoJson,
   loginAccount,
   logoutAccount,
   registerAccount,
-  setAccessToken,
-  setStoredAuthToken,
-  shouldUseBearerStorage,
+  uploadMobileTripSync,
+  usesSessionBearer,
 } from "./api";
 import { sanitizeReportPhotoUrl } from "./components/inspector";
-import { isNativeApp } from "./native/bridge";
 
 interface MockStorage {
   store: Map<string, string>;
@@ -46,199 +43,167 @@ function createMockLocalStorage(
   };
 }
 
-describe("M-4: Cookie-only same-origin web auth & Bearer storage gating", () => {
+function jsonResponse(payload: unknown, status = 200): Response {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+const loginInput = { email: "driver@example.com", password: "test-password" };
+const loginPayload = {
+  access_token: "fixture-session-token",
+  user: { id: "u-1", email: loginInput.email, display_name: "Driver", role: "member", is_active: true },
+};
+
+describe("Browser session authentication", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
   });
 
-  it("returns false from shouldUseBearerStorage() on same-origin browser web and true only when cross-origin or native Capacitor", () => {
-    expect(isNativeApp({ windowObj: {} })).toBe(false);
-    expect(
-      isNativeApp({
-        windowObj: {
-          Capacitor: { isNativePlatform: () => false, getPlatform: () => "web" },
-        },
-      })
-    ).toBe(false);
-    expect(
-      isNativeApp({
-        windowObj: {
-          Capacitor: { isNativePlatform: () => true, getPlatform: () => "ios" },
-        },
-      })
-    ).toBe(true);
-    expect(
-      isNativeApp({
-        windowObj: {
-          Capacitor: {
-            isNativePlatform: () => true,
-            getPlatform: () => "android",
-          },
-        },
-      })
-    ).toBe(true);
-
-    // Same-origin browser web: cookie-only, NEVER localStorage Bearer
-    expect(shouldUseBearerStorage({ apiBaseUrl: "", windowObj: {} })).toBe(
-      false
-    );
-    expect(shouldUseBearerStorage({ apiBaseUrl: "   ", windowObj: {} })).toBe(
-      false
-    );
-
-    // Cross-origin API (VITE_API_BASE_URL set)
-    expect(
-      shouldUseBearerStorage({
-        apiBaseUrl: "https://api.example.com",
-        windowObj: {},
-      })
-    ).toBe(true);
-
-    // Native Capacitor container (even without explicit apiBaseUrl)
-    expect(
-      shouldUseBearerStorage({
-        apiBaseUrl: "",
-        windowObj: {
-          Capacitor: { isNativePlatform: () => true, getPlatform: () => "ios" },
-        },
-      })
-    ).toBe(true);
-    expect(
-      shouldUseBearerStorage({
-        apiBaseUrl: "",
-        windowObj: {
-          Capacitor: {
-            isNativePlatform: () => true,
-            getPlatform: () => "android",
-          },
-        },
-      })
-    ).toBe(true);
-  });
-
-  it("never writes or reads localStorage on same-origin web and purges any legacy token on boot & logout", async () => {
-    const mockStorage = createMockLocalStorage({
-      [AUTH_TOKEN_STORAGE_KEY]: "legacy-v1-token",
+  it("uses the HttpOnly cookie for a same-origin API including an explicit same-origin base URL", async () => {
+    const storage = createMockLocalStorage({ [AUTH_TOKEN_STORAGE_KEY]: "old-token" });
+    vi.stubEnv("VITE_API_BASE_URL", "https://trails.example.test");
+    vi.stubGlobal("window", {
+      location: new URL("https://trails.example.test/"),
+      localStorage: storage,
     });
-    vi.stubGlobal("window", { localStorage: mockStorage });
-
-    // Default Node/browser env without VITE_API_BASE_URL or Capacitor is same-origin web
-    expect(shouldUseBearerStorage()).toBe(false);
-
-    // Never reads localStorage even if a legacy key was present
-    expect(getStoredAuthToken()).toBeNull();
-    expect(getAccessToken()).toBeNull();
-    expect(mockStorage.getItem).not.toHaveBeenCalled();
-
-    // Boot cleanup purges legacy token
-    clearLegacyStoredAuthToken();
-    expect(mockStorage.store.has(AUTH_TOKEN_STORAGE_KEY)).toBe(false);
-
-    // setAccessToken / setStoredAuthToken writes ZERO keys on same-origin web
-    setAccessToken("should-not-persist");
-    setStoredAuthToken("also-should-not-persist");
-    expect(mockStorage.setItem).not.toHaveBeenCalled();
-    expect(mockStorage.store.size).toBe(0);
-
-    // Login, register, fetchAuthMe, and logout use credentials: "include" with NO Authorization header
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            access_token: "server-token-login",
-            user: {
-              id: "u-1",
-              email: "driver@example.com",
-              display_name: "Driver",
-              role: "member",
-              is_active: true,
-            },
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } }
-        )
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            access_token: "server-token-register",
-            user: {
-              id: "u-2",
-              email: "new@example.com",
-              display_name: "New Driver",
-              role: "member",
-              is_active: true,
-            },
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } }
-        )
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ authenticated: true, user: null }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        })
-      )
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ ok: true }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        })
-      );
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(loginPayload))
+      .mockResolvedValueOnce(jsonResponse(loginPayload, 201))
+      .mockResolvedValueOnce(jsonResponse({ authenticated: true, user: loginPayload.user }))
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
     vi.stubGlobal("fetch", fetchMock);
 
-    await loginAccount({ email: "driver@example.com", password: "Password123!" });
-    await registerAccount({
-      email: "new@example.com",
-      display_name: "New Driver",
-      password: "Password123!",
-    });
+    expect(usesSessionBearer()).toBe(false);
+    clearLegacyStoredAuthToken();
+    await loginAccount(loginInput);
+    await registerAccount({ ...loginInput, display_name: "Driver" });
     await fetchAuthMe();
     await logoutAccount();
 
-    expect(mockStorage.setItem).not.toHaveBeenCalled();
-    expect(mockStorage.store.size).toBe(0);
-
+    expect(storage.store.has(AUTH_TOKEN_STORAGE_KEY)).toBe(false);
+    expect(storage.getItem).not.toHaveBeenCalledWith(AUTH_TOKEN_STORAGE_KEY);
+    expect(storage.setItem).not.toHaveBeenCalled();
     for (const [, init] of fetchMock.mock.calls as [string, RequestInit][]) {
       expect(init.credentials).toBe("include");
-      const headers = (init.headers ?? {}) as Record<string, string>;
-      expect(headers.Authorization).toBeUndefined();
+      expect(new Headers(init.headers).has("Authorization")).toBe(false);
     }
   });
 
-  it("persists and clears Bearer token in localStorage when cross-origin or running in native Capacitor", () => {
-    const mockStorage = createMockLocalStorage();
+  it.each([
+    { platform: "cross-origin", base: "https://api.example.test" },
+    { platform: "ios", base: "https://api.example.test" },
+    { platform: "android", base: "https://api.example.test" },
+  ])("keeps a $platform bearer in memory and clears it on logout even if offline", async ({ platform, base }) => {
+    const storage = createMockLocalStorage({ [AUTH_TOKEN_STORAGE_KEY]: "old-token" });
+    const capacitor = platform === "cross-origin" ? undefined : {
+      isNativePlatform: () => true,
+      getPlatform: () => platform,
+    };
+    vi.stubEnv("VITE_API_BASE_URL", base);
     vi.stubGlobal("window", {
-      localStorage: mockStorage,
+      location: new URL("https://trails.example.test/"),
+      localStorage: storage,
+      Capacitor: capacitor,
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(loginPayload))
+      .mockResolvedValueOnce(jsonResponse({ authenticated: true, user: loginPayload.user }))
+      .mockResolvedValueOnce(jsonResponse({ type: "FeatureCollection", features: [] }))
+      .mockRejectedValueOnce(new TypeError("Offline"))
+      .mockResolvedValueOnce(jsonResponse({ authenticated: false, user: null }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(usesSessionBearer()).toBe(true);
+    clearLegacyStoredAuthToken();
+    await loginAccount(loginInput);
+    await fetchAuthMe();
+    await fetchReportsGeoJson({ anonymous: true });
+    await expect(logoutAccount()).rejects.toThrow("Offline");
+    await fetchAuthMe();
+
+    expect(storage.store.has(AUTH_TOKEN_STORAGE_KEY)).toBe(false);
+    expect(storage.getItem).not.toHaveBeenCalledWith(AUTH_TOKEN_STORAGE_KEY);
+    expect(storage.setItem).not.toHaveBeenCalled();
+    const requests = fetchMock.mock.calls as [string, RequestInit][];
+    expect(requests.every(([, init]) => init.credentials === "omit")).toBe(true);
+    expect(requests.map(([, init]) => new Headers(init.headers).get("Authorization"))).toEqual([
+      null, "Bearer fixture-session-token", null, "Bearer fixture-session-token", null,
+    ]);
+  });
+
+  it("checks native runtime independently of API base configuration", () => {
+    vi.stubEnv("VITE_API_BASE_URL", "");
+    vi.stubGlobal("window", {
       Capacitor: { isNativePlatform: () => true, getPlatform: () => "ios" },
     });
+    expect(usesSessionBearer()).toBe(true);
+  });
 
-    expect(shouldUseBearerStorage()).toBe(true);
+  it("falls back to session bearer mode instead of throwing when VITE_API_BASE_URL is malformed", () => {
+    vi.stubEnv("VITE_API_BASE_URL", "http://[invalid-host");
+    vi.stubGlobal("window", {
+      location: new URL("https://trails.example.test/"),
+    });
+    expect(usesSessionBearer()).toBe(true);
+  });
+});
 
-    setAccessToken("  native-jwt-token  ");
-    expect(mockStorage.setItem).toHaveBeenCalledWith(
-      AUTH_TOKEN_STORAGE_KEY,
-      "native-jwt-token"
+describe("Account-bound API requests", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("rethrows HTTP 409 account conflicts from optional-auth endpoints instead of falling back offline", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({ detail: "The signed-in account has changed" }, 409)
     );
-    expect(getAccessToken()).toBe("native-jwt-token");
+    vi.stubGlobal("fetch", fetchMock);
 
-    // Boot cleanup must NOT wipe token inside native Capacitor
-    clearLegacyStoredAuthToken();
-    expect(getAccessToken()).toBe("native-jwt-token");
+    await expect(fetchReportsGeoJson({ ownerId: "u-stale" })).rejects.toMatchObject({
+      status: 409,
+    });
+  });
 
-    // Explicit clear removes the token
-    setAccessToken(null);
-    expect(mockStorage.store.has(AUTH_TOKEN_STORAGE_KEY)).toBe(false);
-    expect(getAccessToken()).toBeNull();
+  const payload = {
+    name: "Offline drive",
+    points: [{ lon: 148.1, lat: -36.5 }, { lon: 148.11, lat: -36.51 }],
+    visibility: "private" as const,
+    privacy_trim_m: 250,
+  };
 
-    // Cross-origin API_BASE_URL in non-native browser also permits Bearer storage
-    vi.stubGlobal("window", { localStorage: mockStorage });
-    const crossOriginCtx = { apiBaseUrl: "https://api.example.com" };
-    expect(shouldUseBearerStorage(crossOriginCtx)).toBe(true);
-    setAccessToken("cross-origin-token", crossOriginCtx);
-    expect(getAccessToken(crossOriginCtx)).toBe("cross-origin-token");
-    setAccessToken(null, crossOriginCtx);
-    expect(getAccessToken(crossOriginCtx)).toBeNull();
+  it("preserves the originating account and cancellation signal during upload fallback", async () => {
+    const signal = new AbortController().signal;
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ detail: "Not found" }, 404))
+      .mockResolvedValueOnce(jsonResponse({ id: "fixture-trip" }, 201));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(uploadMobileTripSync(payload, { ownerId: "u-1", signal })).resolves.toMatchObject({
+      id: "fixture-trip",
+    });
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/api/trips/mobile-sync", "/api/trips/upload",
+    ]);
+    for (const [, init] of fetchMock.mock.calls as [string, RequestInit][]) {
+      expect(new Headers(init.headers).get("X-TrailForge-Account")).toBe("u-1");
+      expect(init.signal).toBe(signal);
+    }
+  });
+
+  it("does not start fallback upload after an account change aborts the first request", async () => {
+    const controller = new AbortController();
+    const fetchMock = vi.fn(async () => {
+      controller.abort();
+      return jsonResponse({ detail: "Not found" }, 404);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(uploadMobileTripSync(payload, {
+      ownerId: "u-1",
+      signal: controller.signal,
+    })).rejects.toMatchObject({ name: "AbortError" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 

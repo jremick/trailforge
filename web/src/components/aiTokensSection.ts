@@ -1,9 +1,5 @@
-import {
-  formatFriendlyApiError,
-  formatShortTimestamp,
-  resolveApiUrl,
-} from "../adminHelpers";
-import { ApiError, getStoredAuthToken } from "../api";
+import { formatFriendlyApiError, formatShortTimestamp } from "../adminHelpers";
+import { ApiError, requestJson } from "../api";
 import { escapeHtml } from "../presets";
 
 export type AiTokenScope = "trailforge:read" | "trailforge:write";
@@ -58,6 +54,8 @@ export interface AiTokensApiClient {
 export interface AiTokensSectionOptions {
   /** Canonical web origin (e.g. `window.location.origin`), defaults to `https://trails.example.com` when unavailable. */
   origin?: string;
+  /** Account that owns the mounted panel. */
+  ownerId?: string;
   /** Optional custom API client (defaults to live `/api/auth/tokens` & `/api/auth/oauth-grants` fetch client). */
   api?: AiTokensApiClient;
   /** Optional clipboard writer override for tests or embedded hosts. */
@@ -235,71 +233,15 @@ function extractListArray(payload: unknown, keys: readonly string[]): unknown[] 
   return [];
 }
 
-async function parseApiErrorMessage(res: Response): Promise<string> {
-  try {
-    const ct = res.headers.get("content-type") ?? "";
-    if (ct.includes("application/json")) {
-      const body = (await res.json()) as {
-        detail?: unknown;
-        message?: unknown;
-      };
-      if (typeof body.detail === "string" && body.detail.trim()) {
-        return body.detail.trim();
-      }
-      if (typeof body.message === "string" && body.message.trim()) {
-        return body.message.trim();
-      }
-    }
-    const text = await res.text();
-    if (text.trim()) return text.trim().slice(0, 200);
-  } catch (err) {
-    console.debug("Unable to parse AI tokens API error response:", err);
-  }
-  return `HTTP ${res.status} ${res.statusText}`;
-}
-
-/**
- * Default fetch-backed client for `/api/auth/tokens` and `/api/auth/oauth-grants`.
- * Uses `credentials: "include"` and optional Bearer only when `getStoredAuthToken()`
- * allows it (cross-origin / native Capacitor — strictly cookie-only on same-origin web).
- */
+/** Fetch client for `/api/auth/tokens` and `/api/auth/oauth-grants`. */
 export function createAiTokensApiClient(
-  fetchImpl: typeof fetch = fetch
+  fetchImpl: typeof fetch = fetch,
+  ownerId?: string
 ): AiTokensApiClient {
-  const request = async <T>(
+  const request = <T>(
     path: string,
     options?: { method?: string; body?: unknown; signal?: AbortSignal }
-  ): Promise<T> => {
-    const hasBody = options?.body !== undefined;
-    const headers: Record<string, string> = {
-      Accept: "application/json",
-    };
-    if (hasBody) {
-      headers["Content-Type"] = "application/json";
-    }
-    const storedToken = getStoredAuthToken();
-    if (storedToken) {
-      headers.Authorization = `Bearer ${storedToken}`;
-    }
-
-    const res = await fetchImpl(resolveApiUrl(path), {
-      method: options?.method ?? "GET",
-      headers,
-      credentials: "include",
-      cache: "no-store",
-      body: hasBody ? JSON.stringify(options.body) : undefined,
-      signal: options?.signal,
-    });
-
-    if (!res.ok) {
-      const detail = await parseApiErrorMessage(res);
-      throw new ApiError(detail, res.status);
-    }
-    if (res.status === 204) {
-      return undefined as T;
-    }
-    return (await res.json()) as T;
-  };
+  ): Promise<T> => requestJson<T>(path, { ...options, ownerId }, fetchImpl);
 
   return {
     async listTokens(signal?: AbortSignal): Promise<PersonalAccessTokenItem[]> {
@@ -607,7 +549,7 @@ export class AiTokensSection {
   private state: AiTokensViewState;
 
   constructor(options: AiTokensSectionOptions = {}) {
-    this.api = options.api ?? createAiTokensApiClient();
+    this.api = options.api ?? createAiTokensApiClient(fetch, options.ownerId);
     this.copyText = options.copyText ?? defaultCopyText;
     const detectedOrigin =
       options.origin ??

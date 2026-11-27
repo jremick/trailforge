@@ -900,7 +900,8 @@ def test_full_oauth21_pkce_dcr_rotation_reuse_revoke_and_grants(
         assert "frame-ancestors 'none'" in consent_csp
         assert "form-action 'self' https://claude.ai;" in consent_csp
         assert user.email in consent_page.text
-        assert "Read your rigs, saved routes &amp; trip summaries" in consent_page.text
+        read_permission = "Read your rigs, saved routes, pins, favorites &amp; trip summaries"
+        assert read_permission in consent_page.text
         assert "Save routes, pins &amp; favorites" in consent_page.text
         assert "<script>alert(1)</script>" not in consent_page.text
         consent_csrf = _extract_csrf(consent_page.text)

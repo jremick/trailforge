@@ -85,6 +85,8 @@ TrailForge's Capacitor configuration is already defined in [`web/capacitor.confi
 4. **Pointing at a self-hosted TrailForge API:**
    In production, configure your HTTPS TrailForge reverse proxy or set `VITE_API_BASE_URL` before `npm run build` (or configure `server.url` in `web/capacitor.config.ts` during LAN development).
 
+   The native app keeps the session bearer in memory. Sign in again after relaunch to sync pending recordings for your account.
+
 ---
 
 ## 4. Android Build Guide (Android Studio + Foreground Location Service)

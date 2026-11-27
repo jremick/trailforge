@@ -58,7 +58,6 @@ import {
   resetUserPreferences,
   revokeAdminInvite,
   saveRoute,
-  setStoredAuthToken,
   triggerAdminClosuresSync,
   triggerAdminGradingRecompute,
   updateAdminUiSettings,
@@ -2677,7 +2676,6 @@ class TrailForgeApp {
       }
     } catch (err) {
       if (err instanceof ApiError && err.status === 403) {
-        setStoredAuthToken(null);
         this.user = null;
         this.showToast(formatFriendlyApiError(err), "error");
       }

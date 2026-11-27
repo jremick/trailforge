@@ -131,15 +131,6 @@ class Settings(BaseSettings):
         ),
         description="Account registration policy ('open', 'invite_only', or 'closed').",
     )
-    admin_email: str = Field(
-        default="",
-        validation_alias=AliasChoices(
-            "TRAILFORGE_ADMIN_EMAIL",
-            "ADMIN_EMAIL",
-            "admin_email",
-        ),
-        description="Optional bootstrap admin email promoted on first registration.",
-    )
     demo_banner: str = Field(
         default="",
         validation_alias=AliasChoices(

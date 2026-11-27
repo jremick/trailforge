@@ -12,7 +12,12 @@ from pydantic import BaseModel, Field, StringConstraints, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from trailforge.auth.dependencies import get_current_user, get_optional_current_user
+from trailforge.auth.dependencies import (
+    get_current_user,
+    get_optional_current_user,
+    get_scoped_read_user,
+    get_scoped_write_user,
+)
 from trailforge.db.models import PlannedRoute, User, VehicleProfile
 from trailforge.db.session import get_db
 from trailforge.routes.export import build_route_geojson, build_route_gpx
@@ -312,7 +317,7 @@ def export_ad_hoc_route(
 def list_saved_routes(
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_scoped_read_user),
     db: Session = Depends(get_db),
 ) -> list[SavedRouteSummaryResponse]:
     """List the signed-in user's saved multi-track routes with batched live summary metrics."""
@@ -375,7 +380,7 @@ def list_saved_routes(
 @router.post("", response_model=SavedRouteDetailResponse, status_code=status.HTTP_201_CREATED)
 def create_saved_route(
     payload: SavedRouteCreateRequest,
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_scoped_write_user),
     db: Session = Depends(get_db),
 ) -> SavedRouteDetailResponse:
     """Persist a planned multi-track route (Tier C) and return live computed analysis."""
@@ -411,7 +416,7 @@ def create_saved_route(
 def get_saved_route(
     route_id: str,
     vehicle_class: str | None = Query(default=None),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_scoped_read_user),
     db: Session = Depends(get_db),
 ) -> SavedRouteDetailResponse:
     """Return an owned saved route with freshly recomputed live analysis."""
@@ -443,7 +448,7 @@ def get_saved_route(
 def update_saved_route(
     route_id: str,
     payload: SavedRouteUpdateRequest,
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_scoped_write_user),
     db: Session = Depends(get_db),
 ) -> SavedRouteDetailResponse:
     """Update an owned saved route's name, notes, track_ids, waypoints, or vehicle_class."""
