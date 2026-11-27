@@ -34,7 +34,12 @@ from trailforge.db.models import (
 from trailforge.db.session import get_db
 from trailforge.feeds.queries import get_closures_for_track_ids
 from trailforge.grading.baseline import SegmentGradeInput, compute_baseline_grade
-from trailforge.grading.live import get_live_summaries_for_tracks, get_track_live_summary
+from trailforge.grading.live import (
+    get_live_summaries_for_tracks,
+    get_track_live_summary,
+    has_public_telemetry,
+    weather_adjusted_grade,
+)
 from trailforge.reports.queries import get_reports_for_track, get_reports_for_tracks
 from trailforge.vehicles.classifier import (
     CapabilityClassLiteral,
@@ -472,17 +477,23 @@ def _park_to_summary(park: CAPADPark | None) -> ParkSummary | None:
 def _grade_to_payload(grade: TrackSegmentGrade | None) -> SegmentGradePayload | None:
     if grade is None:
         return None
+    share = has_public_telemetry(grade.sample_count, grade.live_breakdown)
+    effective_grade = (
+        grade.effective_grade if share else weather_adjusted_grade(
+            grade.baseline_grade, grade.baseline_score, grade.rainfall_context
+        )
+    ) or grade.baseline_grade
     return SegmentGradePayload(
         baseline_grade=grade.baseline_grade,
         baseline_score=grade.baseline_score,
         baseline_breakdown=grade.baseline_breakdown,
-        live_grade=grade.live_grade,
-        live_score=grade.live_score,
-        live_breakdown=grade.live_breakdown,
-        effective_grade=grade.effective_grade,
-        confidence_level=grade.confidence_level,
-        confidence_score=grade.confidence_score,
-        sample_count=grade.sample_count,
+        live_grade=grade.live_grade if share else None,
+        live_score=grade.live_score if share else None,
+        live_breakdown=grade.live_breakdown if share else None,
+        effective_grade=effective_grade,
+        confidence_level=grade.confidence_level if share else "baseline_only",
+        confidence_score=grade.confidence_score if share else 0.0,
+        sample_count=grade.sample_count if share else 0,
         wet_risk_level=grade.wet_risk_level,
         rainfall_context=grade.rainfall_context,
     )
@@ -978,6 +989,9 @@ def get_corridor_tracks_geojson(
             TrackSegmentGrade.is_obstacle_hotspot,
             TrackSegmentGrade.wet_risk_level,
             TrackSegmentGrade.live_computed_at,
+            TrackSegmentGrade.sample_count,
+            TrackSegmentGrade.live_breakdown,
+            TrackSegmentGrade.rainfall_context,
         )
         .outerjoin(TrackSegmentGrade, TrackSegment.segment_id == TrackSegmentGrade.segment_id)
         .where(TrackSegment.is_active.is_(True))
@@ -998,8 +1012,14 @@ def get_corridor_tracks_geojson(
     etag_hasher.update(f"{bbox or ''}|{state or ''}|{grade or ''}|{limit}|{len(rows)}".encode())
     features: list[dict[str, Any]] = []
     for row in rows:
+        share = has_public_telemetry(row.sample_count, row.live_breakdown)
+        effective_grade = (
+            row.effective_grade if share else weather_adjusted_grade(
+                row.baseline_grade, row.baseline_score, row.rainfall_context
+            )
+        )
         etag_hasher.update(
-            f"|{row.segment_id}:{row.seg_updated_at}:{row.effective_grade}:{row.live_computed_at}".encode()
+            f"|{row.segment_id}:{row.seg_updated_at}:{effective_grade}:{row.live_computed_at}".encode()
         )
         features.append(
             {
@@ -1032,17 +1052,18 @@ def get_corridor_tracks_geojson(
                     "has_gate_barrier": row.has_gate_barrier,
                     "primary_source": row.primary_source,
                     "has_osm_source": row.has_osm_source,
-                    "grade": row.effective_grade,
-                    "score": (
-                        row.live_score if row.live_score is not None else row.baseline_score
-                    ),
+                    "grade": effective_grade,
+                    "score": row.live_score if share and row.live_score is not None
+                    else row.baseline_score,
                     "baseline_grade": row.baseline_grade,
                     "baseline_score": row.baseline_score,
-                    "effective_grade": row.effective_grade,
-                    "live_grade": row.live_grade,
-                    "live_score": row.live_score,
-                    "confidence_level": _normalize_confidence(row.confidence_level),
-                    "is_obstacle_hotspot": bool(row.is_obstacle_hotspot),
+                    "effective_grade": effective_grade,
+                    "live_grade": row.live_grade if share else None,
+                    "live_score": row.live_score if share else None,
+                    "confidence_level": (
+                        _normalize_confidence(row.confidence_level) if share else "none"
+                    ),
+                    "is_obstacle_hotspot": share and bool(row.is_obstacle_hotspot),
                     "wet_risk_level": str(row.wet_risk_level or "dry"),
                 },
             }
@@ -1050,7 +1071,7 @@ def get_corridor_tracks_geojson(
     etag = f'"{etag_hasher.hexdigest()[:24]}"'
     cache_headers = {
         "ETag": etag,
-        "Cache-Control": "public, max-age=60",
+        "Cache-Control": "no-store",
     }
     if_none_match = (request.headers.get("if-none-match") or "").strip()
     if if_none_match and (if_none_match == etag or if_none_match == f"W/{etag}"):
@@ -1450,6 +1471,8 @@ def get_track_detail(
 def get_track_details_batch(
     db: Session,
     track_ids: list[str],
+    *,
+    include_community: bool = True,
 ) -> list[TrackDetailResponse]:
     """Batch-build anonymous TrackDetailResponse payloads for a chunk of track IDs (~8 queries).
 
@@ -1500,6 +1523,21 @@ def get_track_details_batch(
         tid: [] for tid in found_ids
     }
     for seg, geom_json, grd, park in raw_seg_rows:
+        if grd is not None and not include_community:
+            # Give the rest of the snapshot serializer only weather and baseline grades.
+            grd = TrackSegmentGrade(
+                baseline_grade=grd.baseline_grade,
+                baseline_score=grd.baseline_score,
+                baseline_breakdown=grd.baseline_breakdown,
+                effective_grade=weather_adjusted_grade(
+                    grd.baseline_grade, grd.baseline_score, grd.rainfall_context
+                ),
+                confidence_level="baseline_only",
+                confidence_score=0,
+                sample_count=0,
+                rainfall_context=grd.rainfall_context,
+                wet_risk_level=grd.wet_risk_level,
+            )
         if seg.track_id in segs_by_track:
             segs_by_track[seg.track_id].append((seg, geom_json, grd, park))
 
@@ -1614,7 +1652,7 @@ def get_track_details_batch(
     # 5. Batched closures, reports, and live summaries
     closures_map = _load_closures_by_track(db, found_ids)
     reports_map = get_reports_for_tracks(db, found_ids, include_resolved=False)
-    live_map = get_live_summaries_for_tracks(db, found_ids)
+    live_map = get_live_summaries_for_tracks(db, found_ids, include_community=include_community)
 
     details: list[TrackDetailResponse] = []
     for tid in found_ids:
@@ -1995,7 +2033,22 @@ def search_network(
     cache_key = (_db_cache_scope(db), term_lower, limit, geocoder_enabled)
     cached = _search_cache_get(cache_key)
     if cached is not None:
-        return cached
+        cached_tracks = [item for item in cached.results if item.kind == "track"]
+        if not cached_tracks:
+            return cached
+        current_grades = {
+            row.track_id: row.effective_grade
+            for row in db.execute(
+                select(Track.track_id, Track.effective_grade)
+                .where(Track.track_id.in_([item.id for item in cached_tracks]))
+            ).all()
+        }
+        # Revalidate the grades in the database across API and worker processes.
+        # Legacy rows without a synchronized grade still use the full fallback query.
+        if all(current_grades.get(item.id) for item in cached_tracks):
+            for item in cached_tracks:
+                item.grade = current_grades[item.id]
+            return cached
 
     escaped_term = _escape_like(term)
     pattern = f"%{escaped_term}%"

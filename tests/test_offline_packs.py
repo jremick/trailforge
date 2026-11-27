@@ -34,6 +34,7 @@ from trailforge.ingestion.pipeline import ingest_corridor_dataset
 from trailforge.packs.builder import (
     MANIFEST_FILENAME,
     SNAPSHOT_FILENAME,
+    TERRAIN_TILE_FILENAME,
     VECTOR_TILE_FILENAME,
     build_regional_pack,
 )
@@ -177,7 +178,7 @@ def test_packs_api_range_206_and_strict_traversal_rejection(tmp_path: Path) -> N
 
     # Synthetic PMTiles payload + outside file + symlink escape attempt
     pmtiles_bytes = b"PMTiles\x03" + bytes(range(256))
-    (alps_dir / VECTOR_TILE_FILENAME).write_bytes(pmtiles_bytes)
+    (alps_dir / TERRAIN_TILE_FILENAME).write_bytes(pmtiles_bytes)
     (alps_dir / SNAPSHOT_FILENAME).write_text('{"region_id":"australian-alps"}\n', encoding="utf-8")
     (alps_dir / MANIFEST_FILENAME).write_text(
         json.dumps({"region_id": "australian-alps", "attributions": list(PACK_ATTRIBUTIONS)}),
@@ -186,7 +187,7 @@ def test_packs_api_range_206_and_strict_traversal_rejection(tmp_path: Path) -> N
 
     outside_file = tmp_path / "secret.pmtiles"
     outside_file.write_bytes(b"SECRET")
-    (alps_dir / "terrain.pmtiles").symlink_to(outside_file)
+    (alps_dir / VECTOR_TILE_FILENAME).symlink_to(outside_file)
 
     app = _build_test_app()
     app.dependency_overrides[get_packs_dir_dep] = lambda: packs_dir
@@ -202,7 +203,7 @@ def test_packs_api_range_206_and_strict_traversal_rejection(tmp_path: Path) -> N
     try:
         with TestClient(app) as client:
             # HEAD full archive
-            r_head = client.head("/api/packs/australian-alps/tiles/vector.pmtiles")
+            r_head = client.head("/api/packs/australian-alps/tiles/terrain.pmtiles")
             assert r_head.status_code == 200
             assert r_head.headers["accept-ranges"] == "bytes"
             assert r_head.headers["content-length"] == str(len(pmtiles_bytes))
@@ -211,7 +212,7 @@ def test_packs_api_range_206_and_strict_traversal_rejection(tmp_path: Path) -> N
 
             # GET Range 206 Partial Content (exact slice)
             r_part = client.get(
-                "/api/packs/australian-alps/tiles/vector.pmtiles",
+                "/api/packs/australian-alps/tiles/terrain.pmtiles",
                 headers={"Range": "bytes=0-15"},
             )
             assert r_part.status_code == 206
@@ -221,7 +222,7 @@ def test_packs_api_range_206_and_strict_traversal_rejection(tmp_path: Path) -> N
 
             # Suffix Range 206
             r_suf = client.get(
-                "/api/packs/australian-alps/tiles/vector.pmtiles",
+                "/api/packs/australian-alps/tiles/terrain.pmtiles",
                 headers={"Range": "bytes=-12"},
             )
             assert r_suf.status_code == 206
@@ -230,14 +231,14 @@ def test_packs_api_range_206_and_strict_traversal_rejection(tmp_path: Path) -> N
             # Out-of-bounds & multi-range -> 416
             assert (
                 client.get(
-                    "/api/packs/australian-alps/tiles/vector.pmtiles",
+                    "/api/packs/australian-alps/tiles/terrain.pmtiles",
                     headers={"Range": "bytes=99999-100000"},
                 ).status_code
                 == 416
             )
             assert (
                 client.get(
-                    "/api/packs/australian-alps/tiles/vector.pmtiles",
+                    "/api/packs/australian-alps/tiles/terrain.pmtiles",
                     headers={"Range": "bytes=0-5, 10-15"},
                 ).status_code
                 == 416
@@ -246,7 +247,7 @@ def test_packs_api_range_206_and_strict_traversal_rejection(tmp_path: Path) -> N
             # ETag conditional 304
             assert (
                 client.get(
-                    "/api/packs/australian-alps/tiles/vector.pmtiles",
+                    "/api/packs/australian-alps/tiles/terrain.pmtiles",
                     headers={"If-None-Match": etag},
                 ).status_code
                 == 304
@@ -254,7 +255,7 @@ def test_packs_api_range_206_and_strict_traversal_rejection(tmp_path: Path) -> N
 
             # Symlink escape blocked -> 422
             assert (
-                client.get("/api/packs/australian-alps/tiles/terrain.pmtiles").status_code == 422
+                client.get("/api/packs/australian-alps/tiles/vector.pmtiles").status_code == 422
             )
 
             # Strict region & filename allowlist + traversal rejection (404 / 422)
@@ -356,7 +357,7 @@ def test_all_four_regional_packs_build_checksums_tarball_snapshot_range_and_memo
             grd.vehicle_class_split = {"Touring 4WD": 3, "Modified 4WD": 1}
             grd.wet_risk_level = "wet"
             grd.live_breakdown = {
-                "version": "live_v1",
+                "version": "live_v2",
                 "sample_count": 4,
                 "confidence_level": "medium",
                 "avg_speed_kmh": 5.4,

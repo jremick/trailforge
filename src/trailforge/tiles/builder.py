@@ -48,6 +48,7 @@ from trailforge.db.models import (
     TrackSegment,
     TrackSegmentGrade,
 )
+from trailforge.grading.live import weather_adjusted_grade
 from trailforge.ingestion.connectors.base import (
     ATTRIBUTION_CAPAD,
     ATTRIBUTION_GA_DEM,
@@ -63,6 +64,8 @@ from trailforge.ingestion.terrain import DemSampler, read_raster_bounds
 logger = logging.getLogger(__name__)
 
 VECTOR_PMTILES_FILENAME: Final[str] = "trailforge_vector.pmtiles"
+PUBLIC_VECTOR_PMTILES_FILENAME: Final[str] = "trailforge_vector_baseline_weather_v1.pmtiles"
+STATIC_TILE_TELEMETRY_POLICY: Final[str] = "baseline_weather_v1"
 TERRAIN_PMTILES_FILENAME: Final[str] = "trailforge_terrain.pmtiles"
 MANIFEST_FILENAME: Final[str] = "manifest.json"
 
@@ -135,6 +138,7 @@ class TileManifest(BaseModel):
     vector_url: str = f"/api/tiles/{VECTOR_PMTILES_FILENAME}"
     terrain_url: str = f"/api/tiles/{TERRAIN_PMTILES_FILENAME}"
     vector_available: bool = False
+    community_telemetry_policy: str | None = None
     terrain_available: bool = False
     layers: list[str] = Field(default_factory=list)
     layer_counts: dict[str, int] = Field(default_factory=dict)
@@ -302,14 +306,9 @@ def export_postgis_vector_layers(
             TrackSegment.has_gate_barrier,
             TrackSegment.access_status,
             func.ST_AsGeoJSON(TrackSegment.geom, 6).label("geom_json"),
-            TrackSegmentGrade.effective_grade,
             TrackSegmentGrade.baseline_grade,
-            TrackSegmentGrade.live_grade,
-            TrackSegmentGrade.live_score,
             TrackSegmentGrade.baseline_score,
-            TrackSegmentGrade.confidence_level,
             TrackSegmentGrade.wet_risk_level,
-            TrackSegmentGrade.live_breakdown,
             TrackSegmentGrade.rainfall_context,
             Track.name.label("track_name"),
         )
@@ -330,20 +329,11 @@ def export_postgis_vector_layers(
             if not geom_json:
                 continue
             resolved_name = row.track_name or row.seg_name or "Unnamed Track"
-            grade_val = (
-                row.effective_grade
-                if row.effective_grade
-                else (row.baseline_grade if row.baseline_grade else "Easy")
-            )
-            score_val = (
-                float(row.live_score)
-                if row.live_score is not None
-                else (float(row.baseline_score) if row.baseline_score is not None else 0.0)
-            )
-            live_bd = row.live_breakdown if isinstance(row.live_breakdown, dict) else {}
+            grade_val = weather_adjusted_grade(
+                row.baseline_grade, row.baseline_score, row.rainfall_context
+            ) or "Easy"
+            score_val = float(row.baseline_score or 0.0)
             rain_ctx = row.rainfall_context if isinstance(row.rainfall_context, dict) else {}
-            raw_conf = row.confidence_level or "baseline_only"
-            conf_level = "none" if raw_conf in ("", "baseline_only") else raw_conf
             wet_risk = str(rain_ctx.get("wet_risk_level") or (row.wet_risk_level or "dry"))
 
             seg_props: dict[str, Any] = {
@@ -352,12 +342,7 @@ def export_postgis_vector_layers(
                 "track_name": resolved_name,
                 "grade": grade_val,
                 "score": round(score_val, 1),
-                "live_grade": row.live_grade,
-                "live_score": (
-                    round(float(row.live_score), 1) if row.live_score is not None else None
-                ),
-                "confidence_level": conf_level,
-                "is_obstacle_hotspot": bool(live_bd.get("is_obstacle_hotspot", False)),
+                "confidence_level": "none",
                 "wet_risk_level": wet_risk,
                 "max_slope_deg": round(row.max_slope_deg, 2)
                 if row.max_slope_deg is not None
@@ -1209,6 +1194,15 @@ def build_tiles(
         if bounds_acc is not None
         else [148.05, -36.68, 148.2, -36.55]
     )
+    manifest_path = out_dir / MANIFEST_FILENAME
+    previous_policy = None
+    if vector_out.is_file() and not vector_built:
+        try:
+            previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(previous, dict):
+                previous_policy = previous.get("community_telemetry_policy")
+        except (OSError, ValueError):
+            pass
     manifest = TileManifest(
         generated_at=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         bounds=final_bounds,
@@ -1217,6 +1211,11 @@ def build_tiles(
         vector_url=f"/api/tiles/{VECTOR_PMTILES_FILENAME}",
         terrain_url=f"/api/tiles/{TERRAIN_PMTILES_FILENAME}",
         vector_available=vector_built or vector_out.is_file(),
+        community_telemetry_policy=(
+            STATIC_TILE_TELEMETRY_POLICY
+            if vector_built or previous_policy == STATIC_TILE_TELEMETRY_POLICY
+            else None
+        ),
         terrain_available=terrain_built or terrain_out.is_file(),
         layers=layers_present,
         layer_counts=layer_counts,
@@ -1225,7 +1224,6 @@ def build_tiles(
         attributions=list(DEFAULT_ATTRIBUTIONS),
     )
 
-    manifest_path = out_dir / MANIFEST_FILENAME
     tmp_manifest = out_dir / f"{MANIFEST_FILENAME}.tmp"
     tmp_manifest.write_text(manifest.model_dump_json(indent=2) + "\n", encoding="utf-8")
     tmp_manifest.replace(manifest_path)

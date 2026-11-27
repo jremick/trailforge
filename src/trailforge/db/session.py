@@ -42,6 +42,7 @@ def _build_engine(url: str, *, statement_timeout_ms: int | None = None) -> Engin
         "pool_size": 5,
         "max_overflow": 5,
         "pool_recycle": DEFAULT_POOL_RECYCLE_S,
+        "hide_parameters": True,
         "future": True,
     }
     if connect_args:

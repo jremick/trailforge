@@ -207,10 +207,12 @@ Verify R2 serves HTTP `206 Partial Content` with CORS headers:
 curl -sSI \
   -H "Origin: https://trails.example.com" \
   -H "Range: bytes=0-127" \
-  "https://tiles.example.com/trailforge_vector.pmtiles"
+  "https://tiles.example.com/trailforge_vector_baseline_weather_v1.pmtiles"
 ```
 
 Confirm `HTTP/2 206`, `access-control-allow-origin: https://trails.example.com`, `content-range:`, `accept-ranges: bytes`, and `etag:` appear in the response.
+
+> **Upgrading from `v1.2.x`:** Re-run `python -m trailforge.tiles.cli` / `python -m trailforge.packs.cli --static-only` and `python -m trailforge.packs.r2_sync` immediately on rollout so the static baseline/weather archive (`trailforge_vector_baseline_weather_v1.pmtiles`) and `static_v1` regional packs are published to R2, then purge any retired legacy objects (`trailforge_vector.pmtiles`, `<region>/snapshot.json`). See [`docs/COMMUNITY_PRIVACY.md`](../../docs/COMMUNITY_PRIVACY.md).
 
 ### 4.3 Create Your First Admin Account & Friend Invite Codes
 

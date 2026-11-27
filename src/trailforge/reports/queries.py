@@ -219,7 +219,7 @@ def serialize_condition_report(
         created_at=base_ts,
         last_confirmed_at=last_confirmed_at,
         confirm_count=int(report.confirm_count or 0),
-        resolved_count=int(report.resolve_count or 0),
+        resolved_count=int(report.eligible_resolve_count or 0),
         status=report.status,
         now=now,
     )

@@ -167,12 +167,12 @@ def test_deterministic_decay_and_auto_resolution_rules() -> None:
     assert one_resolve.freshness_score < 1.0
     assert one_resolve.effective_status == "active"
 
-    # 2 resolve votes vs 0 confirms -> auto-resolves
+    # Two resolve votes leave a community hazard visible.
     two_resolves = evaluate_report_decay(
         "fallen_tree", created_at=now, confirm_count=0, resolved_count=2, now=now
     )
-    assert two_resolves.is_resolved is True
-    assert two_resolves.effective_status == "resolved"
+    assert two_resolves.is_resolved is False
+    assert two_resolves.effective_status == "active"
 
     # Tie (2 resolves vs 2 confirms) -> stays active
     tied = evaluate_report_decay(
@@ -728,7 +728,7 @@ def test_reports_api_end_to_end_photos_voting_decay_snapping_and_privacy(
                 assert r_v2.json()["resolved_count"] == 1
                 assert r_v2.json()["effective_status"] != "resolved"
 
-                # Carol votes resolved (2 resolves > 0 confirms -> automatically resolved!)
+                # Two recent accounts can record observations without removing a warning.
                 r_v3 = client.post(
                     f"/api/reports/{snow_id}/vote",
                     headers=carol_headers,
@@ -736,7 +736,19 @@ def test_reports_api_end_to_end_photos_voting_decay_snapping_and_privacy(
                 )
                 assert r_v3.status_code == 200
                 assert r_v3.json()["resolved_count"] == 2
-                assert r_v3.json()["effective_status"] == "resolved"
+                assert r_v3.json()["effective_status"] == "stale"
+                assert snow_id in {item["id"] for item in client.get("/api/reports").json()}
+
+                session.execute(text("UPDATE users SET created_at = now() - interval '8 days'"))
+                session.commit()
+                for headers in (bob_headers, carol_headers, alice_headers):
+                    mature_vote = client.post(
+                        f"/api/reports/{snow_id}/vote",
+                        headers=headers,
+                        json={"vote": "resolved"},
+                    )
+                    assert mature_vote.status_code == 200
+                assert mature_vote.json()["effective_status"] == "resolved"
 
                 # Resolved report omitted by default, shown when include_resolved=true
                 active_ids = {item["id"] for item in client.get("/api/reports").json()}
@@ -776,6 +788,14 @@ def test_reports_api_end_to_end_photos_voting_decay_snapping_and_privacy(
                     client.post(
                         f"/api/reports/{gate_body['id']}/vote",
                         headers=carol_headers,
+                        json={"vote": "resolved"},
+                    ).status_code
+                    == 200
+                )
+                assert (
+                    client.post(
+                        f"/api/reports/{gate_body['id']}/vote",
+                        headers=alice_headers,
                         json={"vote": "resolved"},
                     ).status_code
                     == 200

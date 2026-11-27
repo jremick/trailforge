@@ -1,7 +1,7 @@
 """Explainable crowdsourced live track-grading & obstacle hotspot engine (Slice 07).
 
 Combines deterministic DEM/OSM baseline grades with:
-  1. Exponentially recency-weighted anonymized ``telemetry_observations`` (90-day half-life).
+  1. One recency-weighted traversal per contributing account and segment (90-day half-life).
   2. Vehicle Capability Class normalization (AWD vs Stock 4WD vs Touring 4WD vs Modified 4WD).
   3. Robust outlier protection (MAD Winsorization + Bayesian prior shrinkage ``eff_n/(eff_n+4)``
      + low-sample safety cap so 1 outlier traversal cannot skew a track grade).
@@ -17,8 +17,8 @@ import math
 import sys
 from collections import defaultdict
 from collections.abc import Sequence
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Literal
 
 import httpx
@@ -33,6 +33,7 @@ from trailforge.db.models import (
     Track,
     TrackSegment,
     TrackSegmentGrade,
+    Trip,
 )
 from trailforge.grading.baseline import GradeLiteral, score_to_grade
 from trailforge.grading.rainfall import (
@@ -44,14 +45,18 @@ from trailforge.grading.rainfall import (
     resolve_cell_rainfall,
     spatial_cell_key,
 )
+from trailforge.matching.contribution_keys import (
+    require_complete_contribution_keyring,
+    trip_contribution_hash_sql,
+)
 
-LIVE_FORMULA_VERSION: Final[str] = "live_v1"
+LIVE_FORMULA_VERSION: Final[str] = "live_v2"
+MIN_PUBLIC_CONTRIBUTORS: Final[int] = 3
 RECENCY_HALF_LIFE_DAYS: Final[float] = 90.0
 PRIOR_STRENGTH: Final[float] = 4.0
 
 HOTSPOT_SLOW_SPEED_KMH: Final[float] = 8.0
 HOTSPOT_ROUGHNESS_RMS: Final[float] = 0.45
-HOTSPOT_MIN_SAMPLES: Final[int] = 2
 HOTSPOT_REL_SLOWDOWN_RATIO: Final[float] = 0.55
 
 VEHICLE_CLASSES: Final[tuple[str, ...]] = (
@@ -214,6 +219,9 @@ def build_vehicle_class_split(samples: Sequence[ObservationSample]) -> dict[str,
     for s in samples:
         if s.vehicle_capability_class in counts:
             counts[s.vehicle_capability_class] += 1
+    # Suppress the complete split if a small class would be exposed by subtraction.
+    if any(0 < count < MIN_PUBLIC_CONTRIBUTORS for count in counts.values()):
+        return {}
     total = sum(counts.values())
     return {
         vc: {
@@ -222,6 +230,27 @@ def build_vehicle_class_split(samples: Sequence[ObservationSample]) -> dict[str,
         }
         for vc in VEHICLE_CLASSES
     }
+
+
+def has_public_telemetry(sample_count: int | None, live_breakdown: Any) -> bool:
+    """Recognize aggregates produced under the contributor policy."""
+    return (
+        (sample_count or 0) >= MIN_PUBLIC_CONTRIBUTORS
+        and isinstance(live_breakdown, dict)
+        and live_breakdown.get("version") == LIVE_FORMULA_VERSION
+    )
+
+
+def weather_adjusted_grade(
+    baseline_grade: str | None,
+    baseline_score: float | None,
+    rainfall_context: dict[str, Any] | None,
+) -> str | None:
+    """Apply the separate rainfall signal to a baseline grade."""
+    wet_points = (rainfall_context or {}).get("wet_score_adjustment")
+    if baseline_score is not None and isinstance(wet_points, (int, float)) and wet_points > 0:
+        return score_to_grade(baseline_score + wet_points)
+    return baseline_grade
 
 
 def compute_segment_live_grade(
@@ -233,12 +262,10 @@ def compute_segment_live_grade(
     now: datetime | None = None,
     track_median_speed_kmh: float | None = None,
 ) -> SegmentLiveComputation:
-    """Pure, deterministic live telemetry + rainfall grading computation for one segment."""
+    """Compute live grading from representative samples of distinct contributors."""
     ref_now = (now or datetime.now(UTC)).astimezone(UTC)
     n = len(samples)
-    db_conf, api_conf = classify_confidence(n)
-
-    if n == 0:
+    if n < MIN_PUBLIC_CONTRIBUTORS:
         eff_score = min(100.0, baseline_score + wet_adjustment.wet_score_adjustment)
         eff_grade = (
             score_to_grade(eff_score)
@@ -248,16 +275,31 @@ def compute_segment_live_grade(
         return SegmentLiveComputation(
             sample_count=0,
             effective_sample_weight=0.0,
-            db_confidence_level=db_conf,
-            api_confidence_level=api_conf,
+            db_confidence_level="baseline_only",
+            api_confidence_level="none",
             confidence_score=0.0,
             effective_grade=eff_grade,
             wet_adjustment=wet_adjustment,
         )
 
-    weights = [
-        compute_recency_weight(s.observed_at, now=ref_now, match_confidence=s.match_confidence)
+    db_conf, api_conf = classify_confidence(n)
+    samples_with_roughness = sum(
+        s.roughness_rms is not None and math.isfinite(s.roughness_rms) for s in samples
+    )
+    if samples_with_roughness < MIN_PUBLIC_CONTRIBUTORS:
+        samples = [replace(sample, roughness_rms=None) for sample in samples]
+    observed_days = [
+        (
+            s.observed_at.astimezone(UTC)
+            if s.observed_at.tzinfo else s.observed_at.replace(tzinfo=UTC)
+        ).replace(hour=0, minute=0, second=0, microsecond=0)
         for s in samples
+    ]
+    ref_day = ref_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    observed_days = [min(day, ref_day) for day in observed_days]
+    weights = [
+        compute_recency_weight(day, now=ref_day, match_confidence=sample.match_confidence)
+        for day, sample in zip(observed_days, samples, strict=True)
     ]
     eff_n = sum(weights)
     w_sum = max(1e-9, eff_n)
@@ -265,71 +307,53 @@ def compute_segment_live_grade(
     raw_deltas = [compute_observation_delta(s, baseline_score) for s in samples]
     outlier_clamped_count = 0
 
-    if n >= 3:
-        arr = np.array(raw_deltas, dtype=float)
-        med = float(np.median(arr))
-        mad = float(np.median(np.abs(arr - med)))
-        mad_eff = max(4.0, 1.4826 * mad)
-        lo = med - 2.5 * mad_eff
-        hi = med + 2.5 * mad_eff
-        clamped_deltas: list[float] = []
-        for d in raw_deltas:
-            if d < lo:
-                clamped_deltas.append(lo)
-                outlier_clamped_count += 1
-            elif d > hi:
-                clamped_deltas.append(hi)
-                outlier_clamped_count += 1
-            else:
-                clamped_deltas.append(d)
-    else:
-        clamped_deltas = list(raw_deltas)
+    arr = np.array(raw_deltas, dtype=float)
+    med = float(np.median(arr))
+    mad = float(np.median(np.abs(arr - med)))
+    mad_eff = max(4.0, 1.4826 * mad)
+    lo = med - 2.5 * mad_eff
+    hi = med + 2.5 * mad_eff
+    clamped_deltas: list[float] = []
+    for d in raw_deltas:
+        clamped = min(hi, max(lo, d))
+        clamped_deltas.append(clamped)
+        outlier_clamped_count += int(clamped != d)
 
     weighted_delta = sum(w * d for w, d in zip(weights, clamped_deltas, strict=True)) / w_sum
     shrinkage_weight = eff_n / (eff_n + PRIOR_STRENGTH)
     shrunk_delta = weighted_delta * shrinkage_weight
 
-    # Hard single-sample & low-sample protection so 1 outlier cannot jump a track grade
-    if n == 1:
-        shrunk_delta = max(-5.0, min(5.0, shrunk_delta))
-    elif n == 2:
-        shrunk_delta = max(-9.0, min(9.0, shrunk_delta))
-
     speeds = [float(s.avg_speed_kmh) for s in samples]
     durations = [float(s.traversal_duration_s) for s in samples]
-    rough_vals = [float(s.roughness_rms) for s in samples if s.roughness_rms is not None]
+    rough_vals = [
+        float(s.roughness_rms)
+        for s in samples
+        if s.roughness_rms is not None and math.isfinite(s.roughness_rms)
+    ]
 
-    avg_speed_kmh = sum(w * v for w, v in zip(weights, speeds, strict=True)) / w_sum
-    median_speed_kmh = float(np.median(speeds))
-    avg_duration_s = sum(w * d for w, d in zip(weights, durations, strict=True)) / w_sum
+    avg_speed_kmh = round(sum(speeds) / n, 0)
+    median_speed_kmh = round(float(np.median(speeds)), 0)
+    avg_duration_s = round(sum(durations) / n, 0)
     median_roughness_rms = float(np.median(rough_vals)) if rough_vals else None
 
-    last_driven_at = max(
-        (
-            s.observed_at.astimezone(UTC)
-            if s.observed_at.tzinfo
-            else s.observed_at.replace(tzinfo=UTC)
-        )
-        for s in samples
-    )
+    corroborated_day = sorted(observed_days, reverse=True)[MIN_PUBLIC_CONTRIBUTORS - 1]
+    last_driven_at = corroborated_day - timedelta(days=corroborated_day.weekday())
     vehicle_split = build_vehicle_class_split(samples)
 
-    # Rough/slow obstacle hotspot detection (requires >=2 traversals to suppress lone stops)
     obstacle_reasons: list[str] = []
-    if n >= HOTSPOT_MIN_SAMPLES:
-        if avg_speed_kmh <= HOTSPOT_SLOW_SPEED_KMH:
-            obstacle_reasons.append(f"Slow crawl speed ({avg_speed_kmh:.1f} km/h avg)")
-        if median_roughness_rms is not None and median_roughness_rms >= HOTSPOT_ROUGHNESS_RMS:
-            obstacle_reasons.append(f"High surface roughness ({median_roughness_rms:.2f} RMS)")
-        if (
-            track_median_speed_kmh is not None
-            and track_median_speed_kmh >= 12.0
-            and avg_speed_kmh <= track_median_speed_kmh * HOTSPOT_REL_SLOWDOWN_RATIO
-        ):
-            obstacle_reasons.append(
-                f"Sharp slowdown ({avg_speed_kmh:.1f} vs "
-                f"{track_median_speed_kmh:.1f} km/h track median)"
-            )
+    if avg_speed_kmh <= HOTSPOT_SLOW_SPEED_KMH:
+        obstacle_reasons.append(f"Slow crawl speed ({avg_speed_kmh:.1f} km/h avg)")
+    if median_roughness_rms is not None and median_roughness_rms >= HOTSPOT_ROUGHNESS_RMS:
+        obstacle_reasons.append(f"High surface roughness ({median_roughness_rms:.2f} RMS)")
+    if (
+        track_median_speed_kmh is not None
+        and track_median_speed_kmh >= 12.0
+        and avg_speed_kmh <= track_median_speed_kmh * HOTSPOT_REL_SLOWDOWN_RATIO
+    ):
+        obstacle_reasons.append(
+            f"Sharp slowdown ({avg_speed_kmh:.1f} vs "
+            f"{track_median_speed_kmh:.1f} km/h track median)"
+        )
     is_obstacle_hotspot = len(obstacle_reasons) > 0
 
     live_score = round(
@@ -339,7 +363,7 @@ def compute_segment_live_grade(
     live_grade = score_to_grade(live_score)
 
     reasons: list[str] = [
-        f"{n} anonymous traversal{'s' if n != 1 else ''} "
+        f"{n} independent contributors "
         f"(recency-weighted eff. n={eff_n:.1f}, {api_conf} confidence)",
         f"Weighted avg speed {avg_speed_kmh:.1f} km/h (median {median_speed_kmh:.1f} km/h)",
     ]
@@ -391,7 +415,7 @@ def compute_segment_live_grade(
         effective_sample_weight=round(eff_n, 3),
         db_confidence_level=db_conf,
         api_confidence_level=api_conf,
-        confidence_score=round(min(1.0, shrinkage_weight), 4),
+        confidence_score=round(n / (n + PRIOR_STRENGTH), 2),
         last_driven_at=last_driven_at,
         avg_speed_kmh=round(avg_speed_kmh, 2),
         median_speed_kmh=round(median_speed_kmh, 2),
@@ -527,6 +551,41 @@ def sync_track_effective_grades(
     return updated
 
 
+def lock_community_grading(session: Session) -> None:
+    """Serialize derivative calculations with withdrawals across API and worker processes."""
+    session.execute(text("SELECT pg_advisory_xact_lock(14812, 7)"))
+
+
+def refresh_grades_after_withdrawal(session: Session, segment_ids: Sequence[str]) -> None:
+    """Refresh affected segments and their tracks' relative hotspot evidence in one transaction."""
+    if not segment_ids:
+        return
+    target_ids = set(segment_ids)
+    track_ids: set[str] = set()
+    for chunk in _chunked(list(target_ids)):
+        track_ids.update(
+            session.scalars(
+                select(TrackSegment.track_id).where(
+                    TrackSegment.segment_id.in_(chunk), TrackSegment.track_id.is_not(None)
+                )
+            ).all()
+        )
+    from trailforge.packs.builder import invalidate_pack_telemetry
+
+    invalidate_pack_telemetry(
+        session, segment_ids=sorted(target_ids), track_ids=sorted(track_ids)
+    )
+    for chunk in _chunked(list(track_ids)):
+        target_ids.update(session.scalars(
+            select(TrackSegment.segment_id).where(
+                TrackSegment.track_id.in_(chunk),
+                TrackSegment.is_active.is_(True),
+                TrackSegment.is_vehicular.is_(True),
+            )
+        ).all())
+    recompute_live_grades(session, segment_ids=sorted(target_ids), include_retired=True)
+
+
 def recompute_live_grades(
     session: Session,
     *,
@@ -536,6 +595,7 @@ def recompute_live_grades(
     fetch_live_rainfall: bool = False,
     http_client: httpx.Client | None = None,
     segment_ids: Sequence[str] | None = None,
+    include_retired: bool = False,
 ) -> LiveGradingRecomputeSummary:
     """Recompute live grades, obstacle hotspots, and 72 h rainfall across active segments.
 
@@ -544,13 +604,18 @@ def recompute_live_grades(
     Leaves ``baseline_grade``, ``baseline_score``, and ``baseline_breakdown`` strictly intact.
     """
     ref_now = (now or datetime.now(UTC)).astimezone(UTC)
+    lock_community_grading(session)
+    require_complete_contribution_keyring(session)
 
     # 0. Collect target active vehicular segment IDs (strings only -> ~6 MB per 250k segments)
     id_query = (
         select(TrackSegment.segment_id)
         .join(TrackSegmentGrade, TrackSegmentGrade.segment_id == TrackSegment.segment_id)
-        .where(TrackSegment.is_active.is_(True), TrackSegment.is_vehicular.is_(True))
     )
+    if not include_retired:
+        id_query = id_query.where(
+            TrackSegment.is_active.is_(True), TrackSegment.is_vehicular.is_(True)
+        )
     if segment_ids is None:
         target_seg_ids = list(session.execute(id_query).scalars().all())
     else:
@@ -575,7 +640,7 @@ def recompute_live_grades(
             rainfall_summary=get_rainfall_summary(session, now=ref_now),
         )
 
-    # 1. Load anonymized telemetry observations without exceeding PostgreSQL's 65,535 param limit
+    # Use a single most recent traversal per account on each canonical segment.
     obs_cols = (
         TelemetryObservation.segment_id,
         TelemetryObservation.vehicle_capability_class,
@@ -587,18 +652,32 @@ def recompute_live_grades(
         TelemetryObservation.roughness_p95,
         TelemetryObservation.match_confidence,
     )
+    obs_query = (
+        select(*obs_cols)
+        .join(Trip, trip_contribution_hash_sql() == TelemetryObservation.contribution_hash)
+        .join(TrackSegment, TrackSegment.segment_id == TelemetryObservation.segment_id)
+        .where(
+            Trip.visibility == "community_anonymous",
+            Trip.community_consent_confirmed.is_(True),
+            TrackSegment.is_active.is_(True),
+            TrackSegment.is_vehicular.is_(True),
+        )
+        .distinct(TelemetryObservation.segment_id, Trip.user_id)
+        .order_by(
+            TelemetryObservation.segment_id,
+            Trip.user_id,
+            TelemetryObservation.observed_at.desc(),
+            TelemetryObservation.id.desc(),
+        )
+    )
     if segment_ids is None:
-        obs_rows = session.execute(
-            select(*obs_cols)
-            .join(TrackSegment, TrackSegment.segment_id == TelemetryObservation.segment_id)
-            .where(TrackSegment.is_active.is_(True), TrackSegment.is_vehicular.is_(True))
-        ).all()
+        obs_rows = session.execute(obs_query).all()
     else:
         obs_rows = []
         for id_chunk in _chunked(target_seg_ids):
             obs_rows.extend(
                 session.execute(
-                    select(*obs_cols).where(TelemetryObservation.segment_id.in_(id_chunk))
+                    obs_query.where(TelemetryObservation.segment_id.in_(id_chunk))
                 ).all()
             )
 
@@ -629,7 +708,7 @@ def recompute_live_grades(
                 )
             ).all():
                 segsamp = samples_by_seg.get(seg_id)
-                if segsamp and track_id is not None:
+                if segsamp and len(segsamp) >= MIN_PUBLIC_CONTRIBUTORS and track_id is not None:
                     track_seg_speeds[track_id].append(
                         float(np.median([s.avg_speed_kmh for s in segsamp]))
                     )
@@ -778,6 +857,8 @@ def get_obstacle_hotspots_geojson(
             TrackSegment.is_active.is_(True),
             TrackSegment.is_vehicular.is_(True),
             TrackSegmentGrade.is_obstacle_hotspot.is_(True),
+            TrackSegmentGrade.sample_count >= MIN_PUBLIC_CONTRIBUTORS,
+            TrackSegmentGrade.live_breakdown["version"].astext == LIVE_FORMULA_VERSION,
         )
         .order_by(TrackSegment.track_id, TrackSegment.segment_seq, TrackSegment.segment_id)
     )
@@ -827,6 +908,8 @@ def get_obstacle_hotspots_geojson(
 def get_live_summaries_for_tracks(
     session: Session,
     track_ids: Sequence[str],
+    *,
+    include_community: bool = True,
 ) -> dict[str, dict[str, Any]]:
     """Aggregate Slice 07 live telemetry, rainfall, and obstacle hotspots per track.
 
@@ -874,7 +957,7 @@ def get_live_summaries_for_tracks(
     summaries: dict[str, dict[str, Any]] = {}
     for tid in unique_ids:
         seg_rows = by_track.get(tid, [])
-        summaries[tid] = _summarize_track_segments(seg_rows)
+        summaries[tid] = _summarize_track_segments(seg_rows, include_community=include_community)
     return summaries
 
 
@@ -885,7 +968,9 @@ def get_track_live_summary(session: Session, track_id: str) -> dict[str, Any]:
     )
 
 
-def _summarize_track_segments(seg_rows: Sequence[Any]) -> dict[str, Any]:
+def _summarize_track_segments(
+    seg_rows: Sequence[Any], *, include_community: bool = True
+) -> dict[str, Any]:
     """Roll up segment-level live grading & rainfall rows into a Track Inspector summary."""
     empty_split = {vc: {"count": 0, "pct": 0.0} for vc in VEHICLE_CLASSES}
     if not seg_rows:
@@ -937,7 +1022,8 @@ def _summarize_track_segments(seg_rows: Sequence[Any]) -> dict[str, Any]:
         total_len_m += seg_len
 
         sc = int(row.sample_count or 0)
-        if sc <= 0 or row.live_score is None:
+        lb = row.live_breakdown if isinstance(row.live_breakdown, dict) else {}
+        if not include_community or row.live_score is None or not has_public_telemetry(sc, lb):
             continue
 
         live_rows.append(row)
@@ -953,7 +1039,6 @@ def _summarize_track_segments(seg_rows: Sequence[Any]) -> dict[str, Any]:
         if row.avg_speed_kmh is not None and row.avg_speed_kmh > 0:
             speeds_weighted.append((float(row.avg_speed_kmh), max(1.0, seg_len)))
 
-        lb = row.live_breakdown if isinstance(row.live_breakdown, dict) else {}
         if lb.get("median_roughness_rms") is not None:
             rough_vals.append(float(lb["median_roughness_rms"]))
         if lb.get("vehicle_normalized_delta") is not None:
@@ -1038,7 +1123,7 @@ def _summarize_track_segments(seg_rows: Sequence[Any]) -> dict[str, Any]:
 
     reasons: list[str] = [
         f"Live p90 track score {p90_score:.1f} ({live_grade}) from up to "
-        f"{max_sample_count} traversals/segment ({api_conf} confidence)",
+        f"{max_sample_count} independent contributors per segment ({api_conf} confidence)",
     ]
     if avg_speed_kmh is not None:
         dur_part = f" (~{est_duration_min:.0f} min total)" if est_duration_min is not None else ""

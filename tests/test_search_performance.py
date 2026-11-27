@@ -335,11 +335,15 @@ def test_search_network_lru_ttl_cache_and_geocoder_guard(monkeypatch: pytest.Mon
     # Mutating returned response must not poison cached value
     first.results[0].name = "MUTATED"
 
-    # Case & whitespace variant hits cache with ZERO DB queries
-    spy2 = _SpySearchSession(engine_sentinel=shared_engine)
+    # Cache retains the match while a fresh DB lookup reflects the changed grade.
+    spy2 = _SpySearchSession(
+        track_rows=[_track_row("trk_1", "Davies Plain Track Lower", effective_grade="Hard")],
+        engine_sentinel=shared_engine,
+    )
     second = search_network(q="  davies  ", limit=20, db=spy2)  # type: ignore[arg-type]
-    assert len(spy2.executed_sql) == 0
+    assert len(spy2.executed_sql) == 1
     assert second.results[0].name == "Davies Plain Track Lower"
+    assert second.results[0].grade == "Hard"
 
     # Advancing monotonic clock past TTL expires cache entry
     clock[0] += tracks_api._SEARCH_CACHE_TTL_SECONDS + 1.0
@@ -692,12 +696,13 @@ def test_postgis_search_uses_cached_grade_trigram_explain_and_sync(
             assert "st_pointonsurface" not in sql_blob
             assert "array_to_string" not in sql_blob
 
-            # Repeated identical search hits in-process cache -> ZERO SQL executed
+            # Repeated search keeps the names cached and reads fresh effective grades.
             executed_sql.clear()
             r1_cached = client.get("/api/search", params={"q": "davies"})
             assert r1_cached.status_code == 200
             assert r1_cached.json()["results"] == body1["results"]
-            assert executed_sql == []
+            assert len(executed_sql) == 1
+            assert "tracks.effective_grade" in executed_sql[0]
 
             # Alias search via search_text matches both Davies Plain tracks
             r_alias = client.get("/api/search", params={"q": "DAVIES PLAIN TRACK"})

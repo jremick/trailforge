@@ -95,6 +95,7 @@ def test_manifest_merges_disk_manifest_and_availability(
         json.dumps(
             {
                 "generated_at": "2026-11-26T01:00:00Z",
+                "community_telemetry_policy": "baseline_weather_v1",
                 "bounds": [148.05, -36.68, 148.20, -36.55],
                 "minzoom": 8,
                 "maxzoom": 15,
@@ -120,6 +121,10 @@ def test_pmtiles_range_200_206_304_416_404_and_head(
     payload = bytes(range(256))  # 256 deterministic bytes
     archive = tiles_dir / "trailforge_vector.pmtiles"
     archive.write_bytes(payload)
+    assert client.get("/api/tiles/trailforge_vector.pmtiles").status_code == 404
+    (tiles_dir / "manifest.json").write_text(
+        '{"community_telemetry_policy":"baseline_weather_v1"}', encoding="utf-8"
+    )
 
     # 1. Full GET -> 200 OK
     r_full = client.get("/api/tiles/trailforge_vector.pmtiles")

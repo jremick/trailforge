@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from trailforge.api.main import create_app
 from trailforge.api.trips import get_track_matcher, reconstruct_trimmed_points
+from trailforge.config import get_settings
 from trailforge.db.models import TelemetryObservation, TrackSegment, UnmappedTrackCandidate
 from trailforge.db.session import get_db
 from trailforge.export.formats import GPX_NS
@@ -29,6 +30,11 @@ from trailforge.matching import (
     TrackMatcher,
     parse_gpx,
 )
+from trailforge.matching.contribution_keys import (
+    ContributionKeyUnavailable,
+    require_complete_contribution_keyring,
+)
+from trailforge.worker.community_keys import rekey_contributions
 
 _WGS84_TO_ALBERS = Transformer.from_crs("EPSG:4326", "EPSG:3577", always_xy=True)
 
@@ -99,6 +105,7 @@ def _register_user(client: TestClient, email: str, name: str) -> dict[str, str]:
 def test_trips_upload_privacy_trim_hmm_toggle_unmapped_and_export(
     postgis_engine: Engine,
     fixtures_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _truncate_all(postgis_engine)
     try:
@@ -274,17 +281,37 @@ def test_trips_upload_privacy_trim_hmm_toggle_unmapped_and_export(
                 assert spur["unmapped_candidate_count"] == 1
                 assert spur["unmapped_candidates"][0]["length_m"] > 500.0
 
-                # Public /api/telemetry/unmapped exposes spur cleanly with ZERO user/hash identity
+                # One contributor's off-network geometry remains in the owner's trip.
                 r_unm_pub = client.get("/api/telemetry/unmapped")
                 assert r_unm_pub.status_code == 200
                 unm_fc = r_unm_pub.json()
-                assert unm_fc["type"] == "FeatureCollection"
-                assert len(unm_fc["features"]) == 1
-                unm_props = unm_fc["features"][0]["properties"]
-                assert unm_props["vehicle_class"] == "Touring 4WD"
-                assert unm_props["length_m"] > 500.0
-                for forbidden in ("user_id", "trip_id", "contribution_hash", "email"):
-                    assert forbidden not in unm_props
+                assert unm_fc == {"type": "FeatureCollection", "features": []}
+                previous_key = get_settings().privacy_secret_key
+                monkeypatch.setenv(
+                    "TRAILFORGE_PREVIOUS_PRIVACY_SECRETS", json.dumps([previous_key])
+                )
+                monkeypatch.setenv("TRAILFORGE_PRIVACY_SECRET", "rotated-offline-fixture-key")
+                get_settings.cache_clear()
+                spur_id = spur["id"]
+                owner = client.get(f"/api/trips/{spur_id}", headers=headers_a)
+                assert owner.status_code == 200
+                assert len(owner.json()["unmapped_candidates"][0]["coordinates"]) > 2
+                monkeypatch.delenv("TRAILFORGE_PREVIOUS_PRIVACY_SECRETS")
+                get_settings.cache_clear()
+                with pytest.raises(ContributionKeyUnavailable):
+                    require_complete_contribution_keyring(session)
+                assert client.get(f"/api/trips/{spur_id}", headers=headers_a).status_code == 503
+
+                monkeypatch.setenv(
+                    "TRAILFORGE_PREVIOUS_PRIVACY_SECRETS", json.dumps([previous_key])
+                )
+                get_settings.cache_clear()
+                assert rekey_contributions(session) == 2
+                session.commit()
+                monkeypatch.delenv("TRAILFORGE_PREVIOUS_PRIVACY_SECRETS")
+                get_settings.cache_clear()
+                require_complete_contribution_keyring(session)
+                assert client.get(f"/api/trips/{spur_id}", headers=headers_a).status_code == 200
 
                 # 7. JSON upload: private trip writes ZERO telemetry observations
                 obs_before_priv_json = session.execute(
@@ -378,6 +405,7 @@ def test_trips_upload_privacy_trim_hmm_toggle_unmapped_and_export(
                 r_del_spur = client.delete(f"/api/trips/{spur['trip_id']}", headers=headers_a)
                 assert r_del_spur.status_code == 200
                 assert r_del_spur.json()["revoked_unmapped"] == 1
+                assert session.scalar(select(func.count(UnmappedTrackCandidate.id))) == 0
                 assert (
                     session.execute(select(func.count(UnmappedTrackCandidate.id))).scalar_one() == 0
                 )

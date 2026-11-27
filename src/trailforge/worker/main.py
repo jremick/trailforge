@@ -20,11 +20,15 @@ from sqlalchemy.orm import Session
 
 from trailforge import __version__
 from trailforge.config import Settings, get_settings
-from trailforge.db.models import FeedSyncStatus, TelemetryObservation, TrackSegmentGrade
+from trailforge.db.models import FeedSyncStatus, TelemetryObservation, TrackSegmentGrade, Trip
 from trailforge.db.session import DbHealthStatus, check_db_health, get_engine, reset_engine
 from trailforge.feeds.adapters import build_default_adapters
 from trailforge.feeds.sync import FeedSyncResult, sync_feed
 from trailforge.grading.live import LiveGradingRecomputeSummary, recompute_live_grades
+from trailforge.matching.contribution_keys import (
+    require_complete_contribution_keyring,
+    trip_contribution_hash_sql,
+)
 
 logger = logging.getLogger("trailforge.worker")
 HEARTBEAT_PATH = Path("/tmp/worker-healthy")
@@ -154,7 +158,7 @@ def run_due_live_grading(
     """Periodically recompute live crowdsourced grades & cached rainfall context (offline-safe).
 
     Never performs outbound HTTP unless ``TRAILFORGE_ENABLE_LIVE_FEEDS`` is explicitly enabled.
-    Skips cleanly when no ``telemetry_observations`` or un-evaluated segments need refresh.
+    Skips when there is no shared telemetry or persisted live evidence to refresh.
     """
     current = now or datetime.now(UTC)
     if interval_s is None:
@@ -170,24 +174,34 @@ def run_due_live_grading(
 
     engine = get_engine()
     with Session(engine) as session:
-        obs_count = int(
-            session.execute(select(func.count(TelemetryObservation.id))).scalar_one() or 0
+        require_complete_contribution_keyring(session)
+        latest_obs = session.scalar(
+            select(func.max(TelemetryObservation.created_at))
+            .join(Trip, trip_contribution_hash_sql() == TelemetryObservation.contribution_hash)
+            .where(
+                Trip.visibility == "community_anonymous",
+                Trip.community_consent_confirmed.is_(True),
+            )
         )
-        if obs_count == 0 and not live_rain:
-            return None
+        clear_last_observation = False
+        if latest_obs is None:
+            clear_last_observation = bool(session.scalar(select(
+                select(TrackSegmentGrade.segment_id)
+                .where(TrackSegmentGrade.live_grade.is_not(None))
+                .exists()
+            )))
+            if not clear_last_observation and not live_rain:
+                return None
 
         last_computed = session.execute(
             select(func.max(TrackSegmentGrade.live_computed_at))
         ).scalar_one_or_none()
-        if last_computed is not None:
+        if last_computed is not None and not clear_last_observation:
             last_dt = (
                 last_computed.astimezone(UTC)
                 if last_computed.tzinfo
                 else last_computed.replace(tzinfo=UTC)
             )
-            latest_obs = session.execute(
-                select(func.max(TelemetryObservation.created_at))
-            ).scalar_one_or_none()
             has_newer_obs = False
             if latest_obs is not None:
                 obs_dt = (

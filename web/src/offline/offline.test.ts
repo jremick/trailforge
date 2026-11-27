@@ -222,6 +222,61 @@ describe("Slice 09 Offline Pack Snapshot store & Sync Queue flush", () => {
     expect(fetchManifest).toHaveBeenCalledOnce();
   });
 
+  it("prefers region R2 PMTiles URLs over relative manifest URLs during pack download", async () => {
+    setOfflineBackendForTesting(new MemoryOfflineBackend());
+    const requestedUrls: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      requestedUrls.push(url);
+      if (url.endsWith("/manifest.json")) {
+        return Response.json({
+          region_id: "australian-alps",
+          version: "2026.11.27",
+          generated_at: "2026-11-27T00:00:00Z",
+          community_telemetry_policy: "static_v1",
+          vector_available: true,
+          terrain_available: true,
+          vector_pmtiles_url: "/api/packs/australian-alps/tiles/vector.pmtiles",
+          terrain_pmtiles_url: "/api/packs/australian-alps/tiles/terrain.pmtiles",
+          bounds: [148, -37, 149, -36],
+          files: [],
+        });
+      }
+      if (url.endsWith("/snapshot.json")) {
+        return Response.json({
+          region_id: "australian-alps",
+          version: "2026.11.27",
+          generated_at: "2026-11-27T00:00:00Z",
+          tracks: [],
+          pois: [],
+          parks: [],
+        });
+      }
+      return new Response(new Uint8Array([1, 2, 3, 4]), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await downloadRegionalPackToDevice({
+      region_id: "australian-alps",
+      name: "Australian Alps",
+      description: "Synthetic region",
+      bbox: [148, -37, 149, -36],
+      status: "ready",
+      community_telemetry_policy: "static_v1",
+      manifest_url: "https://tiles.example.test/packs/australian-alps/static_v1/manifest.json",
+      snapshot_url: "https://tiles.example.test/packs/australian-alps/static_v1/snapshot.json",
+      vector_pmtiles_url: "https://tiles.example.test/packs/australian-alps/static_v1/vector.pmtiles",
+      terrain_pmtiles_url: "https://tiles.example.test/packs/australian-alps/static_v1/terrain.pmtiles",
+    });
+
+    expect(requestedUrls).toEqual([
+      "https://tiles.example.test/packs/australian-alps/static_v1/manifest.json",
+      "https://tiles.example.test/packs/australian-alps/static_v1/snapshot.json",
+      "https://tiles.example.test/packs/australian-alps/static_v1/vector.pmtiles",
+      "https://tiles.example.test/packs/australian-alps/static_v1/terrain.pmtiles",
+    ]);
+  });
+
   it("stores and queries offline pack snapshots (tracks, POIs, parks, closures, reports, hotspots)", async () => {
     setOfflineBackendForTesting(new MemoryOfflineBackend());
 

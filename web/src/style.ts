@@ -2313,8 +2313,20 @@ export function buildTrailForgeStyle(
     }
   );
 
-  // Slice 06 Anonymized Unmapped Track Candidates (subtle violet dashed spurs)
+  // Slice 06 Anonymized Unmapped Track Areas (approximate corroborated grid cells)
   styleLayers.push(
+    {
+      id: "tf-unmapped-fill",
+      type: "fill",
+      source: "tf-unmapped",
+      layout: {
+        visibility: vis(layers.unmapped),
+      },
+      paint: {
+        "fill-color": "#A855F7",
+        "fill-opacity": 0.14,
+      },
+    },
     {
       id: "tf-unmapped-casing",
       type: "line",

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -62,10 +62,12 @@ def trigger_live_grading_recompute(
 
 @router.get("/hotspots/geojson")
 def get_grading_hotspots_geojson(
+    response: Response,
     track_id: str | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Return RFC 7946 FeatureCollection of rough/slow obstacle hotspot segments."""
+    response.headers["Cache-Control"] = "no-store"
     return get_obstacle_hotspots_geojson(db, track_id=track_id)
 
 

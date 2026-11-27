@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
 import subprocess
 import sys
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -17,13 +17,18 @@ from sqlalchemy import Engine, delete, select, text
 from sqlalchemy.orm import Session
 
 from trailforge.api.grading import router as grading_router
+from trailforge.api.packs import get_packs_dir_dep
+from trailforge.api.packs import router as packs_router
+from trailforge.api.trips import router as trips_router
 from trailforge.auth.security import create_access_token, hash_password
+from trailforge.config import get_settings
 from trailforge.db.models import (
     RainfallSnapshot,
     TelemetryObservation,
     Track,
     TrackSegment,
     TrackSegmentGrade,
+    Trip,
     User,
 )
 from trailforge.db.session import get_db
@@ -50,6 +55,9 @@ from trailforge.grading.rainfall import (
 )
 from trailforge.ingestion.connectors import load_corridor_fixtures
 from trailforge.ingestion.pipeline import ingest_corridor_dataset
+from trailforge.matching.contribution_keys import contribution_key_id
+from trailforge.matching.privacy import compute_contribution_hash
+from trailforge.packs.builder import build_regional_pack
 
 _FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
@@ -210,7 +218,7 @@ def test_recency_weighting_prioritizes_recent_traversals() -> None:
     )
     assert res.live_score is not None and res.live_score > 50.0
     assert res.live_grade == "Hard"
-    assert res.avg_speed_kmh is not None and res.avg_speed_kmh < 10.0
+    assert res.avg_speed_kmh == 16.0  # Public speed weights each contributor equally.
 
 
 def test_vehicle_class_normalization_awd_vs_modified_4wd() -> None:
@@ -270,7 +278,7 @@ def test_single_outlier_resistance_and_confidence_tiers() -> None:
         _make_reading(0.0, now=now), surface_class="dirt_unsealed"
     )
 
-    # 1 extreme outlier traversal on a Medium (35.0) segment MUST stay bounded (<= 5 pts, low conf)
+    # A cohort of one contributes nothing to public grading or evidence.
     lone_outlier = [
         ObservationSample(
             vehicle_capability_class="Modified 4WD",
@@ -287,11 +295,16 @@ def test_single_outlier_resistance_and_confidence_tiers() -> None:
         wet_adjustment=dry_adj,
         now=now,
     )
-    assert single_res.api_confidence_level == "low"
-    assert single_res.db_confidence_level == "low"
-    assert single_res.live_grade == "Medium"
-    assert single_res.live_score is not None and single_res.live_score <= 40.0
-    assert single_res.is_obstacle_hotspot is False  # 1 pass cannot create an obstacle hotspot
+    assert single_res.api_confidence_level == "none"
+    assert single_res.db_confidence_level == "baseline_only"
+    assert single_res.effective_grade == "Medium"
+    assert single_res.live_breakdown is None
+    assert single_res.live_grade is None
+    assert single_res.last_driven_at is None
+    assert single_res.avg_speed_kmh is None
+    assert single_res.avg_duration_s is None
+    assert single_res.sample_count == 0
+    assert single_res.is_obstacle_hotspot is False
 
     # 6 normal Touring passes + 1 extreme outlier -> MAD Winsorization clamps the outlier
     normal_passes = [
@@ -315,6 +328,10 @@ def test_single_outlier_resistance_and_confidence_tiers() -> None:
     assert robust_res.outlier_clamped_count >= 1
     assert robust_res.live_grade == "Medium"
     assert robust_res.live_score is not None and abs(robust_res.live_score - 35.0) < 6.0
+    assert robust_res.vehicle_class_split == {}
+    assert robust_res.last_driven_at is not None
+    assert robust_res.last_driven_at.weekday() == 0
+    assert robust_res.last_driven_at.hour == 0
 
     # 8+ samples reaches "high" confidence
     high_res = compute_segment_live_grade(
@@ -334,7 +351,7 @@ def test_obstacle_hotspot_detection_triggers() -> None:
         _make_reading(0.0, now=now), surface_class="dirt_unsealed"
     )
 
-    slow_rough_pair = [
+    slow_rough_cohort = [
         ObservationSample(
             vehicle_capability_class="Touring 4WD",
             observed_at=now - timedelta(days=i),
@@ -342,12 +359,12 @@ def test_obstacle_hotspot_detection_triggers() -> None:
             avg_speed_kmh=6.2,
             roughness_rms=0.62,
         )
-        for i in range(2)
+        for i in range(3)
     ]
     res = compute_segment_live_grade(
         baseline_score=50.0,
         baseline_grade="Hard",
-        samples=slow_rough_pair,
+        samples=slow_rough_cohort,
         wet_adjustment=dry_adj,
         now=now,
         track_median_speed_kmh=18.0,
@@ -396,9 +413,9 @@ def seeded_corridor_engine(postgis_engine: Engine) -> Engine:
 @pytest.mark.integration
 def test_postgis_live_grading_rainfall_hotspots_outage_and_api(
     seeded_corridor_engine: Engine,
+    tmp_path: Path,
 ) -> None:
     now = datetime.now(UTC) - timedelta(hours=1)
-    test_contrib_prefix = hashlib.sha256(b"slice07-test-contrib").hexdigest()[:56]
 
     with Session(seeded_corridor_engine) as session:
         davies_track = session.execute(
@@ -429,22 +446,51 @@ def test_postgis_live_grading_rainfall_hotspots_outage_and_api(
         orig_access_baseline_grade = access_grade_before.baseline_grade
 
         # Clean up any leftover test observations/rainfall before seeding isolated test samples
-        session.execute(
-            delete(TelemetryObservation).where(
-                TelemetryObservation.contribution_hash.like(f"{test_contrib_prefix}%")
-            )
-        )
         session.execute(delete(RainfallSnapshot))
         session.flush()
 
         # Seed multi-class telemetry across first 10 Davies Plain segs; seg[5] = obstacle hotspot
+        contributors = [
+            User(
+                id=uuid.uuid4(),
+                email=f"grading-fixture-{idx}@example.test",
+                password_hash="offline-fixture",
+                display_name=f"Synthetic Driver {idx}",
+            )
+            for idx in range(4)
+        ]
+        hashes: list[str] = []
+        key = get_settings().privacy_secret_key
+
+        def seed_trip(owner: User, seg: TrackSegment, vehicle_class: str) -> tuple[Trip, str]:
+            trip_id, nonce = uuid.uuid4(), uuid.uuid4()
+            trip = Trip(
+                id=trip_id,
+                user_id=owner.id,
+                visibility="community_anonymous",
+                contribution_nonce=nonce,
+                contribution_key_id=contribution_key_id(key),
+                community_consent_confirmed=True,
+                vehicle_capability_class=vehicle_class,
+                raw_geom=seg.geom,
+            )
+            chash = compute_contribution_hash(key, trip_id, nonce)
+            session.add(trip)
+            hashes.append(chash)
+            return trip, chash
+
         try:
+            session.add_all(contributors)
+            session.flush()
             obs_to_insert: list[TelemetryObservation] = []
-            vehicle_cycle = ["Stock 4WD", "Touring 4WD", "Touring 4WD", "Modified 4WD"]
+            vehicle_cycle = ["Touring 4WD"] * 4
+            hotspot_trips: list[Trip] = []
             for idx, (seg, _g) in enumerate(davies_segs[:10]):
                 is_spot = idx == 5
                 for k, vc in enumerate(vehicle_cycle):
-                    chash = f"{test_contrib_prefix}{idx:04x}{k:04x}"
+                    trip, chash = seed_trip(contributors[k], seg, vc)
+                    if is_spot:
+                        hotspot_trips.append(trip)
                     obs_to_insert.append(
                         TelemetryObservation(
                             segment_id=seg.segment_id,
@@ -462,24 +508,26 @@ def test_postgis_live_grading_rainfall_hotspots_outage_and_api(
                             matched_point_count=3,
                         )
                     )
-            # Single extreme outlier on Tom Groggin Access Rd (Easy)
-            obs_to_insert.append(
-                TelemetryObservation(
-                    segment_id=access_seg.segment_id,
-                    contribution_hash=f"{test_contrib_prefix}ffff0001",
-                    vehicle_capability_class="Modified 4WD",
-                    direction="forward",
-                    observed_at=now,
-                    observed_date=now.date(),
-                    traversal_duration_s=240.0,
-                    avg_speed_kmh=1.2,
-                    min_speed_kmh=0.5,
-                    roughness_rms=2.2,
-                    roughness_p95=2.8,
-                    match_confidence=0.90,
-                    matched_point_count=2,
+            # One contributor makes four separate trips on the same segment.
+            for _ in range(4):
+                _, chash = seed_trip(contributors[0], access_seg, "Modified 4WD")
+                obs_to_insert.append(
+                    TelemetryObservation(
+                        segment_id=access_seg.segment_id,
+                        contribution_hash=chash,
+                        vehicle_capability_class="Modified 4WD",
+                        direction="forward",
+                        observed_at=now,
+                        observed_date=now.date(),
+                        traversal_duration_s=240.0,
+                        avg_speed_kmh=1.2,
+                        min_speed_kmh=0.5,
+                        roughness_rms=2.2,
+                        roughness_p95=2.8,
+                        match_confidence=0.90,
+                        matched_point_count=2,
+                    )
                 )
-            )
             session.add_all(obs_to_insert)
             session.commit()
 
@@ -492,7 +540,7 @@ def test_postgis_live_grading_rainfall_hotspots_outage_and_api(
             )
             session.commit()
             assert summary.segments_evaluated > 100
-            assert summary.segments_with_telemetry >= 11
+            assert summary.segments_with_telemetry >= 10
             assert summary.obstacle_hotspots_count >= 1
             assert summary.rainfall_cells_updated >= 1
 
@@ -515,12 +563,14 @@ def test_postgis_live_grading_rainfall_hotspots_outage_and_api(
             assert updated_hotspot.rainfall_context["wet_score_adjustment"] > 0.0
             assert "Open-Meteo" in updated_hotspot.rainfall_context["attribution"]
 
-            # 3. Verify single outlier on Easy access road remained bounded & low confidence
+            # 3. Multiple trips from one member never form a public cohort.
             updated_access = session.get(TrackSegmentGrade, access_seg.segment_id)
             assert updated_access is not None
             assert updated_access.baseline_grade == orig_access_baseline_grade
-            assert updated_access.confidence_level == "low"
-            assert updated_access.live_grade == "Easy"
+            assert updated_access.confidence_level == "baseline_only"
+            assert updated_access.live_grade is None
+            assert updated_access.avg_speed_kmh is None
+            assert updated_access.sample_count == 0
 
             # 4. Verify Track Inspector live summary & hotspots GeoJSON
             track_summary = get_track_live_summary(session, davies_track.track_id)
@@ -580,11 +630,14 @@ def test_postgis_live_grading_rainfall_hotspots_outage_and_api(
 
             app = FastAPI()
             app.include_router(grading_router)
+            app.include_router(packs_router)
+            app.include_router(trips_router)
 
             def _override_db() -> Any:
                 yield session
 
             app.dependency_overrides[get_db] = _override_db
+            app.dependency_overrides[get_packs_dir_dep] = lambda: tmp_path
             with TestClient(app) as client:
                 assert (
                     client.post(
@@ -613,13 +666,61 @@ def test_postgis_live_grading_rainfall_hotspots_outage_and_api(
                 rain_json = r_rain.json()
                 assert "Open-Meteo" in rain_json["attribution"]
                 assert rain_json["max_rain_72h_mm"] == pytest.approx(18.5)
+
+                build_regional_pack(session, "australian-alps", tmp_path, skip_tiles=True)
+                snapshot_url = "/api/packs/australian-alps/snapshot.json"
+                packed = client.get(snapshot_url)
+                assert packed.status_code == 200
+                tracks_by_name = {track["name"]: track for track in packed.json()["tracks"]}
+                assert tracks_by_name["Davies Plain Track Lower"]["sample_count"] >= 3
+                assert tracks_by_name["Tom Groggin Access Rd"]["sample_count"] == 0
+
+                for contributor, trip in zip(contributors, hotspot_trips, strict=True):
+                    owner_headers = {
+                        "Authorization": (
+                            f"Bearer {create_access_token(str(contributor.id), contributor.email)}"
+                        )
+                    }
+                    withdraw = client.delete(f"/api/trips/{trip.id}", headers=owner_headers)
+                    assert withdraw.status_code == 200, withdraw.text
+                    assert withdraw.json()["revoked_observations"] == 1
+
+                refreshed = session.get(TrackSegmentGrade, hotspot_seg.segment_id)
+                assert refreshed is not None and refreshed.sample_count == 0
+                assert refreshed.live_grade is None
+                assert refreshed.avg_speed_kmh is None
+                assert refreshed.is_obstacle_hotspot is False
+                assert refreshed.rainfall_context
+                r_after = client.get("/api/grading/hotspots/geojson")
+                assert all(
+                    feature["id"] != hotspot_seg.segment_id
+                    for feature in r_after.json()["features"]
+                )
+                assert client.get(snapshot_url).status_code == 404
+                build_regional_pack(session, "australian-alps", tmp_path, skip_tiles=True)
+                assert client.get(snapshot_url).status_code == 200
+
+                static = build_regional_pack(
+                    session, "australian-alps", tmp_path, skip_tiles=True, static_only=True
+                )
+                assert static.manifest.community_telemetry_policy == "static_v1"
+                packed = client.get(snapshot_url).json()
+                assert packed["hotspots"]["features"] == []
+                assert all(track["sample_count"] == 0 for track in packed["tracks"])
+                assert all(
+                    segment["grade"]["live_breakdown"] is None
+                    for track in packed["tracks"]
+                    for segment in track["segments"]
+                    if segment["grade"] is not None
+                )
         finally:
             session.execute(
                 delete(TelemetryObservation).where(
-                    TelemetryObservation.contribution_hash.like(f"{test_contrib_prefix}%")
+                    TelemetryObservation.contribution_hash.in_(hashes)
                 )
             )
             session.execute(delete(User).where(User.email == "grading-admin@example.test"))
+            session.execute(delete(User).where(User.email.like("grading-fixture-%@example.test")))
             session.commit()
 
 

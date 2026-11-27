@@ -40,6 +40,11 @@ from trailforge.export.formats import (
     build_gpx_document,
     build_track_geojson,
 )
+from trailforge.grading.live import (
+    MIN_PUBLIC_CONTRIBUTORS,
+    lock_community_grading,
+    refresh_grades_after_withdrawal,
+)
 from trailforge.matching import (
     MAX_PRIVACY_TRIM_M,
     MIN_PRIVACY_TRIM_M,
@@ -57,6 +62,12 @@ from trailforge.matching import (
     trim_privacy_buffer,
 )
 from trailforge.matching import get_track_matcher as build_track_matcher
+from trailforge.matching.contribution_keys import (
+    ContributionKeyUnavailable,
+    contribution_key_id,
+    trip_contribution_hash,
+    trip_contribution_hash_sql,
+)
 from trailforge.matching.parser import MAX_IMU_SAMPLES, MAX_TRACE_POINTS
 from trailforge.vehicles.classifier import CapabilityClassLiteral, normalize_capability_class
 
@@ -69,6 +80,8 @@ RecordingSourceLiteral = Literal["pwa", "capacitor_ios", "capacitor_android"]
 
 _MAX_UPLOAD_BYTES = 15 * 1024 * 1024  # 15 MiB max GPX/JSON trace upload
 _MAX_SPEED_KMH = 160.0
+_PUBLIC_UNMAPPED_GRID_DEG = 0.02
+_PUBLIC_UNMAPPED_CANDIDATE_LIMIT = 10_000
 _FILENAME_SLUG_RE = re.compile(r"[^a-z0-9]+")
 _WGS84_TO_ALBERS = Transformer.from_crs("EPSG:4326", "EPSG:3577", always_xy=True)
 
@@ -152,6 +165,7 @@ class MobileSyncRequest(BaseModel):
     vehicle_profile_id: str | None = None
     vehicle_class: str | None = None
     visibility: TripVisibilityLiteral = "private"
+    confirm_community: bool = False
     privacy_trim_m: float = Field(default=MIN_PRIVACY_TRIM_M)
     client_session_id: str | None = Field(default=None, max_length=128)
     client_uuid: uuid.UUID | None = None
@@ -193,6 +207,7 @@ class TripItemResponse(BaseModel):
     trip_id: str
     name: str
     visibility: TripVisibilityLiteral
+    community_consent_pending: bool = False
     vehicle_profile_id: str | None = None
     vehicle_class: str
     vehicle_capability_class: str
@@ -306,22 +321,32 @@ def _resolve_trip_vehicle(
     return None, "Stock 4WD"
 
 
-def _compute_trip_hash(trip_id: uuid.UUID, nonce: uuid.UUID) -> str:
-    cfg = get_settings()
-    return compute_contribution_hash(cfg.privacy_secret_key, trip_id, nonce)
+def _owned_trip_contribution_hash(trip: Trip) -> str | None:
+    try:
+        return trip_contribution_hash(trip)
+    except ContributionKeyUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
 
 
-def _revoke_trip_contributions(db: Session, contrib_hash: str) -> tuple[int, int]:
-    """Immediately delete all anonymized telemetry & unmapped rows for a contribution hash."""
-    obs_res = db.execute(
-        delete(TelemetryObservation).where(TelemetryObservation.contribution_hash == contrib_hash)
-    )
+def _revoke_trip_contributions(db: Session, contrib_hash: str | None) -> tuple[int, int]:
+    """Delete inputs and refresh persisted public evidence before committing the withdrawal."""
+    if contrib_hash is None:
+        return 0, 0
+    lock_community_grading(db)
+    segments = db.scalars(
+        delete(TelemetryObservation)
+        .where(TelemetryObservation.contribution_hash == contrib_hash)
+        .returning(TelemetryObservation.segment_id)
+    ).all()
     unm_res = db.execute(
         delete(UnmappedTrackCandidate).where(
             UnmappedTrackCandidate.contribution_hash == contrib_hash
         )
     )
-    return int(obs_res.rowcount or 0), int(unm_res.rowcount or 0)
+    refresh_grades_after_withdrawal(db, segments)
+    return len(segments), int(unm_res.rowcount or 0)
 
 
 def _lookup_track_ids_for_segments(
@@ -506,9 +531,9 @@ def _build_unmapped_payload(match_result: MatchResult) -> list[TripUnmappedCandi
 def _load_published_for_trip(
     db: Session, trip: Trip
 ) -> tuple[list[TripMatchedSegmentResponse], list[TripUnmappedCandidateResponse]]:
-    if trip.visibility != "community_anonymous":
+    chash = _owned_trip_contribution_hash(trip)
+    if trip.visibility != "community_anonymous" or not chash:
         return [], []
-    chash = _compute_trip_hash(trip.id, trip.contribution_nonce)
 
     obs_rows = db.execute(
         select(TelemetryObservation, TrackSegment.track_id)
@@ -578,6 +603,9 @@ def _trip_to_response(
         trip_id=str(trip.id),
         name=trip.title or "Recorded Trip",
         visibility=trip.visibility,  # type: ignore[arg-type]
+        community_consent_pending=(
+            trip.visibility == "community_anonymous" and not trip.community_consent_confirmed
+        ),
         vehicle_profile_id=str(trip.vehicle_profile_id) if trip.vehicle_profile_id else None,
         vehicle_class=trip.vehicle_capability_class,
         vehicle_capability_class=trip.vehicle_capability_class,
@@ -605,16 +633,17 @@ def _trip_to_response(
     )
 
 
-def _get_owned_trip(db: Session, user: User, trip_id: str) -> Trip:
+def _get_owned_trip(db: Session, user: User, trip_id: str, *, for_update: bool = False) -> Trip:
     try:
         tid = uuid.UUID(trip_id)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Trip not found"
         ) from exc
-    trip = db.execute(
-        select(Trip).where(Trip.id == tid, Trip.user_id == user.id)
-    ).scalar_one_or_none()
+    stmt = select(Trip).where(Trip.id == tid, Trip.user_id == user.id)
+    if for_update:
+        stmt = stmt.with_for_update()
+    trip = db.execute(stmt).scalar_one_or_none()
     if trip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Trip not found")
     return trip
@@ -634,6 +663,7 @@ async def _ingest_trip_trace(
     client_uuid: uuid.UUID | None,
     imu_samples: Sequence[ImuSample] | None = None,
     always_include_imu_summary: bool = False,
+    confirm_community: bool = True,
 ) -> tuple[TripItemResponse, ImuSummary, str, int]:
     """Shared privacy-trim, IMU alignment, map-match, and persistence pipeline."""
     trim_m = _validate_trim_meters(privacy_trim_m)
@@ -678,7 +708,9 @@ async def _ingest_trip_trace(
 
     trip_id = uuid.uuid4()
     nonce = uuid.uuid4()
-    contrib_hash = _compute_trip_hash(trip_id, nonce)
+    sharing = visibility == "community_anonymous" and confirm_community
+    privacy_key = get_settings().privacy_secret_key
+    contrib_hash = compute_contribution_hash(privacy_key, trip_id, nonce) if sharing else None
 
     trimmed_geom = None
     match_status = "skipped_too_short"
@@ -723,7 +755,7 @@ async def _ingest_trip_trace(
         matched_payload = _build_matched_segments_payload(db, match_result)
         unmapped_payload = _build_unmapped_payload(match_result)
 
-        if visibility == "community_anonymous":
+        if contrib_hash is not None:
             match_status = _derive_match_status(match_result)
             obs_published, unm_published = _persist_community_contributions(
                 db,
@@ -748,6 +780,8 @@ async def _ingest_trip_trace(
         visibility=visibility,
         privacy_trim_m=trim_m,
         contribution_nonce=nonce,
+        contribution_key_id=contribution_key_id(privacy_key) if sharing else None,
+        community_consent_confirmed=sharing,
         raw_geom=from_shape(raw_line, srid=4326),
         trimmed_geom=trimmed_geom,
         raw_distance_m=trim_res.raw_length_m,
@@ -1000,6 +1034,7 @@ async def mobile_sync_trip(
         client_uuid=resolved_client_uuid,
         imu_samples=payload.imu_samples,
         always_include_imu_summary=True,
+        confirm_community=payload.confirm_community,
     )
     base_data = resp.model_dump()
     base_data["imu_summary"] = imu_summary
@@ -1025,9 +1060,9 @@ def list_trips(
         return []
 
     hashes_by_trip = {
-        t.id: _compute_trip_hash(t.id, t.contribution_nonce)
+        t.id: _owned_trip_contribution_hash(t)
         for t in trips
-        if t.visibility == "community_anonymous"
+        if t.visibility == "community_anonymous" and t.contribution_key_id is not None
     }
     obs_counts: dict[str, int] = {}
     unm_counts: dict[str, int] = {}
@@ -1109,7 +1144,7 @@ async def update_trip(
     matcher: TrackMatcher = Depends(get_track_matcher),
 ) -> TripItemResponse:
     """Rename a trip or toggle private <-> community_anonymous with instant revocation/publish."""
-    trip = _get_owned_trip(db, current_user, trip_id)
+    trip = _get_owned_trip(db, current_user, trip_id, for_update=True)
 
     if payload.name is not None:
         trip.title = payload.name
@@ -1119,13 +1154,23 @@ async def update_trip(
     obs_published = 0
     unm_published = 0
 
-    if payload.visibility is not None and payload.visibility != trip.visibility:
-        old_hash = _compute_trip_hash(trip.id, trip.contribution_nonce)
-
+    reaffirming = (
+        payload.visibility == "community_anonymous"
+        and trip.visibility == "community_anonymous"
+        and not trip.community_consent_confirmed
+    )
+    if reaffirming and trip.contribution_key_id is not None:
+        trip.community_consent_confirmed = True
+        matched_payload, unmapped_payload = _load_published_for_trip(db, trip)
+        obs_published = len(matched_payload)
+        unm_published = len(unmapped_payload)
+    elif payload.visibility is not None and (payload.visibility != trip.visibility or reaffirming):
         if payload.visibility == "private":
             # Immediate revocation: purge anonymized telemetry & unmapped rows + rotate nonce
-            _revoke_trip_contributions(db, old_hash)
+            _revoke_trip_contributions(db, _owned_trip_contribution_hash(trip))
             trip.contribution_nonce = uuid.uuid4()
+            trip.contribution_key_id = None
+            trip.community_consent_confirmed = False
             trip.visibility = "private"
             if trip.match_status != "skipped_too_short":
                 trip.match_status = "skipped_private"
@@ -1133,10 +1178,12 @@ async def update_trip(
             # Guard full HMM/Valhalla re-matching with the member daily upload quota
             _enforce_trip_upload_quota(request, current_user)
             # Publish from persisted privacy-trimmed geometry using a rotated contribution_hash
-            _revoke_trip_contributions(db, old_hash)
             trip.contribution_nonce = uuid.uuid4()
-            new_hash = _compute_trip_hash(trip.id, trip.contribution_nonce)
+            privacy_key = get_settings().privacy_secret_key
+            new_hash = compute_contribution_hash(privacy_key, trip.id, trip.contribution_nonce)
+            trip.contribution_key_id = contribution_key_id(privacy_key)
             trip.visibility = "community_anonymous"
+            trip.community_consent_confirmed = True
 
             trimmed_json = db.execute(
                 select(func.ST_AsGeoJSON(Trip.trimmed_geom)).where(Trip.id == trip.id)
@@ -1191,9 +1238,8 @@ def delete_trip(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Revoke any published anonymized telemetry via contribution_hash and delete the trip."""
-    trip = _get_owned_trip(db, current_user, trip_id)
-    old_hash = _compute_trip_hash(trip.id, trip.contribution_nonce)
-    revoked_obs, revoked_unm = _revoke_trip_contributions(db, old_hash)
+    trip = _get_owned_trip(db, current_user, trip_id, for_update=True)
+    revoked_obs, revoked_unm = _revoke_trip_contributions(db, _owned_trip_contribution_hash(trip))
     db.delete(trip)
     db.commit()
     return {
@@ -1263,37 +1309,50 @@ def export_trip(
 
 @router.get("/telemetry/unmapped")
 def get_unmapped_candidates_geojson(
+    response: Response,
     limit: int = Query(default=250, ge=1, le=1000),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Return strictly anonymized off-network unmapped track candidates as GeoJSON."""
-    rows = db.execute(
+    """Return approximate grid cells corroborated by distinct contributing accounts."""
+    response.headers["Cache-Control"] = "no-store"
+    recent = (
         select(
-            UnmappedTrackCandidate,
-            func.ST_AsGeoJSON(UnmappedTrackCandidate.geom).label("geom_json"),
+            UnmappedTrackCandidate.public_cell_lon,
+            UnmappedTrackCandidate.public_cell_lat,
+            UnmappedTrackCandidate.contribution_hash,
         )
         .where(UnmappedTrackCandidate.status != "rejected")
         .order_by(UnmappedTrackCandidate.created_at.desc(), UnmappedTrackCandidate.id.desc())
+        .limit(_PUBLIC_UNMAPPED_CANDIDATE_LIMIT)
+        .subquery()
+    )
+    lon_expr, lat_expr = recent.c.public_cell_lon, recent.c.public_cell_lat
+    rows = db.execute(
+        select(lon_expr, lat_expr)
+        .select_from(recent)
+        .join(Trip, trip_contribution_hash_sql() == recent.c.contribution_hash)
+        .where(
+            Trip.visibility == "community_anonymous",
+            Trip.community_consent_confirmed.is_(True),
+        )
+        .group_by(lon_expr, lat_expr)
+        .having(func.count(Trip.user_id.distinct()) >= MIN_PUBLIC_CONTRIBUTORS)
+        .order_by(lat_expr, lon_expr)
         .limit(limit)
     ).all()
 
     features: list[dict[str, Any]] = []
-    for cand, geom_json in rows:
-        if not geom_json:
-            continue
+    half = _PUBLIC_UNMAPPED_GRID_DEG / 2
+    for lon, lat in rows:
+        west, east = round(max(-180, lon - half), 3), round(min(180, lon + half), 3)
+        south, north = round(max(-90, lat - half), 3), round(min(90, lat + half), 3)
+        ring = [[west, south], [east, south], [east, north], [west, north], [west, south]]
         features.append(
             {
                 "type": "Feature",
-                "id": f"unmapped-{cand.id}",
-                "geometry": json.loads(geom_json),
-                "properties": {
-                    "candidate_id": int(cand.id),
-                    "vehicle_class": cand.vehicle_capability_class,
-                    "length_m": round(float(cand.length_m), 1),
-                    "observed_date": cand.observed_date.isoformat(),
-                    "cluster_key": cand.cluster_key,
-                    "status": cand.status,
-                },
+                "id": f"unmapped-area:{lon:.3f}:{lat:.3f}",
+                "geometry": {"type": "Polygon", "coordinates": [ring]},
+                "properties": {"feature_kind": "approximate_unmapped_area"},
             }
         )
     return {"type": "FeatureCollection", "features": features}

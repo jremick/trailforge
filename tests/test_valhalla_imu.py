@@ -859,6 +859,7 @@ def test_mobile_sync_endpoint_imu_privacy_valhalla_and_revocation(
                             "points": points_payload,
                             "imu_samples": imu_payload[:20],
                             "visibility": "community_anonymous",
+                            "confirm_community": True,
                             "privacy_trim_m": 150,
                         },
                     ).status_code
@@ -871,6 +872,7 @@ def test_mobile_sync_endpoint_imu_privacy_valhalla_and_revocation(
                     "points": points_payload,
                     "imu_samples": imu_payload,
                     "visibility": "community_anonymous",
+                    "confirm_community": True,
                     "privacy_trim_m": 250,
                     "client_session_id": "ios-session-davies-001",
                     "recording_source": "capacitor_ios",
@@ -962,6 +964,7 @@ def test_mobile_sync_endpoint_imu_privacy_valhalla_and_revocation(
                         "points": points_payload,
                         "imu_samples": imu_payload,
                         "visibility": "community_anonymous",
+                        "confirm_community": True,
                         "privacy_trim_m": 250,
                         "recording_source": "capacitor_android",
                     },
