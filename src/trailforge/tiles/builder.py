@@ -7,6 +7,7 @@ Generates:
       * ``waterways`` (non-Connector watercourses)
       * ``pois`` (deduplicated backcountry POIs with outdoor SVG icon keys)
       * ``capad_parks`` (CAPAD 2025 protected area polygons)
+      * ``park_labels`` (CAPAD 2025 ``ST_PointOnSurface`` label centroids, area-tiered minzoom)
       * ``contours`` (20 m minor + 100 m labeled index contours via ``gdal_contour``)
       * ``snowline_bands`` (polygonized elevation >= threshold polygons for 800..1600 m)
   - ``trailforge_terrain.pmtiles`` via GDAL + ``rio-rgbify`` + ``pmtiles convert``:
@@ -108,7 +109,20 @@ VECTOR_LAYER_ORDER: Final[tuple[str, ...]] = (
     "track_segments",
     "steep_sections",
     "pois",
+    "park_labels",
 )
+
+
+def park_label_minzoom(area_ha: float | None) -> int:
+    """Return Tippecanoe per-feature minzoom tier for a CAPAD park label by area (ha)."""
+    if area_ha is not None:
+        if area_ha >= 100_000.0:
+            return 7
+        if area_ha >= 20_000.0:
+            return 9
+        if area_ha >= 2_000.0:
+            return 10
+    return 11
 
 
 class TileManifest(BaseModel):
@@ -479,7 +493,7 @@ def export_postgis_vector_layers(
     if poi_writer.count > 0:
         layer_paths["pois"] = poi_out
 
-    # 4. capad_parks
+    # 4. capad_parks + park_labels (ST_PointOnSurface computed once at tile-build time)
     park_where: list[Any] = []
     if env_geom is not None:
         park_where.append(func.ST_Intersects(CAPADPark.geom, env_geom))
@@ -494,13 +508,19 @@ def export_postgis_vector_layers(
             CAPADPark.type_abbr,
             CAPADPark.state,
             CAPADPark.iucn,
+            CAPADPark.area_ha,
             func.ST_AsGeoJSON(CAPADPark.geom, 5).label("geom_json"),
+            func.ST_AsGeoJSON(func.ST_PointOnSurface(CAPADPark.geom), 5).label("label_geom_json"),
         )
         .where(*park_where)
         .execution_options(yield_per=200)
     )
     park_out = work_dir / "capad_parks.geojson"
-    with _StreamGeoJSONWriter(park_out) as park_writer:
+    park_labels_out = work_dir / "park_labels.geojson"
+    with (
+        _StreamGeoJSONWriter(park_out) as park_writer,
+        _StreamGeoJSONWriter(park_labels_out) as park_label_writer,
+    ):
         for row in session.execute(park_stmt):
             if not row.geom_json:
                 continue
@@ -517,15 +537,40 @@ def export_postgis_vector_layers(
             park_writer.write_raw_feature(
                 f'{{"type":"Feature","geometry":{row.geom_json},"properties":{park_props_json}}}'
             )
+
+            label_geom_json = getattr(row, "label_geom_json", None)
+            clean_name = (row.name or "").strip()
+            if label_geom_json and clean_name:
+                raw_area = getattr(row, "area_ha", None)
+                area_ha_val = round(float(raw_area), 1) if raw_area is not None else None
+                min_z = park_label_minzoom(area_ha_val)
+                label_props_json = json.dumps(
+                    {
+                        "name": clean_name,
+                        "park_type": row.park_type,
+                        "type_abbr": row.type_abbr,
+                        "state": row.state,
+                        "area_ha": area_ha_val,
+                    },
+                    separators=(",", ":"),
+                )
+                park_label_writer.write_raw_feature(
+                    f'{{"type":"Feature","tippecanoe":{{"minzoom":{min_z}}},'
+                    f'"geometry":{label_geom_json},"properties":{label_props_json}}}'
+                )
     layer_counts["capad_parks"] = park_writer.count
     if park_writer.count > 0:
         layer_paths["capad_parks"] = park_out
+    layer_counts["park_labels"] = park_label_writer.count
+    if park_label_writer.count > 0:
+        layer_paths["park_labels"] = park_labels_out
 
     logger.info(
-        "Exported waterways=%d pois=%d capad_parks=%d",
+        "Exported waterways=%d pois=%d capad_parks=%d park_labels=%d",
         ww_writer.count,
         poi_writer.count,
         park_writer.count,
+        park_label_writer.count,
     )
 
     return (layer_paths, layer_counts, bounds_acc)

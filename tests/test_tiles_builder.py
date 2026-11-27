@@ -11,6 +11,8 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 from shapely.geometry import shape
@@ -24,6 +26,7 @@ from trailforge.tiles.builder import (
     MANIFEST_FILENAME,
     POI_CATEGORY_TO_ICON,
     TERRAIN_PMTILES_FILENAME,
+    VECTOR_LAYER_ORDER,
     VECTOR_PMTILES_FILENAME,
     _parse_postgis_box2d,
     _StreamGeoJSONWriter,
@@ -32,6 +35,7 @@ from trailforge.tiles.builder import (
     export_postgis_vector_layers,
     generate_contours_geojson,
     generate_snowline_bands_geojson,
+    park_label_minzoom,
 )
 from trailforge.tiles.cli import build_parser
 
@@ -140,6 +144,118 @@ def test_parse_postgis_box2d_and_stream_geojson_writer(tmp_path: Path) -> None:
     ]
 
 
+def test_park_label_minzoom_tiers_and_layer_order() -> None:
+    assert "park_labels" in VECTOR_LAYER_ORDER
+    assert park_label_minzoom(690_000.0) == 7
+    assert park_label_minzoom(100_000.0) == 7
+    assert park_label_minzoom(99_999.9) == 9
+    assert park_label_minzoom(20_000.0) == 9
+    assert park_label_minzoom(19_999.9) == 10
+    assert park_label_minzoom(2_000.0) == 10
+    assert park_label_minzoom(1_999.9) == 11
+    assert park_label_minzoom(0.0) == 11
+    assert park_label_minzoom(None) == 11
+
+
+def test_export_postgis_vector_layers_park_labels_offline_unit(tmp_path: Path) -> None:
+    """Verify park_labels Point export & area-tiered tippecanoe minzoom 100% offline."""
+    park_rows = [
+        SimpleNamespace(
+            name="Kosciuszko National Park",
+            park_type="National Park",
+            type_abbr="NP",
+            state="NSW",
+            iucn="II",
+            area_ha=673_542.4,
+            geom_json=(
+                '{"type":"MultiPolygon","coordinates":[[[[148.1,-36.6],'
+                "[148.2,-36.6],[148.2,-36.5],[148.1,-36.5],[148.1,-36.6]]]]}"
+            ),
+            label_geom_json='{"type":"Point","coordinates":[148.15,-36.55]}',
+        ),
+        SimpleNamespace(
+            name="Mount Buffalo National Park",
+            park_type="National Park",
+            type_abbr="NP",
+            state="VIC",
+            iucn="II",
+            area_ha=31_000.0,
+            geom_json=(
+                '{"type":"MultiPolygon","coordinates":[[[[146.7,-36.8],'
+                "[146.9,-36.8],[146.9,-36.7],[146.7,-36.7],[146.7,-36.8]]]]}"
+            ),
+            label_geom_json='{"type":"Point","coordinates":[146.8,-36.75]}',
+        ),
+        SimpleNamespace(
+            name="Small Bushland Reserve",
+            park_type="Nature Reserve",
+            type_abbr="NR",
+            state="VIC",
+            iucn="Ia",
+            area_ha=450.25,
+            geom_json=(
+                '{"type":"MultiPolygon","coordinates":[[[[147.0,-36.9],'
+                "[147.02,-36.9],[147.02,-36.88],[147.0,-36.88],[147.0,-36.9]]]]}"
+            ),
+            label_geom_json='{"type":"Point","coordinates":[147.01,-36.89]}',
+        ),
+    ]
+
+    class _FakeResult:
+        def __init__(self, rows: list[Any] | None = None, scalar: Any = None) -> None:
+            self._rows = rows or []
+            self._scalar = scalar
+
+        def scalar_one_or_none(self) -> Any:
+            return self._scalar
+
+        def __iter__(self) -> Any:
+            return iter(self._rows)
+
+    class _FakeSession:
+        def __init__(self) -> None:
+            self.call_idx = 0
+
+        def execute(self, stmt: Any) -> _FakeResult:
+            self.call_idx += 1
+            sql_text = str(stmt)
+            if "ST_Extent" in sql_text:
+                if "capad_parks" in sql_text:
+                    return _FakeResult(scalar="BOX(146.7 -36.9,148.2 -36.5)")
+                return _FakeResult(scalar=None)
+            if "capad_parks" in sql_text:
+                return _FakeResult(rows=park_rows)
+            return _FakeResult(rows=[])
+
+    layer_paths, layer_counts, bounds = export_postgis_vector_layers(
+        cast(Session, _FakeSession()),
+        tmp_path,
+    )
+    assert bounds == [146.7, -36.9, 148.2, -36.5]
+    assert layer_counts["capad_parks"] == 3
+    assert layer_counts["park_labels"] == 3
+    assert "park_labels" in layer_paths
+
+    labels_fc = json.loads(layer_paths["park_labels"].read_text(encoding="utf-8"))
+    assert labels_fc["type"] == "FeatureCollection"
+    assert len(labels_fc["features"]) == 3
+
+    by_name = {f["properties"]["name"]: f for f in labels_fc["features"]}
+    kosci = by_name["Kosciuszko National Park"]
+    assert kosci["geometry"] == {"type": "Point", "coordinates": [148.15, -36.55]}
+    assert kosci["tippecanoe"] == {"minzoom": 7}
+    assert kosci["properties"] == {
+        "name": "Kosciuszko National Park",
+        "park_type": "National Park",
+        "type_abbr": "NP",
+        "state": "NSW",
+        "area_ha": 673542.4,
+    }
+    assert by_name["Mount Buffalo National Park"]["tippecanoe"] == {"minzoom": 9}
+    assert by_name["Small Bushland Reserve"]["tippecanoe"] == {"minzoom": 11}
+    assert by_name["Small Bushland Reserve"]["properties"]["area_ha"] == 450.2
+
+
 @pytest.mark.integration
 def test_export_postgis_vector_layers_contract(
     postgis_engine: Engine, fixtures_dir: Path, tmp_path: Path
@@ -154,6 +270,7 @@ def test_export_postgis_vector_layers_contract(
     assert layer_counts["waterways"] == 2  # Murray River + Limestone Creek (Connector excluded)
     assert layer_counts["pois"] == 5
     assert layer_counts["capad_parks"] == 2
+    assert layer_counts["park_labels"] == 2
 
     # Validate locked vector layer property schemas (#23)
     seg_fc = json.loads(layer_paths["track_segments"].read_text(encoding="utf-8"))
@@ -213,11 +330,26 @@ def test_export_postgis_vector_layers_contract(
         "Kosciuszko National Park",
     }
 
+    park_labels_fc = json.loads(layer_paths["park_labels"].read_text(encoding="utf-8"))
+    assert {f["properties"]["name"] for f in park_labels_fc["features"]} == {
+        "Alpine National Park",
+        "Kosciuszko National Park",
+    }
+    for feat in park_labels_fc["features"]:
+        assert feat["geometry"]["type"] == "Point"
+        assert set(feat["properties"].keys()) == {
+            "name",
+            "park_type",
+            "type_abbr",
+            "state",
+            "area_ha",
+        }
+        assert feat["properties"]["area_ha"] > 0
+        assert feat["tippecanoe"]["minzoom"] in (7, 9, 10, 11)
+
 
 @pytest.mark.skipif(not HAS_FULL_TILE_CLI, reason="GDAL/tippecanoe/pmtiles CLIs require Docker env")
-def test_generate_contours_and_terrain_pmtiles_binary(
-    fixtures_dir: Path, tmp_path: Path
-) -> None:
+def test_generate_contours_and_terrain_pmtiles_binary(fixtures_dir: Path, tmp_path: Path) -> None:
     dem_path = fixtures_dir / "dem_alps_corridor.tif"
 
     # 1. Contours via gdal_contour (20 m interval, 100 m index)
@@ -282,6 +414,7 @@ def test_build_tiles_full_corridor_end_to_end(
         "waterways",
         "pois",
         "capad_parks",
+        "park_labels",
         "contours",
         "snowline_bands",
     }

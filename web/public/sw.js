@@ -40,6 +40,20 @@ const PRECACHE_URLS = [
   "/index.html",
   "/manifest.webmanifest",
   "/icon.svg",
+  "/data/au_places.geojson",
+  "/data/au_highways.geojson",
+  "/fonts/Noto%20Sans%20Regular/0-255.pbf",
+  "/fonts/Noto%20Sans%20Regular/256-511.pbf",
+  "/fonts/Noto%20Sans%20Regular/8192-8447.pbf",
+  "/fonts/Noto%20Sans%20Medium/0-255.pbf",
+  "/fonts/Noto%20Sans%20Medium/256-511.pbf",
+  "/fonts/Noto%20Sans%20Medium/8192-8447.pbf",
+  "/fonts/Noto%20Sans%20Bold/0-255.pbf",
+  "/fonts/Noto%20Sans%20Bold/256-511.pbf",
+  "/fonts/Noto%20Sans%20Bold/8192-8447.pbf",
+  "/fonts/Noto%20Sans%20Italic/0-255.pbf",
+  "/fonts/Noto%20Sans%20Italic/256-511.pbf",
+  "/fonts/Noto%20Sans%20Italic/8192-8447.pbf",
   "/icons/airfield.svg",
   "/icons/campground.svg",
   "/icons/comm_tower.svg",
@@ -329,7 +343,7 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Other static app assets (/icons/*, /manifest.webmanifest): cache-first with background refresh
+  // Other static app assets (/icons/*, /data/*, /fonts/*, /manifest.webmanifest): cache-first with background refresh
   event.respondWith(
     caches.match(request).then((cached) => {
       const networkFetch = fetch(request)

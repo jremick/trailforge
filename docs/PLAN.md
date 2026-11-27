@@ -94,5 +94,21 @@
 ## Out of Scope for v1 (Planned v1.1+ Follow-Ons)
 - Native mobile shell (Capacitor / React Native) for locked-screen iOS background GPS + high-rate IMU telemetry recording.
 - Apple CarPlay / Android Auto projection.
-- Expansion beyond VIC / NSW / ACT to QLD, WA, SA, TAS, NT, and international regions.
 - Optional Valhalla map-matching sidecar plugin for dense mixed urban/rural deployments.
+
+---
+
+## Next Roadmap (v1.2+): Regional Coverage & Vector Basemaps
+
+TrailForge follows a phased, ODbL-clean regional expansion model combining self-hosted MapLibre SDF glyphs, hierarchical place/region/highway gazetteers, official public-land & trail connectors, and crisp regional vector basemap PMTiles:
+
+1. **Phase 1 — Australia (Current):**
+   - Full Pan-Australia places, geographic & 4WD regions, and major highway/arterial corridor layers across all 8 states & territories (VIC, NSW, ACT, TAS, QLD, WA, SA, NT).
+   - Self-hosted Noto Sans SDF font glyphs (`Regular`, `Medium`, `Bold`, `Italic`), CAPAD 2025 protected-area park labels (`park_labels`), and offline PWA precaching so Topo, Vector, Imagery, and Offline Topo basemaps stay legible 100% offline.
+   - Regional & statewide offline packs paired with a self-hosted vector basemap PMTiles option.
+2. **Phase 2 — North America (Next):**
+   - United States & Canada places, geographic/overland regions, and major highway networks (Interstate, US/State routes, Trans-Canada & backcountry forest corridors).
+   - Official public-land trail & land-tenure connectors: USFS Motor Vehicle Use Maps (MVUM), BLM public lands & routes, state/provincial park & forestry feeds, and USGS 3DEP / Natural Resources Canada elevation DEMs.
+   - Regional offline vector basemap & trail packs (e.g., Colorado/Utah/Moab, Pacific Northwest, Sierras/Mojave, BC/Alberta Rockies).
+3. **Phase 3 — Europe, New Zealand, Southern Africa & Other Regions (Following):**
+   - New Zealand DOC & LINZ backcountry tracks, huts, and topographic contours; European alpine/overland trail corridors; Southern Africa 4x4 overland networks; and community-contributed regional connectors and vector basemap packs built on the same ODbL-separated schema.

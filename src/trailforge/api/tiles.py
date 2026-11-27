@@ -26,6 +26,7 @@ from trailforge.ingestion.connectors.base import (
     ATTRIBUTION_OSM,
     ATTRIBUTION_VIC_DEECA,
 )
+from trailforge.tiles.builder import VECTOR_LAYER_ORDER
 
 router = APIRouter(prefix="/api/tiles", tags=["tiles"])
 
@@ -204,6 +205,8 @@ def get_tiles_manifest(
     payload["vector_available"] = vector_path.is_file() or cdn_offload
     payload["terrain_available"] = terrain_path.is_file() or cdn_offload
     payload["cdn_offload"] = cdn_offload
+    if payload["vector_available"] and not payload.get("layers"):
+        payload["layers"] = list(VECTOR_LAYER_ORDER)
     if not payload.get("snowline_bands_m"):
         payload["snowline_bands_m"] = list(DEFAULT_SNOWLINE_BANDS_M)
     if not payload.get("attributions"):
