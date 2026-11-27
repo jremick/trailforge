@@ -5,6 +5,26 @@ All notable changes to **TrailForge** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] - 2026-11-28
+
+Maintenance, maintainability, and test-hardening patch release (publishing `:v1.4.1`, `:v1.4`, and `:latest` multi-arch `linux/amd64` + `linux/arm64` GHCR images) hardening error visibility, eliminating duplicated helper paths, modularizing large MapLibre style / search API / route planner hubs, and closing mutation-tested unit coverage gaps across `540` passing automated offline tests (`342` Python/PostGIS + `198` Vitest).
+
+### Changed & Refactored
+- **Modular MapLibre Style Builders (`web/src/style.ts`, `web/src/style/`):** Split `web/src/style.ts` (`3,038` → `~380` LOC) into focused declarative layer modules (`basemapVector.ts`, `labelsAndHighways.ts`, `trailLayers.ts`, `markerLayers.ts`) while preserving 100% identical public exports and layer ordering.
+- **Dedicated Search API Router (`src/trailforge/api/search.py`, `src/trailforge/api/tracks.py`, `src/trailforge/api/main.py`):** Extracted `/api/search`, its bounded LRU + TTL cache, and slot-budgeting helpers out of `tracks.py` into `src/trailforge/api/search.py` with backward-compatible PEP 484 re-exports preserved on `trailforge.api.tracks`.
+- **Staged Multi-Track Route Planner (`src/trailforge/routes/planner.py`):** Decomposed `_plan_route_with_geometry_impl` into 6 sequential stage helpers (input resolution, DB context & budget loading, leg assembly, spatial overlay loading, safety summary, and rig suitability) and removed its remaining `# type: ignore[arg-type]`.
+- **Shared Feed & PWA Helpers (`src/trailforge/feeds/adapters.py`, `web/src/api.ts`, `web/src/main.ts`, `web/src/map.ts`, `web/src/search.ts`, `web/src/offline/syncQueue.ts`):** Deduplicated GeoJSON feed fetching, multipart `FormData` uploads, browser blob downloads, hover popup teardown, local layer preference resets, post-upload trip refreshes, local search candidate sorting, and private offline sync queue enqueuing.
+- **Repo-Local Anti-Slop Guards (`.anti-slop/learned/rules.json`, `.gitignore`):** Enabled 6 deterministic repo-local guards (`security-boundaries`, `build-config-hygiene`, and Python outbound HTTP timeout checks) and ignored local telemetry/receipt files.
+
+### Fixed
+- **Error Diagnostics, Type Narrowing & Mobile Docs (`web/src/main.ts`, `src/trailforge/feeds/sync.py`, `mobile/README.md`, `tests/test_search_performance.py`):** Replaced 7 silent empty `catch` blocks in `web/src/main.ts` with scoped `console.warn`/`console.debug` diagnostics while preserving offline/abort fallbacks; replaced bare `# type: ignore` suppressions in `src/trailforge/feeds/sync.py` (with `isinstance` narrowing) and `tests/test_search_performance.py` (with a typed `_as_session()` helper); and moved untracked generated Capacitor paths in `mobile/README.md` into fenced build command comments.
+
+### Verification Metrics (`v1.4.1`)
+- **Offline CI Tests:** `540` automated offline tests passing (`342` Python/PostGIS unit, integration, migration, MCP, OAuth 2.1, privacy, resource-budget & sharded pack tests + `198` Vitest web tests across 20 files; `0` failures, `0` Python CVEs via `pip-audit`, `0` high/critical npm CVEs via `npm audit`).
+- **Mutation & Runtime Verification:** Diff-scoped mutation kill rates reached `100.0%` (`48/48`) across TypeScript sweeps and `91.7%` (`22/24`) across pure-Python unit sweeps; `alembic upgrade head` & `alembic check` clean at `0011_closure_datasets` (drop-in upgrade from `v1.4.0`).
+
+---
+
 ## [1.4.0] - 2026-11-28
 
 Feature & scale release (publishing `:v1.4.0`, `:v1.4`, and `:latest` multi-arch `linux/amd64` + `linux/arm64` GHCR images) introducing **compact normalized & sharded offline regional packs (`sharded_v2`)** for 50,000+ track Australian regions while preserving 100% backward compatibility with `inline_v1` small packs.
