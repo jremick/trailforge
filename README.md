@@ -4,25 +4,39 @@
 
 # TrailForge
 
-**Open-source, self-hostable 4WD & off-road mapping, live track-grading, multi-track route planning, and trail-intelligence platform across all 8 Australian states & territories (`VIC`, `NSW`, `ACT`, `TAS`, `QLD`, `WA`, `SA`, `NT`).**
+**Open-source, self-hostable 4WD & off-road mapping, live track-grading, multi-track route planning, and AI/MCP trail-intelligence platform across all 8 Australian states & territories (`VIC`, `NSW`, `ACT`, `TAS`, `QLD`, `WA`, `SA`, `NT`).**
 
+[![Live Demo — MyTrailForge](https://img.shields.io/badge/Live%20Demo-mytrailforge.com-10b981?logo=googleearth&logoColor=white)](https://mytrailforge.com)
+[![CI](https://github.com/jremick/trailforge/actions/workflows/ci.yml/badge.svg)](https://github.com/jremick/trailforge/actions/workflows/ci.yml)
+[![GHCR Multi-Arch](https://github.com/jremick/trailforge/actions/workflows/release-images.yml/badge.svg)](https://github.com/jremick/trailforge/actions/workflows/release-images.yml)
+[![Release](https://img.shields.io/github/v/release/jremick/trailforge?color=f59e0b)](https://github.com/jremick/trailforge/releases/latest)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-[![Release: v1.2.1](https://img.shields.io/badge/Release-v1.2.1-16a34a)](CHANGELOG.md)
 [![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![PostGIS 3.4 + PMTiles](https://img.shields.io/badge/PostGIS-3.4%20%2B%20PMTiles-336791?logo=postgresql&logoColor=white)](Dockerfile)
 [![MapLibre GL JS 6](https://img.shields.io/badge/MapLibre%20GL%20JS-6-396CB2?logo=maplibre&logoColor=white)](web/package.json)
-[![Multi-Arch](https://img.shields.io/badge/Docker-arm64%20%7C%20amd64-2496ED?logo=docker&logoColor=white)](docker-compose.ghcr.yml)
+[![Multi-Arch GHCR](https://img.shields.io/badge/GHCR-amd64%20%7C%20arm64-2496ED?logo=docker&logoColor=white)](https://github.com/jremick/trailforge/pkgs/container/trailforge-backend)
 [![Tests](https://img.shields.io/badge/Tests-449%20passing-2ea44f)](tests/)
-[![Idle RAM](https://img.shields.io/badge/Idle%20RAM-~350%20MiB-f59e0b)](docker-compose.yml)
+[![Idle RAM](https://img.shields.io/badge/Idle%20RAM-~350%20MiB-f59e0b)](docker-compose.ghcr.yml)
 [![Sibling: GridForge](https://img.shields.io/badge/Sibling-GridForge-10b981)](https://github.com/jremick/gridforge)
 
-Pan-Australia 8-State Open Data · Explainable 2-Stage Grading · Interactive Route Planner · Native AI / MCP Server + OAuth 2.1 & Interactive MCP App · Pluggable HMM / Valhalla Sidecar + 50 Hz IMU Telemetry · 11 Live AU Closure Feeds · 15-Region Streaming Offline Packs · Capacitor 7 Mobile Shell & 4WD Clinometer · Hardened Public Hosting (Railway + Cloudflare R2) · GridForge 300 DPI Strip Atlas Handoff
+**Pan-Australia 8-State Open Data** · **Explainable 2-Stage Grading** (`DEM + Telemetry + 72h Rain`) · **Multi-Track Route Planner** · **Native AI / MCP Server + OAuth 2.1 & Interactive MCP App** · **Pluggable HMM / Valhalla Sidecar + 50 Hz IMU** · **11 Live AU Closure Feeds** · **15-Region Streaming Offline `PMTiles` Packs** · **Capacitor 7 Mobile Shell & 4WD Clinometer** · **GridForge 300 DPI Strip Atlas Handoff**
+
+**[Try TrailForge Live (`mytrailforge.com`)](https://mytrailforge.com)** · [60-Second Quickstart](#60-second-self-hosted-quickstart) · [Visual Gallery](#visual-feature-gallery) · [What Makes It Different](#what-makes-trailforge-different) · [Route Planner & GridForge](#interactive-multi-track-route-planner--gridforge-handoff) · [AI & MCP Server](docs/AI_INTEGRATION.md) · [Hosted & Homelab Deploy](#option-c-public-instance-hosting-railway--cloudflare-510mo-hard-capped) · [Changelog](CHANGELOG.md)
 
 </div>
 
 ---
 
-![TrailForge VIC & NSW 4WD Map and Track Inspector](docs/images/trailforge-hero.png)
+## Try It Live — MyTrailForge (`mytrailforge.com`)
+
+Want to explore Australian 4WD tracks before self-hosting? **[MyTrailForge (`https://mytrailforge.com`)](https://mytrailforge.com)** is the official live hosted deployment powered by open-source **TrailForge**:
+
+- **Zero install, anonymous-first browsing:** Explore Pan-Australia graded 4WD tracks across all 8 states & territories (`VIC`, `NSW`, `ACT`, `TAS`, `QLD`, `WA`, `SA`, `NT`), inspect explainable DEM + live-telemetry difficulty scores & elevation profiles, check live official agency closures & park alerts, switch Quick Rig classes (`AWD`–`Modified 4WD`), plan multi-track routes, and export GPX/GeoJSON — with zero sign-in required.
+- **Full self-hosted control:** Spin up your own private homelab or 4WD club stack in 60 seconds below (unlimited custom vehicle profiles, GPX & 50 Hz IMU telemetry uploads, private trip logs, custom regional offline pack bakes, and native AI/MCP OAuth 2.1 integration) — or deploy your own hardened public instance on Railway + Cloudflare R2 using `TRAILFORGE_REGISTRATION_MODE=invite_only`.
+
+---
+
+![TrailForge Pan-Australia 4WD Map and Track Inspector](docs/images/trailforge-hero.png)
 
 ## What Makes TrailForge Different
 
@@ -105,7 +119,7 @@ Open **<http://localhost:5173>** in your browser (interactive OpenAPI docs at **
 
 ### Option C: Public Instance Hosting (Railway + Cloudflare, ~$5–$10/mo Hard-Capped)
 
-Host a hardened, public-facing TrailForge instance where anyone can browse tracks, live grades, closures, and route planning while registration stays locked to friend invites and heavy tiles/packs stream at **$0 egress** from Cloudflare R2:
+Host a hardened, public-facing TrailForge instance (powering the live **[MyTrailForge (`mytrailforge.com`)](https://mytrailforge.com)** deployment) where anyone can browse tracks, live grades, closures, and route planning while registration stays locked to friend invites and heavy tiles/packs stream at **$0 egress** from Cloudflare R2:
 
 - **Railway Config-as-Code & Production Playbook:** [`railway.toml`](railway.toml), [`deploy/railway/README.md`](deploy/railway/README.md), and [`deploy/railway/env.railway.example`](deploy/railway/env.railway.example) configure PostGIS (`imresamu/postgis:16-3.4`), `api` (`alembic upgrade head && uvicorn ... --port ${PORT:-8000}`), and `worker` (`python -m trailforge.worker.main`) over Railway private networking with a **$10–$15/mo hard billing cap**.
 - **Cloudflare Pages Proxy, Zero-Egress R2 & Free WAF Kit (`deploy/cloudflare/`):**
@@ -299,6 +313,7 @@ web/
 └── public/sw.js           # Offline-first Service Worker v3 with LRU cache pruning, range-sliced PMTiles & /mcp passthrough
 mobile/                    # iOS Info.plist & AndroidManifest background GPS/IMU snippets, build guide & CarPlay/Android Auto spec
 deploy/                    # Production HTTPS kit (Tailscale, Caddy v2, Traefik v3, Valhalla), Railway + Cloudflare kit & Antigravity AI plugin
+scripts/                   # sync_github_metadata.sh (GitHub repo metadata, Social Preview & GHCR public pull verification)
 railway.toml               # Railway Config-as-Code (Dockerfile build, Alembic boot + dynamic $PORT, /api/health)
 migrations/                # Alembic spatial migrations (0001..0008 incl. UI preferences, AI/OAuth 2.1 & pg_trgm perf indexes; 35 base tables, 21 GIST indexes)
 assets/icons/              # 21 self-contained outdoor/topo/4WD SVG symbols (adapted from GridForge)
@@ -330,33 +345,17 @@ See [`docs/AI_INTEGRATION.md`](docs/AI_INTEGRATION.md) for ChatGPT/Claude/Antigr
 
 ---
 
-## Release Status & Roadmap (`v1.2.0`)
+## Release Status & Roadmap (`v1.2.1`)
 
-- **Shipped in `v1.2.0` (Current Stable Release — publishes `:v1.2.0`, `:v1.2` & `:latest` multi-arch GHCR images):**
-  - **Native AI / MCP Server, OAuth 2.1 & Interactive MCP App:** Stateless Streamable HTTP MCP server (`18` tools, Pillow PNG trail/elevation visuals, `trailforge://` resources, 4WD prompts), interactive single-file **SEP-1865 MCP App** (`ui://trailforge/explorer.html`), self-hosted **Personal Access Tokens** (`tf_pat_...`) & **OAuth 2.1 + PKCE + RFC 7591 DCR** (`migrations/versions/0007_ai_mcp_auth.py`), `trailforge-mcp` local `stdio` bridge, and Antigravity plugin kit (`deploy/ai/antigravity-plugin/`).
-  - **MapLibre GL JS v6 & End-to-End Performance Optimizations:** Upgraded `maplibre-gl` to v6 with explicit Vite ES-module worker bundling (`maplibre-gl-worker.mjs?url`) and Blob-URL worker bundling in the MCP App; added `migrations/versions/0008_perf_and_security_indexes.py` (`pg_trgm` trigram search + active-closure/grade/observation partial indexes; **35 base tables, 21 GIST indexes**); eliminated N+1 queries, vectorized 50 Hz IMU alignment, offloaded event-loop hotspots, lazy-loaded heavy web drawers (~84 KB initial bundle cut), switched IMU recording to a typed-array ring buffer, and upgraded Service Worker v3 LRU caching.
-  - **Deep Security & Container Hardening:** Fail-closed default `TRAILFORGE_TRUST_PROXY_HEADERS=false`, CIDR-verified right-to-left `X-Forwarded-For` parsing, explicit `TRAILFORGE_TRUST_CLOUDFLARE_HEADERS` gating, partitioned `api`/`auth`/`mcp`/`oauth_dcr` rate-limiter buckets, mandatory `TRAILFORGE_PUBLIC_BASE_URL` in production MCP mode, cookie-bound OAuth login CSRF nonces & strict JSON parameter typing, strict MCP JSON Schema validation (`validate_input=True`), 2048 px EXIF/PNG-tEXt stripped report photos, non-leaking `create-admin --password-stdin`, unprivileged `nginxinc/nginx-unprivileged` web container (`uid=101`, port `8080`), SHA-256 checksummed GIS binary downloads, and automated CI `pip-audit` + `npm audit` gates (`0` CVEs).
-- **Previously shipped in `v1.1.6`:**
-  - **Click-to-Inspect Emergency Incidents & Admin/User Map Layer Preferences:** Added `GET /api/closures/{closure_id}`, right-hand `ClosureInspectorDrawer` with overlapping-alert switching & map outline highlight, `migrations/versions/0006_ui_preferences_and_settings.py`, drag-and-drop/auto-saved sidebar layer ordering, Admin Console Settings tab, and `TRAILFORGE_SHOW_STACK_TELEMETRY_PUBLIC` toggle.
-- **Previously shipped in `v1.1.0`:**
-  - **Access Control, Friend Invites & Admin Console:** Tier C `0004_public_access_control` & `0005_user_token_version` migrations (30 base tables / 21 GIST indexes), `admin`/`member` roles, instant `is_active` suspension & server-side `token_version` session revocation, `TRAILFORGE_REGISTRATION_MODE=open|invite_only|closed`, `TRAILFORGE_ADMIN_EMAIL` bootstrap, `python -m trailforge.auth.cli`, admin-gated compute POST routes, `/api/admin/{stats,users,invites}`, and slide-over web Admin Console.
-  - **Zero-Redis Edge Guard, Upload Quotas & Cloudflare R2 Offload:** `O(1)` LRU `CF-Connecting-IP`/`X-Forwarded-For` sliding-window rate limiter (`429` + `Retry-After` + `X-RateLimit-*`), `uploads_max_total_mb` HTTP `507` disk cap, daily per-user trip & photo upload quotas, `TILES_PUBLIC_BASE_URL` / `PACKS_PUBLIC_BASE_URL` R2 offload (with absolute `https://` `PMTiles` support in MapLibre + `sw.js`), and pure-Python SigV4 `python -m trailforge.packs.r2_sync`.
-  - **Railway + Cloudflare Deploy Kit:** `railway.toml`, `deploy/railway/` (~$5–$10/mo hard-capped playbook & env template), `deploy/cloudflare/` (Pages `/api/*` proxy function with `307 Location` origin rewrite & `X-TrailForge-Origin-Secret` injection, R2 CORS policy, Free-tier WAF/cache/Web Analytics recipe), and Compose/`.env.example` parity.
-  - **Pre-Launch OWASP/STRIDE Security Hardening (13 Findings Closed):** Shared origin secret (`X-TrailForge-Origin-Secret`), fail-closed production secret validation (`create_app()`), streaming ASGI `413` request body-size limits + `50k`/`100k` telemetry array caps, Pillow EXIF GPS/metadata stripping on report photos, same-origin `HttpOnly` cookie-only web auth + server-side `token_version` revocation on logout/role/status change, cookie CSRF guard (`Sec-Fetch-Site`/`Origin`), global security headers & MapLibre-safe CSP (`web/public/_headers`, `web/nginx.conf`, FastAPI, Pages proxy), invite-before-email enumeration & scrypt timing-oracle fixes, `NaN`/`Inf` bbox & XML `<!ENTITY` feed guards, production `/docs` disablement, and non-root `USER trailforge` container image.
-- **Previously shipped in `v1.0.1`:**
-  - **Pan-Australia Live Upstream Endpoint Fixes:** Fixed NTG `ROAD_CENTRELINES` ArcGIS query (`UFI` OID field instead of nonexistent `OBJECTID`), switched QLD alerts default (`qld_des_alerts`) to Queensland Fire Department's live GeoJSON feed (`https://www.fire.qld.gov.au/data/alerts/bushfireAlert.json`), switched WA alerts (`wa_emergency`) to Emergency WA's v1 JSON API (`https://api.emergency.wa.gov.au/v1/warnings` with `geo-source` Polygon preference), and switched NT alerts (`nt_securent`) to NT DIPL's live Road Report NT API (`https://roadreport.nt.gov.au/api/Obstruction/GetAll` with LineString/Point road-closure & 4WD-access parsing), while preserving 100% backward compatibility with existing RSS/GeoJSON fixtures and verifying all 8 states live.
-- **Shipped in `v1.0.0` (Inaugural Stable GA Release):**
-  - **Pan-Australia 8-State Connectors & 15-Region Pack Catalog:** Full connectors for `ACT`, `TAS`, `QLD`, `WA` (strictly excluding `CC BY-NC`), `SA`, and `NT` alongside `VIC` & `NSW` via `AutoAUStateTrailsRouter`, Tier A `0003_pan_au_source_tracks` migration (28 base tables / 21 GIST indexes), and 15 offline pack regions (`7` iconic 4WD + `8` statewide) with dynamic per-state attributions.
-  - **Pan-Australia Official Closure & Emergency Feeds:** 6 new state adapters (`act_esa`, `tas_alert`, `qld_des_alerts`, `wa_emergency`, `sa_cfs_parks`, `nt_securent`) alongside the 5 core VIC/NSW/OSM feeds (11 feeds total), CAPAD park joins, `?state=` filtering, and lean `TRAILFORGE_ENABLED_STATES` scoping.
-  - **Pluggable Valhalla `TrackMatcher` Sidecar & 50 Hz Mobile IMU:** `ValhallaTrackMatcher` + pure-Python Polyline6 decoder + canonical PostGIS `track_segments` projection + automatic `postgis_hmm_fallback`, opt-in `deploy/valhalla-compose.override.yml`, high-rate IMU roughness/shock/clinometer processor (`src/trailforge/matching/imu.py`) with mandatory `≥ 250 m` privacy trimming, and `POST /api/trips/mobile-sync`.
-  - **Capacitor 7 Mobile Shell, Live 4WD Clinometer & Pan-AU UI:** `web/capacitor.config.ts`, `web/src/native/bridge.ts`, `mobile/` iOS/Android background GPS & sensor templates, live Pitch°/Roll° 4WD Clinometer in the In-Cab Recorder, Pan-AU 15-region presets & pack category filters, and CarPlay / Android Auto projection spec.
-  - **Graduated to Stable GA:** All `v1.0.0-beta.1` and `v1.0.0-alpha.1` capabilities including the Interactive Multi-Track Route Planner & GridForge 300 DPI Strip Atlas handoff, streaming OSM PBF regional bake pipeline, zero-build multi-arch GHCR + HTTPS deploy kit, and all 9 core vertical slices.
-- **Previously shipped in `v1.0.0-beta.1`:**
-  - Streaming OSM PBF + live VIC/NSW open-data tiled regional bake pipeline (`bake_cli`), real-data AU corridor bake verification (Blue Mountains & Tom Groggin), and `11,179`-segment PostGIS GIST scale benchmark (`13.65 MiB` heap, `0.18–0.63 ms` index scans).
-  - Multi-arch GHCR release workflow (`.github/workflows/release-images.yml`), zero-build `docker-compose.ghcr.yml`, turnkey HTTPS deploy kit (`deploy/`), and isolated `trailforge_test` PostGIS integration test DB (`make test-integration`).
-  - Interactive Multi-Track Route Planner (`planned_routes` migration, DP leg orientation, combined 4-grade elevation profile, saved routes CRUD, GPX/GeoJSON export, and 1-click GridForge 300 DPI Strip Atlas CLI handoff).
-- **Previously shipped in `v1.0.0-alpha.1`:** All **9 vertical slices** from [`docs/PLAN.md`](docs/PLAN.md) verified end-to-end across Checkpoints A, B, and C on the VIC/NSW Australian Alps corridor.
-- **Next Milestones (`v1.1+`):** Statewide production PBF/DEM pack bakes across Australia, multi-week live agency soak testing, and native iOS CarPlay (`CPMapTemplate`) & Android Auto (`NavigationTemplate`) companion packaging.
+See **[CHANGELOG.md](CHANGELOG.md)** and **[GitHub Releases](https://github.com/jremick/trailforge/releases)** for full per-version notes (`v1.0.0-alpha.1` through `v1.2.1`).
+
+- **Current Stable Release (`v1.2.1` — publishes `:v1.2.1`, `:v1.2` & `:latest` multi-arch `amd64`/`arm64` GHCR images):**
+  - **Idempotent Production Upgrades (`v1.2.1`):** Made `migrations/versions/0008_perf_and_security_indexes.py` fully idempotent (`if_not_exists=True` / `DROP CONSTRAINT IF EXISTS`) so upgrading live `v1.1.x` PostGIS databases with pre-existing `pg_trgm` or operational indexes succeeds cleanly.
+  - **Native AI / MCP Server, OAuth 2.1 & Interactive MCP App (`v1.2.0`):** Stateless Streamable HTTP MCP server (`18` tools, Pillow PNG trail/elevation visuals, `trailforge://` resources, 4WD prompts), interactive single-file **SEP-1865 MCP App** (`ui://trailforge/explorer.html`), self-hosted **Personal Access Tokens** (`tf_pat_...`) & **OAuth 2.1 + PKCE + RFC 7591 DCR** (`migrations/versions/0007_ai_mcp_auth.py`), `trailforge-mcp` local `stdio` bridge, and Antigravity plugin kit (`deploy/ai/antigravity-plugin/`).
+  - **MapLibre GL JS v6 & End-to-End Performance Optimizations (`v1.2.0`):** Upgraded `maplibre-gl` to v6 with explicit Vite ES-module worker bundling (`maplibre-gl-worker.mjs?url`) and Blob-URL worker bundling in the MCP App; added `pg_trgm` trigram search + active-closure/grade/observation partial indexes (**35 base tables, 21 GIST indexes**); eliminated N+1 queries, vectorized 50 Hz IMU alignment, offloaded event-loop hotspots, lazy-loaded heavy web drawers (~84 KB initial bundle cut), switched IMU recording to a typed-array ring buffer, and upgraded Service Worker v3 LRU caching.
+  - **Deep Security & Container Hardening (`v1.2.0`):** Fail-closed default `TRAILFORGE_TRUST_PROXY_HEADERS=false`, CIDR-verified right-to-left `X-Forwarded-For` parsing, explicit `TRAILFORGE_TRUST_CLOUDFLARE_HEADERS` gating, partitioned `api`/`auth`/`mcp`/`oauth_dcr` rate-limiter buckets, mandatory `TRAILFORGE_PUBLIC_BASE_URL` in production MCP mode, cookie-bound OAuth login CSRF nonces & strict JSON parameter typing, strict MCP JSON Schema validation (`validate_input=True`), 2048 px EXIF/PNG-tEXt stripped report photos, non-leaking `create-admin --password-stdin`, unprivileged `nginxinc/nginx-unprivileged` web container (`uid=101`, port `8080`), SHA-256 checksummed GIS binary downloads, and automated CI `pip-audit` + `npm audit` gates (`0` CVEs).
+- **Previously Shipped Foundations (`v1.0.0` – `v1.1.6`):** Pan-Australia 8-state connectors & 15-region streaming offline packs, 11 live emergency & park closure feeds with click-to-inspect incident drawer, interactive multi-track Route Planner with GridForge 300 DPI Strip Atlas handoff, pluggable Valhalla sidecar & 50 Hz mobile IMU + Capacitor 7 clinometer shell, invite-only access control & Admin Console, Cloudflare R2 zero-egress offload, and Railway + Cloudflare production deploy kit.
+- **Next Milestones (`v1.3+`):** Statewide production PBF/DEM pack bakes across all 8 Australian states, multi-week live agency soak testing, and native iOS CarPlay (`CPMapTemplate`) & Android Auto (`NavigationTemplate`) companion packaging.
 
 ---
 

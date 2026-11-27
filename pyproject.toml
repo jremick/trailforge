@@ -5,14 +5,14 @@ build-backend = "hatchling.build"
 [project]
 name = "trailforge"
 version = "1.2.1"
-description = "Open-source, self-hostable 4WD & off-road mapping, live track-grading, and trail-intelligence platform for Victoria & New South Wales"
+description = "Open-source, self-hostable Pan-Australia 4WD & off-road mapping, live track-grading, route planning, and AI/MCP trail-intelligence platform"
 readme = "README.md"
 license = "GPL-3.0-or-later"
 requires-python = ">=3.12"
 authors = [
     { name = "TrailForge Contributors" },
 ]
-keywords = ["gis", "4wd", "offroad", "postgis", "pmtiles", "maplibre", "victoria", "nsw", "tracks"]
+keywords = ["gis", "4wd", "offroad", "overlanding", "australia", "postgis", "pmtiles", "maplibre", "mcp", "gpx", "tracks"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Environment :: Web Environment",
@@ -65,6 +65,13 @@ dev = [
 trailforge-api = "trailforge.api.main:run"
 trailforge-worker = "trailforge.worker.main:run"
 trailforge-mcp = "trailforge.mcp.stdio_proxy:main"
+
+[project.urls]
+Homepage = "https://mytrailforge.com"
+Repository = "https://github.com/jremick/trailforge"
+Documentation = "https://github.com/jremick/trailforge#readme"
+Changelog = "https://github.com/jremick/trailforge/blob/main/CHANGELOG.md"
+Issues = "https://github.com/jremick/trailforge/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/trailforge"]
