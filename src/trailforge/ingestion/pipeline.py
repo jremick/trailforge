@@ -14,6 +14,7 @@ import logging
 import re
 import uuid
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -43,6 +44,7 @@ from trailforge.db.models import (
 )
 from trailforge.db.session import get_engine
 from trailforge.grading.baseline import SegmentGradeInput, compute_baseline_grade
+from trailforge.grading.live import sync_track_effective_grades
 from trailforge.ingestion.conflate import conflate_tracks, to_albers
 from trailforge.ingestion.connectors.base import (
     AU_EXTENDED_STATE_CODES,
@@ -129,6 +131,22 @@ def _slugify(value: str | None) -> str:
         return "unnamed"
     slug = _SLUG_RE.sub("-", value.strip().lower()).strip("-")
     return slug or "unnamed"
+
+
+def build_track_search_text(name: str, alt_names: Sequence[str] | None = None) -> str | None:
+    """Build normalized ``name`` + ``alt_names`` search text for trigram indexing."""
+    parts: list[str] = []
+    seen_lower: set[str] = set()
+    clean_name = (name or "").strip()
+    if clean_name:
+        parts.append(clean_name)
+        seen_lower.add(clean_name.lower())
+    for alt in alt_names or ():
+        clean_alt = str(alt).strip()
+        if clean_alt and clean_alt.lower() not in seen_lower:
+            seen_lower.add(clean_alt.lower())
+            parts.append(clean_alt)
+    return " ".join(parts) or None
 
 
 _UPSERT_CHUNK_SIZE = 500
@@ -787,6 +805,7 @@ def ingest_corridor_dataset(
                 "track_id": trk.track_id,
                 "name": trk.name,
                 "alt_names": trk.alt_names,
+                "search_text": build_track_search_text(trk.name, trk.alt_names),
                 "state": trk.state,
                 "primary_source": trk.primary_source,
                 "has_osm_source": trk.has_osm_source,
@@ -813,6 +832,7 @@ def ingest_corridor_dataset(
         update_cols=(
             "name",
             "alt_names",
+            "search_text",
             "state",
             "primary_source",
             "has_osm_source",
@@ -907,9 +927,12 @@ def ingest_corridor_dataset(
     # Flush new segments before pointing superseded_by_segment_id FKs to them
     session.flush()
 
+    retired_track_ids: set[str] = set()
     for retired in plan.retired_segments:
         row = session.get(TrackSegment, retired.segment_id)
         if row is not None:
+            if row.track_id:
+                retired_track_ids.add(row.track_id)
             row.is_active = False
             row.retired_at = now
             row.superseded_by_segment_id = retired.superseded_by_segment_id
@@ -967,6 +990,12 @@ def ingest_corridor_dataset(
             )
         },
     )
+
+    # Synchronize cached tracks.effective_grade after baseline/live segment grades are written
+    touched_track_ids = list(dict.fromkeys([*track_by_id.keys(), *sorted(retired_track_ids)]))
+    if touched_track_ids:
+        session.flush()
+        sync_track_effective_grades(session, track_ids=touched_track_ids)
 
     # -------------------------------------------------------------------------
     # 8. Upsert Deduplicated Canonical `pois`

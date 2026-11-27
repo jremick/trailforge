@@ -14,6 +14,7 @@ Strictly leaves ``baseline_grade``, ``baseline_score``, and ``baseline_breakdown
 from __future__ import annotations
 
 import math
+import sys
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -23,7 +24,8 @@ from typing import Any, Final, Literal
 import httpx
 import numpy as np
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, update
+from sqlalchemy import Text, bindparam, func, select, text, update
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Session
 
 from trailforge.db.models import (
@@ -418,6 +420,113 @@ def _chunked(items: Sequence[str], size: int = _MAX_SQL_IN_PARAMS) -> list[list[
     return [list(items[i : i + size]) for i in range(0, len(items), size)]
 
 
+def _invalidate_in_process_search_cache() -> None:
+    """Clear the API in-process search cache if ``trailforge.api.tracks`` is loaded."""
+    tracks_mod = sys.modules.get("trailforge.api.tracks")
+    reset_fn = getattr(tracks_mod, "reset_search_cache", None)
+    if callable(reset_fn):
+        reset_fn()
+
+
+_SYNC_ALL_TRACK_GRADES_SQL = text(
+    """
+    WITH track_grades AS (
+        SELECT
+            t.track_id,
+            CASE MAX(
+                CASE tsg.effective_grade
+                    WHEN 'Easy' THEN 1
+                    WHEN 'Medium' THEN 2
+                    WHEN 'Hard' THEN 3
+                    WHEN 'Extreme' THEN 4
+                    ELSE 0
+                END
+            )
+                WHEN 1 THEN 'Easy'
+                WHEN 2 THEN 'Medium'
+                WHEN 3 THEN 'Hard'
+                WHEN 4 THEN 'Extreme'
+                ELSE NULL
+            END AS computed_grade
+        FROM tracks AS t
+        LEFT JOIN track_segments AS ts
+          ON ts.track_id = t.track_id
+         AND ts.is_active IS TRUE
+        LEFT JOIN track_segment_grades AS tsg
+          ON tsg.segment_id = ts.segment_id
+        GROUP BY t.track_id
+    )
+    UPDATE tracks AS t
+    SET effective_grade = tg.computed_grade
+    FROM track_grades AS tg
+    WHERE t.track_id = tg.track_id
+      AND t.effective_grade IS DISTINCT FROM tg.computed_grade
+    """
+)
+
+_SYNC_SUBSET_TRACK_GRADES_SQL = text(
+    """
+    WITH target_ids(track_id) AS (
+        SELECT UNNEST(:track_ids)
+    ),
+    track_grades AS (
+        SELECT
+            ti.track_id,
+            CASE MAX(
+                CASE tsg.effective_grade
+                    WHEN 'Easy' THEN 1
+                    WHEN 'Medium' THEN 2
+                    WHEN 'Hard' THEN 3
+                    WHEN 'Extreme' THEN 4
+                    ELSE 0
+                END
+            )
+                WHEN 1 THEN 'Easy'
+                WHEN 2 THEN 'Medium'
+                WHEN 3 THEN 'Hard'
+                WHEN 4 THEN 'Extreme'
+                ELSE NULL
+            END AS computed_grade
+        FROM target_ids AS ti
+        LEFT JOIN track_segments AS ts
+          ON ts.track_id = ti.track_id
+         AND ts.is_active IS TRUE
+        LEFT JOIN track_segment_grades AS tsg
+          ON tsg.segment_id = ts.segment_id
+        GROUP BY ti.track_id
+    )
+    UPDATE tracks AS t
+    SET effective_grade = tg.computed_grade
+    FROM track_grades AS tg
+    WHERE t.track_id = tg.track_id
+      AND t.effective_grade IS DISTINCT FROM tg.computed_grade
+    """
+).bindparams(bindparam("track_ids", type_=ARRAY(Text)))
+
+
+def sync_track_effective_grades(
+    session: Session,
+    track_ids: Sequence[str] | None = None,
+) -> int:
+    """Synchronize cached ``tracks.effective_grade`` from active ``track_segment_grades``.
+
+    Returns the total number of ``tracks`` rows updated.
+    """
+    updated = 0
+    if track_ids is None:
+        res = session.execute(_SYNC_ALL_TRACK_GRADES_SQL)
+        updated = int(res.rowcount or 0)
+    else:
+        unique_ids = list(dict.fromkeys(tid for tid in track_ids if tid))
+        if not unique_ids:
+            return 0
+        for id_chunk in _chunked(unique_ids, size=5_000):
+            res = session.execute(_SYNC_SUBSET_TRACK_GRADES_SQL, {"track_ids": id_chunk})
+            updated += int(res.rowcount or 0)
+    _invalidate_in_process_search_cache()
+    return updated
+
+
 def recompute_live_grades(
     session: Session,
     *,
@@ -530,6 +639,7 @@ def recompute_live_grades(
 
     # 3 & 4. Stream scalar segment+baseline columns in 2,000-row batches and bulk-UPDATE grades
     cell_readings: dict[str, RainfallReading] = {}
+    affected_track_ids: set[str] = set()
     segments_evaluated = 0
     segments_with_telemetry = 0
     obstacle_hotspots_count = 0
@@ -556,6 +666,8 @@ def recompute_live_grades(
         ).all()
         batch_updates: list[dict[str, Any]] = []
         for row in rows:
+            if row.track_id is not None:
+                affected_track_ids.add(row.track_id)
             lon = float(row.mid_lon)
             lat = float(row.mid_lat)
             cell_id, _, _ = spatial_cell_key(lon, lat)
@@ -622,6 +734,12 @@ def recompute_live_grades(
             session.execute(update(TrackSegmentGrade), batch_updates)
 
     session.flush()
+    if segment_ids is None:
+        sync_track_effective_grades(session)
+    elif affected_track_ids:
+        sync_track_effective_grades(session, track_ids=sorted(affected_track_ids))
+    else:
+        _invalidate_in_process_search_cache()
     session.expire_all()
     return LiveGradingRecomputeSummary(
         segments_evaluated=segments_evaluated,

@@ -363,6 +363,10 @@ class Track(Base):
             "'unsealed_road','walking_track')",
             name="trail_class_valid",
         ),
+        CheckConstraint(
+            "effective_grade IN ('Easy','Medium','Hard','Extreme')",
+            name="effective_grade_valid",
+        ),
         Index("ix_tracks_bbox_geom", "bbox_geom", postgresql_using="gist"),
         Index("ix_tracks_state_is_active", "state", "is_active"),
         Index("ix_tracks_lower_name", text("lower(name)")),
@@ -373,6 +377,12 @@ class Track(Base):
             postgresql_using="gin",
             postgresql_ops={"name": "gin_trgm_ops"},
         ),
+        Index(
+            "ix_tracks_search_text_trgm",
+            "search_text",
+            postgresql_using="gin",
+            postgresql_ops={"search_text": "gin_trgm_ops"},
+        ),
     )
 
     track_id: Mapped[str] = mapped_column(Text, primary_key=True)
@@ -380,12 +390,14 @@ class Track(Base):
     alt_names: Mapped[list[str]] = mapped_column(
         ARRAY(Text), nullable=False, server_default=text("'{}'::text[]")
     )
+    search_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     state: Mapped[str] = mapped_column(Text, nullable=False)
     primary_source: Mapped[str] = mapped_column(Text, nullable=False)
     has_osm_source: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
     trail_class: Mapped[str] = mapped_column(Text, nullable=False)
+    effective_grade: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_vehicular: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("true")
     )
@@ -601,6 +613,12 @@ class POI(Base):
         Index("ix_pois_geom", "geom", postgresql_using="gist"),
         Index("ix_pois_type_state", "poi_type", "state"),
         Index("ix_pois_lower_name", text("lower(name)")),
+        Index(
+            "ix_pois_name_trgm",
+            "name",
+            postgresql_using="gin",
+            postgresql_ops={"name": "gin_trgm_ops"},
+        ),
         Index("ix_pois_nearest_segment_id", "nearest_segment_id"),
         Index(
             "ix_pois_name_trgm",

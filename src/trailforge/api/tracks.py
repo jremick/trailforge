@@ -5,13 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections import Counter
+import threading
+import time
+from collections import Counter, OrderedDict
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy.exc import UnboundExecutionError
 from sqlalchemy.orm import Session
 
 from trailforge.api.geocoder import geocode_au_places
@@ -66,6 +69,164 @@ _ACCESS_STRICTNESS = {
     "closed": 5,
 }
 _NEARBY_POI_RADIUS_M = 1500.0
+_SEARCH_CACHE_MAX_ENTRIES = 256
+_SEARCH_CACHE_TTL_SECONDS = 30.0
+_SEARCH_POI_SUBQUERY_CAP = 5
+_SEARCH_PARK_SUBQUERY_CAP = 4
+_SEARCH_KIND_ORDER = {"track": 0, "park": 1, "poi": 2, "place": 3}
+
+_search_cache_lock = threading.Lock()
+_search_cache: OrderedDict[tuple[int, str, int, bool], tuple[float, Any]] = OrderedDict()
+
+
+def reset_search_cache() -> None:
+    """Clear the bounded in-process ``/api/search`` LRU + TTL cache."""
+    with _search_cache_lock:
+        _search_cache.clear()
+
+
+def _db_cache_scope(db: Session) -> int:
+    """Derive a stable per-engine cache scope so isolated test engines never collide."""
+    get_bind = getattr(db, "get_bind", None)
+    if callable(get_bind):
+        try:
+            bind = get_bind()
+        except (UnboundExecutionError, AttributeError, TypeError):
+            return id(db)
+        if bind is not None:
+            engine = getattr(bind, "engine", bind)
+            return id(engine)
+    return id(db)
+
+
+def _search_cache_get(key: tuple[int, str, int, bool]) -> SearchResponse | None:
+    now = time.monotonic()
+    with _search_cache_lock:
+        entry = _search_cache.get(key)
+        if entry is None:
+            return None
+        cached_at, payload = entry
+        if now - cached_at > _SEARCH_CACHE_TTL_SECONDS:
+            _search_cache.pop(key, None)
+            return None
+        _search_cache.move_to_end(key)
+        return payload.model_copy(deep=True)
+
+
+def _search_cache_put(key: tuple[int, str, int, bool], response: SearchResponse) -> None:
+    now = time.monotonic()
+    snapshot = response.model_copy(deep=True)
+    with _search_cache_lock:
+        _search_cache[key] = (now, snapshot)
+        _search_cache.move_to_end(key)
+        while len(_search_cache) > _SEARCH_CACHE_MAX_ENTRIES:
+            _search_cache.popitem(last=False)
+
+
+def _bbox_midpoint(
+    xmin: float | None, ymin: float | None, xmax: float | None, ymax: float | None
+) -> tuple[float | None, float | None]:
+    if xmin is None or ymin is None or xmax is None or ymax is None:
+        return (None, None)
+    return (
+        round((float(xmin) + float(xmax)) / 2.0, 6),
+        round((float(ymin) + float(ymax)) / 2.0, 6),
+    )
+
+
+def _search_match_tier(name: str, term_lower: str) -> int:
+    low = name.strip().lower()
+    if low == term_lower:
+        return 0
+    if low.startswith(term_lower):
+        return 1
+    if term_lower in low:
+        return 2
+    return 3
+
+
+def _merge_search_results(
+    track_items: list[SearchResultItem],
+    poi_items: list[SearchResultItem],
+    park_items: list[SearchResultItem],
+    *,
+    term: str,
+    limit: int,
+) -> list[SearchResultItem]:
+    """Budget slots so tracks lead while matching parks & POIs still surface cleanly."""
+    if limit <= 0:
+        return []
+
+    term_lower = term.lower()
+    indexed_tracks = list(enumerate(track_items))
+    indexed_parks = list(enumerate(park_items))
+    indexed_pois = list(enumerate(poi_items))
+
+    selected: list[tuple[int, int, int, SearchResultItem]] = []
+    selected_keys: set[tuple[str, str]] = set()
+
+    def _try_add(item: SearchResultItem, orig_idx: int) -> bool:
+        if len(selected) >= limit:
+            return False
+        key = (item.kind, item.id)
+        if key in selected_keys:
+            return False
+        selected_keys.add(key)
+        tier = _search_match_tier(item.name, term_lower)
+        kind_ord = _SEARCH_KIND_ORDER.get(item.kind, 9)
+        selected.append((tier, kind_ord, orig_idx, item))
+        return True
+
+    # 1. Always promote exact name matches across tracks, parks, and POIs first.
+    for bucket in (indexed_tracks, indexed_parks, indexed_pois):
+        for idx, item in bucket:
+            if _search_match_tier(item.name, term_lower) == 0:
+                _try_add(item, idx)
+
+    if len(selected) < limit:
+        remaining_budget = limit - len(selected)
+        rem_tracks = [
+            (idx, item)
+            for idx, item in indexed_tracks
+            if (item.kind, item.id) not in selected_keys
+        ]
+        rem_parks = [
+            (idx, item)
+            for idx, item in indexed_parks
+            if (item.kind, item.id) not in selected_keys
+        ]
+        rem_pois = [
+            (idx, item)
+            for idx, item in indexed_pois
+            if (item.kind, item.id) not in selected_keys
+        ]
+
+        if remaining_budget >= 3:
+            park_reserve = min(len(rem_parks), min(2, max(1, remaining_budget // 8)))
+            poi_reserve = min(len(rem_pois), min(3, max(1, remaining_budget // 6)))
+            track_target = max(1, remaining_budget - park_reserve - poi_reserve)
+            for idx, item in rem_tracks[:track_target]:
+                _try_add(item, idx)
+            for idx, item in rem_parks[:park_reserve]:
+                _try_add(item, idx)
+            for idx, item in rem_pois[:poi_reserve]:
+                _try_add(item, idx)
+        else:
+            # Small limit (<3): still let prefix matches win over substring matches
+            for bucket in (rem_tracks, rem_parks, rem_pois):
+                for idx, item in bucket:
+                    if _search_match_tier(item.name, term_lower) == 1:
+                        _try_add(item, idx)
+
+        # 3. Backfill any remaining slots up to limit: tracks -> parks -> POIs.
+        for bucket in (rem_tracks, rem_parks, rem_pois):
+            for idx, item in bucket:
+                if len(selected) >= limit:
+                    break
+                _try_add(item, idx)
+
+    selected.sort(key=lambda entry: (entry[0], entry[1], entry[2]))
+    return [entry[3] for entry in selected[:limit]]
 
 
 def _parse_bbox(bbox: str | None) -> tuple[float, float, float, float] | None:
@@ -579,12 +740,7 @@ def list_tracks(
         track_filters.append(Track.trail_class == trail_class)
     if q:
         pattern = f"%{_escape_like(q.strip())}%"
-        track_filters.append(
-            or_(
-                Track.name.ilike(pattern, escape="\\"),
-                func.array_to_string(Track.alt_names, " ").ilike(pattern, escape="\\"),
-            )
-        )
+        track_filters.append(Track.search_text.ilike(pattern, escape="\\"))
     if parsed_bbox is not None:
         min_lon, min_lat, max_lon, max_lat = parsed_bbox
         env = func.ST_MakeEnvelope(min_lon, min_lat, max_lon, max_lat, 4326)
@@ -1831,41 +1987,41 @@ def search_network(
 ) -> SearchResponse:
     """Search canonical tracks (name & aliases), POIs, and CAPAD parks with coordinates/bbox."""
     term = q.strip()
+    if not term:
+        return SearchResponse(query="", total=0, results=[])
+
+    term_lower = term.lower()
+    geocoder_enabled = bool(get_settings().enable_geocoder)
+    cache_key = (_db_cache_scope(db), term_lower, limit, geocoder_enabled)
+    cached = _search_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     escaped_term = _escape_like(term)
     pattern = f"%{escaped_term}%"
     prefix_pattern = f"{escaped_term}%"
     tokens = [_escape_like(tok) for tok in term.split() if tok][:6]
-    items: list[SearchResultItem] = []
 
     def _token_match_track() -> Any:
         if len(tokens) <= 1:
-            return or_(
-                Track.name.ilike(pattern, escape="\\"),
-                func.array_to_string(Track.alt_names, " ").ilike(pattern, escape="\\"),
-            )
-        alt_text = func.array_to_string(Track.alt_names, " ")
-        return and_(
-            *(
-                or_(
-                    Track.name.ilike(f"%{tok}%", escape="\\"),
-                    alt_text.ilike(f"%{tok}%", escape="\\"),
-                )
-                for tok in tokens
-            )
-        )
+            return Track.search_text.ilike(pattern, escape="\\")
+        return and_(*(Track.search_text.ilike(f"%{tok}%", escape="\\") for tok in tokens))
 
     def _token_match_col(col: Any) -> Any:
         if len(tokens) <= 1:
             return col.ilike(pattern, escape="\\")
         return and_(*(col.ilike(f"%{tok}%", escape="\\") for tok in tokens))
 
-    # 1. Filter tracks FIRST (no 267k-segment full-table GROUP BY before filtering!)
-    relevance_rank = case(
-        (func.lower(Track.name) == term.lower(), 0),
-        (Track.name.ilike(prefix_pattern), 1),
-        (Track.name.ilike(pattern), 2),
-        else_=3,
-    )
+    def _name_relevance_rank(col: Any) -> Any:
+        return case(
+            (func.lower(col) == term_lower, 0),
+            (col.ilike(prefix_pattern, escape="\\"), 1),
+            (col.ilike(pattern, escape="\\"), 2),
+            else_=3,
+        )
+
+    # 1. Trigram-indexed track search reading cached Track.effective_grade directly
+    relevance_rank = _name_relevance_rank(Track.name)
     class_rank = case(
         (Track.trail_class == "4wd_track", 0),
         (Track.trail_class == "4wd_route", 0),
@@ -1879,8 +2035,7 @@ def search_network(
             Track.name,
             Track.state,
             Track.trail_class,
-            func.ST_X(func.ST_Centroid(Track.bbox_geom)).label("lon"),
-            func.ST_Y(func.ST_Centroid(Track.bbox_geom)).label("lat"),
+            Track.effective_grade,
             func.ST_XMin(Track.bbox_geom).label("xmin"),
             func.ST_YMin(Track.bbox_geom).label("ymin"),
             func.ST_XMax(Track.bbox_geom).label("xmax"),
@@ -1899,10 +2054,10 @@ def search_network(
         .limit(limit)
     ).all()
 
-    # 2. Aggregate effective grade ONLY for the <=limit matched track IDs (indexed lookup)
-    rank_by_track: dict[str, int] = {}
-    if track_rows:
-        matched_ids = [r.track_id for r in track_rows]
+    # 2. Fall back to track_segments/track_segment_grades ONLY if Track.effective_grade IS NULL
+    missing_grade_ids = [r.track_id for r in track_rows if not r.effective_grade]
+    fallback_rank_by_track: dict[str, int] = {}
+    if missing_grade_ids:
         grade_rank_expr = case(
             (TrackSegmentGrade.effective_grade == "Easy", 1),
             (TrackSegmentGrade.effective_grade == "Medium", 2),
@@ -1918,17 +2073,21 @@ def search_network(
             .outerjoin(TrackSegmentGrade, TrackSegment.segment_id == TrackSegmentGrade.segment_id)
             .where(
                 TrackSegment.is_active.is_(True),
-                TrackSegment.track_id.in_(matched_ids),
+                TrackSegment.track_id.in_(missing_grade_ids),
             )
             .group_by(TrackSegment.track_id)
         ).all():
             if tid is not None:
-                rank_by_track[tid] = int(worst_rank or 0)
+                fallback_rank_by_track[tid] = int(worst_rank or 0)
 
-    for tid, name, state, trail_class, lon, lat, xmin, ymin, xmax, ymax in track_rows:
-        worst_rank = rank_by_track.get(tid, 0)
-        eff_grade = _RANK_GRADE.get(worst_rank) if worst_rank else None
-        items.append(
+    track_items: list[SearchResultItem] = []
+    for tid, name, state, trail_class, cached_grade, xmin, ymin, xmax, ymax in track_rows:
+        eff_grade = cached_grade
+        if not eff_grade:
+            worst_rank = fallback_rank_by_track.get(tid, 0)
+            eff_grade = _RANK_GRADE.get(worst_rank) if worst_rank else None
+        lon, lat = _bbox_midpoint(xmin, ymin, xmax, ymax)
+        track_items.append(
             SearchResultItem(
                 kind="track",
                 id=tid,
@@ -1937,12 +2096,14 @@ def search_network(
                 subtitle=trail_class.replace("_", " "),
                 category=trail_class,
                 grade=eff_grade,
-                lon=round(float(lon), 6) if lon is not None else None,
-                lat=round(float(lat), 6) if lat is not None else None,
+                lon=lon,
+                lat=lat,
                 bbox=_bbox_list(xmin, ymin, xmax, ymax),
             )
         )
 
+    # 3. Budgeted trigram-indexed POI lookup (capped to avoid fetching & discarding extras)
+    poi_limit = min(limit, _SEARCH_POI_SUBQUERY_CAP)
     poi_rows = db.execute(
         select(
             POI.id,
@@ -1953,44 +2114,55 @@ def search_network(
             func.ST_Y(POI.geom).label("lat"),
         )
         .where(_token_match_col(POI.name))
-        .order_by(func.length(POI.name).asc(), POI.name.asc())
-        .limit(limit)
-    ).all()
-    for pid, name, state, poi_type, lon, lat in poi_rows:
-        items.append(
-            SearchResultItem(
-                kind="poi",
-                id=str(pid),
-                name=name,
-                state=state,
-                subtitle=poi_type,
-                category=poi_type,
-                grade=None,
-                lon=round(float(lon), 6),
-                lat=round(float(lat), 6),
-                bbox=None,
-            )
+        .order_by(
+            _name_relevance_rank(POI.name).asc(),
+            func.length(POI.name).asc(),
+            POI.name.asc(),
         )
+        .limit(poi_limit)
+    ).all()
+    poi_items = [
+        SearchResultItem(
+            kind="poi",
+            id=str(pid),
+            name=name,
+            state=state,
+            subtitle=poi_type,
+            category=poi_type,
+            grade=None,
+            lon=round(float(lon), 6),
+            lat=round(float(lat), 6),
+            bbox=None,
+        )
+        for pid, name, state, poi_type, lon, lat in poi_rows
+    ]
 
+    # 4. Budgeted trigram-indexed CAPAD park lookup using bbox midpoint (zero ST_PointOnSurface /
+    #    zero MultiPolygon TOAST decompression!)
+    park_limit = min(limit, _SEARCH_PARK_SUBQUERY_CAP)
     park_rows = db.execute(
         select(
             CAPADPark.id,
             CAPADPark.name,
             CAPADPark.state,
             CAPADPark.park_type,
-            func.ST_X(func.ST_PointOnSurface(CAPADPark.geom)).label("lon"),
-            func.ST_Y(func.ST_PointOnSurface(CAPADPark.geom)).label("lat"),
             func.ST_XMin(CAPADPark.geom).label("xmin"),
             func.ST_YMin(CAPADPark.geom).label("ymin"),
             func.ST_XMax(CAPADPark.geom).label("xmax"),
             func.ST_YMax(CAPADPark.geom).label("ymax"),
         )
         .where(_token_match_col(CAPADPark.name))
-        .order_by(func.length(CAPADPark.name).asc(), CAPADPark.name.asc())
-        .limit(limit)
+        .order_by(
+            _name_relevance_rank(CAPADPark.name).asc(),
+            func.length(CAPADPark.name).asc(),
+            CAPADPark.name.asc(),
+        )
+        .limit(park_limit)
     ).all()
-    for pk_id, name, state, park_type, lon, lat, xmin, ymin, xmax, ymax in park_rows:
-        items.append(
+    park_items: list[SearchResultItem] = []
+    for pk_id, name, state, park_type, xmin, ymin, xmax, ymax in park_rows:
+        lon, lat = _bbox_midpoint(xmin, ymin, xmax, ymax)
+        park_items.append(
             SearchResultItem(
                 kind="park",
                 id=str(pk_id),
@@ -1999,15 +2171,23 @@ def search_network(
                 subtitle=park_type,
                 category=park_type,
                 grade=None,
-                lon=round(float(lon), 6),
-                lat=round(float(lat), 6),
+                lon=lon,
+                lat=lat,
                 bbox=_bbox_list(xmin, ymin, xmax, ymax),
             )
         )
 
+    items = _merge_search_results(
+        track_items,
+        poi_items,
+        park_items,
+        term=term,
+        limit=limit,
+    )
+
     # Fall back to external AU Nominatim geocoding ONLY when no local track/POI/park matched
-    # so searching baked tracks returns in ~25 ms without blocking on external HTTP calls.
-    if not items and len(term) >= 3 and get_settings().enable_geocoder:
+    # so searching baked tracks returns fast without blocking on external HTTP calls.
+    if not items and len(term) >= 3 and geocoder_enabled:
         seen_names = {item.name.strip().lower() for item in items}
         remaining = max(1, min(5, limit))
         for place in geocode_au_places(term, limit=remaining):
@@ -2030,4 +2210,6 @@ def search_network(
             )
 
     trimmed = items[:limit]
-    return SearchResponse(query=term, total=len(trimmed), results=trimmed)
+    response = SearchResponse(query=term, total=len(trimmed), results=trimmed)
+    _search_cache_put(cache_key, response)
+    return response

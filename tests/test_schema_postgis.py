@@ -85,13 +85,23 @@ EXPECTED_GIST_INDEXES = frozenset(
 )
 
 
+EXPECTED_TRGM_INDEXES = frozenset(
+    {
+        "ix_tracks_name_trgm",
+        "ix_tracks_search_text_trgm",
+        "ix_pois_name_trgm",
+        "ix_capad_parks_name_trgm",
+    }
+)
+
+
 @pytest.mark.integration
 def test_postgis_health_and_schema_revision(postgis_engine: Engine) -> None:
     status = check_db_health(postgis_engine)
     assert status.db_ok is True
     assert status.postgis_version is not None
     assert status.postgis_version.startswith("3.")
-    assert status.schema_revision == "0008_perf_and_security_indexes"
+    assert status.schema_revision == "0009_search_trigram_track_grade"
 
 
 @pytest.mark.integration
@@ -106,7 +116,7 @@ def test_fastapi_health_against_live_postgis(postgis_engine: Engine) -> None:
     body = resp.json()
     assert body["status"] == "ok"
     assert body["db_ok"] is True
-    assert body["schema_revision"] == "0008_perf_and_security_indexes"
+    assert body["schema_revision"] == "0009_search_trigram_track_grade"
 
 
 @pytest.mark.integration
@@ -132,6 +142,29 @@ def test_all_35_tables_and_21_gist_indexes_exist(postgis_engine: Engine) -> None
     gist_indexes = set(gist_rows)
     missing_gist = EXPECTED_GIST_INDEXES - gist_indexes
     assert not missing_gist, f"Missing GIST indexes: {sorted(missing_gist)}"
+
+    # Verify pg_trgm extension and all 4 GIN gin_trgm_ops search indexes exist
+    with postgis_engine.connect() as conn:
+        has_trgm = conn.execute(
+            text("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'")
+        ).scalar_one_or_none()
+        trgm_rows = conn.execute(
+            text(
+                """
+                SELECT indexname
+                FROM pg_indexes
+                WHERE schemaname = 'public'
+                  AND indexdef ILIKE '%USING gin%'
+                  AND indexdef ILIKE '%gin_trgm_ops%'
+                """
+            )
+        ).scalars().all()
+    assert has_trgm == 1, "pg_trgm extension must be installed by migration 0007"
+    missing_trgm = EXPECTED_TRGM_INDEXES - set(trgm_rows)
+    assert not missing_trgm, f"Missing GIN trigram indexes: {sorted(missing_trgm)}"
+
+    track_cols = {col["name"] for col in inspector.get_columns("tracks")}
+    assert {"effective_grade", "search_text"}.issubset(track_cols)
 
     # Verify all CHECK constraints are single-prefixed (zero double-prefix / hash truncation)
     with postgis_engine.connect() as conn:
