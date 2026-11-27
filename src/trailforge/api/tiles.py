@@ -160,6 +160,7 @@ def get_tiles_manifest(
     cfg = getattr(getattr(request.app, "state", None), "custom_settings", None) or get_settings()
     public_base = cfg.tiles_public_base_url.strip().rstrip("/")
     cdn_offload = bool(public_base)
+    configured_vector_basemap_url = cfg.vector_basemap_url.strip()
 
     vector_path = tiles_dir / "trailforge_vector.pmtiles"
     terrain_path = tiles_dir / "trailforge_terrain.pmtiles"
@@ -183,6 +184,7 @@ def get_tiles_manifest(
         "maxzoom": 15,
         "vector_url": default_vector_url,
         "terrain_url": default_terrain_url,
+        "vector_basemap_url": configured_vector_basemap_url or None,
         "vector_available": vector_path.is_file() or cdn_offload,
         "terrain_available": terrain_path.is_file() or cdn_offload,
         "cdn_offload": cdn_offload,
@@ -202,6 +204,15 @@ def get_tiles_manifest(
     # Always reflect live disk/CDN availability & canonical URLs
     payload["vector_url"] = default_vector_url
     payload["terrain_url"] = default_terrain_url
+    if configured_vector_basemap_url:
+        payload["vector_basemap_url"] = configured_vector_basemap_url
+    else:
+        disk_basemap = payload.get("vector_basemap_url")
+        payload["vector_basemap_url"] = (
+            disk_basemap.strip()
+            if isinstance(disk_basemap, str) and disk_basemap.strip()
+            else None
+        )
     payload["vector_available"] = vector_path.is_file() or cdn_offload
     payload["terrain_available"] = terrain_path.is_file() or cdn_offload
     payload["cdn_offload"] = cdn_offload

@@ -22,6 +22,8 @@ import {
   SELECTED_CLOSURE_OUTLINE_LAYER_ID,
   SELECTED_TRACK_LAYER_IDS,
   SELECTED_TRACK_STEEP_LAYER_ID,
+  VECTOR_BASEMAP_BOTTOM_LAYER_IDS,
+  VECTOR_BASEMAP_SOURCE_ID,
   buildSearchPinGeoJson,
   buildSelectedClosureFilter,
   buildSelectedTrackFilter,
@@ -453,13 +455,14 @@ export class TrailForgeMap {
       }
     });
 
-    // Gracefully absorb external raster tile load failures when offline
+    // Gracefully absorb external raster or vector basemap tile load failures when offline
     this.map.on("error", (event) => {
       const sourceId = (event as { sourceId?: string }).sourceId;
       const isExternalBasemap =
         sourceId === "osm-standard" ||
         sourceId === "opentopomap" ||
-        sourceId === "esri-imagery";
+        sourceId === "esri-imagery" ||
+        sourceId === VECTOR_BASEMAP_SOURCE_ID;
 
       if (isExternalBasemap && !this.reportedTileError) {
         this.reportedTileError = true;
@@ -1248,13 +1251,36 @@ export class TrailForgeMap {
     const showOsm = this.currentBasemap === "osm";
     const showOpenTopo = this.currentBasemap === "opentopo";
     const showSat = this.currentBasemap === "satellite";
+    const showVector = this.currentBasemap === "vector";
 
     this.setLayerVis("basemap-osm-underlay", showOsm);
     this.setLayerVis("basemap-opentopo", showOpenTopo);
     this.setLayerVis("basemap-satellite", showSat);
+
+    for (const id of VECTOR_BASEMAP_BOTTOM_LAYER_IDS) {
+      this.setLayerVis(id, showVector);
+    }
+    this.setLayerVis("tf-vbase-water-name", showVector);
+    this.setLayerVis("tf-vbase-mountain-peak", showVector);
+    this.setLayerVis(
+      "tf-vbase-road-name",
+      showVector && this.currentLayers.highways
+    );
+    this.setLayerVis(
+      "tf-vbase-place-suburb",
+      showVector && this.currentLayers.placesRegions
+    );
+    for (const id of HIGHWAY_LINE_LAYER_IDS) {
+      this.setLayerVis(id, this.currentLayers.highways && !showVector);
+    }
+    this.setLayerVis(
+      HIGHWAY_LABEL_LAYER_ID,
+      this.currentLayers.highways && !showVector
+    );
   }
 
   private applyLayerVisibility(): void {
+    const showVector = this.currentBasemap === "vector";
     for (const id of SELECTED_TRACK_LAYER_IDS) {
       this.setLayerVis(id, this.currentLayers.tracks);
     }
@@ -1301,12 +1327,23 @@ export class TrailForgeMap {
     this.setLayerVis("tf-pois-layer", this.currentLayers.pois);
     this.setLayerVis("tf-pois-icons", this.currentLayers.pois);
     for (const id of HIGHWAY_LINE_LAYER_IDS) {
-      this.setLayerVis(id, this.currentLayers.highways);
+      this.setLayerVis(id, this.currentLayers.highways && !showVector);
     }
-    this.setLayerVis(HIGHWAY_LABEL_LAYER_ID, this.currentLayers.highways);
+    this.setLayerVis(
+      HIGHWAY_LABEL_LAYER_ID,
+      this.currentLayers.highways && !showVector
+    );
+    this.setLayerVis(
+      "tf-vbase-road-name",
+      showVector && this.currentLayers.highways
+    );
     for (const id of PLACES_REGIONS_LAYER_IDS) {
       this.setLayerVis(id, this.currentLayers.placesRegions);
     }
+    this.setLayerVis(
+      "tf-vbase-place-suburb",
+      showVector && this.currentLayers.placesRegions
+    );
   }
 
   private applySnowLineFilter(): void {

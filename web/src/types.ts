@@ -1,6 +1,6 @@
 export type BBoxTuple = readonly [number, number, number, number];
 
-export type BasemapId = "offline-topo" | "opentopo" | "osm" | "satellite";
+export type BasemapId = "offline-topo" | "opentopo" | "vector" | "osm" | "satellite";
 
 export type TrackDifficulty = "easy" | "medium" | "hard" | "extreme";
 
@@ -152,6 +152,7 @@ export interface TileManifestResponse {
   maxzoom?: number;
   vector_url: string;
   terrain_url: string;
+  vector_basemap_url?: string | null;
   vector_available: boolean;
   terrain_available: boolean;
   cdn_offload?: boolean;

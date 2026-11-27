@@ -103,8 +103,16 @@ def test_ghcr_compose_parity_with_dev_compose() -> None:
         "AUTH_COOKIE_SECURE",
         "TRAILFORGE_ENABLE_LIVE_FEEDS",
         "CORS_ORIGINS",
+        "TRAILFORGE_VECTOR_BASEMAP_URL",
     ):
         assert required_secret in api_env
+
+    assert "TRAILFORGE_VECTOR_BASEMAP_URL=" in (REPO_ROOT / ".env.example").read_text(
+        encoding="utf-8"
+    )
+    assert "TRAILFORGE_VECTOR_BASEMAP_URL=" in (
+        REPO_ROOT / "deploy" / "railway" / "env.railway.example"
+    ).read_text(encoding="utf-8")
 
     # 5. All 5 persistent volumes & per-service mounts match dev compose
     expected_volumes = {

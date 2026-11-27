@@ -346,6 +346,18 @@ class Settings(BaseSettings):
         ),
         description="Optional public CDN/R2 base URL serving offline regional packs.",
     )
+    vector_basemap_url: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "TRAILFORGE_VECTOR_BASEMAP_URL",
+            "VECTOR_BASEMAP_URL",
+            "vector_basemap_url",
+        ),
+        description=(
+            "Optional self-hosted OpenMapTiles vector basemap URL (.pmtiles archive or TileJSON); "
+            "leave empty to use zero-key OpenFreeMap online."
+        ),
+    )
     r2_endpoint_url: str = Field(
         default="",
         validation_alias=AliasChoices(

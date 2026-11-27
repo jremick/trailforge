@@ -1,19 +1,30 @@
+import { validateStyleMin } from "@maplibre/maplibre-gl-style-spec";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError, fetchHealth } from "./api";
+import { buildCourseMiniMapStyle } from "./components/courseMiniMap";
 import { isWithinAustralia } from "./coords";
 import {
+  BASEMAP_OPTIONS,
   DEFAULT_SNOWLINE_BANDS_M,
   PAN_AU_PACK_PRESETS,
+  REQUIRED_ATTRIBUTIONS,
   createInitialLayerState,
   snapSnowlineBand,
 } from "./presets";
 import {
+  AU_PLACES_ATTRIBUTION,
+  DEFAULT_VECTOR_BASEMAP_ATTRIBUTION,
+  DEFAULT_VECTOR_BASEMAP_URL,
   HIGHWAY_LABEL_LAYER_ID,
   HIGHWAY_LINE_LAYER_IDS,
   PLACES_REGIONS_LAYER_IDS,
   SELECTED_CLOSURE_OUTLINE_LAYER_ID,
   SELECTED_TRACK_LAYER_IDS,
   SELECTED_TRACK_STEEP_LAYER_ID,
+  VECTOR_BASEMAP_ALL_LAYER_IDS,
+  VECTOR_BASEMAP_BOTTOM_LAYER_IDS,
+  VECTOR_BASEMAP_LABEL_LAYER_IDS,
+  VECTOR_BASEMAP_SOURCE_ID,
   buildOfflineGraticuleGeoJson,
   buildRegionalBoundsGeoJson,
   buildSelectedClosureFilter,
@@ -26,6 +37,7 @@ import {
   poisToGeoJson,
   resolveGlyphsUrl,
   resolveStaticAssetUrl,
+  resolveVectorBasemapSource,
   toPmtilesUrl,
   userPinsToGeoJson,
 } from "./style";
@@ -297,6 +309,7 @@ describe("MapLibre 5 PMTiles & offline fallback style builder", () => {
     expect(style.sources["tf-places"]).toEqual({
       type: "geojson",
       data: "/data/au_places.geojson",
+      attribution: AU_PLACES_ATTRIBUTION,
     });
     expect(style.sources["tf-highways"]).toEqual({
       type: "geojson",
@@ -386,6 +399,7 @@ describe("MapLibre 5 PMTiles & offline fallback style builder", () => {
     expect(style.sources["tf-places"]).toEqual({
       type: "geojson",
       data: "https://app.example.com/data/au_places.geojson",
+      attribution: AU_PLACES_ATTRIBUTION,
     });
     expect(style.sources["tf-highways"]).toEqual({
       type: "geojson",
@@ -567,6 +581,199 @@ describe("MapLibre 5 PMTiles & offline fallback style builder", () => {
     });
     expect(formatPlaceClassLabel("regional_hub")).toBe("Regional Hub");
     expect(formatPlaceClassLabel("park", "State Forest")).toBe("State Forest");
+  });
+
+  it("mounts split-stack OpenMapTiles vector basemap with MapLibre spec validation and self-hosted overrides", () => {
+    // Basemap switcher places Vector immediately after Topo and preserves OpenFreeMap + GeoNames attributions
+    expect(BASEMAP_OPTIONS.map((b) => b.id)).toEqual([
+      "opentopo",
+      "vector",
+      "osm",
+      "satellite",
+      "offline-topo",
+    ]);
+    const attribIds = new Set(REQUIRED_ATTRIBUTIONS.map((a) => a.id));
+    expect(attribIds.has("openfreemap")).toBe(true);
+    expect(attribIds.has("geonames")).toBe(true);
+
+    // Self-hosted .pmtiles, TileJSON, and default OpenFreeMap resolution
+    expect(resolveVectorBasemapSource(null, "https://app.example.com")).toEqual({
+      type: "vector",
+      url: DEFAULT_VECTOR_BASEMAP_URL,
+      attribution: DEFAULT_VECTOR_BASEMAP_ATTRIBUTION,
+    });
+    expect(
+      resolveVectorBasemapSource(
+        {
+          ...SAMPLE_MANIFEST,
+          vector_basemap_url: "https://tiles.example.com/au-basemap.pmtiles",
+        },
+        "https://app.example.com"
+      )
+    ).toEqual({
+      type: "vector",
+      url: "pmtiles://https://tiles.example.com/au-basemap.pmtiles",
+      attribution: DEFAULT_VECTOR_BASEMAP_ATTRIBUTION,
+    });
+    expect(
+      resolveVectorBasemapSource(
+        {
+          ...SAMPLE_MANIFEST,
+          vector_basemap_url: "/api/tiles/basemap.pmtiles",
+        },
+        "http://localhost:5173"
+      )
+    ).toEqual({
+      type: "vector",
+      url: "pmtiles://http://localhost:5173/api/tiles/basemap.pmtiles",
+      attribution: DEFAULT_VECTOR_BASEMAP_ATTRIBUTION,
+    });
+    expect(
+      resolveVectorBasemapSource(
+        {
+          ...SAMPLE_MANIFEST,
+          vector_basemap_url: "https://tiles.example.com/planet",
+        },
+        "https://app.example.com"
+      )
+    ).toEqual({
+      type: "vector",
+      url: "https://tiles.example.com/planet",
+      attribution: DEFAULT_VECTOR_BASEMAP_ATTRIBUTION,
+    });
+
+    const pmtilesVectorStyle = buildTrailForgeStyle({
+      initialBasemap: "vector",
+      layers: createInitialLayerState(),
+      tileManifest: SAMPLE_MANIFEST,
+      origin: "http://localhost:5173",
+      assetsOrigin: "http://localhost:5173",
+    });
+    const pmtilesTopoStyle = buildTrailForgeStyle({
+      initialBasemap: "opentopo",
+      layers: createInitialLayerState(),
+      tileManifest: SAMPLE_MANIFEST,
+      origin: "http://localhost:5173",
+      assetsOrigin: "http://localhost:5173",
+    });
+    const fallbackVectorStyle = buildTrailForgeStyle({
+      initialBasemap: "vector",
+      layers: createInitialLayerState(),
+      origin: "http://localhost:5173",
+      assetsOrigin: "http://localhost:5173",
+    });
+    const miniVectorStyle = buildCourseMiniMapStyle(
+      "vector",
+      { type: "FeatureCollection", features: [] },
+      { type: "FeatureCollection", features: [] },
+      SAMPLE_MANIFEST,
+      "http://localhost:5173",
+      "http://localhost:5173"
+    );
+
+    // Zero MapLibre GL Style Spec validation errors across PMTiles, fallback, raster, vector & mini-map styles
+    expect(validateStyleMin(pmtilesVectorStyle)).toEqual([]);
+    expect(validateStyleMin(pmtilesTopoStyle)).toEqual([]);
+    expect(validateStyleMin(fallbackVectorStyle)).toEqual([]);
+    expect(validateStyleMin(miniVectorStyle)).toEqual([]);
+
+    expect(pmtilesVectorStyle.sources[VECTOR_BASEMAP_SOURCE_ID]).toEqual({
+      type: "vector",
+      url: DEFAULT_VECTOR_BASEMAP_URL,
+      attribution: DEFAULT_VECTOR_BASEMAP_ATTRIBUTION,
+    });
+
+    const byId = new Map(pmtilesVectorStyle.layers.map((l) => [l.id, l]));
+    const layerIdx = (id: string) =>
+      pmtilesVectorStyle.layers.findIndex((l) => l.id === id);
+    const maxLineIdx = pmtilesVectorStyle.layers.reduce(
+      (max, l, idx) => (l.type === "line" ? Math.max(max, idx) : max),
+      -1
+    );
+
+    // Split-stack invariant: ALL bottom vector basemap layers sit AFTER basemap-satellite
+    // and STRICTLY BELOW tf-hillshade, tf-parks-fill, tf-contours-index, tf-waterways-perennial & tf-tracks-line
+    const satIdx = layerIdx("basemap-satellite");
+    const hillshadeIdx = layerIdx("tf-hillshade");
+    const tracksIdx = layerIdx("tf-tracks-line");
+    expect(satIdx).toBeGreaterThan(-1);
+    expect(hillshadeIdx).toBeGreaterThan(satIdx);
+    expect(tracksIdx).toBeGreaterThan(hillshadeIdx);
+
+    for (const id of VECTOR_BASEMAP_BOTTOM_LAYER_IDS) {
+      const idx = layerIdx(id);
+      expect(idx, `Missing bottom vector basemap layer ${id}`).toBeGreaterThan(satIdx);
+      expect(idx, `${id} must sit below tf-hillshade`).toBeLessThan(hillshadeIdx);
+      expect(idx, `${id} must sit below tf-tracks-line`).toBeLessThan(tracksIdx);
+      expect((byId.get(id)?.layout as { visibility?: string })?.visibility).toBe(
+        "visible"
+      );
+    }
+    expect(layerIdx("tf-vbase-road-motorway")).toBeLessThan(hillshadeIdx);
+    expect(layerIdx("tf-vbase-water")).toBeLessThan(hillshadeIdx);
+
+    // Split-stack invariant: ALL top vector label layers sit STRICTLY ABOVE tf-tracks-line & maxLineIdx
+    // and use ONLY self-hosted Noto Sans SDF glyphs
+    const allowedFonts = new Set([
+      "Noto Sans Regular",
+      "Noto Sans Medium",
+      "Noto Sans Bold",
+      "Noto Sans Italic",
+    ]);
+    for (const id of VECTOR_BASEMAP_LABEL_LAYER_IDS) {
+      const idx = layerIdx(id);
+      const layer = byId.get(id);
+      expect(layer?.type).toBe("symbol");
+      expect(idx, `${id} must sit above tf-tracks-line`).toBeGreaterThan(tracksIdx);
+      expect(idx, `${id} must sit above all line layers`).toBeGreaterThan(maxLineIdx);
+      const layout = (layer?.layout ?? {}) as Record<string, unknown>;
+      expect(layout.visibility).toBe("visible");
+      for (const f of (layout["text-font"] as string[]) ?? []) {
+        expect(allowedFonts.has(f), `Unexpected font ${f} on ${id}`).toBe(true);
+      }
+    }
+
+    // Existing regression: ALL POI icons & point markers still sit strictly ABOVE all line layers
+    expect(layerIdx("tf-pois-layer")).toBeGreaterThan(maxLineIdx);
+    expect(layerIdx("tf-pois-icons")).toBeGreaterThan(layerIdx("tf-pois-layer"));
+    expect(layerIdx("tf-closures-points")).toBeGreaterThan(maxLineIdx);
+    expect(layerIdx("tf-reports-points")).toBeGreaterThan(maxLineIdx);
+    expect(layerIdx("tf-user-pins-dot")).toBeGreaterThan(maxLineIdx);
+
+    // Duplicate GeoJSON highway lines & labels hide while Vector basemap is active
+    for (const id of [...HIGHWAY_LINE_LAYER_IDS, HIGHWAY_LABEL_LAYER_ID]) {
+      expect((byId.get(id)?.layout as { visibility?: string })?.visibility).toBe("none");
+    }
+
+    // Zero network cost on non-vector basemaps: every tf-vbase-* layer is hidden
+    const topoById = new Map(pmtilesTopoStyle.layers.map((l) => [l.id, l]));
+    for (const id of VECTOR_BASEMAP_ALL_LAYER_IDS) {
+      expect(
+        (topoById.get(id)?.layout as { visibility?: string })?.visibility,
+        `Expected ${id} hidden on opentopo basemap`
+      ).toBe("none");
+    }
+
+    // Toggling Major Highways & Places/Regions OFF while on Vector basemap hides tf-vbase-road-name & tf-vbase-place-suburb
+    const vectorToggledOff = buildTrailForgeStyle({
+      initialBasemap: "vector",
+      layers: {
+        ...createInitialLayerState(),
+        highways: false,
+        placesRegions: false,
+      },
+      tileManifest: SAMPLE_MANIFEST,
+      origin: "http://localhost:5173",
+    });
+    const toggledById = new Map(vectorToggledOff.layers.map((l) => [l.id, l]));
+    expect(
+      (toggledById.get("tf-vbase-road-name")?.layout as { visibility?: string })
+        ?.visibility
+    ).toBe("none");
+    expect(
+      (toggledById.get("tf-vbase-place-suburb")?.layout as { visibility?: string })
+        ?.visibility
+    ).toBe("none");
   });
 
   it("generates non-empty offline graticule and corridor GeoJSON", () => {

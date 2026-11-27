@@ -45,10 +45,45 @@ def test_manifest_fallback_when_tiles_not_yet_built(
     body = resp.json()
     assert body["vector_url"] == "/api/tiles/trailforge_vector.pmtiles"
     assert body["terrain_url"] == "/api/tiles/trailforge_terrain.pmtiles"
+    assert body["vector_basemap_url"] is None
     assert body["vector_available"] is False
     assert body["terrain_available"] is False
     assert body["snowline_bands_m"] == [800, 900, 1000, 1100, 1200, 1400, 1600]
     assert len(body["attributions"]) >= 5
+
+
+def test_manifest_exposes_vector_basemap_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRAILFORGE_VECTOR_BASEMAP_URL", "https://tiles.example.com/au.pmtiles")
+    cfg = Settings()
+    assert cfg.vector_basemap_url == "https://tiles.example.com/au.pmtiles"
+
+    monkeypatch.delenv("TRAILFORGE_VECTOR_BASEMAP_URL", raising=False)
+    monkeypatch.setenv("VECTOR_BASEMAP_URL", "https://tiles.example.com/planet.json")
+    cfg_alias = Settings()
+    assert cfg_alias.vector_basemap_url == "https://tiles.example.com/planet.json"
+
+    app = create_app(
+        settings=Settings(
+            vector_basemap_url="  https://tiles.example.com/au-basemap.pmtiles  ",
+        )
+    )
+    app.dependency_overrides[get_tiles_dir] = lambda: tmp_path
+    with TestClient(app) as client:
+        resp = client.get("/api/tiles/manifest.json")
+        assert resp.status_code == 200
+        assert resp.json()["vector_basemap_url"] == "https://tiles.example.com/au-basemap.pmtiles"
+    app.dependency_overrides.clear()
+
+    blank_app = create_app(settings=Settings(vector_basemap_url="   "))
+    blank_app.dependency_overrides[get_tiles_dir] = lambda: tmp_path
+    with TestClient(blank_app) as client:
+        resp = client.get("/api/tiles/manifest.json")
+        assert resp.status_code == 200
+        assert resp.json()["vector_basemap_url"] is None
+    blank_app.dependency_overrides.clear()
 
 
 def test_manifest_merges_disk_manifest_and_availability(

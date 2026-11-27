@@ -441,6 +441,11 @@ export const BASEMAP_OPTIONS: readonly {
   hint: string;
 }[] = [
   { id: "opentopo", label: "Topo", hint: "OpenTopoMap raster (online)" },
+  {
+    id: "vector",
+    label: "Vector",
+    hint: "Crisp OpenMapTiles vector basemap with labels floated above tracks & terrain",
+  },
   { id: "osm", label: "OSM", hint: "OpenStreetMap Standard (online)" },
   { id: "satellite", label: "Imagery", hint: "Esri World Imagery (online)" },
   {
@@ -633,6 +638,19 @@ export const REQUIRED_ATTRIBUTIONS: readonly AttributionItem[] = [
     label: "Open-Meteo",
     license: "CC BY 4.0",
     fullText: "Rainfall & Weather © Open-Meteo (CC BY 4.0)",
+  },
+  {
+    id: "openfreemap",
+    label: "OpenFreeMap / OpenMapTiles",
+    license: "CC BY 4.0 / ODbL",
+    fullText:
+      "Vector basemap tiles © OpenFreeMap © OpenMapTiles © OpenStreetMap contributors",
+  },
+  {
+    id: "geonames",
+    label: "GeoNames AU",
+    license: "CC BY 4.0",
+    fullText: "Australian place names & coordinates © GeoNames (CC BY 4.0)",
   },
 ];
 

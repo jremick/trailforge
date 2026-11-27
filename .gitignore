@@ -54,10 +54,12 @@ web/.vite/
 *.gpx
 *.geojson
 
-# Keep synthetic unit/integration test fixtures and demo examples tracked
+# Keep synthetic unit/integration test fixtures, demo examples, and Pan-AU GeoJSON assets tracked
 !tests/fixtures/
 !tests/fixtures/**
 !examples/
 !examples/**
+!web/public/data/
+!web/public/data/**
 tests/fixtures/__pycache__/
 tests/fixtures/**/*.py[cod]

@@ -16,6 +16,8 @@ import { getGradeColor } from "../presets";
 import {
   EMPTY_FEATURE_COLLECTION,
   buildOfflineGraticuleGeoJson,
+  resolveGlyphsUrl,
+  resolveVectorBasemapSource,
   toPmtilesUrl,
 } from "../style";
 import type { BasemapId, TileManifestResponse, WaterwayCrossingItem } from "../types";
@@ -117,17 +119,32 @@ function buildCrossingsFeatures(
   };
 }
 
-function buildCourseMiniMapStyle(
+const MINI_VECTOR_BASEMAP_LAYER_IDS = [
+  "mini-vbase-land",
+  "mini-vbase-landcover",
+  "mini-vbase-park",
+  "mini-vbase-landuse",
+  "mini-vbase-water",
+  "mini-vbase-waterway",
+  "mini-vbase-roads",
+  "mini-vbase-water-name",
+  "mini-vbase-road-name",
+] as const;
+
+export function buildCourseMiniMapStyle(
   basemap: BasemapId,
   trackFc: FeatureCollection<LineString>,
   crossingsFc: FeatureCollection<Point>,
   tileManifest?: TileManifestResponse | null,
-  origin?: string
+  origin?: string,
+  assetsOrigin?: string
 ): StyleSpecification {
   const showOpenTopo = basemap === "opentopo";
   const showOsm = basemap === "osm";
   const showSat = basemap === "satellite";
   const showOffline = basemap === "offline-topo";
+  const showVector = basemap === "vector";
+  const showTerrainContext = showOffline || showVector;
   const vis = (enabled: boolean): "visible" | "none" => (enabled ? "visible" : "none");
 
   const useVector = Boolean(tileManifest?.vector_available && tileManifest.vector_url);
@@ -158,6 +175,7 @@ function buildCourseMiniMapStyle(
       tileSize: 256,
       maxzoom: 19,
     },
+    "mini-vector-basemap": resolveVectorBasemapSource(tileManifest, origin),
     "mini-graticule": {
       type: "geojson",
       data: buildOfflineGraticuleGeoJson(),
@@ -237,15 +255,114 @@ function buildCourseMiniMapStyle(
         "raster-opacity": 0.95,
       },
     },
+    {
+      id: "mini-vbase-land",
+      type: "background",
+      layout: { visibility: vis(showVector) },
+      paint: { "background-color": "#111921" },
+    },
+    {
+      id: "mini-vbase-landcover",
+      type: "fill",
+      source: "mini-vector-basemap",
+      "source-layer": "landcover",
+      layout: { visibility: vis(showVector) },
+      paint: {
+        "fill-color": [
+          "match",
+          ["coalesce", ["get", "class"], ""],
+          ["wood", "forest"],
+          "#162620",
+          ["grass", "meadow", "farmland"],
+          "#1A2721",
+          "#152220",
+        ],
+        "fill-opacity": 0.78,
+      },
+    },
+    {
+      id: "mini-vbase-park",
+      type: "fill",
+      source: "mini-vector-basemap",
+      "source-layer": "park",
+      layout: { visibility: vis(showVector) },
+      paint: {
+        "fill-color": "#132922",
+        "fill-opacity": 0.52,
+      },
+    },
+    {
+      id: "mini-vbase-landuse",
+      type: "fill",
+      source: "mini-vector-basemap",
+      "source-layer": "landuse",
+      minzoom: 8,
+      layout: { visibility: vis(showVector) },
+      paint: {
+        "fill-color": "#1B242E",
+        "fill-opacity": 0.72,
+      },
+    },
+    {
+      id: "mini-vbase-water",
+      type: "fill",
+      source: "mini-vector-basemap",
+      "source-layer": "water",
+      layout: { visibility: vis(showVector) },
+      paint: { "fill-color": "#0C2336" },
+    },
+    {
+      id: "mini-vbase-waterway",
+      type: "line",
+      source: "mini-vector-basemap",
+      "source-layer": "waterway",
+      layout: { visibility: vis(showVector) },
+      paint: {
+        "line-color": "#1D4E6E",
+        "line-width": 1.2,
+        "line-opacity": 0.72,
+      },
+    },
+    {
+      id: "mini-vbase-roads",
+      type: "line",
+      source: "mini-vector-basemap",
+      "source-layer": "transportation",
+      filter: [
+        "in",
+        ["coalesce", ["get", "class"], ""],
+        ["literal", ["motorway", "trunk", "primary", "secondary", "tertiary", "minor"]],
+      ],
+      layout: {
+        visibility: vis(showVector),
+        "line-cap": "round",
+        "line-join": "round",
+      },
+      paint: {
+        "line-color": [
+          "match",
+          ["coalesce", ["get", "class"], ""],
+          "motorway",
+          "#C88A32",
+          "trunk",
+          "#B48A3E",
+          "primary",
+          "#64748B",
+          "#384859",
+        ],
+        "line-width": ["interpolate", ["linear"], ["zoom"], 8, 1.0, 14, 3.0],
+        "line-opacity": 0.88,
+      },
+    },
   ];
 
-  // Offline/topo DEM hillshade & vector contours/waterways for rich offline context
+  // Offline/vector DEM hillshade & vector contours/waterways for rich topo context
   if (useTerrain) {
     layers.push({
       id: "mini-hillshade",
       type: "hillshade",
       source: "mini-terrain",
-      layout: { visibility: vis(showOffline) },
+      layout: { visibility: vis(showTerrainContext) },
       paint: {
         "hillshade-exaggeration": 0.55,
         "hillshade-shadow-color": "#050A0E",
@@ -263,7 +380,7 @@ function buildCourseMiniMapStyle(
         type: "line",
         source: "mini-vector",
         "source-layer": "contours",
-        layout: { visibility: vis(showOffline) },
+        layout: { visibility: vis(showTerrainContext) },
         paint: {
           "line-color": "#476074",
           "line-width": 0.85,
@@ -275,7 +392,7 @@ function buildCourseMiniMapStyle(
         type: "line",
         source: "mini-vector",
         "source-layer": "waterways",
-        layout: { visibility: vis(showOffline) },
+        layout: { visibility: vis(showTerrainContext) },
         paint: {
           "line-color": "#3B82A8",
           "line-width": 1.3,
@@ -317,6 +434,46 @@ function buildCourseMiniMapStyle(
       paint: {
         "line-color": ["coalesce", ["get", "color"], "#38BDF8"],
         "line-width": 4.2,
+      },
+    },
+    {
+      id: "mini-vbase-water-name",
+      type: "symbol",
+      source: "mini-vector-basemap",
+      "source-layer": "water_name",
+      minzoom: 8,
+      layout: {
+        visibility: vis(showVector),
+        "text-field": ["coalesce", ["get", "name:latin"], ["get", "name"], ""],
+        "text-font": ["Noto Sans Italic"],
+        "text-size": 10.5,
+        "text-allow-overlap": false,
+      },
+      paint: {
+        "text-color": "#7DD3FC",
+        "text-halo-color": "rgba(9, 14, 20, 0.92)",
+        "text-halo-width": 1.5,
+      },
+    },
+    {
+      id: "mini-vbase-road-name",
+      type: "symbol",
+      source: "mini-vector-basemap",
+      "source-layer": "transportation_name",
+      minzoom: 10,
+      layout: {
+        visibility: vis(showVector),
+        "symbol-placement": "line",
+        "symbol-spacing": 280,
+        "text-field": ["coalesce", ["get", "name:latin"], ["get", "name"], ["get", "ref"], ""],
+        "text-font": ["Noto Sans Medium"],
+        "text-size": 10,
+        "text-allow-overlap": false,
+      },
+      paint: {
+        "text-color": "#E2E8F0",
+        "text-halo-color": "rgba(9, 14, 20, 0.92)",
+        "text-halo-width": 1.6,
       },
     },
     {
@@ -368,6 +525,7 @@ function buildCourseMiniMapStyle(
   return {
     version: 8,
     name: "TrailForge Course MiniMap",
+    glyphs: resolveGlyphsUrl(assetsOrigin ?? origin),
     sources,
     layers,
   };
@@ -416,7 +574,8 @@ export class CourseMiniMap {
         trackFc,
         crossingsFc,
         options.tileManifest,
-        origin
+        origin,
+        window.location.origin
       ),
       center,
       zoom: 12,
@@ -514,12 +673,17 @@ export class CourseMiniMap {
         this.map.setLayoutProperty(id, "visibility", visible ? "visible" : "none");
       }
     };
+    const showVector = basemap === "vector";
+    const showTerrainContext = basemap === "offline-topo" || showVector;
     setVis("mini-basemap-opentopo", basemap === "opentopo");
     setVis("mini-basemap-osm", basemap === "osm");
     setVis("mini-basemap-satellite", basemap === "satellite");
-    setVis("mini-hillshade", basemap === "offline-topo");
-    setVis("mini-contours", basemap === "offline-topo");
-    setVis("mini-waterways", basemap === "offline-topo");
+    for (const id of MINI_VECTOR_BASEMAP_LAYER_IDS) {
+      setVis(id, showVector);
+    }
+    setVis("mini-hillshade", showTerrainContext);
+    setVis("mini-contours", showTerrainContext);
+    setVis("mini-waterways", showTerrainContext);
   }
 
   fitTrack(): void {

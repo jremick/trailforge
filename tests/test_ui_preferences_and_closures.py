@@ -91,7 +91,9 @@ def test_canonical_layer_parity_between_backend_and_frontend() -> None:
         ts_src,
         re.DOTALL,
     )
-    assert vis_match is not None, "Could not locate DEFAULT_LAYER_VISIBILITY in layerPrefsHelpers.ts"
+    assert vis_match is not None, (
+        "Could not locate DEFAULT_LAYER_VISIBILITY in layerPrefsHelpers.ts"
+    )
     frontend_vis = {
         k: (v == "true")
         for k, v in re.findall(r"([A-Za-z0-9_]+)\s*:\s*(true|false)", vis_match.group(1))

@@ -2794,9 +2794,9 @@ class TrailForgeApp {
         );
       }
 
+      const isOfflinePack =
+        Boolean(this.activeOfflinePackId) || !this.isOnline;
       if (manifest.vector_available || manifest.terrain_available) {
-        const isOfflinePack =
-          Boolean(this.activeOfflinePackId) || !this.isOnline;
         this.map.applyTileManifest(manifest, { isOfflinePack });
         const modeLabel =
           manifest.vector_available && manifest.terrain_available
@@ -2810,6 +2810,10 @@ class TrailForgeApp {
           await this.loadGeoJsonFallback();
         }
         return;
+      }
+
+      if (manifest.vector_basemap_url) {
+        this.map.applyTileManifest(manifest, { isOfflinePack });
       }
     } catch {
       // Manifest unavailable — fall through to GeoJSON fallback cleanly
