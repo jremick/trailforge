@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Final
 
@@ -32,10 +32,13 @@ from trailforge.feeds.adapters_au import (
 from trailforge.feeds.base import (
     ALL_FEED_REGISTRY,
     FEED_REGISTRY,
+    MAX_FEED_BODY_BYTES,
     BaseHttpFeedAdapter,
     DbSeverityLiteral,
     FeedSourceLiteral,
     NormalizedClosure,
+    check_feed_record_count,
+    extract_wfs_total_count,
     get_feeds_for_states,
     normalize_alert_type,
     normalize_db_severity,
@@ -44,10 +47,10 @@ from trailforge.feeds.base import (
     normalize_status,
     parse_iso_datetime,
     parse_safe_xml,
+    reject_partial_feed_snapshot,
     resolve_enabled_states,
     resolve_feed_source,
     sanitize_source_url,
-    strip_html,
 )
 from trailforge.ingestion.connectors.base import prop_ci
 
@@ -59,7 +62,6 @@ _normalize_state = normalize_state
 _normalize_status = normalize_status
 _normalize_alert_type = normalize_alert_type
 _normalize_db_severity = normalize_db_severity
-_strip_html = strip_html
 _BaseHttpFeedAdapter = BaseHttpFeedAdapter
 
 _RELEVANT_VIC_CATEGORIES: Final[tuple[str, ...]] = (
@@ -80,6 +82,51 @@ class VicSeasonalClosuresAdapter(_BaseHttpFeedAdapter):
     """VIC MapShareVic / DEECA seasonal road closure adapter."""
 
     feed_source: FeedSourceLiteral = "vic_mapshare_seasonal"
+
+    def _fetch_snapshot(self) -> Any:
+        response = self._http_get()
+        payload = response.json()
+        if not isinstance(payload, Mapping):
+            return payload
+        features = payload.get("features")
+        total = extract_wfs_total_count(payload)
+        if not isinstance(features, list) or total is None or total <= len(features):
+            reject_partial_feed_snapshot(payload)
+            return payload
+
+        url = response.url
+        params = {k.lower(): v.lower() for k, v in url.params.multi_items()}
+        if (
+            params.get("service") != "wfs"
+            or params.get("request") != "getfeature"
+            or params.get("startindex", "0") != "0"
+            or not features
+        ):
+            raise ValueError("VIC seasonal feed reported an incomplete snapshot")
+        check_feed_record_count(total)
+        remaining_bytes = MAX_FEED_BODY_BYTES - len(response.content)
+        base_params = [(k, v) for k, v in url.params.multi_items() if k.lower() != "startindex"]
+        for _ in range(19):  # The default WFS page size is 500, with at most 10,000 records.
+            if remaining_bytes <= 0:
+                raise ValueError("VIC seasonal feed pages exceed the response byte limit")
+            next_url = url.copy_with(params=[*base_params, ("startIndex", str(len(features)))])
+            response = self._http_get(str(next_url), max_bytes=remaining_bytes)
+            remaining_bytes -= len(response.content)
+            page = response.json()
+            if not isinstance(page, Mapping):
+                raise ValueError("Unexpected VIC seasonal WFS page format")
+            next_features = page.get("features")
+            if (
+                extract_wfs_total_count(page) != total
+                or not isinstance(next_features, list)
+                or not next_features
+                or len(features) + len(next_features) > total
+            ):
+                raise ValueError("VIC seasonal WFS page counts did not match the snapshot")
+            features.extend(next_features)
+            if len(features) == total:
+                return features
+        raise ValueError("VIC seasonal feed exceeds the WFS page limit")
 
     def _parse_item(self, item: Mapping[str, Any]) -> NormalizedClosure | None:
         # Handle both GeoJSON Feature (WFS/ArcGIS) and normalized fixture dict
@@ -155,7 +202,9 @@ class VicSeasonalClosuresAdapter(_BaseHttpFeedAdapter):
             raw_items: list[Mapping[str, Any]] = self._fixture_items
         else:
             payload = (
-                self._fixture_payload if self._fixture_payload is not None else self._fetch_json()
+                self._fixture_payload
+                if self._fixture_payload is not None
+                else self._fetch_snapshot()
             )
             if isinstance(payload, Mapping) and isinstance(payload.get("features"), list):
                 raw_items = payload["features"]
@@ -164,6 +213,7 @@ class VicSeasonalClosuresAdapter(_BaseHttpFeedAdapter):
             else:
                 raise ValueError("Unexpected VIC seasonal closures payload format")
 
+        check_feed_record_count(len(raw_items))
         out: list[NormalizedClosure] = []
         for item in raw_items:
             if isinstance(item, Mapping):
@@ -248,6 +298,7 @@ class VicEmergencyAdapter(_BaseHttpFeedAdapter):
             else:
                 raise ValueError("Unexpected VicEmergency GeoJSON payload format")
 
+        check_feed_record_count(len(raw_items))
         out: list[NormalizedClosure] = []
         for item in raw_items:
             if isinstance(item, Mapping):
@@ -320,6 +371,7 @@ class NSWRFSAdapter(_BaseHttpFeedAdapter):
             else:
                 raise ValueError("Unexpected NSW RFS majorIncidents payload format")
 
+        check_feed_record_count(len(raw_items))
         out: list[NormalizedClosure] = []
         for item in raw_items:
             if isinstance(item, Mapping):
@@ -329,9 +381,41 @@ class NSWRFSAdapter(_BaseHttpFeedAdapter):
         return out
 
 
-_HTML_STRONG_RE: Final[re.Pattern[str]] = re.compile(
-    r"<strong[^>]*>(.*?)</strong>", re.IGNORECASE | re.DOTALL
-)
+MAX_NPWS_DESCRIPTION_CHARS: Final[int] = 32_768
+
+
+class _NPWSDescriptionParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.body: list[str] = []
+        self.headline: list[str] = []
+        self._strong_depth = 0
+        self.headline_complete = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "strong" and not self.headline_complete:
+            self._strong_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "strong" and self._strong_depth:
+            self._strong_depth -= 1
+            self.headline_complete = self._strong_depth == 0
+
+    def handle_data(self, data: str) -> None:
+        self.body.append(data)
+        if self._strong_depth:
+            self.headline.append(data)
+
+
+def _parse_npws_description(raw: str) -> tuple[str, str]:
+    if len(raw) > MAX_NPWS_DESCRIPTION_CHARS:
+        raise ValueError(f"NPWS description exceeds {MAX_NPWS_DESCRIPTION_CHARS} characters")
+    parser = _NPWSDescriptionParser()
+    parser.feed(raw)
+    parser.close()
+    headline = " ".join(" ".join(parser.headline).split()) if parser.headline_complete else ""
+    body = " ".join(" ".join(parser.body).split())
+    return headline, body
 
 
 class NSWNPWSAdapter(_BaseHttpFeedAdapter):
@@ -345,8 +429,12 @@ class NSWNPWSAdapter(_BaseHttpFeedAdapter):
 
     def _parse_rss_items(self, xml_text: str) -> list[dict[str, Any]]:
         root = parse_safe_xml(xml_text)
+        channel = root.find("channel") if root.tag == "rss" else None
+        if channel is None:
+            raise ValueError("Unexpected NSW NPWS RSS payload format")
         parsed_items: list[dict[str, Any]] = []
-        for elem in root.findall(".//item"):
+        for idx, elem in enumerate(channel.iterfind("item"), start=1):
+            check_feed_record_count(idx)
             park_name = (elem.findtext("title") or "").strip()
             if not park_name:
                 continue
@@ -355,15 +443,8 @@ class NSWNPWSAdapter(_BaseHttpFeedAdapter):
             pub_date = (elem.findtext("pubDate") or "").strip()
             raw_desc = elem.findtext("description") or ""
 
-            headline = ""
-            m_strong = _HTML_STRONG_RE.search(raw_desc)
-            if m_strong:
-                headline = _strip_html(m_strong.group(1))
-            plain_desc = _strip_html(raw_desc)
-            if len(plain_desc) > 1200:
-                plain_desc = plain_desc[:1197].rstrip() + "..."
+            headline, plain_desc = _parse_npws_description(raw_desc)
 
-            title = f"{park_name} — {headline}" if headline else park_name
             lower_blob = f"{headline} {plain_desc}".lower()
             if "closed" in lower_blob or "closure" in lower_blob:
                 alert_type = "park_closure"
@@ -377,6 +458,12 @@ class NSWNPWSAdapter(_BaseHttpFeedAdapter):
             else:
                 alert_type = "hazard_warning"
                 severity = "advisory"
+
+            if len(plain_desc) > 1200:
+                plain_desc = plain_desc[:1197].rstrip() + "..."
+            if len(headline) > 512:
+                headline = headline[:509].rstrip() + "..."
+            title = f"{park_name} — {headline}" if headline else park_name
 
             parsed_items.append(
                 {
@@ -402,7 +489,9 @@ class NSWNPWSAdapter(_BaseHttpFeedAdapter):
             or body_text.lstrip().startswith("<")
         ):
             return self._parse_rss_items(body_text)
-        return resp.json()
+        payload = resp.json()
+        reject_partial_feed_snapshot(payload)
+        return payload
 
     def _parse_item(self, item: Mapping[str, Any]) -> NormalizedClosure | None:
         if item.get("type") == "Feature":
@@ -472,6 +561,7 @@ class NSWNPWSAdapter(_BaseHttpFeedAdapter):
             else:
                 raise ValueError("Unexpected NSW NPWS alerts payload format")
 
+        check_feed_record_count(len(raw_items))
         out: list[NormalizedClosure] = []
         for item in raw_items:
             if isinstance(item, Mapping):
@@ -668,8 +758,22 @@ def build_default_adapters(
     """
     fixture_feeds: dict[str, list[Mapping[str, Any]]] | None = None
     if fixtures_path is not None:
-        raw = json.loads(Path(fixtures_path).read_text(encoding="utf-8"))
-        fixture_feeds = dict(raw.get("feeds") or {})
+        with Path(fixtures_path).open("rb") as file:
+            body = file.read(MAX_FEED_BODY_BYTES + 1)
+        if len(body) > MAX_FEED_BODY_BYTES:
+            raise ValueError(f"Closure fixture exceeds {MAX_FEED_BODY_BYTES} bytes")
+        raw = json.loads(body)
+        if not isinstance(raw, dict) or not isinstance(raw.get("feeds"), dict):
+            raise ValueError("Closure fixture must contain a feeds object")
+        fixture_feeds = raw["feeds"]
+        for feed_key, records in fixture_feeds.items():
+            if not isinstance(records, list) or any(
+                not isinstance(item, dict) for item in records
+            ):
+                raise ValueError(
+                    f"Closure fixture feed {feed_key!r} must contain a list of records"
+                )
+            check_feed_record_count(len(records))
 
     if only_feeds:
         selected_keys = [resolve_feed_source(name) for name in only_feeds]
@@ -685,12 +789,12 @@ def build_default_adapters(
         if feed_key == "osm_access":
             adapters.append(adapter_cls())
         else:
+            if fixture_feeds is not None and feed_key not in fixture_feeds:
+                continue
             adapters.append(
                 adapter_cls(
                     client=client,
-                    fixture_items=fixture_feeds.get(feed_key, [])
-                    if fixture_feeds is not None
-                    else None,
+                    fixture_items=fixture_feeds[feed_key] if fixture_feeds is not None else None,
                 )
             )
 

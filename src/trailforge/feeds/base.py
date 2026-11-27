@@ -9,9 +9,12 @@ import os
 import re
 import socket
 import xml.etree.ElementTree as ET
-from collections.abc import Mapping, Sequence
+import zlib
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from typing import Any, Final, Literal, Protocol, runtime_checkable
 
 import httpx
@@ -97,6 +100,10 @@ DEFAULT_SA_CFS_PARKS_URL: Final[str] = (
     "https://data.eso.sa.gov.au/prod/cfs/criimson/cfs_current_incidents.json"
 )
 DEFAULT_NT_SECURENT_URL: Final[str] = "https://roadreport.nt.gov.au/api/Obstruction/GetAll"
+
+LIVE_DATASET_KEY: Final[str] = "live"
+FIXTURE_DATASET_KEY: Final[str] = "fixture"
+_URL_SCOPED_FEEDS: Final[frozenset[str]] = frozenset({"qld_des_alerts", "nt_securent"})
 
 _PARK_ALERT_FEEDS: Final[frozenset[str]] = frozenset(
     {
@@ -425,6 +432,7 @@ def normalize_geojson_geometry(raw_geom: Any) -> dict[str, Any] | None:
         else:
             return None
 
+    _check_geometry_budget(geom_obj)
     try:
         shp = shape(geom_obj)
     except Exception:
@@ -438,6 +446,32 @@ def normalize_geojson_geometry(raw_geom: Any) -> dict[str, Any] | None:
                     return dict(mapping(part))
         return None
     return dict(mapping(shp))
+
+
+def _check_geometry_budget(geometry: Mapping[str, Any]) -> None:
+    """Bound coordinate and collection traversal before passing data to GEOS."""
+    remaining = MAX_FEED_GEOMETRY_VALUES
+
+    def visit(value: Any, depth: int) -> None:
+        nonlocal remaining
+        if depth > MAX_FEED_GEOMETRY_DEPTH:
+            raise ValueError("Upstream feed geometry is nested too deeply")
+        if isinstance(value, Mapping):
+            visit(value.get("coordinates"), depth + 1)
+            geom_type = str(value.get("type", "")).lower()
+            if geom_type == "geometrycollection":
+                visit(value.get("geometries"), depth + 1)
+            elif geom_type == "feature":
+                visit(value.get("geometry"), depth + 1)
+        elif isinstance(value, (list, tuple)):
+            remaining -= len(value)
+            if remaining < 0:
+                raise ValueError("Upstream feed geometry exceeds the coordinate budget")
+            for child in value:
+                if isinstance(child, (list, tuple, Mapping)):
+                    visit(child, depth + 1)
+
+    visit(geometry, 0)
 
 
 def normalize_state(raw: Any, default: StateLiteral) -> StateLiteral:
@@ -524,12 +558,108 @@ def normalize_db_severity(raw: Any, default: DbSeverityLiteral) -> DbSeverityLit
     return default
 
 
-_HTML_TAG_RE: Final[re.Pattern[str]] = re.compile(r"<[^>]+>")
+_HTML_TAG_RE: Final[re.Pattern[str]] = re.compile(r"<[^<>]+>")
 _WS_COLLAPSE_RE: Final[re.Pattern[str]] = re.compile(r"\s+")
 _UNSAFE_XML_PATTERN: Final[re.Pattern[str]] = re.compile(r"<!(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
 _SAFE_HTTP_URL_RE: Final[re.Pattern[str]] = re.compile(r"^https?://", re.IGNORECASE)
 MAX_FEED_BODY_BYTES: Final[int] = 10 * 1024 * 1024  # 10 MiB upstream feed response cap
 MAX_FEED_XML_ELEMENTS: Final[int] = 250_000
+MAX_FEED_RECORDS: Final[int] = 10_000
+MAX_FEED_GEOMETRY_VALUES: Final[int] = 200_000
+MAX_FEED_GEOMETRY_DEPTH: Final[int] = 12
+MAX_FEED_REDIRECTS: Final[int] = 5
+
+
+def check_feed_record_count(count: int) -> None:
+    if count > MAX_FEED_RECORDS:
+        raise ValueError(f"Upstream feed contains too many records (limit {MAX_FEED_RECORDS})")
+
+
+def _int_not_bool(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def extract_wfs_total_count(payload: Mapping[str, Any]) -> int | None:
+    """Return WFS total count, falling back to totalFeatures when numberMatched is null."""
+    raw = payload.get("numberMatched")
+    if raw is None:
+        raw = payload.get("totalFeatures")
+    return _int_not_bool(raw)
+
+
+def reject_partial_feed_snapshot(payload: Any) -> None:
+    """Reject upstream responses that explicitly indicate missing records."""
+    if not isinstance(payload, Mapping):
+        return
+    if payload.get("exceededTransferLimit") is True:
+        raise ValueError("Upstream feed reported an incomplete snapshot")
+    matched = extract_wfs_total_count(payload)
+    returned = _int_not_bool(payload.get("numberReturned"))
+    features = payload.get("features")
+    if returned is None and isinstance(features, list):
+        returned = len(features)
+    if matched is not None and returned is not None and matched > returned:
+        raise ValueError("Upstream feed reported an incomplete snapshot")
+
+
+def _bounded_feed_response_body(resp: httpx.Response, max_bytes: int) -> bytes:
+    over_limit = f"Upstream feed response exceeds {max_bytes} byte limit"
+    if resp.is_stream_consumed:
+        # In-process test transports can supply an already-buffered, decoded response.
+        if len(resp.content) > max_bytes:
+            raise ValueError(over_limit)
+        return resp.content
+
+    encoding = resp.headers.get("content-encoding", "identity").strip().lower()
+    if encoding not in ("", "identity", "gzip", "x-gzip"):
+        raise ValueError("Unsupported upstream feed content encoding")
+    decoder = zlib.decompressobj(zlib.MAX_WBITS + 16) if encoding in ("gzip", "x-gzip") else None
+    wire_bytes = 0
+    body = bytearray()
+    for chunk in resp.iter_raw():
+        wire_bytes += len(chunk)
+        if wire_bytes > max_bytes:
+            raise ValueError(over_limit)
+        if decoder is not None:
+            data = chunk
+            while data:
+                try:
+                    out = decoder.decompress(data, max_bytes - len(body) + 1)
+                except zlib.error as exc:
+                    raise ValueError("Invalid upstream gzip feed") from exc
+                if len(body) + len(out) > max_bytes:
+                    raise ValueError(over_limit)
+                body.extend(out)
+                if decoder.eof:
+                    trailing = decoder.unused_data
+                    if not trailing:
+                        break
+                    decoder = zlib.decompressobj(zlib.MAX_WBITS + 16)
+                    data = trailing
+                else:
+                    break
+        else:
+            if len(body) + len(chunk) > max_bytes:
+                raise ValueError(over_limit)
+            body.extend(chunk)
+    if decoder is not None and not decoder.eof:
+        raise ValueError("Incomplete upstream gzip feed")
+    return bytes(body)
+
+
+@contextmanager
+def _stream_feed_response(http: httpx.Client, url: str) -> Iterator[httpx.Response]:
+    request = http.build_request(
+        "GET", url, headers={"User-Agent": USER_AGENT, "Accept-Encoding": "gzip, identity"}
+    )
+    for _ in range(MAX_FEED_REDIRECTS + 1):
+        # HTTPX automatic redirects buffer intermediate response bodies.
+        with closing(http.send(request, stream=True, follow_redirects=False)) as response:
+            if response.next_request is None:
+                yield response
+                return
+            request = response.next_request
+    raise httpx.TooManyRedirects("Too many upstream feed redirects", request=request)
 
 
 def _assert_safe_feed_url(url: httpx.URL) -> None:
@@ -650,15 +780,13 @@ class BaseHttpFeedAdapter:
             if self._client is not None
             else httpx.Client(
                 timeout=httpx.Timeout(self.timeout_s, connect=min(8.0, self.timeout_s)),
-                follow_redirects=True,
-                max_redirects=5,
                 headers={"User-Agent": USER_AGENT},
                 event_hooks={"request": [lambda req: _assert_safe_feed_url(req.url)]},
             )
         )
         try:
-            if hasattr(http, "stream"):
-                with http.stream("GET", target, headers={"User-Agent": USER_AGENT}) as resp:
+            if hasattr(http, "build_request") and hasattr(http, "send"):
+                with _stream_feed_response(http, target) as resp:
                     resp.raise_for_status()
                     raw_cl = resp.headers.get("content-length")
                     if raw_cl:
@@ -670,16 +798,7 @@ class BaseHttpFeedAdapter:
                             raise ValueError(
                                 f"Upstream feed response exceeds {max_bytes} byte limit"
                             )
-                    chunks: list[bytes] = []
-                    total_bytes = 0
-                    for chunk in resp.iter_bytes():
-                        total_bytes += len(chunk)
-                        if total_bytes > max_bytes:
-                            raise ValueError(
-                                f"Upstream feed response exceeds {max_bytes} byte limit"
-                            )
-                        chunks.append(chunk)
-                    body = b"".join(chunks)
+                    body = _bounded_feed_response_body(resp, max_bytes)
                     clean_headers = [
                         (k, v)
                         for k, v in resp.headers.multi_items()
@@ -703,7 +822,13 @@ class BaseHttpFeedAdapter:
                 http.close()
 
     def _fetch_json(self) -> Any:
-        return self._http_get().json()
+        payload = self._http_get().json()
+        reject_partial_feed_snapshot(payload)
+        return payload
+
+    @property
+    def uses_fixtures(self) -> bool:
+        return self._fixture_items is not None or self._fixture_payload is not None
 
 
 def map_db_to_api_severity(db_severity: str) -> ApiSeverityLiteral:
@@ -777,7 +902,7 @@ class NormalizedClosure(BaseModel):
     """Normalized closure/incident/gate record emitted by any ``FeedAdapter``."""
 
     source_feed: FeedSourceLiteral
-    external_id: str
+    external_id: str = Field(min_length=1, max_length=512)
     alert_type: DbAlertTypeLiteral
     db_severity: DbSeverityLiteral
     status: ClosureStatusLiteral = "active"
@@ -816,3 +941,23 @@ class FeedAdapter(Protocol):
     def fetch(self, *, session: Session | None = None) -> list[NormalizedClosure]:
         """Fetch and normalize current active/scheduled alerts from the upstream source."""
         ...
+
+
+def live_dataset_key(feed_source: str, source_url: str) -> str:
+    """QLD and NT feed slots can point at independent agency datasets."""
+    if feed_source in _URL_SCOPED_FEEDS:
+        # Keep query parameters, which may select a specific upstream layer/filter.
+        endpoint = source_url.strip().partition("#")[0]
+        return f"endpoint:{sha256(endpoint.encode()).hexdigest()}"
+    return LIVE_DATASET_KEY
+
+
+def live_feed_polling_enabled() -> bool:
+    enabled = os.environ.get("TRAILFORGE_ENABLE_LIVE_FEEDS", "").strip().lower()
+    return enabled in ("1", "true", "yes", "on")
+
+
+def adapter_dataset_key(adapter: FeedAdapter) -> str:
+    if isinstance(adapter, BaseHttpFeedAdapter) and adapter.uses_fixtures:
+        return FIXTURE_DATASET_KEY
+    return live_dataset_key(adapter.feed_source, adapter.source_url)

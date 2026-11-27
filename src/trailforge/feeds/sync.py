@@ -16,7 +16,9 @@ from pydantic import BaseModel, Field
 from pyproj import Transformer
 from shapely import transform as shapely_transform_coords
 from shapely.geometry import LineString, MultiLineString, shape
+from shapely.geometry.base import BaseGeometry
 from sqlalchemy import delete, func, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from trailforge.db.models import (
@@ -31,6 +33,7 @@ from trailforge.feeds.base import (
     FeedAdapter,
     FeedSourceLiteral,
     NormalizedClosure,
+    adapter_dataset_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,6 +45,7 @@ LINE_MIN_OVERLAP_FRAC: float = 0.50
 POLYGON_BUFFER_M: float = 100.0
 POINT_INCIDENT_BUFFER_M: float = 500.0
 GATE_POINT_BUFFER_M: float = 60.0
+REGIONAL_POLYGON_AREA_M2: float = 5_000_000_000.0
 
 _TO_ALBERS = Transformer.from_crs("EPSG:4326", "EPSG:3577", always_xy=True)
 
@@ -52,7 +56,7 @@ _PARK_SUFFIX_RE = re.compile(
 )
 
 
-def _to_albers(geom: LineString | MultiLineString) -> LineString | MultiLineString:
+def _to_albers(geom: BaseGeometry) -> BaseGeometry:
     def _arr(coords: np.ndarray) -> np.ndarray:
         if coords.size == 0:
             return coords
@@ -132,24 +136,34 @@ class SyncRunSummary(BaseModel):
     results: list[FeedSyncResult] = Field(default_factory=list)
 
 
-def _get_or_create_sync_status(session: Session, adapter: FeedAdapter) -> FeedSyncStatus:
-    row = session.get(FeedSyncStatus, adapter.feed_source)
-    if row is None:
-        row = FeedSyncStatus(
+def _lock_sync_status(
+    session: Session, adapter: FeedAdapter, dataset_key: str
+) -> FeedSyncStatus:
+    session.execute(
+        insert(FeedSyncStatus)
+        .values(
             feed_name=adapter.feed_source,
+            dataset_key=dataset_key,
             source_url=adapter.source_url,
             sync_interval_s=adapter.sync_interval_s,
             stale_after_s=adapter.stale_after_s,
-            last_status="never_run",
-            consecutive_failures=0,
-            records_synced=0,
         )
-        session.add(row)
-        session.flush()
-    else:
-        row.source_url = adapter.source_url
-        row.sync_interval_s = adapter.sync_interval_s
-        row.stale_after_s = adapter.stale_after_s
+        .on_conflict_do_nothing(
+            index_elements=[FeedSyncStatus.feed_name, FeedSyncStatus.dataset_key]
+        )
+    )
+    row = session.execute(
+        select(FeedSyncStatus)
+        .where(
+            FeedSyncStatus.feed_name == adapter.feed_source,
+            FeedSyncStatus.dataset_key == dataset_key,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one()
+    row.source_url = adapter.source_url
+    row.sync_interval_s = adapter.sync_interval_s
+    row.stale_after_s = adapter.stale_after_s
     return row
 
 
@@ -252,21 +266,12 @@ def _propagate_segment_links(
         for seg_id in park_seg_ids:
             links.setdefault(seg_id, ("capad_park_join", 0.0))
 
-    # 3. Spatial intersection & EPSG:3577 metric buffer match when geometry is provided
+    # 3. Spatial intersection & EPSG:3577 metric buffer match for local geometry.
     if item.geometry is not None:
         geom_type = str(item.geometry.get("type") or "")
-        alert_shp_4326 = shape(item.geometry)
-        alert_shp_3577 = _to_albers(alert_shp_4326)
 
-        # Skip per-segment fanout for massive statewide/district weather polygons (> 5,000 km²);
-        # their polygon boundary still renders directly via closures_alerts.geom without
-        # inserting 50,000+ redundant segment_closure_links rows.
-        is_giant_regional_polygon = (
-            geom_type in ("Polygon", "MultiPolygon")
-            and float(alert_shp_3577.area) > 5_000_000_000.0
-        )
-
-        if not is_giant_regional_polygon:
+        # Regional polygons are matched at read time to avoid statewide link fanout.
+        if not alert.is_regional:
             geom_json_str = json.dumps(item.geometry)
             alert_geom_4326 = func.ST_SetSRID(func.ST_GeomFromGeoJSON(geom_json_str), 4326)
             alert_geom_3577 = func.ST_Transform(alert_geom_4326, 3577)
@@ -289,7 +294,7 @@ def _propagate_segment_links(
             alert_line_m: LineString | MultiLineString | None = None
             alert_buf_m: object | None = None
             if is_line_closure:
-                alert_line_m = alert_shp_3577  # type: ignore[assignment]
+                alert_line_m = _to_albers(shape(item.geometry))  # type: ignore[assignment]
                 alert_buf_m = alert_line_m.buffer(LINE_BUFFER_M)
 
             dist_expr = func.ST_Distance(seg_geom_3577, alert_geom_3577)
@@ -348,23 +353,30 @@ def sync_feed(
 ) -> FeedSyncResult:
     """Sync one closure feed with outage resilience (retains last-known state on failure)."""
     ts = now or datetime.now(UTC)
-    sync_row = _get_or_create_sync_status(session, adapter)
+    dataset_key = adapter_dataset_key(adapter)
+    sync_row = _lock_sync_status(session, adapter, dataset_key)
     sync_row.last_attempt_at = ts
 
     try:
         items = adapter.fetch(session=session)
+        if any(item.source_feed != adapter.feed_source for item in items):
+            raise ValueError("Closure record does not belong to the current feed")
+        if len({item.external_id for item in items}) != len(items):
+            raise ValueError("Closure feed returned duplicate record IDs")
     except Exception as exc:
+        error = str(exc)[:500]
         logger.warning(
-            "Closure feed %s failed (%s); retaining last-known state", adapter.feed_source, exc
+            "Closure feed %s failed (%s); retaining last-known state", adapter.feed_source, error
         )
         sync_row.consecutive_failures = int(sync_row.consecutive_failures or 0) + 1
-        sync_row.last_error = str(exc)[:500]
+        sync_row.last_error = error
         sync_row.last_status = "degraded" if sync_row.last_success_at is not None else "failed"
 
         retained = int(
             session.execute(
                 select(func.count(ClosureAlert.id)).where(
                     ClosureAlert.source_feed == adapter.feed_source,
+                    ClosureAlert.dataset_key == dataset_key,
                     ClosureAlert.status != "cleared",
                 )
             ).scalar_one()
@@ -378,11 +390,13 @@ def sync_feed(
             ok=False,
             status=sync_row.last_status,
             retained_existing=retained,
-            error=str(exc),
+            error=error,
         )
 
     existing_rows = session.execute(
-        select(ClosureAlert).where(ClosureAlert.source_feed == adapter.feed_source)
+        select(ClosureAlert).where(
+            ClosureAlert.source_feed == adapter.feed_source, ClosureAlert.dataset_key == dataset_key
+        )
     ).scalars().all()
     existing_by_ext = {row.external_id: row for row in existing_rows}
 
@@ -393,14 +407,19 @@ def sync_feed(
     for item in items:
         seen_ext_ids.add(item.external_id)
         capad_park_id = _resolve_capad_park_id(session, item)
-        geom_val = (
-            from_shape(shape(item.geometry), srid=4326) if item.geometry is not None else None
+        shp = shape(item.geometry) if item.geometry is not None else None
+        geom_val = from_shape(shp, srid=4326) if shp is not None else None
+        is_regional = (
+            shp is not None
+            and shp.geom_type in ("Polygon", "MultiPolygon")
+            and _to_albers(shp).area > REGIONAL_POLYGON_AREA_M2
         )
 
         alert = existing_by_ext.get(item.external_id)
         if alert is None:
             alert = ClosureAlert(
                 source_feed=item.source_feed,
+                dataset_key=dataset_key,
                 external_id=item.external_id,
                 alert_type=item.alert_type,
                 severity=item.db_severity,
@@ -411,6 +430,7 @@ def sync_feed(
                 source_url=item.source_url,
                 capad_park_id=capad_park_id,
                 geom=geom_val,
+                is_regional=is_regional,
                 effective_from=item.effective_from,
                 effective_to=item.effective_to,
                 source_updated_at=item.source_updated_at or ts,
@@ -429,6 +449,7 @@ def sync_feed(
             alert.source_url = item.source_url
             alert.capad_park_id = capad_park_id
             alert.geom = geom_val
+            alert.is_regional = is_regional
             alert.effective_from = item.effective_from
             alert.effective_to = item.effective_to
             alert.source_updated_at = item.source_updated_at or ts
@@ -439,7 +460,7 @@ def sync_feed(
         segments_linked += _propagate_segment_links(session, alert, item, now=ts)
         upserted += 1
 
-    # Clear previously active alerts from this feed that disappeared from upstream
+    # Reconcile absence only within the snapshot's own dataset.
     cleared = 0
     for ext_id, old_alert in existing_by_ext.items():
         if ext_id not in seen_ext_ids and old_alert.status != "cleared":

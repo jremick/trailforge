@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -31,9 +32,12 @@ from trailforge.feeds import (
     sync_feed,
     sync_from_fixtures,
 )
+from trailforge.feeds.adapters import NTFireParksAdapter, QLDParksAlertsAdapter
+from trailforge.feeds.base import ALL_FEED_REGISTRY
 from trailforge.feeds.cli import build_parser
 from trailforge.ingestion.connectors import load_corridor_fixtures
 from trailforge.ingestion.pipeline import ingest_corridor_dataset
+from trailforge.routes.planner import plan_route
 from trailforge.worker.main import run_due_closure_syncs
 
 
@@ -187,6 +191,164 @@ def test_feeds_cli_parser() -> None:
     assert args.live is False
 
 
+def test_vic_wfs_follows_reported_pages_before_reconciling() -> None:
+    offsets: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        start = int(request.url.params.get("startIndex", "0"))
+        offsets.append(start)
+        return httpx.Response(200, json={
+            "type": "FeatureCollection",
+            "numberMatched": 3,
+            "numberReturned": 1,
+            "features": [{"id": f"road-{start}", "title": "Temporary road closure"}],
+        })
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        adapter = VicSeasonalClosuresAdapter(client=client)
+        assert [item.external_id for item in adapter.fetch()] == ["road-0", "road-1", "road-2"]
+    assert offsets == [0, 1, 2]
+
+
+def test_vic_wfs_handles_null_number_matched_and_uppercase_startindex() -> None:
+    seen_params: list[list[tuple[str, str]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_params.append(list(request.url.params.multi_items()))
+        start = int(
+            next((v for k, v in request.url.params.multi_items() if k.lower() == "startindex"), "0")
+        )
+        return httpx.Response(200, json={
+            "type": "FeatureCollection",
+            "numberMatched": None,
+            "totalFeatures": 2,
+            "features": [{"id": f"road-{start}", "title": "Temporary road closure"}],
+        })
+
+    wfs_url = "https://fixtures.example.test/wfs?service=WFS&request=GetFeature&STARTINDEX=0"
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        adapter = VicSeasonalClosuresAdapter(client=client, source_url=wfs_url)
+        assert [item.external_id for item in adapter.fetch()] == ["road-0", "road-1"]
+    second_keys = [k.lower() for k, _ in seen_params[1]]
+    assert second_keys.count("startindex") == 1
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("adapter_class", [QLDParksAlertsAdapter, NTFireParksAdapter])
+def test_closure_snapshot_reconciliation_is_scoped_to_endpoint_and_fixture(
+    postgis_engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    adapter_class: type[FeedAdapter],
+) -> None:
+    primary = "https://fixtures.example.test/feed-a"
+    alternate = "https://fixtures.example.test/feed-b"
+    notice = {"id": "safety-42", "title": "Road closed", "alert_type": "road_closure"}
+    state = {"items": [notice]}
+
+    def response(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=state["items"])
+
+    with (
+        Session(postgis_engine) as session,
+        httpx.Client(transport=httpx.MockTransport(response)) as client,
+    ):
+        create = adapter_class(client=client, source_url=primary)
+        swap = adapter_class(client=client, source_url=alternate)
+        assert sync_feed(session, create, commit=False).records_upserted == 1
+        state["items"] = [{**notice, "title": "Flooded track closed"}]
+        assert sync_feed(session, swap, commit=False).records_upserted == 1
+        state["items"] = []
+        assert sync_feed(session, swap, commit=False).records_cleared == 1
+
+        fixtures = tmp_path / "partial.json"
+        fixture_notice = {**notice, "title": "Fixture road closed"}
+        fixtures.write_text(json.dumps({"feeds": {create.feed_source: [fixture_notice]}}))
+        result = sync_from_fixtures(session, fixtures, states="ALL", commit=False)
+        assert {r.feed_source for r in result.results} == {create.feed_source, "osm_access"}
+
+        # With a fresh fixture status present, a new endpoint remains unpolled.
+        env_var = ALL_FEED_REGISTRY[create.feed_source].env_var
+        monkeypatch.setenv(env_var, "https://fixtures.example.test/feed-new")
+        new_feed = get_feed_health_summary(session, state=create.state)["feeds"][0]
+        assert new_feed["status"] == "never_run"
+        assert new_feed["record_count"] == 0
+
+        fixtures.write_text(json.dumps({"feeds": {create.feed_source: []}}))
+        result = sync_from_fixtures(
+            session, fixtures, only_feeds=[create.feed_source], commit=False
+        )
+        assert result.results[0].records_cleared == 1
+
+        alerts = list_closures(session, active_only=True, feed_source=create.feed_source)["items"]
+        assert [(item["external_id"], item["title"]) for item in alerts] == [
+            ("safety-42", "Road closed")
+        ]
+        assert alerts[0]["is_stale"]
+        assert sync_feed(session, create, commit=False).records_cleared == 1
+        assert list_closures(session, active_only=True, feed_source=create.feed_source)[
+            "items"
+        ] == []
+
+
+@pytest.mark.integration
+def test_regional_closure_warns_for_intersecting_track_and_route_without_segment_links(
+    postgis_engine: Engine, fixtures_dir: Path
+) -> None:
+    now = datetime(2026, 11, 26, 1, 0, 0, tzinfo=UTC)
+    with Session(postgis_engine) as session:
+        ingest_corridor_dataset(session, load_corridor_fixtures(fixtures_dir))
+        track_ids = dict(session.execute(select(Track.name, Track.track_id)).all())
+        tracks = [track_ids["Davies Plain Track Lower"], track_ids["BUCKY RIDGE FIRE TRAIL"]]
+        notice = {
+            "id": "region-fixture-1",
+            "title": "Regional bushfire Watch and Act",
+            "severity": "Watch and Act",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [
+                    [[147, -36.3], [148.14, -36.3], [148.14, -37], [147, -37], [147, -36.3]]
+                ],
+            },
+        }
+        adapter = NSWRFSAdapter(fixture_items=[notice])
+        result = sync_feed(session, adapter, now=now, commit=False)
+        assert result.ok and result.segments_linked == 0
+
+        rollups = get_closures_for_track_ids(session, tracks, now=now)
+        associated = [
+            tid for tid in tracks
+            if any(c["title"] == notice["title"] for c in rollups[tid]["active_closures"])
+        ]
+        assert associated == [tracks[0]]
+        analysis = plan_route(session, tracks)
+        assert any(closure["title"] == notice["title"] for closure in analysis.closures)
+        with pytest.raises(ValueError, match="too many closure alerts"):
+            get_closures_for_track_ids(session, tracks, max_results=0)
+
+
+def test_npws_description_and_feed_record_caps_bound_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = NSWNPWSAdapter()
+    description = "<p><strong>Walking track closed</strong></p><p>Road works near the river.</p>"
+    item = (
+        f"<item><title>Sample National Park</title><description><![CDATA[{description}]]>"
+        "</description></item>"
+    )
+    rss = f"<rss><channel>{item}</channel></rss>"
+    result = adapter._parse_rss_items(rss)
+    assert result[0]["title"] == "Sample National Park — Walking track closed"
+    assert result[0]["alertType"] == "park_closure"
+    assert result[0]["description"] == "Walking track closed Road works near the river."
+
+    monkeypatch.setattr("trailforge.feeds.adapters.MAX_NPWS_DESCRIPTION_CHARS", 32)
+    with pytest.raises(ValueError, match="NPWS description"):
+        adapter._parse_rss_items(rss)
+
+    monkeypatch.setattr("trailforge.feeds.base.MAX_FEED_RECORDS", 1)
+    with pytest.raises(ValueError, match="too many records"):
+        NSWRFSAdapter(fixture_items=[{"id": "one"}, {"id": "two"}]).fetch()
+
+
 @pytest.mark.integration
 def test_closures_sync_propagation_capad_join_and_outage_resilience(
     postgis_engine: Engine, fixtures_dir: Path
@@ -203,11 +365,11 @@ def test_closures_sync_propagation_capad_join_and_outage_resilience(
         session.execute(delete(FeedSyncStatus))
         session.commit()
 
-        # 1. Sync all 5 feeds offline from committed fixtures + OSM PostGIS flags
+        # 1. Sync the supplied fixtures + OSM PostGIS flags.
         summary = sync_from_fixtures(session, fixtures_dir / "closures_sample.json", now=now)
         assert summary.overall_ok is True
         by_feed = {r.feed_source: r for r in summary.results}
-        assert set(by_feed.keys()) == set(FEED_REGISTRY.keys())
+        assert set(by_feed) == set(FEED_REGISTRY) - {"nsw_rfs"}
         assert by_feed["vic_mapshare_seasonal"].records_upserted == 1
         assert by_feed["vic_mapshare_seasonal"].segments_linked > 0
         assert by_feed["vic_emergency"].records_upserted == 1
@@ -218,10 +380,10 @@ def test_closures_sync_propagation_capad_join_and_outage_resilience(
         assert by_feed["osm_access"].records_upserted >= 2
         assert by_feed["osm_access"].segments_linked > 0
 
-        # 2. Verify feed health is healthy & fresh
+        # 2. The missing NSW RFS fixture leaves RFS unpolled.
         health = get_feed_health_summary(session, now=now + timedelta(minutes=5))
-        assert health["overall_status"] == "healthy"
-        assert all(not f["is_stale"] for f in health["feeds"])
+        assert health["overall_status"] == "stale"
+        assert {f["feed_source"] for f in health["feeds"] if f["is_stale"]} == {"nsw_rfs"}
 
         # 3. Verify track-level closure rollup across all corridor tracks
         tracks = session.execute(select(Track).where(Track.is_active.is_(True))).scalars().all()
@@ -299,8 +461,15 @@ def test_closures_sync_propagation_capad_join_and_outage_resilience(
         )[by_name["PINCH RIVER FIRE TRAIL"]]
         assert pinch_after_rfs["closure_status"] == "closed"
 
-        # 6. OUTAGE RESILIENCE: simulate HTTP 503 outage on VicEmergency -> MUST retain existing
-        #    closures & segment links untouched and flag feed degraded + is_stale=True!
+        # 6. Seed a provider snapshot and verify the failed live poll preserves its links.
+        fixture_doc = json.loads((fixtures_dir / "closures_sample.json").read_text())
+        with httpx.Client(
+            transport=httpx.MockTransport(
+                lambda _: httpx.Response(200, json=fixture_doc["feeds"]["vic_emergency"])
+            )
+        ) as vc_client:
+            assert sync_feed(session, VicEmergencyAdapter(client=vc_client), now=now).ok
+
         def outage_handler(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(503, text="Upstream Agency Temporarily Unavailable")
 
@@ -320,7 +489,9 @@ def test_closures_sync_propagation_capad_join_and_outage_resilience(
             session, [by_name["BUCKY RIDGE FIRE TRAIL"]], now=now + timedelta(minutes=20)
         )[by_name["BUCKY RIDGE FIRE TRAIL"]]
         assert bucky_during_outage["closure_status"] == "warning"
-        assert bucky_during_outage["active_closures"][0]["is_stale"] is True
+        assert sorted(c["is_stale"] for c in bucky_during_outage["active_closures"]) == [
+            False, True,
+        ]
 
         degraded_health = get_feed_health_summary(session, now=now + timedelta(minutes=20))
         assert degraded_health["overall_status"] == "degraded"
@@ -386,7 +557,7 @@ def test_closures_sync_propagation_capad_join_and_outage_resilience(
                 r_anon = api_client.post("/api/closures/sync", json={"use_fixtures": True})
                 assert r_anon.status_code == 401
 
-                # Re-sync from fixtures recovers vic_emergency back to healthy (admin required)
+                # Fixture refresh leaves the live VicEmergency outage visible.
                 r_sync = api_client.post(
                     "/api/closures/sync",
                     headers=admin_headers,
@@ -398,8 +569,8 @@ def test_closures_sync_propagation_capad_join_and_outage_resilience(
                 assert r_sync.status_code == 200
                 assert r_sync.json()["overall_ok"] is True
 
-                r_status_ok = api_client.get("/api/closures/status")
-                assert r_status_ok.json()["overall_status"] == "healthy"
+                r_status_after_fixtures = api_client.get("/api/closures/status")
+                assert r_status_after_fixtures.json()["overall_status"] == "degraded"
 
                 # Path-traversal / arbitrary-file-read confinement regression checks (#40)
                 for bad_path in ("/etc/passwd", "../../pyproject.toml", "/tmp/outside.json"):
@@ -426,7 +597,7 @@ def test_closures_sync_propagation_capad_join_and_outage_resilience(
             enable_live_feeds=False,
             fixtures_path=fixtures_dir / "closures_sample.json",
         )
-        assert len(res_due) == 5
+        assert len(res_due) == 4
         assert all(r.ok for r in res_due)
 
         # Confirm list_closures with severity filter works cleanly

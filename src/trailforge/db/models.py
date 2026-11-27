@@ -773,8 +773,14 @@ class ClosureAlert(Base):
             "state ~ '^(VIC|NSW|ACT|TAS|QLD|WA|SA|NT)(/(VIC|NSW|ACT|TAS|QLD|WA|SA|NT))*$'",
             name="state_valid",
         ),
-        UniqueConstraint("source_feed", "external_id", name="uq_closures_alerts_feed_ext"),
+        UniqueConstraint(
+            "source_feed", "dataset_key", "external_id", name="uq_closures_alerts_feed_ext"
+        ),
         Index("ix_closures_alerts_geom", "geom", postgresql_using="gist"),
+        Index(
+            "ix_closures_alerts_regional_geom", "geom", postgresql_using="gist",
+            postgresql_where=text("is_regional IS TRUE"),
+        ),
         Index("ix_closures_alerts_status_state_type", "status", "state", "alert_type"),
         Index("ix_closures_alerts_capad_park_id", "capad_park_id"),
         Index("ix_closures_alerts_feed_last_seen", "source_feed", text("last_seen_at DESC")),
@@ -782,6 +788,7 @@ class ClosureAlert(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     source_feed: Mapped[str] = mapped_column(Text, nullable=False)
+    dataset_key: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'live'"))
     external_id: Mapped[str] = mapped_column(Text, nullable=False)
     alert_type: Mapped[str] = mapped_column(Text, nullable=False)
     severity: Mapped[str] = mapped_column(Text, nullable=False)
@@ -796,6 +803,7 @@ class ClosureAlert(Base):
     geom: Mapped[Any | None] = mapped_column(
         Geometry("GEOMETRY", srid=4326, spatial_index=False), nullable=True
     )
+    is_regional: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     effective_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     effective_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     source_updated_at: Mapped[datetime | None] = mapped_column(
@@ -849,6 +857,7 @@ class FeedSyncStatus(Base):
     )
 
     feed_name: Mapped[str] = mapped_column(Text, primary_key=True)
+    dataset_key: Mapped[str] = mapped_column(Text, primary_key=True, server_default=text("'live'"))
     source_url: Mapped[str] = mapped_column(Text, nullable=False)
     sync_interval_s: Mapped[int] = mapped_column(Integer, nullable=False)
     stale_after_s: Mapped[int] = mapped_column(Integer, nullable=False)

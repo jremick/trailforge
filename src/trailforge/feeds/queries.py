@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import case, func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 
 from trailforge.db.models import (
     CAPADPark,
@@ -24,12 +24,15 @@ from trailforge.db.models import (
 from trailforge.feeds.base import (
     ALL_AU_STATES,
     ALL_FEED_REGISTRY,
+    FIXTURE_DATASET_KEY,
     ApiClosureTypeLiteral,
     ApiSeverityLiteral,
     FeedSourceLiteral,
     TrackClosureStatusLiteral,
     compute_feed_is_stale,
     get_feeds_for_states,
+    live_dataset_key,
+    live_feed_polling_enabled,
     map_alert_to_closure_type,
     map_db_to_api_severity,
     parse_state_filter,
@@ -49,7 +52,7 @@ _TRACK_STATUS_RANK: dict[TrackClosureStatusLiteral, int] = {
 }
 _RANK_GRADE: dict[int, str] = {1: "Easy", 2: "Medium", 3: "Hard", 4: "Extreme"}
 _HTML_BLOCK_BREAK_RE = re.compile(r"</(?:p|div|li|h[1-6]|tr)>|<br\s*/?>", re.IGNORECASE)
-_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_HTML_TAG_RE = re.compile(r"<[^<>]+>")
 _MULTI_BLANK_LINE_RE = re.compile(r"\n{3,}")
 _GENERIC_INCIDENT_TITLES = frozenset(
     {
@@ -192,15 +195,17 @@ def _build_feeds_health_rows(
     now: datetime,
 ) -> tuple[str, list[dict[str, Any]]]:
     rows = {
-        row.feed_name: row
+        (row.feed_name, row.dataset_key): row
         for row in session.execute(select(FeedSyncStatus)).scalars().all()
     }
-    counts_by_feed = {
-        feed: int(cnt)
-        for feed, cnt in session.execute(
-            select(ClosureAlert.source_feed, func.count(ClosureAlert.id))
+    feeds_with_live_history = {name for name, key in rows if key != FIXTURE_DATASET_KEY}
+    allow_fixture_health = not live_feed_polling_enabled()
+    counts_by_dataset = {
+        (feed, key): int(cnt)
+        for feed, key, cnt in session.execute(
+            select(ClosureAlert.source_feed, ClosureAlert.dataset_key, func.count(ClosureAlert.id))
             .where(ClosureAlert.status != "cleared")
-            .group_by(ClosureAlert.source_feed)
+            .group_by(ClosureAlert.source_feed, ClosureAlert.dataset_key)
         ).all()
     }
 
@@ -210,7 +215,11 @@ def _build_feeds_health_rows(
 
     for feed_source in feed_keys:
         meta = ALL_FEED_REGISTRY[feed_source]
-        row = rows.get(feed_source)
+        key = live_dataset_key(feed_source, meta.resolve_url())
+        row = rows.get((feed_source, key))
+        if row is None and allow_fixture_health and feed_source not in feeds_with_live_history:
+            row = rows.get((feed_source, FIXTURE_DATASET_KEY))
+        counts_key = (feed_source, row.dataset_key if row else key)
         is_stale = compute_feed_is_stale(row, now=now)
         status_str = row.last_status if row is not None else "never_run"
         if status_str in ("failed", "degraded"):
@@ -228,7 +237,7 @@ def _build_feeds_health_rows(
                 "last_attempt_at": _iso_or_none(row.last_attempt_at if row else None),
                 "last_success_at": _iso_or_none(row.last_success_at if row else None),
                 "consecutive_failures": int(row.consecutive_failures) if row else 0,
-                "record_count": counts_by_feed.get(feed_source, 0),
+                "record_count": counts_by_dataset.get(counts_key, 0),
                 "is_stale": is_stale,
                 "last_error": row.last_error if row else None,
                 "source_url": row.source_url if row else meta.resolve_url(),
@@ -280,17 +289,19 @@ def get_feed_health_summary(
     return payload
 
 
-def _stale_map_by_feed(
+def _stale_map_by_dataset(
     session: Session, *, now: datetime | None = None
-) -> dict[str, bool]:
+) -> dict[tuple[str, str], bool]:
     current = now or datetime.now(UTC)
-    rows = {
-        row.feed_name: row
-        for row in session.execute(select(FeedSyncStatus)).scalars().all()
+    configured_keys = {
+        feed_source: live_dataset_key(feed_source, meta.resolve_url())
+        for feed_source, meta in ALL_FEED_REGISTRY.items()
     }
     return {
-        feed_source: compute_feed_is_stale(rows.get(feed_source), now=current)
-        for feed_source in ALL_FEED_REGISTRY
+        (row.feed_name, row.dataset_key): row.dataset_key
+        not in (FIXTURE_DATASET_KEY, configured_keys.get(row.feed_name))
+        or compute_feed_is_stale(row, now=current)
+        for row in session.execute(select(FeedSyncStatus)).scalars()
     }
 
 
@@ -309,7 +320,7 @@ def list_closures(
     requested_states = parse_state_filter(state)
 
     # Always compute staleness across all 11 Pan-AU feeds so every alert gets exact is_stale
-    stale_by_feed = _stale_map_by_feed(session, now=current)
+    stale_by_dataset = _stale_map_by_dataset(session, now=current)
 
     # Include feeds for enabled states PLUS any explicitly requested extra state(s)
     feed_states = tuple(dict.fromkeys([*enabled_states, *requested_states]))
@@ -402,7 +413,7 @@ def list_closures(
                 "effective_to": _iso_or_none(alert.effective_to),
                 "source_url": alert.source_url,
                 "last_updated_at": _iso_or_none(last_updated),
-                "is_stale": stale_by_feed.get(alert.source_feed, False)
+                "is_stale": stale_by_dataset.get((alert.source_feed, alert.dataset_key), True)
                 or alert.status == "stale",
                 "affected_segment_ids": seg_links.get(alert.id, []),
                 "affected_track_ids": sorted(track_links.get(alert.id, set())),
@@ -432,7 +443,7 @@ def get_closures_geojson(
     """Build RFC 7946 FeatureCollection of affected track segments + incident/gate geometries."""
     current = now or datetime.now(UTC)
     requested_states = parse_state_filter(state)
-    stale_by_feed = _stale_map_by_feed(session, now=current)
+    stale_by_dataset = _stale_map_by_dataset(session, now=current)
     features: list[dict[str, Any]] = []
 
     # 1. Affected track segments (dashed red/amber overlay lines on the map).
@@ -466,6 +477,7 @@ def get_closures_geojson(
                 SegmentClosureLink.link_method,
                 ClosureAlert.id.label("closure_id"),
                 ClosureAlert.source_feed,
+                ClosureAlert.dataset_key,
                 ClosureAlert.alert_type,
                 ClosureAlert.severity,
                 ClosureAlert.status,
@@ -526,7 +538,7 @@ def get_closures_geojson(
                         "last_updated_at": _iso_or_none(
                             row.source_updated_at or row.last_seen_at
                         ),
-                        "is_stale": stale_by_feed.get(row.source_feed, False)
+                        "is_stale": stale_by_dataset.get((row.source_feed, row.dataset_key), True)
                         or row.status == "stale",
                         "track_id": row.track_id,
                         "track_name": row.track_name or row.seg_name,
@@ -589,7 +601,7 @@ def get_closures_geojson(
                     "effective_from": _iso_or_none(alert.effective_from),
                     "effective_to": _iso_or_none(alert.effective_to),
                     "last_updated_at": _iso_or_none(alert.source_updated_at or alert.last_seen_at),
-                    "is_stale": stale_by_feed.get(alert.source_feed, False)
+                    "is_stale": stale_by_dataset.get((alert.source_feed, alert.dataset_key), True)
                     or alert.status == "stale",
                     "capad_park_name": park_name,
                     "track_id": (alert.raw_payload or {}).get("track_id"),
@@ -627,7 +639,7 @@ def get_closure_detail(
         return None
 
     alert, park_name, geom_type, min_lon, min_lat, max_lon, max_lat = row
-    stale_by_feed = _stale_map_by_feed(session, now=current)
+    stale_by_dataset = _stale_map_by_dataset(session, now=current)
     resolved_feed = resolve_feed_source(alert.source_feed)
     meta = ALL_FEED_REGISTRY.get(resolved_feed) if resolved_feed else None
     closure_type = map_alert_to_closure_type(
@@ -726,7 +738,8 @@ def get_closure_detail(
         "effective_to": _iso_or_none(alert.effective_to),
         "source_url": sanitize_source_url(alert.source_url),
         "last_updated_at": _iso_or_none(alert.source_updated_at or alert.last_seen_at),
-        "is_stale": stale_by_feed.get(alert.source_feed, False) or alert.status == "stale",
+        "is_stale": stale_by_dataset.get((alert.source_feed, alert.dataset_key), True)
+        or alert.status == "stale",
         "capad_park_name": park_name,
         "geometry_type": str(geom_type).removeprefix("ST_") if geom_type else None,
         "bbox": bbox,
@@ -742,6 +755,7 @@ def get_closures_for_track_ids(
     track_ids: Sequence[str],
     *,
     now: datetime | None = None,
+    max_results: int | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Return closure status rollup + active closure summaries keyed by ``track_id``.
 
@@ -755,31 +769,43 @@ def get_closures_for_track_ids(
     if not unique_ids:
         return result
 
-    stale_by_feed = _stale_map_by_feed(session, now=now)
-
-    rows = session.execute(
-        select(
-            TrackSegment.track_id,
-            ClosureAlert,
-            CAPADPark.name.label("park_name"),
-        )
+    selected_segments = (
+        TrackSegment.track_id.in_(unique_ids), TrackSegment.is_active.is_(True)
+    )
+    linked = (
+        select(TrackSegment.track_id, SegmentClosureLink.closure_id)
+        .select_from(TrackSegment)
         .join(SegmentClosureLink, TrackSegment.segment_id == SegmentClosureLink.segment_id)
         .join(ClosureAlert, SegmentClosureLink.closure_id == ClosureAlert.id)
-        .outerjoin(CAPADPark, ClosureAlert.capad_park_id == CAPADPark.id)
+        .where(*selected_segments, ClosureAlert.status != "cleared")
+    )
+    regional = (
+        select(TrackSegment.track_id, ClosureAlert.id.label("closure_id"))
+        .select_from(TrackSegment)
+        .join(ClosureAlert, func.ST_Intersects(ClosureAlert.geom, TrackSegment.geom))
         .where(
-            TrackSegment.track_id.in_(unique_ids),
-            TrackSegment.is_active.is_(True),
+            *selected_segments,
+            ClosureAlert.is_regional.is_(True),
             ClosureAlert.status != "cleared",
         )
-        .order_by(ClosureAlert.id.asc())
+    )
+    pairs = linked.union(regional).subquery()
+    if max_results is not None:
+        pairs = select(pairs).limit(max_results + 1).subquery()
+
+    rows = session.execute(
+        select(pairs.c.track_id, ClosureAlert, CAPADPark.name.label("park_name"))
+        .select_from(pairs)
+        .join(ClosureAlert, ClosureAlert.id == pairs.c.closure_id)
+        .outerjoin(CAPADPark, ClosureAlert.capad_park_id == CAPADPark.id)
+        .options(defer(ClosureAlert.geom))
+        .order_by(ClosureAlert.id.asc(), pairs.c.track_id.asc())
     ).all()
+    if max_results is not None and len(rows) > max_results:
+        raise ValueError("Route has too many closure alerts to analyze. Split the route and retry.")
 
-    seen_pairs: set[tuple[str, int]] = set()
+    stale_by_dataset = _stale_map_by_dataset(session, now=now)
     for tid, alert, park_name in rows:
-        if not tid or (tid, alert.id) in seen_pairs:
-            continue
-        seen_pairs.add((tid, alert.id))
-
         meta = ALL_FEED_REGISTRY.get(alert.source_feed)  # type: ignore[arg-type]
         closure_type = map_alert_to_closure_type(
             alert.alert_type,
@@ -809,7 +835,7 @@ def get_closures_for_track_ids(
                 "effective_to": _iso_or_none(alert.effective_to),
                 "source_url": alert.source_url,
                 "last_updated_at": _iso_or_none(alert.source_updated_at or alert.last_seen_at),
-                "is_stale": stale_by_feed.get(alert.source_feed, False)
+                "is_stale": stale_by_dataset.get((alert.source_feed, alert.dataset_key), True)
                 or alert.status == "stale",
                 "capad_park_name": park_name,
                 "description": alert.description,

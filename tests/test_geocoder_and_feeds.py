@@ -82,6 +82,56 @@ def test_http_feed_adapter_still_enforces_max_bytes_on_gzip_stream() -> None:
         client.close()
 
 
+def test_http_feed_adapter_bounds_and_validates_streamed_gzip() -> None:
+    payload = json.dumps({"description": "Alpine tracks temporarily closed. " * 16}).encode()
+    compressed = gzip.compress(payload)
+
+    class FeedBody(httpx.SyncByteStream):
+        body = compressed
+
+        def __iter__(self):
+            yield self.body[:20]
+            yield self.body[20:]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"Content-Encoding": "gzip"}, stream=FeedBody())
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        adapter = VicEmergencyAdapter(client=client)
+        assert adapter._http_get(max_bytes=len(payload)).content == payload
+        with pytest.raises(ValueError, match="byte limit"):
+            adapter._http_get(max_bytes=len(payload) - 1)
+        FeedBody.body = compressed[:-4]
+        with pytest.raises(ValueError, match="Incomplete upstream gzip feed"):
+            adapter._http_get(max_bytes=len(payload))
+
+        # RFC 1952 multi-member gzip and x-gzip stay bounded and decode cleanly
+        multi = gzip.compress(payload[:40]) + gzip.compress(payload[40:])
+        FeedBody.body = multi
+        assert adapter._http_get(max_bytes=len(payload)).content == payload
+        with pytest.raises(ValueError, match="byte limit"):
+            adapter._http_get(max_bytes=len(payload) - 1)
+        FeedBody.body = compressed + b"not-gzip"
+        with pytest.raises(ValueError, match="Invalid upstream gzip feed"):
+            adapter._http_get(max_bytes=len(payload) + 32)
+
+
+def test_http_feed_adapter_follows_redirect_without_reading_intermediate_body() -> None:
+    class RedirectBody(httpx.SyncByteStream):
+        def __iter__(self):
+            pytest.fail("Feed reader must only stream the final response")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/previous.json":
+            return httpx.Response(302, headers={"Location": "/current.json"}, stream=RedirectBody())
+        assert request.url.path == "/current.json"
+        return httpx.Response(200, json=[])
+
+    with httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True) as client:
+        adapter = VicEmergencyAdapter(client=client, source_url="https://fixture.test/previous.json")
+        assert adapter._fetch_json() == []
+
+
 def test_au_geocoder_parses_nominatim_bbox_state_and_caches() -> None:
     """Nominatim fallback converts [s,n,w,e] -> [w,s,e,n], normalizes VIC, and caches hits."""
     reset_geocoder_cache()

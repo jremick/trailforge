@@ -27,6 +27,7 @@ from trailforge.feeds.base import (
     FeedSourceLiteral,
     NormalizedClosure,
     StateLiteral,
+    check_feed_record_count,
     normalize_alert_type,
     normalize_db_severity,
     normalize_geojson_geometry,
@@ -34,6 +35,7 @@ from trailforge.feeds.base import (
     normalize_status,
     parse_iso_datetime,
     parse_safe_xml,
+    reject_partial_feed_snapshot,
     sanitize_source_url,
     strip_html,
 )
@@ -150,6 +152,7 @@ def _extract_feature_collection_geometry(fc: Any) -> dict[str, Any] | None:
     """Extract highest-dimensional valid GeoJSON geometry from a FeatureCollection."""
     if not isinstance(fc, Mapping) or not isinstance(fc.get("features"), list):
         return None
+    check_feed_record_count(len(fc["features"]))
     rank = {
         "MultiPolygon": 5,
         "Polygon": 4,
@@ -278,6 +281,7 @@ def _parse_cap_au_xml(root: ET.Element, *, default_url: str) -> list[dict[str, A
                 alert_nodes.append(node)
 
     items: list[dict[str, Any]] = []
+    record_count = 0
     for alert_el in alert_nodes:
         ident = ""
         sent = ""
@@ -295,6 +299,8 @@ def _parse_cap_au_xml(root: ET.Element, *, default_url: str) -> list[dict[str, A
                 info_nodes.append(child)
 
         for idx, info_el in enumerate(info_nodes):
+            record_count += 1
+            check_feed_record_count(record_count)
             fields: dict[str, str] = {}
             geom: dict[str, Any] | None = None
             area_descs: list[str] = []
@@ -361,6 +367,7 @@ def _parse_rss_or_atom_xml(root: ET.Element, *, default_url: str) -> list[dict[s
     entry_nodes = [
         node for node in root.iter() if _xml_local_name(node.tag) in ("item", "entry")
     ]
+    check_feed_record_count(len(entry_nodes))
     for node in entry_nodes:
         title = ""
         guid = ""
@@ -440,7 +447,9 @@ def _parse_xml_feed(xml_text: str, *, default_url: str) -> list[dict[str, Any]]:
         cap_items = _parse_cap_au_xml(root, default_url=default_url)
         if cap_items:
             return cap_items
-    return _parse_rss_or_atom_xml(root, default_url=default_url)
+    if lname in ("rss", "feed", "rdf"):
+        return _parse_rss_or_atom_xml(root, default_url=default_url)
+    raise ValueError("Unexpected XML feed payload format")
 
 
 class _PanAUFeedAdapter(BaseHttpFeedAdapter):
@@ -476,9 +485,14 @@ class _PanAUFeedAdapter(BaseHttpFeedAdapter):
         return resp.json()
 
     def _extract_raw_items(self, payload: Any) -> list[Mapping[str, Any]]:
+        reject_partial_feed_snapshot(payload)
         if isinstance(payload, list):
+            check_feed_record_count(len(payload))
             return [x for x in payload if isinstance(x, Mapping)]
         if isinstance(payload, Mapping):
+            items: list[Mapping[str, Any]] = []
+            record_count = 0
+            found_collection = False
             for key in (
                 "features",
                 "alerts",
@@ -491,16 +505,18 @@ class _PanAUFeedAdapter(BaseHttpFeedAdapter):
                 "response",
             ):
                 val = payload.get(key)
+                if isinstance(val, Mapping) and key in (
+                    "warnings", "incidents", "alerts", "features"
+                ):
+                    reject_partial_feed_snapshot(val)
+                    val = val.get("features")
                 if isinstance(val, list):
-                    return [x for x in val if isinstance(x, Mapping)]
-            # Combined Emergency WA / multi-key envelopes
-            combined: list[Mapping[str, Any]] = []
-            for key in ("warnings", "incidents", "alerts", "features"):
-                val = payload.get(key)
-                if isinstance(val, Mapping) and isinstance(val.get("features"), list):
-                    combined.extend(x for x in val["features"] if isinstance(x, Mapping))
-            if combined:
-                return combined
+                    found_collection = True
+                    record_count += len(val)
+                    check_feed_record_count(record_count)
+                    items.extend(x for x in val if isinstance(x, Mapping))
+            if found_collection:
+                return items
         raise ValueError(f"Unexpected {self.feed_source} payload format")
 
     def _is_relevant(self, props: Mapping[str, Any], title: str, desc: str | None) -> bool:
@@ -730,6 +746,7 @@ class _PanAUFeedAdapter(BaseHttpFeedAdapter):
     def fetch(self, *, session: Session | None = None) -> list[NormalizedClosure]:
         if self._fixture_items is not None:
             raw_items: list[Mapping[str, Any]] = self._fixture_items
+            check_feed_record_count(len(raw_items))
         else:
             payload = self._fetch_raw_payload()
             raw_items = self._extract_raw_items(payload)
