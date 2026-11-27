@@ -40,6 +40,7 @@ export { sanitizeReportPhotoUrl };
 import type {
   BasemapId,
   BBoxTuple,
+  ClosureItem,
   ConditionReportCreateInput,
   ConditionReportType,
   PoiItem,
@@ -71,6 +72,7 @@ export interface TrackInspectorCallbacks {
   onZoomToTrack: (bbox: BBoxTuple) => void;
   onPoiSelect: (poi: PoiItem) => void;
   onHotspotSelect?: (lat: number, lon: number, label: string) => void;
+  onOpenClosure?: (closure: ClosureItem) => void;
   onOpenRigPanel: () => void;
   onRequireSignIn: () => void;
   onToggleFavorite: (trackId: string, currentlyFavorite: boolean) => void;
@@ -359,7 +361,7 @@ export class TrackInspectorDrawer {
             </div>
             <div class="tf-card-stack">
               ${activeClosures
-                .map((c) => {
+                .map((c, closureIdx) => {
                   const tone = getClosureTone(c.closure_type, c.severity);
                   const typeLabel = formatClosureTypeLabel(c.closure_type);
                   const dateSpan = formatClosureDateRange(
@@ -371,6 +373,9 @@ export class TrackInspectorDrawer {
                     c.source_url && /^https?:\/\//i.test(c.source_url)
                       ? c.source_url
                       : null;
+                  const hasClosureId =
+                    (c.closure_id !== undefined && c.closure_id !== null) ||
+                    (c.id !== undefined && c.id !== null);
                   return `
                     <div class="tf-closure-card tone-${tone}">
                       <div class="tf-closure-top">
@@ -392,11 +397,18 @@ export class TrackInspectorDrawer {
                         ${dateSpan ? `<span>· ${escapeHtml(dateSpan)}</span>` : ""}
                         ${c.last_updated_at ? `<span>· Updated ${escapeHtml(updatedAgo)}</span>` : ""}
                       </div>
-                      ${
-                        safeUrl
-                          ? `<a class="tf-closure-link" href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">Official Agency Source ↗</a>`
-                          : ""
-                      }
+                      <div class="tf-closure-card-actions">
+                        ${
+                          hasClosureId
+                            ? `<button type="button" class="tf-mini-btn" data-open-closure-idx="${closureIdx}">Full Incident Details →</button>`
+                            : ""
+                        }
+                        ${
+                          safeUrl
+                            ? `<a class="tf-closure-link" href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">Official Agency Source ↗</a>`
+                            : ""
+                        }
+                      </div>
                     </div>
                   `;
                 })
@@ -1210,6 +1222,16 @@ export class TrackInspectorDrawer {
               `${norm.name} obstacle hotspot`
             );
           }
+        });
+      });
+
+    this.root
+      .querySelectorAll<HTMLButtonElement>("[data-open-closure-idx]")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const idx = Number(btn.dataset.openClosureIdx);
+          const item = activeClosures[idx];
+          if (item) this.callbacks.onOpenClosure?.(item);
         });
       });
 

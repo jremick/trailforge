@@ -67,7 +67,7 @@ from trailforge.db.models_ai_auth import (
 from trailforge.db.session import get_db
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-MIGRATION_0006_PATH = REPO_ROOT / "migrations" / "versions" / "0006_ai_mcp_auth.py"
+MIGRATION_0007_PATH = REPO_ROOT / "migrations" / "versions" / "0007_ai_mcp_auth.py"
 
 _CSRF_INPUT_RE = re.compile(r'name="csrf_token"\s+value="([^"]+)"')
 
@@ -91,6 +91,7 @@ def _create_sqlite_ai_auth_schema(engine: Engine) -> None:
             token_version INTEGER NOT NULL DEFAULT 1,
             disabled_at DATETIME,
             invited_by_code VARCHAR(64),
+            ui_preferences JSON NOT NULL DEFAULT '{}',
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
@@ -297,14 +298,14 @@ def _extract_csrf(html_body: str) -> str:
 
 
 def test_migration_0006_and_tier_c_orm_invariants() -> None:
-    assert MIGRATION_0006_PATH.exists()
-    spec = importlib.util.spec_from_file_location("migration_0006", MIGRATION_0006_PATH)
+    assert MIGRATION_0007_PATH.exists()
+    spec = importlib.util.spec_from_file_location("migration_0007", MIGRATION_0007_PATH)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
-    assert mod.revision == "0006_ai_mcp_auth"
-    assert mod.down_revision == "0005_user_token_version"
+    assert mod.revision == "0007_ai_mcp_auth"
+    assert mod.down_revision == "0006_ui_preferences_and_settings"
     assert callable(mod.upgrade)
     assert callable(mod.downgrade)
 

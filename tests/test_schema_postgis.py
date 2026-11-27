@@ -1,4 +1,4 @@
-"""Offline PostGIS integration tests verifying 34 tables, 21 GIST indexes, ODbL & privacy rules."""
+"""Offline PostGIS integration tests verifying 35 tables, 21 GIST indexes, ODbL & privacy rules."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ EXPECTED_TABLES = frozenset(
         "track_segments",
         "segment_reconciliation_log",
         "pois",
-        # Tier C — Independent TrailForge intelligence, community & AI/access-control tables (22)
+        # Tier C — Independent TrailForge intelligence, community, UI & AI/auth tables (23)
         "track_segment_grades",
         "closures_alerts",
         "segment_closure_links",
@@ -43,6 +43,7 @@ EXPECTED_TABLES = frozenset(
         "oauth_clients",
         "oauth_authorization_codes",
         "oauth_tokens",
+        "instance_ui_settings",
         "vehicle_profiles",
         "user_favorites",
         "user_pins",
@@ -90,7 +91,7 @@ def test_postgis_health_and_schema_revision(postgis_engine: Engine) -> None:
     assert status.db_ok is True
     assert status.postgis_version is not None
     assert status.postgis_version.startswith("3.")
-    assert status.schema_revision == "0007_perf_and_security_indexes"
+    assert status.schema_revision == "0008_perf_and_security_indexes"
 
 
 @pytest.mark.integration
@@ -105,12 +106,12 @@ def test_fastapi_health_against_live_postgis(postgis_engine: Engine) -> None:
     body = resp.json()
     assert body["status"] == "ok"
     assert body["db_ok"] is True
-    assert body["schema_revision"] == "0007_perf_and_security_indexes"
+    assert body["schema_revision"] == "0008_perf_and_security_indexes"
 
 
 @pytest.mark.integration
-def test_all_34_tables_and_21_gist_indexes_exist(postgis_engine: Engine) -> None:
-    assert len(EXPECTED_TABLES) == 34
+def test_all_35_tables_and_21_gist_indexes_exist(postgis_engine: Engine) -> None:
+    assert len(EXPECTED_TABLES) == 35
     assert len(EXPECTED_GIST_INDEXES) == 21
     inspector = inspect(postgis_engine)
     tables = set(inspector.get_table_names(schema="public"))
@@ -177,6 +178,7 @@ def test_odbl_and_privacy_column_invariants(postgis_engine: Engine) -> None:
         "oauth_clients",
         "oauth_authorization_codes",
         "oauth_tokens",
+        "instance_ui_settings",
     )
     for table_name in tier_c_tables:
         cols = {col["name"] for col in inspector.get_columns(table_name)}
@@ -190,6 +192,7 @@ def test_odbl_and_privacy_column_invariants(postgis_engine: Engine) -> None:
         "oauth_clients",
         "oauth_authorization_codes",
         "oauth_tokens",
+        "instance_ui_settings",
     ):
         non_spatial_cols = {col["name"] for col in inspector.get_columns(non_spatial_table)}
         assert "geom" not in non_spatial_cols

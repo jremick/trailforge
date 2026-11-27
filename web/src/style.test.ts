@@ -8,10 +8,12 @@ import {
   snapSnowlineBand,
 } from "./presets";
 import {
+  SELECTED_CLOSURE_OUTLINE_LAYER_ID,
   SELECTED_TRACK_LAYER_IDS,
   SELECTED_TRACK_STEEP_LAYER_ID,
   buildOfflineGraticuleGeoJson,
   buildRegionalBoundsGeoJson,
+  buildSelectedClosureFilter,
   buildSnowlineFilter,
   buildTrailForgeStyle,
   getTrackSelectionOpacities,
@@ -174,6 +176,15 @@ describe("MapLibre 5 PMTiles & offline fallback style builder", () => {
       source: "tf-closures",
       layout: { visibility: "visible" },
     });
+    expect(byId.get(SELECTED_CLOSURE_OUTLINE_LAYER_ID)).toMatchObject({
+      source: "tf-closures",
+      layout: { visibility: "visible" },
+    });
+    expect(buildSelectedClosureFilter(42)).toEqual([
+      "all",
+      ["in", ["geometry-type"], ["literal", ["Polygon", "LineString"]]],
+      ["==", ["to-string", ["coalesce", ["get", "closure_id"], ""]], "42"],
+    ]);
     // Slice 06 unmapped spurs (hidden by default) & Slice 08 reports/gate warnings
     expect(byId.get("tf-unmapped-line")).toMatchObject({
       source: "tf-unmapped",

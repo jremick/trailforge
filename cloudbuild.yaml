@@ -24,6 +24,7 @@ steps:
         docker pull "$${CACHE_IMG}" || true
         docker build \
           --build-arg BUILDKIT_INLINE_CACHE=1 \
+          --build-arg INSTALL_DEV=true \
           --cache-from "$${CACHE_IMG}" \
           -t "trailforge-backend:ci-${BUILD_ID}" \
           -t "$${CACHE_IMG}" \

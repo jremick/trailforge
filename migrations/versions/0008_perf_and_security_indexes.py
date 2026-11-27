@@ -1,7 +1,7 @@
 """Add hotspot column, pg_trgm/report/admin indexes, OAuth code family link, and drop redundant indexes.
 
-Revision ID: 0007_perf_and_security_indexes
-Revises: 0006_ai_mcp_auth
+Revision ID: 0008_perf_and_security_indexes
+Revises: 0007_ai_mcp_auth
 Create Date: 2026-11-27 09:45:00.000000
 """
 
@@ -14,8 +14,8 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
-revision: str = "0007_perf_and_security_indexes"
-down_revision: str | Sequence[str] | None = "0006_ai_mcp_auth"
+revision: str = "0008_perf_and_security_indexes"
+down_revision: str | Sequence[str] | None = "0007_ai_mcp_auth"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

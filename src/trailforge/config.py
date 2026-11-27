@@ -149,6 +149,18 @@ class Settings(BaseSettings):
         ),
         description="Optional public info banner text displayed in the web UI.",
     )
+    show_stack_telemetry_public: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "TRAILFORGE_SHOW_STACK_TELEMETRY_PUBLIC",
+            "SHOW_STACK_TELEMETRY_PUBLIC",
+            "show_stack_telemetry_public",
+        ),
+        description=(
+            "Show the sidebar Stack & Offline Telemetry section to anonymous visitors "
+            "(always visible to signed-in members and admins)."
+        ),
+    )
 
     # Optional Australian place-name geocoder fallback for /api/search (Nominatim AU)
     enable_geocoder: bool = Field(

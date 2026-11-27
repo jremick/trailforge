@@ -328,6 +328,7 @@ def test_sec_h4_and_m3_no_scrypt_on_rejected_register_and_no_admin_bypass(
                     token_version INTEGER NOT NULL DEFAULT 1,
                     disabled_at DATETIME,
                     invited_by_code VARCHAR(64),
+                    ui_preferences JSON NOT NULL DEFAULT '{}',
                     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
@@ -413,6 +414,7 @@ def test_sec_h5_and_m2_oauth_login_nonce_cookie_and_strict_json_types() -> None:
                 token_version INTEGER NOT NULL DEFAULT 1,
                 disabled_at DATETIME,
                 invited_by_code VARCHAR(64),
+                ui_preferences JSON NOT NULL DEFAULT '{}',
                 created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
@@ -718,6 +720,7 @@ def test_cli_create_admin_password_stdin(
                     token_version INTEGER NOT NULL DEFAULT 1,
                     disabled_at DATETIME,
                     invited_by_code VARCHAR(64),
+                    ui_preferences JSON NOT NULL DEFAULT '{}',
                     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )

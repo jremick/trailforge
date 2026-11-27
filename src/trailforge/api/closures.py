@@ -15,6 +15,7 @@ from trailforge.db.models import User
 from trailforge.db.session import get_db
 from trailforge.feeds.adapters import build_default_adapters
 from trailforge.feeds.queries import (
+    get_closure_detail,
     get_closures_geojson,
     get_feed_health_summary,
     list_closures,
@@ -142,6 +143,21 @@ def get_closures_status(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
         ) from exc
+
+
+@router.get("/{closure_id}")
+def get_single_closure_detail(
+    closure_id: int,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Return full details, metadata, bbox, and affected tracks for a single closure/incident."""
+    detail = get_closure_detail(db, closure_id)
+    if detail is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Closure or incident not found",
+        )
+    return detail
 
 
 @router.post("/sync", response_model=SyncRunSummary)

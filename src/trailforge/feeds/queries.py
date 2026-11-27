@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import html
 import json
-from collections.abc import Sequence
+import re
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from trailforge.db.models import (
@@ -17,6 +19,7 @@ from trailforge.db.models import (
     SegmentClosureLink,
     Track,
     TrackSegment,
+    TrackSegmentGrade,
 )
 from trailforge.feeds.base import (
     ALL_AU_STATES,
@@ -32,6 +35,8 @@ from trailforge.feeds.base import (
     parse_state_filter,
     resolve_enabled_states,
     resolve_feed_source,
+    sanitize_source_url,
+    strip_html,
 )
 
 _TRACK_STATUS_RANK: dict[TrackClosureStatusLiteral, int] = {
@@ -42,6 +47,121 @@ _TRACK_STATUS_RANK: dict[TrackClosureStatusLiteral, int] = {
     "seasonal": 4,
     "closed": 5,
 }
+_RANK_GRADE: dict[int, str] = {1: "Easy", 2: "Medium", 3: "Hard", 4: "Extreme"}
+_HTML_BLOCK_BREAK_RE = re.compile(r"</(?:p|div|li|h[1-6]|tr)>|<br\s*/?>", re.IGNORECASE)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_MULTI_BLANK_LINE_RE = re.compile(r"\n{3,}")
+_GENERIC_INCIDENT_TITLES = frozenset(
+    {
+        "advice",
+        "watch and act",
+        "emergency warning",
+        "community information",
+        "warning",
+        "incident",
+        "alert",
+    }
+)
+
+
+def clean_closure_text(raw: str | None) -> str | None:
+    """Decode HTML entities and strip markup while preserving paragraph line breaks."""
+    if not raw or not isinstance(raw, str):
+        return None
+    text_val = raw.strip()
+    if not text_val:
+        return None
+    if "<" not in text_val and "&" not in text_val:
+        return text_val
+    unescaped = html.unescape(text_val)
+    with_breaks = _HTML_BLOCK_BREAK_RE.sub("\n", unescaped)
+    stripped = _HTML_TAG_RE.sub(" ", with_breaks)
+    lines = [" ".join(line.split()) for line in stripped.splitlines()]
+    cleaned = "\n".join(lines).strip()
+    cleaned = _MULTI_BLANK_LINE_RE.sub("\n\n", cleaned)
+    return cleaned or None
+
+
+def _pick_payload_text(payload: Mapping[str, Any], *keys: str) -> str | None:
+    if not payload:
+        return None
+    lowered = {str(k).lower(): v for k, v in payload.items()}
+    for key in keys:
+        val = lowered.get(key.lower())
+        if val is None or isinstance(val, (dict, list, bool)):
+            continue
+        cleaned = strip_html(str(val))
+        if cleaned:
+            return cleaned
+    return None
+
+
+def extract_incident_details(
+    raw_payload: Mapping[str, Any] | None,
+    *,
+    title: str = "",
+) -> dict[str, str]:
+    """Extract clean, human-readable incident metadata from upstream feed ``raw_payload``."""
+    if not isinstance(raw_payload, Mapping) or not raw_payload:
+        return {}
+
+    title_norm = title.strip().lower()
+    details: dict[str, str] = {}
+
+    headline = _pick_payload_text(raw_payload, "webHeadline", "headline", "sourceTitle")
+    if headline and headline.lower() != title_norm:
+        details["headline"] = headline
+
+    location = _pick_payload_text(raw_payload, "location", "name", "road_name", "ezi_road_name")
+    if location and location.lower() != title_norm:
+        details["location"] = location
+
+    category_parts: list[str] = []
+    for key in ("category1", "category2", "type", "alertType"):
+        part = _pick_payload_text(raw_payload, key)
+        if part and part.lower() not in {p.lower() for p in category_parts}:
+            category_parts.append(part)
+    if category_parts:
+        details["category"] = " · ".join(category_parts)
+
+    alert_level = _pick_payload_text(raw_payload, "category", "feedType", "cap_severity")
+    if alert_level and alert_level.lower() != title_norm:
+        details["alert_level"] = alert_level
+
+    incident_status = _pick_payload_text(raw_payload, "incidentStatus", "status")
+    if incident_status:
+        details["incident_status"] = incident_status
+
+    size = _pick_payload_text(raw_payload, "sizeFmt", "size")
+    if size:
+        details["size"] = size
+
+    resources = _pick_payload_text(raw_payload, "resources", "appliances", "vehicles")
+    if resources:
+        details["resources"] = resources
+
+    council = _pick_payload_text(raw_payload, "councilArea", "council", "municipality")
+    if council:
+        details["council_area"] = council
+
+    responsible = _pick_payload_text(raw_payload, "responsibleAgency", "sourceOrg")
+    if responsible:
+        details["responsible_agency"] = responsible
+
+    return details
+
+
+def extract_closure_subtitle(
+    title: str,
+    raw_payload: Mapping[str, Any] | None,
+) -> str | None:
+    """Derive a concise secondary line for generic alert titles (e.g. VicEmergency 'Advice')."""
+    details = extract_incident_details(raw_payload, title=title)
+    if title.strip().lower() in _GENERIC_INCIDENT_TITLES:
+        for key in ("headline", "location", "category"):
+            if key in details:
+                return details[key]
+    return details.get("location") or details.get("headline") or None
 
 
 def _iso_or_none(dt: datetime | None) -> str | None:
@@ -418,7 +538,12 @@ def get_closures_geojson(
 
     # 2. Alert polygons & point markers (incident perimeters, gate markers, etc.)
     alert_stmt = (
-        select(ClosureAlert, func.ST_AsGeoJSON(ClosureAlert.geom).label("geom_json"))
+        select(
+            ClosureAlert,
+            func.ST_AsGeoJSON(ClosureAlert.geom).label("geom_json"),
+            CAPADPark.name.label("park_name"),
+        )
+        .outerjoin(CAPADPark, ClosureAlert.capad_park_id == CAPADPark.id)
         .where(ClosureAlert.geom.is_not(None))
         .order_by(ClosureAlert.id.asc())
     )
@@ -427,7 +552,7 @@ def get_closures_geojson(
     if requested_states and set(requested_states) != set(ALL_AU_STATES):
         alert_stmt = alert_stmt.where(ClosureAlert.state.in_(requested_states))
 
-    for alert, geom_json in session.execute(alert_stmt).all():
+    for alert, geom_json, park_name in session.execute(alert_stmt).all():
         geom_obj = json.loads(geom_json)
         if geom_obj.get("type") not in ("Point", "Polygon", "MultiPolygon"):
             continue
@@ -440,6 +565,8 @@ def get_closures_geojson(
             capad_park_id=alert.capad_park_id,
         )
         api_sev = map_db_to_api_severity(alert.severity)
+        subtitle = extract_closure_subtitle(alert.title, alert.raw_payload)
+        cleaned_desc = clean_closure_text(alert.description)
         features.append(
             {
                 "type": "Feature",
@@ -449,19 +576,22 @@ def get_closures_geojson(
                     "feature_kind": "alert_geometry",
                     "closure_id": alert.id,
                     "feed_source": alert.source_feed,
+                    "feed_display_name": meta.display_name if meta else alert.source_feed,
                     "closure_type": closure_type,
                     "severity": api_sev,
                     "status": alert.status,
                     "state": alert.state,
                     "title": alert.title,
-                    "description": alert.description,
+                    "subtitle": subtitle,
+                    "description": cleaned_desc,
                     "agency": meta.agency if meta else alert.source_feed,
-                    "source_url": alert.source_url,
+                    "source_url": sanitize_source_url(alert.source_url),
                     "effective_from": _iso_or_none(alert.effective_from),
                     "effective_to": _iso_or_none(alert.effective_to),
                     "last_updated_at": _iso_or_none(alert.source_updated_at or alert.last_seen_at),
                     "is_stale": stale_by_feed.get(alert.source_feed, False)
                     or alert.status == "stale",
+                    "capad_park_name": park_name,
                     "track_id": (alert.raw_payload or {}).get("track_id"),
                     "segment_id": None,
                 },
@@ -469,6 +599,142 @@ def get_closures_geojson(
         )
 
     return {"type": "FeatureCollection", "features": features}
+
+
+def get_closure_detail(
+    session: Session,
+    closure_id: int,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Return full details, bounding box, metadata, and affected tracks for a single alert."""
+    current = now or datetime.now(UTC)
+    row = session.execute(
+        select(
+            ClosureAlert,
+            CAPADPark.name.label("park_name"),
+            func.ST_GeometryType(ClosureAlert.geom).label("geom_type"),
+            func.ST_XMin(ClosureAlert.geom).label("min_lon"),
+            func.ST_YMin(ClosureAlert.geom).label("min_lat"),
+            func.ST_XMax(ClosureAlert.geom).label("max_lon"),
+            func.ST_YMax(ClosureAlert.geom).label("max_lat"),
+        )
+        .outerjoin(CAPADPark, ClosureAlert.capad_park_id == CAPADPark.id)
+        .where(ClosureAlert.id == closure_id)
+        .limit(1)
+    ).first()
+    if row is None:
+        return None
+
+    alert, park_name, geom_type, min_lon, min_lat, max_lon, max_lat = row
+    stale_by_feed = _stale_map_by_feed(session, now=current)
+    resolved_feed = resolve_feed_source(alert.source_feed)
+    meta = ALL_FEED_REGISTRY.get(resolved_feed) if resolved_feed else None
+    closure_type = map_alert_to_closure_type(
+        alert.alert_type,
+        source_feed=alert.source_feed,
+        title=alert.title,
+        raw_payload=alert.raw_payload,
+        capad_park_id=alert.capad_park_id,
+    )
+    api_sev = map_db_to_api_severity(alert.severity)
+
+    affected_segment_count = int(
+        session.execute(
+            select(func.count(SegmentClosureLink.segment_id)).where(
+                SegmentClosureLink.closure_id == alert.id
+            )
+        ).scalar_one()
+    )
+
+    grade_rank_expr = case(
+        (TrackSegmentGrade.effective_grade == "Easy", 1),
+        (TrackSegmentGrade.effective_grade == "Medium", 2),
+        (TrackSegmentGrade.effective_grade == "Hard", 3),
+        (TrackSegmentGrade.effective_grade == "Extreme", 4),
+        else_=0,
+    )
+    track_rows = session.execute(
+        select(
+            Track.track_id,
+            Track.name,
+            Track.state,
+            Track.total_length_m,
+            func.coalesce(func.max(grade_rank_expr), 0).label("worst_rank"),
+        )
+        .join(TrackSegment, TrackSegment.track_id == Track.track_id)
+        .join(SegmentClosureLink, SegmentClosureLink.segment_id == TrackSegment.segment_id)
+        .outerjoin(TrackSegmentGrade, TrackSegmentGrade.segment_id == TrackSegment.segment_id)
+        .where(
+            SegmentClosureLink.closure_id == alert.id,
+            Track.is_active.is_(True),
+            TrackSegment.is_active.is_(True),
+        )
+        .group_by(Track.track_id, Track.name, Track.state, Track.total_length_m)
+        .order_by(Track.name.asc())
+        .limit(25)
+    ).all()
+
+    affected_tracks = [
+        {
+            "track_id": tid,
+            "name": tname,
+            "state": tstate,
+            "grade": _RANK_GRADE.get(int(wrank)) if int(wrank or 0) > 0 else None,
+            "total_length_m": float(tlen or 0.0),
+        }
+        for tid, tname, tstate, tlen, wrank in track_rows
+    ]
+
+    bbox: list[float] | None = None
+    if (
+        min_lon is not None
+        and min_lat is not None
+        and max_lon is not None
+        and max_lat is not None
+    ):
+        bbox = [
+            round(float(min_lon), 6),
+            round(float(min_lat), 6),
+            round(float(max_lon), 6),
+            round(float(max_lat), 6),
+        ]
+
+    incident_details = extract_incident_details(alert.raw_payload, title=alert.title)
+    subtitle = extract_closure_subtitle(alert.title, alert.raw_payload)
+    description = clean_closure_text(alert.description)
+    if not description:
+        raw_body = _pick_payload_text(alert.raw_payload or {}, "webBody", "text", "body", "details")
+        description = clean_closure_text(raw_body)
+
+    return {
+        "closure_id": alert.id,
+        "feed_source": alert.source_feed,
+        "feed_display_name": meta.display_name if meta else alert.source_feed,
+        "agency": meta.agency if meta else alert.source_feed,
+        "external_id": alert.external_id,
+        "title": alert.title,
+        "subtitle": subtitle,
+        "description": description,
+        "closure_type": closure_type,
+        "alert_type": alert.alert_type,
+        "severity": api_sev,
+        "raw_severity": alert.severity,
+        "status": alert.status,
+        "state": alert.state,
+        "effective_from": _iso_or_none(alert.effective_from),
+        "effective_to": _iso_or_none(alert.effective_to),
+        "source_url": sanitize_source_url(alert.source_url),
+        "last_updated_at": _iso_or_none(alert.source_updated_at or alert.last_seen_at),
+        "is_stale": stale_by_feed.get(alert.source_feed, False) or alert.status == "stale",
+        "capad_park_name": park_name,
+        "geometry_type": str(geom_type).removeprefix("ST_") if geom_type else None,
+        "bbox": bbox,
+        "incident_details": incident_details,
+        "affected_segment_count": affected_segment_count,
+        "affected_tracks": affected_tracks,
+        "affected_track_ids": [t["track_id"] for t in affected_tracks],
+    }
 
 
 def get_closures_for_track_ids(

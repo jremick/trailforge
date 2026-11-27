@@ -112,7 +112,7 @@ class McpAuthContext:
   - OAuth Authorization Code: `tf_oac_<43-char-urlsafe-secret>` (TTL `60 s`, single-use).
   - Only `SHA-256(token)` hex digests are stored in PostgreSQL; lookup uses indexed digest equality and constant-time comparisons for secrets.
 
-### 5.2 Database Schema — Migration `0006_ai_mcp_auth` (Tier C, Zero OSM Data)
+### 5.2 Database Schema — Migration `0007_ai_mcp_auth` (Tier C, Zero OSM Data)
 Revises `0005_user_token_version`. Adds four Tier C tables:
 
 1. **`personal_access_tokens`**
@@ -433,7 +433,7 @@ export interface CompactElevationPoint {
 - **`ROUTE_GROUPS`:** Add `"mcp"` to `ROUTE_GROUPS` in `middleware.py` and classify `/mcp` and `/mcp/*` → `"mcp"`, `/.well-known/oauth-*` and `/api/oauth/*` → `"auth"`.
 - **Body Limit:** Enforce `1 MiB` streaming body limit on `/mcp*` and `/api/oauth/*`.
 - **Origin Secret:** Enforce `X-TrailForge-Origin-Secret` on `/mcp*`, `/.well-known/oauth-*`, and `/api/oauth/*` whenever `TRAILFORGE_ORIGIN_SHARED_SECRET` is set.
-- **Cloudflare Pages Proxy:** Update `deploy/cloudflare/pages-proxy-worker.js` to proxy `/api/*`, `/mcp`, `/mcp/*`, and `/.well-known/oauth-*` (streaming without buffering, forwarding MCP/OAuth headers, preserving `WWW-Authenticate` and `Mcp-Session-Id`), and document Cloudflare Pages mounting (e.g., `functions/_middleware.js` or thin wrappers).
+- **Cloudflare Pages Proxy:** Update `deploy/cloudflare/pages-proxy-worker.js` to proxy `/api/*`, `/mcp`, `/mcp/*`, and `/.well-known/oauth-*` (streaming without buffering, forwarding MCP/OAuth headers, preserving `WWW-Authenticate` and `Mcp-Session-Id`), and document Cloudflare Pages middleware mounting (copying the proxy into `<pages-project>/functions/_middleware.js` or thin wrappers).
 - **Cloudflare R2 CORS (`deploy/cloudflare/r2-cors.json`):** Document optional `"*"` read-only (`GET`/`HEAD`) `AllowedOrigins` profile for public `PMTiles` buckets when enabling full MapLibre vector tile rendering inside opaque-origin MCP App iframes (while noting the zero-network SVG/Canvas fallback works even with strict single-origin R2 CORS).
 - **Docker `nginx`, Vite dev proxy & Caddy:** Proxy `/mcp`, `/mcp/*`, and `/.well-known/oauth-*` to `api:8000` with `proxy_buffering off` (and exclude `/mcp*` from Caddy `encode` compression).
 
@@ -506,7 +506,7 @@ To execute cleanly in parallel via `/swarm` with minimal merge friction, split w
 
 | Workstream | Owns (Disjoint Paths) | Implements |
 | :--- | :--- | :--- |
-| **W1 — PAT & OAuth 2.1 Auth** | `migrations/versions/0006_ai_mcp_auth.py`, `src/trailforge/auth/tokens.py`, `src/trailforge/auth/oauth.py`, `src/trailforge/api/oauth.py`, `tests/test_ai_auth_oauth.py` | Tier C auth tables, PAT mint/verify/revoke, OAuth 2.1 + PKCE + DCR + consent HTML + `/.well-known/*`, Account Panel API hooks |
+| **W1 — PAT & OAuth 2.1 Auth** | `migrations/versions/0007_ai_mcp_auth.py`, `src/trailforge/auth/tokens.py`, `src/trailforge/auth/oauth.py`, `src/trailforge/api/oauth.py`, `tests/test_ai_auth_oauth.py` | Tier C auth tables, PAT mint/verify/revoke, OAuth 2.1 + PKCE + DCR + consent HTML + `/.well-known/*`, Account Panel API hooks |
 | **W2 — MCP Server, Tools & PNG Renderer** | `src/trailforge/mcp/*` (`server.py`, `tools.py`, `schemas.py`, `renderer.py`, `resources.py`, `prompts.py`, `context.py`, `stdio_proxy.py`), `tests/test_mcp_server.py`, `tests/test_mcp_renderer.py` | Stateless Streamable HTTP MCP server, all 18 tools (public, app-only, personal, private write), resources, prompts, Pillow PNG visual renderer, `stdio` CLI proxy |
 | **W3 — MCP App Widget, Deep Links & Account UI** | `web/mcp-app.html`, `web/vite.mcp.config.ts`, `web/src/mcp/*`, `web/src/urlState.ts`, `web/src/urlState.test.ts`, `web/src/components/accountPanel.ts` (PAT/OAuth tokens section) | Single-file SEP-1865 interactive map + linked elevation app (`@modelcontextprotocol/ext-apps`, MapLibre + SVG/Canvas fallback), `?route=&rig=` URL deep links, PAT/Connected AI Apps UI |
 | **W4 — Edge Proxy, Packaging & Docs** | `deploy/cloudflare/pages-proxy-worker.js`, `deploy/cloudflare/r2-cors.json`, `deploy/Caddyfile.example`, `deploy/ai/antigravity-plugin/*`, `web/nginx.conf`, `web/vite.config.ts`, `docs/AI_INTEGRATION.md`, `tests/test_mcp_edge_security.py` | Edge proxy routing for `/mcp*` & `/.well-known/oauth-*`, non-buffered streaming, Antigravity plugin template, client setup guides |

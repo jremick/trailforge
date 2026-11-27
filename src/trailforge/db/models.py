@@ -868,8 +868,29 @@ class User(Base):
     )
     disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     invited_by_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    ui_preferences: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class InstanceUiSettings(Base):
+    """Singleton admin-configurable default UI preferences & visibility settings (Tier C)."""
+
+    __tablename__ = "instance_ui_settings"
+    __table_args__ = (CheckConstraint("id = 1", name="singleton_row"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    default_layer_order: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    default_layer_visibility: Mapped[dict[str, bool] | None] = mapped_column(JSONB, nullable=True)
+    show_stack_telemetry_public: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -1453,6 +1474,7 @@ __all__ = [
     "ConditionReport",
     "ConditionReportVote",
     "FeedSyncStatus",
+    "InstanceUiSettings",
     "InviteCode",
     "OAuthAuthorizationCode",
     "OAuthClient",

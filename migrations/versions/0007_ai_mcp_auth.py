@@ -1,7 +1,7 @@
 """Add Tier C AI/MCP authentication tables (PATs & OAuth 2.1 + PKCE + DCR).
 
-Revision ID: 0006_ai_mcp_auth
-Revises: 0005_user_token_version
+Revision ID: 0007_ai_mcp_auth
+Revises: 0006_ui_preferences_and_settings
 Create Date: 2026-11-27 08:30:00.000000
 """
 
@@ -14,8 +14,8 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
-revision: str = "0006_ai_mcp_auth"
-down_revision: str | Sequence[str] | None = "0005_user_token_version"
+revision: str = "0007_ai_mcp_auth"
+down_revision: str | Sequence[str] | None = "0006_ui_preferences_and_settings"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

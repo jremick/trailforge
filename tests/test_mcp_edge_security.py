@@ -78,7 +78,7 @@ def _make_offline_app(settings: Settings | None = None) -> Any:
         lambda: DbHealthStatus(
             db_ok=True,
             postgis_version="3.4 USE_GEOS=1 USE_PROJ=1",
-            schema_revision="0006_ai_mcp_auth",
+            schema_revision="0008_perf_and_security_indexes",
         )
     )
     return app
