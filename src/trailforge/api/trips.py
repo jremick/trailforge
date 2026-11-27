@@ -68,6 +68,7 @@ from trailforge.matching.contribution_keys import (
     trip_contribution_hash,
     trip_contribution_hash_sql,
 )
+from trailforge.matching.hmm import MatchBudgetExceeded
 from trailforge.matching.parser import MAX_IMU_SAMPLES, MAX_TRACE_POINTS
 from trailforge.vehicles.classifier import CapabilityClassLiteral, normalize_capability_class
 
@@ -327,6 +328,15 @@ def _owned_trip_contribution_hash(trip: Trip) -> str | None:
     except ContributionKeyUnavailable as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+
+
+async def _match_trip_trace(matcher: TrackMatcher, points: list[GpsPoint]) -> MatchResult:
+    try:
+        return await matcher.match_trace(points)
+    except MatchBudgetExceeded as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
 
 
@@ -743,7 +753,7 @@ async def _ingest_trip_trace(
             imu_summary = aligned.summary
             discarded_imu_count = aligned.discarded_sample_count
 
-        match_result = await matcher.match_trace(matching_points)
+        match_result = await _match_trip_trace(matcher, matching_points)
         if trimmed_imu_samples:
             match_result = await anyio.to_thread.run_sync(
                 enrich_match_result_with_imu, match_result, trimmed_imu_samples
@@ -1202,7 +1212,7 @@ async def update_trip(
                     )
                 )
                 if len(pts) >= 2:
-                    match_result = await matcher.match_trace(pts)
+                    match_result = await _match_trip_trace(matcher, pts)
                     trip.matcher_name = match_result.matcher_name
                     trip.avg_match_confidence = float(match_result.overall_confidence)
                     trip.match_status = _derive_match_status(match_result)

@@ -45,6 +45,8 @@ from trailforge.ingestion.connectors.base import (
     RawPoiFeature,
     RawTrackFeature,
     TrailClassLiteral,
+    UpstreamLimitError,
+    _geometry_node_count,
     clean_feature_name,
     dedupe_poi_features,
     deterministic_feature_id,
@@ -147,6 +149,12 @@ DEFAULT_SA_PARKS_JSON_URL: Final[str] = (
 DEFAULT_SA_SURVEY_MARKS_URL: Final[str] = (
     "https://location.sa.gov.au/server5/rest/services/MAD_WMS_PRD/MapServer/0/query"
 )
+_MAX_SA_TRAILS_ARCHIVE_BYTES: Final[int] = 48 * 1024 * 1024
+_MAX_SA_TRAILS_MEMBER_BYTES: Final[int] = 48 * 1024 * 1024
+_MAX_SA_TRAILS_FEATURES: Final[int] = 10_000
+_MAX_SA_TRAILS_GEOMETRY_NODES: Final[int] = 300_000
+_MAX_SA_PARKS_BYTES: Final[int] = 8 * 1024 * 1024
+_MAX_SA_PARKS_RECORDS: Final[int] = 4_096
 
 # NT — NTG Road Centrelines + NTLIS GeoServer WFS 2.0 + GA Topo250K (CC BY 4.0)
 DEFAULT_NT_ROADS_URL: Final[str] = (
@@ -302,6 +310,7 @@ def _stream_download_cached_safe(
     *,
     chunk_bytes: int = 1_048_576,
     timeout_s: float = 60.0,
+    max_bytes: int = _MAX_SA_TRAILS_ARCHIVE_BYTES,
     client: httpx.Client | None = None,
 ) -> Path | None:
     """Stream-download a file with atomic cache write, returning None gracefully on outages."""
@@ -311,6 +320,7 @@ def _stream_download_cached_safe(
             dest,
             chunk_bytes=chunk_bytes,
             timeout_s=timeout_s,
+            max_bytes=max_bytes,
             client=client,
         )
     except Exception as exc:
@@ -1954,7 +1964,7 @@ def read_sa_trails_from_zip(
 ) -> list[RawTrackFeature]:
     """Low-RAM spatial filter of SA Recreation Trails ZIP via GDAL /vsizip/ (or Python fallback)."""
     resolved = zip_path.resolve()
-    if not resolved.is_file():
+    if not resolved.is_file() or resolved.stat().st_size > _MAX_SA_TRAILS_ARCHIVE_BYTES:
         return []
 
     inner_name: str | None = None
@@ -1969,13 +1979,16 @@ def read_sa_trails_from_zip(
                     if low.endswith(".geojson") or low.endswith(".json"):
                         inner_name = candidate
                         break
-    except zipfile.BadZipFile as exc:
+            if inner_name and zf.getinfo(inner_name).file_size > _MAX_SA_TRAILS_MEMBER_BYTES:
+                raise UpstreamLimitError("SA trails archive exceeds the expanded member size limit")
+    except (OSError, zipfile.BadZipFile, UpstreamLimitError) as exc:
         logger.warning("Corrupt SA trails archive %s (%s); skipping", resolved, exc)
         return []
 
     if not inner_name:
         return []
 
+    geometry_remaining = _MAX_SA_TRAILS_GEOMETRY_NODES
     # Fast, low-RAM streaming path via GDAL /vsizip/ OGR spatial filter when osgeo is installed
     try:
         from osgeo import ogr  # type: ignore[import-untyped]
@@ -1990,11 +2003,14 @@ def read_sa_trails_from_zip(
                 if layer is None:
                     return []
                 layer.SetSpatialFilterRect(bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y)
-                for feat in layer:
+                for idx, feat in enumerate(layer):
+                    if idx >= _MAX_SA_TRAILS_FEATURES:
+                        raise UpstreamLimitError("SA trails archive exceeds the feature limit")
                     geom_ref = feat.GetGeometryRef()
                     if geom_ref is None or geom_ref.IsEmpty():
                         continue
                     gj_geom = json.loads(geom_ref.ExportToJson())
+                    geometry_remaining -= _geometry_node_count(gj_geom, geometry_remaining)
                     parsed = _parse_sa_recreation_trail(gj_geom, feat.items())
                     if parsed is not None:
                         out.append(parsed)
@@ -2003,6 +2019,9 @@ def read_sa_trails_from_zip(
                 ds = None
     except ImportError:
         pass
+    except UpstreamLimitError as exc:
+        logger.warning("Skipping SA trails archive %s (%s)", resolved, exc)
+        return []
     except Exception as exc:
         logger.warning(
             "GDAL /vsizip/ read failed for %s (%s); falling back to zip JSON", resolved, exc
@@ -2012,16 +2031,30 @@ def read_sa_trails_from_zip(
     out_py: list[RawTrackFeature] = []
     try:
         with zipfile.ZipFile(resolved, "r") as zf, zf.open(inner_name) as fh:
-            payload = json.load(fh)
+            raw = fh.read(_MAX_SA_TRAILS_MEMBER_BYTES + 1)
+            if len(raw) > _MAX_SA_TRAILS_MEMBER_BYTES:
+                raise UpstreamLimitError("SA trails archive exceeds the expanded member size limit")
+            payload = json.loads(raw)
     except Exception as exc:
         logger.warning("Failed reading SA trails zip %s (%s)", resolved, exc)
         return []
 
-    for feat in payload.get("features") or []:
+    features = payload.get("features") if isinstance(payload, Mapping) else None
+    if not isinstance(features, list) or len(features) > _MAX_SA_TRAILS_FEATURES:
+        return []
+    geometry_remaining = _MAX_SA_TRAILS_GEOMETRY_NODES
+    for feat in features:
         if not isinstance(feat, Mapping):
             continue
         geom = feat.get("geometry")
-        if not isinstance(geom, Mapping) or not _geom_intersects_bbox(geom, bbox):
+        if not isinstance(geom, Mapping):
+            continue
+        try:
+            geometry_remaining -= _geometry_node_count(geom, geometry_remaining)
+        except UpstreamLimitError as exc:
+            logger.warning("Skipping SA trails archive %s (%s)", resolved, exc)
+            return []
+        if not _geom_intersects_bbox(geom, bbox):
             continue
         parsed = _parse_sa_recreation_trail(geom, feat.get("properties") or {})
         if parsed is not None:
@@ -2202,16 +2235,21 @@ class SATrailsConnector:
             parks_dest,
             chunk_bytes=262_144,
             timeout_s=self.timeout_s,
+            max_bytes=_MAX_SA_PARKS_BYTES,
             client=self._client,
         )
         if cached_path is None or not cached_path.is_file():
             return []
         try:
-            parks = json.loads(cached_path.read_text(encoding="utf-8"))
+            with cached_path.open("rb") as file:
+                raw = file.read(_MAX_SA_PARKS_BYTES + 1)
+            if len(raw) > _MAX_SA_PARKS_BYTES:
+                raise UpstreamLimitError("SA parks catalog exceeds the size limit")
+            parks = json.loads(raw)
         except Exception as exc:
             logger.warning("Failed parsing SA parks-data.json (%s); skipping", exc)
             return []
-        if not isinstance(parks, list):
+        if not isinstance(parks, list) or len(parks) > _MAX_SA_PARKS_RECORDS:
             return []
 
         out: list[RawPoiFeature] = []

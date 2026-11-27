@@ -6,12 +6,18 @@ All network connectors accept an injectable ``httpx.Client`` and support offline
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
 import math
 import re
-from collections.abc import Mapping, Sequence
+import shutil
+import tempfile
+import time
+import zlib
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Final, Literal
 
@@ -27,6 +33,17 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 
 USER_AGENT: Final[str] = "trailforge/0.1 (+https://github.com/trailforge/trailforge)"
+IDENTITY_HTTP_HEADERS: Final[dict[str, str]] = {
+    "User-Agent": USER_AGENT,
+    "Accept-Encoding": "identity",
+}
+
+_MAX_VECTOR_PAGE_BYTES: Final[int] = 12 * 1024 * 1024
+_MAX_VECTOR_QUERY_BYTES: Final[int] = 32 * 1024 * 1024
+_MAX_VECTOR_GEOMETRY_NODES: Final[int] = 65_536
+_MAX_VECTOR_QUERY_GEOMETRY_NODES: Final[int] = 300_000
+_MIN_DOWNLOAD_FREE_BYTES: Final[int] = 256 * 1024 * 1024
+_MAX_DOWNLOAD_SECONDS: Final[float] = 20 * 60
 
 ATTRIBUTION_OSM: Final[str] = (
     "Map data © OpenStreetMap contributors (ODbL) — openstreetmap.org/copyright"
@@ -649,12 +666,13 @@ def esri_feature_to_geojson(feat: Mapping[str, Any]) -> dict[str, Any] | None:
     geom = feat.get("geometry")
     if not isinstance(geom, Mapping):
         return None
-    props = dict(feat.get("attributes") or feat.get("properties") or {})
+    properties = feat.get("attributes") or feat.get("properties")
+    props = dict(properties) if isinstance(properties, Mapping) else {}
     if "x" in geom and "y" in geom:
         gj_geom: dict[str, Any] = {"type": "Point", "coordinates": [geom["x"], geom["y"]]}
     elif "paths" in geom:
         paths = geom["paths"]
-        if not paths:
+        if not isinstance(paths, (list, tuple)) or not paths:
             return None
         gj_geom = (
             {"type": "LineString", "coordinates": paths[0]}
@@ -668,15 +686,200 @@ def esri_feature_to_geojson(feat: Mapping[str, Any]) -> dict[str, Any] | None:
     return {"type": "Feature", "geometry": gj_geom, "properties": props}
 
 
-def _read_cached_feature_list(cache_path: Path | None) -> list[dict[str, Any]] | None:
-    if cache_path is None or not cache_path.is_file() or cache_path.stat().st_size == 0:
+class UpstreamLimitError(ValueError):
+    """A remote payload exceeded its transfer or processing budget."""
+
+
+@contextmanager
+def stream_upstream(
+    client: httpx.Client,
+    url: str,
+    *,
+    params: Mapping[str, str] | None = None,
+    method: str = "GET",
+    data: Mapping[str, str] | None = None,
+) -> Iterator[httpx.Response]:
+    """Follow a bounded number of redirects without reading intermediary bodies."""
+    request = client.build_request(
+        method, url, params=params, data=data, headers=IDENTITY_HTTP_HEADERS
+    )
+    for _ in range(6):
+        response = client.send(request, stream=True, follow_redirects=False)
+        try:
+            next_request = response.next_request
+            if next_request is None:
+                yield response
+                return
+            request = next_request
+        finally:
+            response.close()
+    raise UpstreamLimitError("Upstream request exceeds the redirect limit")
+
+
+def checked_content_length(response: httpx.Response, max_bytes: int) -> int | None:
+    """Validate any declared length before buffering or writing the response."""
+    value = response.headers.get("content-length")
+    if value is None:
+        return None
+    if len(value) > 20 or not value.isascii() or not value.isdecimal():
+        raise UpstreamLimitError("Invalid upstream Content-Length")
+    length = int(value)
+    if length > max_bytes:
+        raise UpstreamLimitError("Upstream response exceeds the size limit")
+    return length
+
+
+def iter_bounded_response(
+    response: httpx.Response,
+    *,
+    max_bytes: int,
+    max_duration_s: float,
+    chunk_bytes: int = 65_536,
+) -> Iterator[bytes]:
+    """Read an identity or gzip response with cumulative byte and duration limits."""
+    encoding = response.headers.get("content-encoding", "identity").strip().lower()
+    if encoding not in ("", "identity", "gzip", "x-gzip"):
+        raise UpstreamLimitError(f"Unsupported upstream content encoding: {encoding!r}")
+
+    is_gzip = encoding in ("gzip", "x-gzip")
+    declared_size = checked_content_length(response, max_bytes)
+    deadline = time.monotonic() + max_duration_s
+
+    if response.is_stream_consumed:
+        decoded_bytes = 0
+        for chunk in response.iter_bytes():
+            decoded_bytes += len(chunk)
+            if decoded_bytes > max_bytes:
+                raise UpstreamLimitError("Upstream response exceeds the size limit")
+            if time.monotonic() > deadline:
+                raise UpstreamLimitError("Upstream response exceeds the download time limit")
+            for offset in range(0, len(chunk), chunk_bytes):
+                yield chunk[offset : offset + chunk_bytes]
+        if not is_gzip and declared_size is not None and decoded_bytes != declared_size:
+            raise UpstreamLimitError("Incomplete upstream response")
+        return
+
+    wire_bytes = 0
+    decoded_bytes = 0
+    decoder = zlib.decompressobj(zlib.MAX_WBITS + 16) if is_gzip else None
+    for chunk in response.iter_raw():
+        wire_bytes += len(chunk)
+        if wire_bytes > max_bytes:
+            raise UpstreamLimitError("Upstream response exceeds the size limit")
+        if time.monotonic() > deadline:
+            raise UpstreamLimitError("Upstream response exceeds the download time limit")
+        if decoder is None:
+            decoded_bytes += len(chunk)
+            for offset in range(0, len(chunk), chunk_bytes):
+                yield chunk[offset : offset + chunk_bytes]
+            continue
+
+        data = chunk
+        while data:
+            step_limit = min(chunk_bytes, max_bytes - decoded_bytes + 1)
+            try:
+                out = decoder.decompress(data, step_limit)
+            except zlib.error as exc:
+                raise UpstreamLimitError("Invalid upstream gzip response") from exc
+            decoded_bytes += len(out)
+            if decoded_bytes > max_bytes:
+                raise UpstreamLimitError("Upstream response exceeds the size limit")
+            if time.monotonic() > deadline:
+                raise UpstreamLimitError("Upstream response exceeds the download time limit")
+            if out:
+                yield out
+            if decoder.eof:
+                trailing = decoder.unused_data
+                if not trailing:
+                    break
+                decoder = zlib.decompressobj(zlib.MAX_WBITS + 16)
+                data = trailing
+            elif decoder.unconsumed_tail:
+                data = decoder.unconsumed_tail
+            else:
+                break
+
+    if declared_size is not None and wire_bytes != declared_size:
+        raise UpstreamLimitError("Incomplete upstream response")
+    if decoder is not None and not decoder.eof:
+        raise UpstreamLimitError("Incomplete upstream gzip response")
+
+
+def read_bounded_json(
+    response: httpx.Response, *, max_bytes: int, max_duration_s: float
+) -> tuple[Any, int]:
+    """Return decoded JSON and its transfer size after verifying the input budget."""
+    body = bytearray()
+    for chunk in iter_bounded_response(
+        response, max_bytes=max_bytes, max_duration_s=max_duration_s
+    ):
+        body.extend(chunk)
+    return json.loads(body), len(body)
+
+
+def _geometry_node_count(geometry: Mapping[str, Any], max_nodes: int) -> int:
+    """Count positions and nested containers before constructing GEOS geometries."""
+    pending: list[tuple[Any, int]] = [(geometry, 0)]
+    count = 0
+    while pending:
+        node, depth = pending.pop()
+        count += 1
+        if count > max_nodes or depth > 8:
+            raise UpstreamLimitError("Vector geometry exceeds the complexity limit")
+        if isinstance(node, Mapping):
+            children = [
+                node[key] for key in ("coordinates", "geometries") if key in node
+            ]
+        elif isinstance(node, (list, tuple)):
+            if node and isinstance(node[0], (int, float)):
+                if len(node) > 4 or any(
+                    value is not None and not isinstance(value, (int, float)) for value in node
+                ):
+                    raise UpstreamLimitError("Vector coordinate exceeds the dimension limit")
+                children = []
+            else:
+                children = node
+        else:
+            children = []
+        if len(children) + len(pending) + count > max_nodes:
+            raise UpstreamLimitError("Vector geometry exceeds the complexity limit")
+        pending.extend((child, depth + 1) for child in children)
+    return count
+
+
+def _count_feature_geometry(
+    features: Sequence[Mapping[str, Any]], *, available_nodes: int
+) -> int:
+    count = 0
+    for feature in features:
+        geometry = feature.get("geometry")
+        if isinstance(geometry, Mapping):
+            count += _geometry_node_count(
+                geometry, min(_MAX_VECTOR_GEOMETRY_NODES, available_nodes - count)
+            )
+    return count
+
+
+def _read_cached_feature_list(
+    cache_path: Path | None, *, max_features: int
+) -> list[dict[str, Any]] | None:
+    if cache_path is None or not cache_path.is_file():
         return None
     try:
-        cached = json.loads(cache_path.read_text(encoding="utf-8"))
-        if isinstance(cached, list):
-            return cached
-    except json.JSONDecodeError:
-        logger.warning("Ignoring corrupt cached overlay JSON: %s", cache_path)
+        with cache_path.open("rb") as file:
+            if file.seek(0, 2) > _MAX_VECTOR_QUERY_BYTES:
+                raise UpstreamLimitError("Cached vector response exceeds the size limit")
+            file.seek(0)
+            raw = file.read(_MAX_VECTOR_QUERY_BYTES + 1)
+        if len(raw) > _MAX_VECTOR_QUERY_BYTES:
+            raise UpstreamLimitError("Cached vector response exceeds the size limit")
+        cached = json.loads(raw)
+        if isinstance(cached, list) and len(cached) <= max_features:
+            features = [item for item in cached if isinstance(item, dict)]
+            _count_feature_geometry(features, available_nodes=_MAX_VECTOR_QUERY_GEOMETRY_NODES)
+            return features
+    except (OSError, ValueError, RecursionError):
+        logger.warning("Ignoring invalid cached overlay JSON: %s", cache_path)
     return None
 
 
@@ -684,9 +887,16 @@ def _write_cached_feature_list(cache_path: Path | None, features: list[dict[str,
     if cache_path is None:
         return
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = cache_path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(features), encoding="utf-8")
-    tmp.replace(cache_path)
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=cache_path.parent, suffix=".json.tmp", delete=False
+    ) as file:
+        tmp = Path(file.name)
+        try:
+            json.dump(features, file, ensure_ascii=False, separators=(",", ":"))
+            file.close()
+            tmp.replace(cache_path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def query_arcgis_geojson(
@@ -704,7 +914,7 @@ def query_arcgis_geojson(
     client: httpx.Client | None = None,
 ) -> list[dict[str, Any]]:
     """Query an Australian ArcGIS REST service by WGS84 bbox with pagination, fallback, & cache."""
-    cached = _read_cached_feature_list(cache_path)
+    cached = _read_cached_feature_list(cache_path, max_features=page_size * max_pages)
     if cached is not None:
         return cached
 
@@ -714,7 +924,6 @@ def query_arcgis_geojson(
         if client is not None
         else httpx.Client(
             timeout=httpx.Timeout(timeout_s, connect=min(8.0, timeout_s)),
-            follow_redirects=True,
             headers={"User-Agent": USER_AGENT},
         )
     )
@@ -728,6 +937,8 @@ def query_arcgis_geojson(
                 for attempt in range(max(1, retries)):
                     collected: list[dict[str, Any]] = []
                     offset = 0
+                    bytes_remaining = _MAX_VECTOR_QUERY_BYTES
+                    geometry_remaining = _MAX_VECTOR_QUERY_GEOMETRY_NODES
                     succeeded = True
                     for _page in range(max_pages):
                         params: dict[str, str] = {
@@ -749,9 +960,17 @@ def query_arcgis_geojson(
                             params.update(extra_params)
 
                         try:
-                            resp = http.get(url, params=params, headers={"User-Agent": USER_AGENT})
-                            resp.raise_for_status()
-                            data = resp.json()
+                            with stream_upstream(http, url, params=params) as resp:
+                                resp.raise_for_status()
+                                data, page_bytes = read_bounded_json(
+                                    resp,
+                                    max_bytes=min(_MAX_VECTOR_PAGE_BYTES, bytes_remaining),
+                                    max_duration_s=timeout_s * 2,
+                                )
+                            bytes_remaining -= page_bytes
+                        except UpstreamLimitError as exc:
+                            logger.warning("Skipping ArcGIS layer: %s", exc)
+                            return []
                         except Exception as exc:
                             last_error = f"{url} (f={fmt}, try={attempt + 1}): {exc}"
                             succeeded = False
@@ -766,15 +985,28 @@ def query_arcgis_geojson(
                             break
 
                         raw_features = data.get("features") or []
+                        if not isinstance(raw_features, list) or len(raw_features) > page_size:
+                            logger.warning("Skipping ArcGIS layer with invalid feature count")
+                            return []
+                        features: list[dict[str, Any]] = []
                         for feat in raw_features:
                             if isinstance(feat, Mapping):
                                 gj = esri_feature_to_geojson(feat)
                                 if gj is not None and gj.get("geometry") is not None:
-                                    collected.append(gj)
+                                    features.append(gj)
+                        try:
+                            geometry_remaining -= _count_feature_geometry(
+                                features, available_nodes=geometry_remaining
+                            )
+                        except UpstreamLimitError as exc:
+                            logger.warning("Skipping ArcGIS layer: %s", exc)
+                            return []
+                        collected.extend(features)
 
-                        exceeded = bool(
-                            data.get("exceededTransferLimit")
-                            or (data.get("properties") or {}).get("exceededTransferLimit")
+                        properties = data.get("properties")
+                        exceeded = bool(data.get("exceededTransferLimit")) or (
+                            isinstance(properties, Mapping)
+                            and bool(properties.get("exceededTransferLimit"))
                         )
                         if not exceeded or not raw_features:
                             break
@@ -807,7 +1039,7 @@ def query_wfs_geojson(
     client: httpx.Client | None = None,
 ) -> list[dict[str, Any]]:
     """Query an OGC WFS 2.0.0 GeoJSON endpoint with EPSG:4326 CQL or CRS84 bbox and disk cache."""
-    cached = _read_cached_feature_list(cache_path)
+    cached = _read_cached_feature_list(cache_path, max_features=max_features)
     if cached is not None:
         return cached
 
@@ -838,7 +1070,6 @@ def query_wfs_geojson(
         if client is not None
         else httpx.Client(
             timeout=httpx.Timeout(timeout_s, connect=min(8.0, timeout_s)),
-            follow_redirects=True,
             headers={"User-Agent": USER_AGENT},
         )
     )
@@ -847,9 +1078,14 @@ def query_wfs_geojson(
     try:
         for attempt in range(max(1, retries)):
             try:
-                resp = http.get(wfs_url, params=params, headers={"User-Agent": USER_AGENT})
-                resp.raise_for_status()
-                data = resp.json()
+                with stream_upstream(http, wfs_url, params=params) as resp:
+                    resp.raise_for_status()
+                    data, _ = read_bounded_json(
+                        resp, max_bytes=_MAX_VECTOR_PAGE_BYTES, max_duration_s=timeout_s * 2
+                    )
+            except UpstreamLimitError as exc:
+                logger.warning("Skipping WFS layer %s: %s", type_name, exc)
+                return []
             except Exception as exc:
                 last_error = f"{wfs_url} ({type_name}, try={attempt + 1}): {exc}"
                 continue
@@ -858,11 +1094,19 @@ def query_wfs_geojson(
                 last_error = f"{wfs_url} ({type_name}): unexpected WFS payload"
                 continue
 
+            if len(data["features"]) > max_features:
+                logger.warning("Skipping WFS layer %s with too many features", type_name)
+                return []
             features = [
                 f
                 for f in data["features"]
                 if isinstance(f, dict) and f.get("geometry") is not None
             ]
+            try:
+                _count_feature_geometry(features, available_nodes=_MAX_VECTOR_QUERY_GEOMETRY_NODES)
+            except UpstreamLimitError as exc:
+                logger.warning("Skipping WFS layer %s: %s", type_name, exc)
+                return []
             _write_cached_feature_list(cache_path, features)
             return features
     finally:
@@ -880,39 +1124,90 @@ def stream_download_file(
     *,
     chunk_bytes: int = 1_048_576,
     timeout_s: float = 120.0,
+    max_bytes: int = 128 * 1024 * 1024,
+    verify_cached_size: bool = False,
     client: httpx.Client | None = None,
 ) -> Path:
-    """Stream a large file disk-to-disk in 1 MiB chunks with atomic ``.part`` rename."""
+    """Download within byte and free-space budgets and publish the complete file atomically."""
+    if max_bytes <= 0 or chunk_bytes <= 0:
+        raise ValueError("Download and chunk size limits must be positive")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.is_file() and dest.stat().st_size > 0:
-        return dest
-
     part_path = dest.with_suffix(dest.suffix + ".part")
-    if part_path.exists():
-        part_path.unlink()
+    size_path = dest.with_suffix(dest.suffix + ".size")
+    size_part_path = size_path.with_suffix(".size.part")
 
+    # Serialize downloads sharing a cache directory so their free-space checks and
+    # temporary files also work across worker processes.
+    with (dest.parent / ".download.lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        part_path.unlink(missing_ok=True)
+        size_part_path.unlink(missing_ok=True)
+        if dest.is_file():
+            cached_size = dest.stat().st_size
+            if 0 < cached_size <= max_bytes:
+                if not verify_cached_size:
+                    return dest
+                try:
+                    with size_path.open("rb") as file:
+                        if file.read(32) == str(cached_size).encode("ascii"):
+                            return dest
+                except FileNotFoundError:
+                    pass
+        return _download_to_cache(
+            url, dest, part_path, size_path if verify_cached_size else None, size_part_path,
+            chunk_bytes=chunk_bytes, timeout_s=timeout_s, max_bytes=max_bytes, client=client,
+        )
+
+
+def _download_to_cache(
+    url: str,
+    dest: Path,
+    part_path: Path,
+    size_path: Path | None,
+    size_part_path: Path,
+    *,
+    chunk_bytes: int,
+    timeout_s: float,
+    max_bytes: int,
+    client: httpx.Client | None,
+) -> Path:
     owns_client = client is None
     http = (
         client
         if client is not None
         else httpx.Client(
-            follow_redirects=True,
             timeout=httpx.Timeout(connect=30.0, read=timeout_s, write=30.0, pool=30.0),
             headers={"User-Agent": USER_AGENT},
         )
     )
     try:
-        with http.stream("GET", url, headers={"User-Agent": USER_AGENT}) as resp:
+        with stream_upstream(http, url) as resp:
             resp.raise_for_status()
+            if resp.status_code != 200 or "content-range" in resp.headers:
+                raise UpstreamLimitError("Expected a complete upstream download")
+            declared_size = checked_content_length(resp, max_bytes)
+            available = shutil.disk_usage(dest.parent).free - _MIN_DOWNLOAD_FREE_BYTES
+            if available <= 0 or (declared_size is not None and declared_size > available):
+                raise UpstreamLimitError("Insufficient free space for upstream download")
             with part_path.open("wb") as fh:
-                for chunk in resp.iter_bytes(chunk_size=chunk_bytes):
-                    if chunk:
-                        fh.write(chunk)
+                for chunk in iter_bounded_response(
+                    resp, max_bytes=max_bytes, max_duration_s=_MAX_DOWNLOAD_SECONDS,
+                    chunk_bytes=chunk_bytes,
+                ):
+                    if shutil.disk_usage(dest.parent).free < _MIN_DOWNLOAD_FREE_BYTES + len(chunk):
+                        raise UpstreamLimitError("Insufficient free space for upstream download")
+                    fh.write(chunk)
+                file_size = fh.tell()
+        if file_size == 0:
+            raise UpstreamLimitError("Empty upstream download")
+        if size_path is not None:
+            size_part_path.write_text(str(file_size), encoding="ascii")
         part_path.replace(dest)
-    except Exception:
-        part_path.unlink(missing_ok=True)
-        raise
+        if size_path is not None:
+            size_part_path.replace(size_path)
     finally:
+        part_path.unlink(missing_ok=True)
+        size_part_path.unlink(missing_ok=True)
         if owns_client:
             http.close()
 

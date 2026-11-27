@@ -26,7 +26,12 @@ from sqlalchemy.orm import Session
 
 from trailforge.db.models import RainfallSnapshot
 from trailforge.grading.baseline import WetRiskLiteral
-from trailforge.ingestion.connectors.base import ATTRIBUTION_OPEN_METEO, USER_AGENT
+from trailforge.ingestion.connectors.base import (
+    ATTRIBUTION_OPEN_METEO,
+    IDENTITY_HTTP_HEADERS,
+    read_bounded_json,
+    stream_upstream,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +41,8 @@ OPEN_METEO_ATTRIBUTION: Final[str] = ATTRIBUTION_OPEN_METEO
 RAINFALL_GRID_STEP_DEG: Final[float] = 0.15
 RAINFALL_STALE_AFTER_HOURS: Final[float] = 12.0
 MAX_WET_SCORE_ADJUSTMENT: Final[float] = 12.0
+_MAX_OPEN_METEO_BYTES: Final[int] = 128 * 1024
+_MAX_OPEN_METEO_HOURS: Final[int] = 192  # Up to one week of history plus a day of forecast
 
 ApiWetRiskLiteral = Literal["dry", "damp", "wet", "heavy_rain"]
 DbWetRiskLiteral = WetRiskLiteral  # "dry" | "damp" | "wet" | "saturated"
@@ -268,6 +275,8 @@ def parse_open_meteo_hourly_payload(
     precip = hourly.get("precipitation")
     if not isinstance(times, list) or not isinstance(precip, list) or len(times) != len(precip):
         raise ValueError("Open-Meteo 'hourly.time' and 'hourly.precipitation' arrays invalid")
+    if len(times) > _MAX_OPEN_METEO_HOURS:
+        raise ValueError("Open-Meteo hourly response exceeds the sample limit")
     if not times:
         return (0.0, 0.0, None)
 
@@ -334,16 +343,20 @@ def fetch_open_meteo_rainfall(
     owns_client = client is None
     http_client = client or httpx.Client(
         timeout=timeout_s,
-        headers={"User-Agent": USER_AGENT},
+        headers=IDENTITY_HTTP_HEADERS,
     )
     try:
-        response = http_client.get(OPEN_METEO_FORECAST_URL, params=params)
-        response.raise_for_status()
-        payload = response.json()
+        with stream_upstream(http_client, OPEN_METEO_FORECAST_URL, params=params) as response:
+            response.raise_for_status()
+            payload, _ = read_bounded_json(
+                response, max_bytes=_MAX_OPEN_METEO_BYTES, max_duration_s=timeout_s * 2
+            )
     finally:
         if owns_client:
             http_client.close()
 
+    if not isinstance(payload, Mapping):
+        raise ValueError("Invalid Open-Meteo response")
     rain_24h, rain_72h, rain_7d = parse_open_meteo_hourly_payload(payload, now=ref_now)
     api_risk, db_risk = classify_regional_wet_risk(rain_72h)
     return RainfallReading(

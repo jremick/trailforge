@@ -30,6 +30,7 @@ SHOCK_TOTAL_THRESHOLD_G: float = 1.8
 DEFAULT_BASELINE_WINDOW_MS: float = 1000.0
 DEFAULT_SHOCK_DEBOUNCE_MS: float = 150.0
 _EPOCH_MS_CUTOFF: float = 1e11  # Values >= 1e11 (~1973-03-03) are Unix epoch milliseconds
+_MAX_SEGMENT_IMU_SAMPLE_VISITS = 500_000
 
 
 def _require_finite(value: float, field_name: str) -> float:
@@ -523,17 +524,27 @@ def enrich_match_result_with_imu(
     )
     abs_dyn = np.abs(dynamic_g)
 
+    segments = match_result.matched_segments
+    start_times = np.fromiter(
+        (_to_epoch_ms(seg.entry_at) for seg in segments), dtype=np.float64, count=len(segments)
+    )
+    end_times = np.fromiter(
+        (_to_epoch_ms(seg.exit_at) for seg in segments), dtype=np.float64, count=len(segments)
+    )
+    starts = np.searchsorted(t_ms, start_times, side="left")
+    ends = np.searchsorted(t_ms, end_times, side="right")
+    if int(np.maximum(ends - starts, 0).sum()) > _MAX_SEGMENT_IMU_SAMPLE_VISITS:
+        # Heavily overlapping estimated traversal times can repeatedly visit the
+        # same IMU samples. Keep the existing point-aligned segment measurements.
+        return match_result
+
     updated_segments: list[MatchedSegmentTraversal] = []
-    for seg in match_result.matched_segments:
-        s_ms = _to_epoch_ms(seg.entry_at)
-        e_ms = _to_epoch_ms(seg.exit_at)
-        lo = int(np.searchsorted(t_ms, s_ms, side="left"))
-        hi = int(np.searchsorted(t_ms, e_ms, side="right"))
+    for seg, lo, hi in zip(segments, starts, ends, strict=True):
         if hi > lo:
             win_dyn = dynamic_g[lo:hi]
             win_abs = abs_dyn[lo:hi]
             seg_rms = round(float(np.sqrt(np.mean(win_dyn * win_dyn))), 4)
-            seg_p95 = round(float(np.percentile(win_abs, 95)), 4)
+            seg_p95 = round(float(win_abs[0] if hi - lo == 1 else np.percentile(win_abs, 95)), 4)
             updated_segments.append(
                 seg.model_copy(update={"roughness_rms": seg_rms, "roughness_p95": seg_p95})
             )

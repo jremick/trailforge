@@ -154,6 +154,7 @@ services:
       TRAILFORGE_PACKS_DIR: ${TRAILFORGE_PACKS_DIR:-/data/packs}
       GDAL_CACHEMAX: ${GDAL_CACHEMAX:-192}
       OMP_THREAD_LIMIT: ${OMP_THREAD_LIMIT:-1}
+      TRAILFORGE_PBF_MAX_DOWNLOAD_BYTES: ${TRAILFORGE_PBF_MAX_DOWNLOAD_BYTES:-4294967296}
     volumes:
       - trailforge-data:/data
       - trailforge_tiles:/data/tiles

@@ -256,6 +256,33 @@ def test_build_ignore_files_exclude_private_gis_and_keep_fixtures() -> None:
 
 
 @requires_repo_checkout
+def test_nginx_tile_and_pack_proxies_enforce_per_ip_limits_and_bounded_buffering() -> None:
+    nginx = (REPO_ROOT / "web" / "nginx.conf").read_text(encoding="utf-8")
+    assert "limit_conn_zone $server_name zone=tile_proxy_connections:1m;" in nginx
+    assert "limit_conn_zone $binary_remote_addr zone=tile_proxy_per_ip:4m;" in nginx
+
+    tiles_block = nginx.split("location /api/tiles/ {", 1)[1].split("location ~ ^/api/packs", 1)[0]
+    assert "proxy_buffering on;" in tiles_block
+    assert "proxy_max_temp_file_size 8m;" in tiles_block
+    assert "limit_conn tile_proxy_per_ip 8;" in tiles_block
+    assert "limit_conn tile_proxy_connections 24;" in tiles_block
+
+    packs_block = nginx.split("location ~ ^/api/packs(/|$) {", 1)[1].split(
+        "location = /api/oauth", 1
+    )[0]
+    assert "proxy_buffering on;" in packs_block
+    assert "proxy_buffering off;" not in packs_block
+    assert "proxy_max_temp_file_size 8m;" in packs_block
+    assert "limit_conn tile_proxy_per_ip 4;" in packs_block
+    assert "limit_conn tile_proxy_connections 24;" in packs_block
+
+    mcp_block = nginx.split("location ~ ^/mcp(/|$) {", 1)[1].split(
+        "location ~ ^/\\.well-known", 1
+    )[0]
+    assert "proxy_buffering off;" in mcp_block
+
+
+@requires_repo_checkout
 def test_deploy_kit_files_https_range_and_upload_limits() -> None:
     deploy_dir = REPO_ROOT / "deploy"
     caddy_path = deploy_dir / "Caddyfile.example"

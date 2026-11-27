@@ -31,10 +31,12 @@ import anyio
 import numpy as np
 from pyproj import Transformer
 from shapely import STRtree, wkb
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, box
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
+from trailforge.matching.parser import MAX_TRACE_POINTS
 from trailforge.matching.protocol import (
     GpsPoint,
     MatchedSegmentTraversal,
@@ -46,6 +48,22 @@ _MAX_SPEED_KMH: float = 160.0
 _SLOW_HOTSPOT_KMH: float = 5.0
 _MIN_DURATION_S: float = 0.5
 _ENDPOINT_CONNECT_TOL_M: float = 3.0
+_MAX_HMM_CORRIDOR_SEGMENTS = 12_000
+_MAX_HMM_CORRIDOR_VERTICES = 250_000
+_MAX_HMM_SEGMENT_VERTICES = 512
+_MAX_HMM_NEARBY_SEGMENTS = 64
+_MAX_HMM_CANDIDATE_EVALUATIONS = 300_000
+_MAX_HMM_JUNCTION_NEIGHBORS = 64
+_MAX_HMM_ADJACENCY_WORK = 240_000
+_MAX_HMM_GRAPH_WORK = 1_500_000
+_MAX_HMM_CACHE_ENTRIES = 25_000
+
+
+class MatchBudgetExceeded(ValueError):
+    """The trace exceeded the work budget for a single map match."""
+
+    def __init__(self) -> None:
+        super().__init__("Trip is too complex to match in one upload. Split the trip and retry.")
 
 
 @lru_cache(maxsize=1)
@@ -154,9 +172,13 @@ def _build_node_adjacency(
         node_pairs.append((seg.start_node_key, seg.end_node_key))
 
     adj_sets: dict[tuple[int, int], set[tuple[int, int]]] = defaultdict(set)
+    work = 0
     for members in node_buckets.values():
         if len(members) < 2:
             continue
+        work += len(members) ** 2
+        if len(members) > _MAX_HMM_JUNCTION_NEIGHBORS or work > _MAX_HMM_ADJACENCY_WORK:
+            raise MatchBudgetExceeded()
         for u in members:
             for v in members:
                 if u[0] != v[0]:
@@ -167,9 +189,13 @@ def _build_node_adjacency(
         ep_pts = [Point(x, y) for _, _, x, y in endpoint_list]
         tree = STRtree(ep_pts)
         for i, (seg_u, end_u, _xu, _yu) in enumerate(endpoint_list):
-            for j_raw in tree.query(
+            neighbors = tree.query(
                 ep_pts[i], predicate="dwithin", distance=_ENDPOINT_CONNECT_TOL_M
-            ):
+            )
+            work += len(neighbors)
+            if len(neighbors) > _MAX_HMM_JUNCTION_NEIGHBORS or work > _MAX_HMM_ADJACENCY_WORK:
+                raise MatchBudgetExceeded()
+            for j_raw in neighbors:
                 j = int(j_raw)
                 if j <= i:
                     continue
@@ -192,11 +218,19 @@ class _CorridorGraph:
         self.segments = segments
         self.max_hops = max_hops
         self.adj, _ = _build_node_adjacency(segments)
+        self._graph_work = 0
         # Cache: (seg_u, exit_end_u, seg_v, entry_end_v) -> (mid_dist_m, [(mid_seg_idx, enter_end)])
         self._ep_cache: dict[
             tuple[int, int, int, int],
             tuple[float, list[tuple[int, int]]] | None,
         ] = {}
+
+    def _neighbors(self, key: tuple[int, int]) -> Sequence[tuple[int, int]]:
+        neighbors = self.adj.get(key, ())
+        self._graph_work += len(neighbors) + 1
+        if self._graph_work > _MAX_HMM_GRAPH_WORK:
+            raise MatchBudgetExceeded()
+        return neighbors
 
     def _shortest_between_endpoints(
         self,
@@ -213,11 +247,13 @@ class _CorridorGraph:
             if cached is None:
                 return None
             return cached if cached[0] <= max_dist_m else None
+        if len(self._ep_cache) >= _MAX_HMM_CACHE_ENTRIES:
+            self._ep_cache.clear()
 
         # Dijkstra over directed transitions entering segments:
         # state = (cost_m, hops, cur_seg, cur_entry_end, mid_path)
         pq: list[tuple[float, int, int, int, list[tuple[int, int]]]] = []
-        for nbr_seg, nbr_entry in self.adj.get((seg_u, exit_end_u), ()):
+        for nbr_seg, nbr_entry in self._neighbors((seg_u, exit_end_u)):
             if nbr_seg == seg_v and nbr_entry == entry_end_v:
                 result: tuple[float, list[tuple[int, int]]] = (0.0, [])
                 self._ep_cache[key] = result
@@ -239,7 +275,7 @@ class _CorridorGraph:
                 continue
             best_seen[state_key] = cost_m
 
-            for nbr_seg, nbr_entry in self.adj.get((cur_seg, exit_end), ()):
+            for nbr_seg, nbr_entry in self._neighbors((cur_seg, exit_end)):
                 if nbr_seg == seg_v and nbr_entry == entry_end_v:
                     found = (cost_m, mid_path)
                     break
@@ -342,24 +378,50 @@ class PostGISHMMMatcher:
         search_radius_m: float,
     ) -> list[_CorridorSegment]:
         """Load active vehicular canonical segments near the trace in a single PostGIS query."""
+        if len(points) > MAX_TRACE_POINTS:
+            raise MatchBudgetExceeded()
         trace_coords = ", ".join(f"{p.lon:.7f} {p.lat:.7f}" for p in points)
         trace_wkt = f"LINESTRING({trace_coords})"
         # 1 deg lat ~ 111 km; generous bbox expansion in deg keeps GIST index fast & lossless
         corridor_radius_m = max(search_radius_m + 25.0, 60.0)
         expand_deg = (corridor_radius_m / 80_000.0) + 0.002
 
-        rows = self._session.execute(
-            text(
-                """
+        try:
+            rows = self._session.execute(
+                text(
+                    """
                 WITH trace AS (
-                    SELECT
-                        ST_GeomFromText(:trace_wkt, 4326) AS geom_4326,
-                        ST_Transform(ST_GeomFromText(:trace_wkt, 4326), 3577) AS geom_3577
+                    SELECT ST_Transform(ST_GeomFromText(:trace_wkt, 4326), 3577) AS geom_3577
                 ),
-                trace_parts AS (
-                    SELECT ST_Subdivide(geom_3577, 64) AS part_3577 FROM trace
+                trace_parts AS MATERIALIZED (
+                    SELECT part_3577,
+                           ST_Expand(ST_Transform(part_3577, 4326), :expand_deg) AS bbox
+                    FROM (SELECT ST_Subdivide(geom_3577, 64) AS part_3577 FROM trace) AS parts
+                ),
+                corridor AS MATERIALIZED (
+                    SELECT DISTINCT ts.segment_id
+                    FROM trace_parts parts
+                    JOIN track_segments ts ON ts.geom && parts.bbox
+                    WHERE ts.is_active = TRUE
+                      AND ts.is_vehicular = TRUE
+                      AND CASE WHEN ST_NPoints(ts.geom) > :segment_vertices THEN TRUE
+                          ELSE ST_DWithin(
+                              ST_Transform(ts.geom, 3577), parts.part_3577, :corridor_radius_m
+                          ) END
+                    LIMIT :segment_lookahead
+                ),
+                measured AS MATERIALIZED (
+                    SELECT ts.segment_id, ST_NPoints(ts.geom) AS vertices
+                    FROM corridor c JOIN track_segments ts ON ts.segment_id = c.segment_id
+                ),
+                budget AS (
+                    SELECT COUNT(*) < :segment_lookahead
+                       AND COALESCE(SUM(vertices), 0) <= :corridor_vertices
+                       AND COALESCE(MAX(vertices), 0) <= :segment_vertices AS within_limit
+                    FROM measured
                 )
                 SELECT
+                    budget.within_limit,
                     ts.segment_id,
                     ts.track_id,
                     ts.start_node_key,
@@ -368,32 +430,32 @@ class PostGISHMMMatcher:
                     ts.bearing_deg,
                     ST_AsEWKB(ts.geom) AS geom_4326_wkb,
                     ST_AsEWKB(ST_Transform(ts.geom, 3577)) AS geom_3577_wkb
-                FROM track_segments ts
-                CROSS JOIN trace
-                WHERE ts.is_active = TRUE
-                  AND ts.is_vehicular = TRUE
-                  AND ts.geom && ST_Expand(trace.geom_4326, :expand_deg)
-                  AND EXISTS (
-                      SELECT 1
-                      FROM trace_parts tp
-                      WHERE ST_DWithin(
-                          ST_Transform(ts.geom, 3577),
-                          tp.part_3577,
-                          :corridor_radius_m
-                      )
-                  )
+                FROM budget
+                LEFT JOIN measured m ON budget.within_limit
+                LEFT JOIN track_segments ts ON ts.segment_id = m.segment_id
                 ORDER BY ts.segment_id
-                """
-            ),
-            {
-                "trace_wkt": trace_wkt,
-                "expand_deg": expand_deg,
-                "corridor_radius_m": corridor_radius_m,
-            },
-        ).fetchall()
+                    """
+                ),
+                {
+                    "trace_wkt": trace_wkt,
+                    "expand_deg": expand_deg,
+                    "corridor_radius_m": corridor_radius_m,
+                    "segment_lookahead": _MAX_HMM_CORRIDOR_SEGMENTS + 1,
+                    "corridor_vertices": _MAX_HMM_CORRIDOR_VERTICES,
+                    "segment_vertices": _MAX_HMM_SEGMENT_VERTICES,
+                },
+            ).fetchall()
+        except DBAPIError as exc:
+            if getattr(exc.orig, "sqlstate", None) == "57014":
+                raise MatchBudgetExceeded() from exc
+            raise
 
         segments: list[_CorridorSegment] = []
-        for idx, row in enumerate(rows):
+        for row in rows:
+            if not row.within_limit:
+                raise MatchBudgetExceeded()
+            if row.segment_id is None:
+                continue
             geom_4326 = wkb.loads(bytes(row.geom_4326_wkb))
             geom_3577 = wkb.loads(bytes(row.geom_3577_wkb))
             if not isinstance(geom_4326, LineString) or not isinstance(geom_3577, LineString):
@@ -408,7 +470,7 @@ class PostGISHMMMatcher:
             )
             segments.append(
                 _CorridorSegment(
-                    idx=idx,
+                    idx=len(segments),
                     segment_id=str(row.segment_id),
                     track_id=str(row.track_id) if row.track_id is not None else None,
                     start_node_key=str(row.start_node_key),
@@ -444,6 +506,7 @@ class PostGISHMMMatcher:
         tree = STRtree([seg.geom_3577 for seg in segments])
         candidates_per_pt: list[list[_CandidateState]] = []
         unmatched_reasons: list[Literal["no_candidates", "low_confidence"] | None] = []
+        evaluations = 0
 
         for idx, pt in enumerate(points):
             px, py = xys[idx]
@@ -451,7 +514,16 @@ class PostGISHMMMatcher:
             sigma = max(self.sigma_z_m, pt.accuracy_m or self.sigma_z_m)
             pt_bearing = bearings[idx]
 
-            nearby_indices = tree.query(p_geom, predicate="dwithin", distance=search_radius_m)
+            nearby_indices = tree.query(box(
+                px - search_radius_m, py - search_radius_m,
+                px + search_radius_m, py + search_radius_m,
+            ))
+            evaluations += len(nearby_indices)
+            if (
+                len(nearby_indices) > _MAX_HMM_NEARBY_SEGMENTS
+                or evaluations > _MAX_HMM_CANDIDATE_EVALUATIONS
+            ):
+                raise MatchBudgetExceeded()
             raw_cands: list[_CandidateState] = []
             had_any_within_radius = False
 
@@ -491,7 +563,7 @@ class PostGISHMMMatcher:
                     )
                 )
 
-            raw_cands.sort(key=lambda c: (-c.log_emission, c.perp_dist_m))
+            raw_cands.sort(key=lambda c: (-c.log_emission, c.perp_dist_m, c.seg_idx))
             filtered = [
                 c
                 for c in raw_cands[: self.max_candidates]

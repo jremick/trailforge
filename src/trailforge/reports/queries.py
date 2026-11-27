@@ -428,6 +428,7 @@ def get_reports_for_tracks(
     include_resolved: bool = False,
     current_user_id: uuid.UUID | None = None,
     now: datetime | None = None,
+    max_results: int | None = None,
 ) -> dict[str, dict[str, list[dict[str, Any]]]]:
     """Batch-load condition reports and active gate warnings for multiple tracks in one query."""
     unique_ids = list(dict.fromkeys(tid for tid in track_ids if tid))
@@ -437,19 +438,9 @@ def get_reports_for_tracks(
     if not unique_ids:
         return result
 
-    seg_rows = session.execute(
-        select(TrackSegment.segment_id, TrackSegment.track_id).where(
-            TrackSegment.track_id.in_(unique_ids)
-        )
-    ).all()
-    seg_to_track: dict[str, str] = {
-        seg_id: tid for seg_id, tid in seg_rows if seg_id and tid is not None
-    }
-
-    conditions = [ConditionReport.track_id.in_(unique_ids)]
-    if seg_to_track:
-        conditions.append(ConditionReport.segment_id.in_(list(seg_to_track.keys())))
-
+    route_segment_ids = select(TrackSegment.segment_id).where(
+        TrackSegment.track_id.in_(unique_ids)
+    )
     stmt = (
         select(
             ConditionReport,
@@ -457,16 +448,30 @@ def get_reports_for_tracks(
             func.ST_Y(ConditionReport.geom).label("lat"),
             User.display_name.label("author_display_name"),
             Track.name.label("track_name"),
+            TrackSegment.track_id.label("segment_track_id"),
         )
         .join(User, ConditionReport.user_id == User.id)
         .outerjoin(Track, ConditionReport.track_id == Track.track_id)
-        .where(ConditionReport.status != "hidden", or_(*conditions))
+        .outerjoin(TrackSegment, ConditionReport.segment_id == TrackSegment.segment_id)
+        .where(
+            ConditionReport.status != "hidden",
+            or_(
+                ConditionReport.track_id.in_(unique_ids),
+                ConditionReport.segment_id.in_(route_segment_ids),
+            ),
+        )
         .order_by(ConditionReport.observed_at.desc(), ConditionReport.created_at.desc())
     )
     if not include_resolved:
         stmt = stmt.where(ConditionReport.status != "resolved")
+    if max_results is not None:
+        stmt = stmt.limit(max_results + 1)
 
     rows = session.execute(stmt).all()
+    if max_results is not None and len(rows) > max_results:
+        raise ValueError(
+            "Route has too many reports to analyze in one request. Split the route and retry."
+        )
     if not rows:
         return result
 
@@ -476,7 +481,7 @@ def get_reports_for_tracks(
     )
 
     seen_per_track: dict[str, set[uuid.UUID]] = {tid: set() for tid in unique_ids}
-    for report, lon, lat, author_name, track_name in rows:
+    for report, lon, lat, author_name, track_name, segment_track_id in rows:
         payload = serialize_condition_report(
             report,
             lon=float(lon),
@@ -493,8 +498,8 @@ def get_reports_for_tracks(
         target_tids: set[str] = set()
         if report.track_id in result:
             target_tids.add(report.track_id)
-        if report.segment_id and report.segment_id in seg_to_track:
-            target_tids.add(seg_to_track[report.segment_id])
+        if segment_track_id in result:
+            target_tids.add(segment_track_id)
 
         is_active_gate = bool(
             payload["is_gate_warning"]

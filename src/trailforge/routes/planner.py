@@ -11,13 +11,15 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Final, Literal
 
 from pydantic import BaseModel, Field
 from sqlalchemy import case, func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.orm import Session, defer, load_only
 
 from trailforge.api.tracks import ParkSummary, PoiResponse
 from trailforge.db.models import (
@@ -52,6 +54,12 @@ LEG_GAP_THRESHOLD_M: Final[float] = 100.0
 MAX_PROFILE_POINTS: Final[int] = 600
 _NEARBY_POI_RADIUS_M: Final[float] = 1500.0
 _MAX_NEARBY_POIS: Final[int] = 40
+_MAX_ROUTE_SEGMENTS: Final[int] = 3_000
+_MAX_ROUTE_COORDINATES: Final[int] = 24_000
+_MAX_ROUTE_PROFILE_SAMPLES: Final[int] = 32_000
+_MAX_ROUTE_SAFETY_ITEMS: Final[int] = 512
+_MAX_ROUTE_ANALYSIS_BYTES: Final[int] = 2 * 1024 * 1024
+MAX_ROUTE_EXPORT_BYTES: Final[int] = 4 * 1024 * 1024
 _EARTH_RADIUS_M: Final[float] = 6_371_008.8
 
 GRADE_SPEED_KMH: Final[dict[str, float]] = {
@@ -110,6 +118,15 @@ class TrackNotFoundError(ValueError):
         self.missing_track_ids = list(missing_track_ids)
         joined = ", ".join(self.missing_track_ids)
         super().__init__(f"Unknown or inactive track_id(s): {joined}")
+
+
+class RouteWorkBudgetExceeded(ValueError):
+    """The route exceeded the work budget for full analysis or export."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Route has too much detail to analyze in one request. Split the route and retry."
+        )
 
 
 class RouteWaypoint(BaseModel):
@@ -662,6 +679,41 @@ def _stitch_single_track(
     )
 
 
+def _bounded_route_segment_ids(session: Session, track_ids: Sequence[str]) -> list[str]:
+    """Check weighted route size before loading geometries, grades, or profile arrays."""
+    uses_by_track = Counter(track_ids)
+    profile_len = case(
+        (
+            func.jsonb_typeof(TrackSegment.elevation_profile_m) == "array",
+            func.jsonb_array_length(TrackSegment.elevation_profile_m),
+        ),
+        else_=0,
+    )
+    rows = session.execute(
+        select(
+            TrackSegment.segment_id,
+            TrackSegment.track_id,
+            func.ST_NPoints(TrackSegment.geom).label("vertices"),
+            func.greatest(2, profile_len).label("profile_samples"),
+        )
+        .where(TrackSegment.track_id.in_(uses_by_track), TrackSegment.is_active.is_(True))
+        .limit(_MAX_ROUTE_SEGMENTS + 1)
+    ).all()
+    segments = coordinates = profile_samples = 0
+    for row in rows:
+        use_count = uses_by_track[row.track_id]
+        segments += use_count
+        coordinates += row.vertices * use_count
+        profile_samples += row.profile_samples * use_count
+    if (
+        segments > _MAX_ROUTE_SEGMENTS
+        or coordinates > _MAX_ROUTE_COORDINATES
+        or profile_samples > _MAX_ROUTE_PROFILE_SAMPLES
+    ):
+        raise RouteWorkBudgetExceeded()
+    return [row.segment_id for row in rows]
+
+
 def plan_route_with_geometry(
     session: Session,
     track_ids: Sequence[str],
@@ -672,6 +724,30 @@ def plan_route_with_geometry(
     name: str | None = None,
 ) -> tuple[PlannedRouteAnalysis, list[OrientedLegTrack]]:
     """Plan and analyze a chained multi-track route, returning `(analysis, oriented_leg_tracks)`."""
+    try:
+        return _plan_route_with_geometry_impl(
+            session,
+            track_ids,
+            vehicle_class=vehicle_class,
+            vehicle_profile=vehicle_profile,
+            waypoints=waypoints,
+            name=name,
+        )
+    except DBAPIError as exc:
+        if getattr(exc.orig, "sqlstate", None) == "57014":
+            raise RouteWorkBudgetExceeded() from exc
+        raise
+
+
+def _plan_route_with_geometry_impl(
+    session: Session,
+    track_ids: Sequence[str],
+    *,
+    vehicle_class: str | None = None,
+    vehicle_profile: VehicleProfile | None = None,
+    waypoints: Sequence[RouteWaypoint | dict[str, Any]] | None = None,
+    name: str | None = None,
+) -> tuple[PlannedRouteAnalysis, list[OrientedLegTrack]]:
     if not isinstance(track_ids, (list, tuple)):
         raise ValueError("track_ids must be a list of canonical track IDs")
     cleaned_ids = [str(tid).strip() for tid in track_ids]
@@ -707,14 +783,17 @@ def plan_route_with_geometry(
 
     # 1. Load canonical tracks and verify every requested ID exists & is active
     track_rows = session.execute(
-        select(Track).where(Track.track_id.in_(unique_ids), Track.is_active.is_(True))
+        select(Track)
+        .where(Track.track_id.in_(unique_ids), Track.is_active.is_(True))
+        .options(defer(Track.bbox_geom))
     ).scalars().all()
     tracks_by_id: dict[str, Track] = {t.track_id: t for t in track_rows}
     missing = [tid for tid in unique_ids if tid not in tracks_by_id]
     if missing:
         raise TrackNotFoundError(missing)
 
-    # 2. Load active segments + grades for all unique tracks in one query
+    # 2. Enforce budgets including repeated legs before loading the full segment rows.
+    segment_ids = _bounded_route_segment_ids(session, cleaned_ids)
     raw_seg_rows = session.execute(
         select(
             TrackSegment,
@@ -722,7 +801,17 @@ def plan_route_with_geometry(
             TrackSegmentGrade,
         )
         .outerjoin(TrackSegmentGrade, TrackSegment.segment_id == TrackSegmentGrade.segment_id)
-        .where(TrackSegment.track_id.in_(unique_ids), TrackSegment.is_active.is_(True))
+        .where(TrackSegment.segment_id.in_(segment_ids), TrackSegment.is_active.is_(True))
+        .options(
+            defer(TrackSegment.geom),
+            load_only(
+                TrackSegmentGrade.effective_grade,
+                TrackSegmentGrade.baseline_grade,
+                TrackSegmentGrade.baseline_score,
+                TrackSegmentGrade.rainfall_context,
+                TrackSegmentGrade.wet_risk_level,
+            ),
+        )
         .order_by(
             TrackSegment.track_id.asc(),
             TrackSegment.segment_seq.asc().nullslast(),
@@ -744,8 +833,12 @@ def plan_route_with_geometry(
 
     # 3. Bulk-load live grading summaries, official closures, and community condition reports
     live_map = get_live_summaries_for_tracks(session, unique_ids)
-    closures_map = get_closures_for_track_ids(session, unique_ids)
-    raw_reports_map = get_reports_for_tracks(session, unique_ids, include_resolved=False)
+    closures_map = get_closures_for_track_ids(
+        session, unique_ids, max_results=_MAX_ROUTE_SAFETY_ITEMS
+    )
+    raw_reports_map = get_reports_for_tracks(
+        session, unique_ids, include_resolved=False, max_results=_MAX_ROUTE_SAFETY_ITEMS
+    )
     reports_by_track: dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {
         tid: (
             list(raw_reports_map.get(tid, {}).get("condition_reports") or []),
@@ -787,12 +880,16 @@ def plan_route_with_geometry(
             ),
         )
         .where(
-            TrackSegment.track_id.in_(unique_ids),
+            TrackSegment.segment_id.in_(segment_ids),
             TrackSegment.is_active.is_(True),
             func.lower(SourceWaterway.feature_type) != "connector",
             func.ST_DWithin(TrackSegment.geom, SourceWaterway.geom, 0.0005),
         )
+        .limit(_MAX_ROUTE_SAFETY_ITEMS + 1)
     ).all()
+    track_uses = Counter(cleaned_ids)
+    if sum(track_uses[row.track_id] for row in ww_rows) > _MAX_ROUTE_SAFETY_ITEMS:
+        raise RouteWorkBudgetExceeded()
 
     ww_by_track: dict[str, list[Any]] = {tid: [] for tid in unique_ids}
     for row in ww_rows:
@@ -1131,20 +1228,26 @@ def plan_route_with_geometry(
     )
 
     # 9. Intersecting CAPAD parks & nearby POIs within 1,500 m of combined route segments
-    route_union_sq = (
-        select(func.ST_Union(TrackSegment.geom).label("geom"))
-        .where(TrackSegment.track_id.in_(unique_ids), TrackSegment.is_active.is_(True))
-        .subquery("route_union")
+    route_geometry = (
+        select(func.ST_Collect(TrackSegment.geom).label("geom"))
+        .where(TrackSegment.segment_id.in_(segment_ids), TrackSegment.is_active.is_(True))
+        .subquery("route_geometry")
     )
 
     all_park_ids: set[int] = set()
     for tg in track_geom_map.values():
         all_park_ids.update(tg.park_ids)
+    if len(all_park_ids) > _MAX_ROUTE_SAFETY_ITEMS:
+        raise RouteWorkBudgetExceeded()
 
     parks_by_id: dict[int, CAPADPark] = {}
     if all_park_ids:
         park_objs = (
-            session.execute(select(CAPADPark).where(CAPADPark.id.in_(list(all_park_ids))))
+            session.execute(
+                select(CAPADPark)
+                .where(CAPADPark.id.in_(all_park_ids))
+                .options(defer(CAPADPark.geom))
+            )
             .scalars()
             .all()
         )
@@ -1153,11 +1256,15 @@ def plan_route_with_geometry(
 
     intersecting_parks = session.execute(
         select(CAPADPark)
-        .join(route_union_sq, func.ST_Intersects(CAPADPark.geom, route_union_sq.c.geom))
+        .join(route_geometry, func.ST_Intersects(CAPADPark.geom, route_geometry.c.geom))
+        .options(defer(CAPADPark.geom))
         .order_by(CAPADPark.name.asc())
+        .limit(_MAX_ROUTE_SAFETY_ITEMS + 1)
     ).scalars().all()
     for pk in intersecting_parks:
         parks_by_id.setdefault(pk.id, pk)
+    if len(parks_by_id) > _MAX_ROUTE_SAFETY_ITEMS:
+        raise RouteWorkBudgetExceeded()
 
     capad_parks = [
         ParkSummary(
@@ -1175,7 +1282,7 @@ def plan_route_with_geometry(
 
     dist_expr = func.ST_Distance(
         func.ST_Transform(POI.geom, 3577),
-        func.ST_Transform(route_union_sq.c.geom, 3577),
+        func.ST_Transform(route_geometry.c.geom, 3577),
     ).label("distance_m")
     poi_rows = session.execute(
         select(
@@ -1186,15 +1293,16 @@ def plan_route_with_geometry(
             dist_expr,
         )
         .join(
-            route_union_sq,
+            route_geometry,
             func.ST_DWithin(
                 func.ST_Transform(POI.geom, 3577),
-                func.ST_Transform(route_union_sq.c.geom, 3577),
+                func.ST_Transform(route_geometry.c.geom, 3577),
                 _NEARBY_POI_RADIUS_M,
             ),
         )
         .outerjoin(CAPADPark, POI.capad_park_id == CAPADPark.id)
-        .where(func.ST_DWithin(POI.geom, route_union_sq.c.geom, 0.025))
+        .where(func.ST_DWithin(POI.geom, route_geometry.c.geom, 0.025))
+        .options(defer(POI.geom))
         .order_by(dist_expr.asc(), POI.name.asc())
         .limit(_MAX_NEARBY_POIS)
     ).all()
@@ -1420,6 +1528,8 @@ def plan_route_with_geometry(
         attributions=list(ROUTE_ATTRIBUTIONS),
     )
 
+    if len(analysis.model_dump_json().encode("utf-8")) > _MAX_ROUTE_ANALYSIS_BYTES:
+        raise RouteWorkBudgetExceeded()
     return analysis, oriented_tracks
 
 
