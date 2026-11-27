@@ -1,6 +1,14 @@
 import { summarizeFeedStatus } from "../closuresHelpers";
 import { REGION_PRESETS, escapeHtml, getGradeColor } from "../presets";
-import { resolveLocalSearch, runUnifiedSearch } from "../search";
+import {
+  MIN_REMOTE_SEARCH_LENGTH,
+  isExactCoordinateQuery,
+  peekCachedUnifiedSearch,
+  preloadAuPlaces,
+  resolveLocalSearch,
+  runUnifiedSearch,
+  shouldRunRemoteSearch,
+} from "../search";
 import type {
   ClosuresStatusResponse,
   HealthState,
@@ -23,13 +31,212 @@ export interface TopBarCallbacks {
   onAdminClick?: () => void;
 }
 
-const SEARCH_DEBOUNCE_MS = 200;
+export const SEARCH_DEBOUNCE_MS = 250;
+export const TOPBAR_SEARCH_LIMIT = 10;
+export const MIN_CHARS_SEARCH_HINT =
+  "Type 2+ characters to search tracks, POIs & parks";
+
+export type SearchMenuMode =
+  | "hidden"
+  | "results"
+  | "searching"
+  | "hint"
+  | "empty";
+
+export type SearchMenuFooterMode = "none" | "searching" | "min_chars_hint";
+
+export interface TopBarSearchTransition {
+  isSearching: boolean;
+  shouldScheduleRemote: boolean;
+  shouldCancelPending: boolean;
+  results: UnifiedSearchItem[];
+  resultsQuery: string;
+  activeIdx: number;
+  menuMode: SearchMenuMode;
+  footerMode: SearchMenuFooterMode;
+  remoteError: boolean;
+}
+
+export type SearchSubmitAction =
+  | { kind: "noop" }
+  | { kind: "select"; item: UnifiedSearchItem }
+  | { kind: "hint" }
+  | { kind: "execute_remote" };
+
+/**
+ * Pure state transition for TopBar search input changes.
+ *
+ * Ensures:
+ * - Empty input clears everything cleanly.
+ * - Exact coordinate/MGRS inputs resolve 100% locally and mark resultsQuery final.
+ * - 1-character queries resolve local matches only and never trigger remote search.
+ * - Client LRU cache hits render 0 ms instant without flashing a loading state.
+ * - Queries with instant local matches STILL show searching state (`isSearching: true`,
+ *   `footerMode: "searching"`) and keep `resultsQuery = ""` until remote completes so
+ *   pressing Enter waits for track results instead of prematurely selecting a preset.
+ */
+export function computeSearchInputTransition(params: {
+  rawValue: string;
+  localItems: UnifiedSearchItem[];
+  cachedItems: UnifiedSearchItem[] | null;
+}): TopBarSearchTransition {
+  const q = params.rawValue.trim();
+
+  if (!q) {
+    return computeSearchClearTransition();
+  }
+
+  if (isExactCoordinateQuery(q)) {
+    return {
+      isSearching: false,
+      shouldScheduleRemote: false,
+      shouldCancelPending: true,
+      results: params.localItems,
+      resultsQuery: q,
+      activeIdx: params.localItems.length > 0 ? 0 : -1,
+      menuMode: params.localItems.length > 0 ? "results" : "empty",
+      footerMode: "none",
+      remoteError: false,
+    };
+  }
+
+  if (q.length < MIN_REMOTE_SEARCH_LENGTH) {
+    return {
+      isSearching: false,
+      shouldScheduleRemote: false,
+      shouldCancelPending: true,
+      results: params.localItems,
+      resultsQuery: "",
+      activeIdx: params.localItems.length > 0 ? 0 : -1,
+      menuMode: params.localItems.length > 0 ? "results" : "hint",
+      footerMode: params.localItems.length > 0 ? "min_chars_hint" : "none",
+      remoteError: false,
+    };
+  }
+
+  if (params.cachedItems !== null) {
+    return {
+      isSearching: false,
+      shouldScheduleRemote: false,
+      shouldCancelPending: true,
+      results: params.cachedItems,
+      resultsQuery: q,
+      activeIdx: params.cachedItems.length > 0 ? 0 : -1,
+      menuMode: params.cachedItems.length > 0 ? "results" : "empty",
+      footerMode: "none",
+      remoteError: false,
+    };
+  }
+
+  if (params.localItems.length > 0) {
+    return {
+      isSearching: true,
+      shouldScheduleRemote: true,
+      shouldCancelPending: false,
+      results: params.localItems,
+      resultsQuery: "",
+      activeIdx: 0,
+      menuMode: "results",
+      footerMode: "searching",
+      remoteError: false,
+    };
+  }
+
+  return {
+    isSearching: true,
+    shouldScheduleRemote: true,
+    shouldCancelPending: false,
+    results: [],
+    resultsQuery: "",
+    activeIdx: -1,
+    menuMode: "searching",
+    footerMode: "none",
+    remoteError: false,
+  };
+}
+
+/**
+ * Pure state transition once remote `/api/search` finishes for a query.
+ */
+export function computeSearchResolvedTransition(params: {
+  query: string;
+  items: UnifiedSearchItem[];
+  remoteError: boolean;
+}): TopBarSearchTransition {
+  const q = params.query.trim();
+  return {
+    isSearching: false,
+    shouldScheduleRemote: false,
+    shouldCancelPending: false,
+    results: params.items,
+    resultsQuery: q,
+    activeIdx: params.items.length > 0 ? 0 : -1,
+    menuMode: params.items.length > 0 ? "results" : "empty",
+    footerMode: "none",
+    remoteError: params.remoteError,
+  };
+}
+
+/**
+ * Pure state transition when search is cleared or dismissed cleanly.
+ */
+export function computeSearchClearTransition(): TopBarSearchTransition {
+  return {
+    isSearching: false,
+    shouldScheduleRemote: false,
+    shouldCancelPending: true,
+    results: [],
+    resultsQuery: "",
+    activeIdx: -1,
+    menuMode: "hidden",
+    footerMode: "none",
+    remoteError: false,
+  };
+}
+
+/**
+ * Pure decision helper for Enter / form submit in TopBar search.
+ */
+export function computeSearchSubmitAction(params: {
+  query: string;
+  resultsQuery: string;
+  results: readonly UnifiedSearchItem[];
+  activeIdx: number;
+}): SearchSubmitAction {
+  const q = params.query.trim();
+  if (!q) return { kind: "noop" };
+
+  if (
+    params.resultsQuery === q &&
+    params.activeIdx >= 0 &&
+    params.results[params.activeIdx]
+  ) {
+    return { kind: "select", item: params.results[params.activeIdx]! };
+  }
+
+  if (!shouldRunRemoteSearch(q)) {
+    if (params.results.length > 0) {
+      const idx =
+        params.activeIdx >= 0 && params.activeIdx < params.results.length
+          ? params.activeIdx
+          : 0;
+      const picked = params.results[idx];
+      if (picked) return { kind: "select", item: picked };
+    }
+    if (q.length < MIN_REMOTE_SEARCH_LENGTH) {
+      return { kind: "hint" };
+    }
+  }
+
+  return { kind: "execute_remote" };
+}
 
 export class TopBar {
   private readonly root: HTMLElement;
   private readonly callbacks: TopBarCallbacks;
   private readonly sidebarBtnEl: HTMLButtonElement;
   private readonly searchWrapEl: HTMLElement;
+  private readonly searchFormEl: HTMLFormElement;
   private readonly searchInputEl: HTMLInputElement;
   private readonly searchKbdEl: HTMLElement;
   private readonly searchClearBtn: HTMLButtonElement;
@@ -63,9 +270,11 @@ export class TopBar {
   private searchAbort: AbortController | null = null;
   private inFlightQuery: string | null = null;
   private inFlightPromise: Promise<UnifiedSearchItem[]> | null = null;
+  private placesPreloadStarted = false;
   private resultsQuery = "";
   private results: UnifiedSearchItem[] = [];
   private activeIdx = -1;
+  private isSearching = false;
   private lastRemoteError = false;
   private healthSeverity: "online" | "degraded" | "offline" | "connecting" =
     "connecting";
@@ -130,18 +339,22 @@ export class TopBar {
 
       <div class="tf-search-wrap" data-role="search-wrap">
         <form class="tf-search-form" data-role="search-form" role="search">
-          <svg class="tf-search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <circle cx="11" cy="11" r="8"></circle>
-            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-          </svg>
+          <span class="tf-search-leading" aria-hidden="true">
+            <svg class="tf-search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="11" cy="11" r="8"></circle>
+              <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+            </svg>
+            <span class="tf-search-spinner" data-role="search-spinner"></span>
+          </span>
           <input
             type="text"
             class="tf-search-input"
             data-role="search-input"
-            placeholder="Search tracks, huts, camps, coords, or MGRS…"
-            aria-label="Search Australian tracks, camps, huts, coordinates, or MGRS"
+            placeholder="Search tracks, towns, huts, camps, coords, or MGRS…"
+            aria-label="Search Australian tracks, towns, regions, camps, huts, coordinates, or MGRS"
             aria-autocomplete="list"
             aria-expanded="false"
+            aria-busy="false"
             autocomplete="off"
             spellcheck="false"
           />
@@ -291,7 +504,7 @@ export class TopBar {
       "[data-role='topbar-sidebar-btn']"
     );
     this.searchWrapEl = this.q("[data-role='search-wrap']");
-    const searchForm = this.q<HTMLFormElement>("[data-role='search-form']");
+    this.searchFormEl = this.q<HTMLFormElement>("[data-role='search-form']");
     this.searchInputEl = this.q<HTMLInputElement>("[data-role='search-input']");
     this.searchKbdEl = this.q("[data-role='search-kbd']");
     this.searchClearBtn = this.q<HTMLButtonElement>("[data-role='search-clear']");
@@ -326,36 +539,44 @@ export class TopBar {
       callbacks.onToggleSidebar?.();
     });
 
-    searchForm.addEventListener("submit", (e) => {
+    this.searchFormEl.addEventListener("submit", (e) => {
       e.preventDefault();
       void this.handleSubmit();
     });
 
     this.searchInputEl.addEventListener("input", () => {
-      const q = this.searchInputEl.value.trim();
+      this.ensurePlacesPreloaded();
+      const rawValue = this.searchInputEl.value;
+      const q = rawValue.trim();
       this.syncSearchAccessoryState(q.length > 0);
-      if (!q) {
+
+      const localItems = q ? resolveLocalSearch(q) : [];
+      const cachedItems = q
+        ? peekCachedUnifiedSearch(q, { limit: TOPBAR_SEARCH_LIMIT })
+        : null;
+
+      const next = computeSearchInputTransition({
+        rawValue,
+        localItems,
+        cachedItems,
+      });
+
+      if (next.shouldCancelPending) {
         this.cancelPendingSearch();
-        this.results = [];
-        this.resultsQuery = "";
-        this.hideMenu();
-        return;
+      } else if (this.inFlightQuery !== null && this.inFlightQuery !== q) {
+        this.abortInFlightSearch();
       }
-      const instant = resolveLocalSearch(q);
-      if (instant.length > 0) {
-        this.resultsQuery = q;
-        this.renderMenu(instant, false);
-      } else {
-        this.results = [];
-        this.resultsQuery = "";
-        this.activeIdx = -1;
-        this.renderSearchingMenu(q);
+
+      this.applySearchTransition(next, q);
+
+      if (next.shouldScheduleRemote) {
+        this.scheduleSearch(q);
       }
-      this.scheduleSearch(q);
     });
 
     this.searchInputEl.addEventListener("focus", () => {
       this.searchKbdEl.classList.add("hidden");
+      this.ensurePlacesPreloaded();
     });
 
     this.searchInputEl.addEventListener("blur", () => {
@@ -373,6 +594,8 @@ export class TopBar {
           (this.activeIdx - 1 + this.results.length) % this.results.length;
         this.highlightMenuOption();
       } else if (e.key === "Escape") {
+        this.cancelPendingSearch();
+        this.setSearchingState(false);
         this.hideMenu();
       }
     });
@@ -386,6 +609,8 @@ export class TopBar {
     document.addEventListener("click", (e) => {
       const target = e.target as Node;
       if (!this.searchWrapEl.contains(target)) {
+        this.cancelPendingSearch();
+        this.setSearchingState(false);
         this.hideMenu();
       }
       if (!this.statusWrapEl.contains(target)) {
@@ -400,12 +625,11 @@ export class TopBar {
     });
 
     this.searchClearBtn.addEventListener("click", () => {
+      const cleared = computeSearchClearTransition();
       this.cancelPendingSearch();
-      this.results = [];
-      this.resultsQuery = "";
       this.searchInputEl.value = "";
       this.syncSearchAccessoryState(false);
-      this.hideMenu();
+      this.applySearchTransition(cleared, "");
       callbacks.onSearchClear();
       this.searchInputEl.focus();
     });
@@ -674,15 +898,94 @@ export class TopBar {
     this.searchKbdEl.classList.toggle("hidden", hasValue || focused);
   }
 
+  private setSearchingState(searching: boolean): void {
+    this.isSearching = searching;
+    this.searchFormEl.classList.toggle("is-searching", searching);
+    this.searchInputEl.setAttribute("aria-busy", String(searching));
+  }
+
+  private ensurePlacesPreloaded(): void {
+    if (this.placesPreloadStarted) return;
+    this.placesPreloadStarted = true;
+    void preloadAuPlaces().then((places) => {
+      if (places.length === 0) return;
+      const q = this.searchInputEl.value.trim();
+      if (!q || this.resultsQuery === q) return;
+      if (this.searchMenuEl.classList.contains("hidden")) return;
+
+      const localItems = resolveLocalSearch(q);
+      if (localItems.length === 0) return;
+
+      if (q.length < MIN_REMOTE_SEARCH_LENGTH) {
+        this.results = localItems;
+        this.activeIdx = 0;
+        this.renderMenu(localItems, {
+          remoteError: false,
+          footerMode: "min_chars_hint",
+          query: q,
+        });
+      } else if (this.isSearching) {
+        this.results = localItems;
+        this.activeIdx = 0;
+        this.renderMenu(localItems, {
+          remoteError: false,
+          footerMode: "searching",
+          query: q,
+        });
+      }
+    });
+  }
+
+  private abortInFlightSearch(): void {
+    this.searchAbort?.abort();
+    this.searchAbort = null;
+    this.inFlightQuery = null;
+    this.inFlightPromise = null;
+  }
+
   private cancelPendingSearch(): void {
     if (this.searchTimer !== null) {
       window.clearTimeout(this.searchTimer);
       this.searchTimer = null;
     }
-    this.searchAbort?.abort();
-    this.searchAbort = null;
-    this.inFlightQuery = null;
-    this.inFlightPromise = null;
+    this.abortInFlightSearch();
+  }
+
+  private applySearchTransition(
+    transition: TopBarSearchTransition,
+    query: string
+  ): void {
+    this.setSearchingState(transition.isSearching);
+    this.results = transition.results;
+    this.resultsQuery = transition.resultsQuery;
+    this.activeIdx = transition.activeIdx;
+    this.lastRemoteError = transition.remoteError;
+
+    switch (transition.menuMode) {
+      case "hidden":
+        this.hideMenu();
+        break;
+      case "searching":
+        this.renderSearchingMenu(query);
+        break;
+      case "hint":
+        this.renderHintMenu();
+        break;
+      case "empty":
+        this.renderMenu([], {
+          remoteError: transition.remoteError,
+          footerMode: "none",
+          query,
+        });
+        break;
+      case "results":
+        this.renderMenu(transition.results, {
+          remoteError: transition.remoteError,
+          footerMode: transition.footerMode,
+          query,
+        });
+        break;
+    }
   }
 
   private scheduleSearch(query: string): void {
@@ -704,17 +1007,26 @@ export class TopBar {
     const controller = new AbortController();
     this.searchAbort = controller;
     this.inFlightQuery = query;
+    this.setSearchingState(true);
 
     const promise = (async (): Promise<UnifiedSearchItem[]> => {
       try {
         const { items, remoteError } = await runUnifiedSearch(query, {
-          limit: 10,
+          limit: TOPBAR_SEARCH_LIMIT,
           signal: controller.signal,
         });
-        if (controller.signal.aborted) return [];
-        this.lastRemoteError = remoteError;
-        this.resultsQuery = query;
-        this.renderMenu(items, remoteError);
+        if (
+          controller.signal.aborted ||
+          this.searchInputEl.value.trim() !== query
+        ) {
+          return [];
+        }
+        const resolved = computeSearchResolvedTransition({
+          query,
+          items,
+          remoteError,
+        });
+        this.applySearchTransition(resolved, query);
         return items;
       } catch {
         return [];
@@ -722,6 +1034,9 @@ export class TopBar {
         if (this.inFlightQuery === query && this.searchAbort === controller) {
           this.inFlightQuery = null;
           this.inFlightPromise = null;
+          if (this.searchTimer === null) {
+            this.setSearchingState(false);
+          }
         }
       }
     })();
@@ -739,16 +1054,35 @@ export class TopBar {
       this.searchTimer = null;
     }
 
-    if (
-      this.resultsQuery === query &&
-      this.activeIdx >= 0 &&
-      this.results[this.activeIdx]
-    ) {
-      this.selectResult(this.results[this.activeIdx]!);
+    const action = computeSearchSubmitAction({
+      query,
+      resultsQuery: this.resultsQuery,
+      results: this.results,
+      activeIdx: this.activeIdx,
+    });
+
+    if (action.kind === "noop") return;
+    if (action.kind === "select") {
+      this.selectResult(action.item);
+      return;
+    }
+    if (action.kind === "hint") {
+      this.setSearchingState(false);
+      this.renderHintMenu();
       return;
     }
 
-    this.renderSearchingMenu(query);
+    this.setSearchingState(true);
+    if (this.results.length > 0) {
+      this.renderMenu(this.results, {
+        remoteError: false,
+        footerMode: "searching",
+        query,
+      });
+    } else {
+      this.renderSearchingMenu(query);
+    }
+
     const items = await this.executeSearch(query);
     if (this.searchInputEl.value.trim() !== query) return;
     if (items.length > 0 && items[0]) {
@@ -759,39 +1093,91 @@ export class TopBar {
     }
   }
 
+  private renderHintMenu(): void {
+    this.searchMenuEl.innerHTML = `<div class="tf-search-hint">${escapeHtml(MIN_CHARS_SEARCH_HINT)}</div>`;
+    this.searchMenuEl.classList.remove("hidden");
+    this.searchInputEl.setAttribute("aria-expanded", "true");
+  }
+
   private renderSearchingMenu(query: string): void {
-    this.searchMenuEl.innerHTML = `<div class="tf-search-empty">Searching tracks, POIs &amp; parks for “${escapeHtml(query)}”…</div>`;
+    this.searchMenuEl.innerHTML = `
+      <div class="tf-search-loading-head" role="status" aria-live="polite">
+        <span class="tf-search-inline-spinner" aria-hidden="true"></span>
+        <span class="tf-search-loading-label">Searching tracks, POIs &amp; parks for “${escapeHtml(query)}”…</span>
+      </div>
+      <div class="tf-search-skeleton-list" aria-hidden="true">
+        <div class="tf-search-skeleton-row">
+          <div class="tf-search-skeleton-copy">
+            <span class="tf-search-skeleton-line tf-search-skeleton-title" style="width:64%"></span>
+            <span class="tf-search-skeleton-line tf-search-skeleton-sub" style="width:42%"></span>
+          </div>
+          <span class="tf-search-skeleton-pill"></span>
+        </div>
+        <div class="tf-search-skeleton-row">
+          <div class="tf-search-skeleton-copy">
+            <span class="tf-search-skeleton-line tf-search-skeleton-title" style="width:52%"></span>
+            <span class="tf-search-skeleton-line tf-search-skeleton-sub" style="width:36%"></span>
+          </div>
+          <span class="tf-search-skeleton-pill"></span>
+        </div>
+        <div class="tf-search-skeleton-row">
+          <div class="tf-search-skeleton-copy">
+            <span class="tf-search-skeleton-line tf-search-skeleton-title" style="width:58%"></span>
+            <span class="tf-search-skeleton-line tf-search-skeleton-sub" style="width:46%"></span>
+          </div>
+          <span class="tf-search-skeleton-pill"></span>
+        </div>
+      </div>
+    `;
     this.searchMenuEl.classList.remove("hidden");
     this.searchInputEl.setAttribute("aria-expanded", "true");
   }
 
   private selectResult(item: UnifiedSearchItem): void {
+    this.cancelPendingSearch();
+    this.setSearchingState(false);
     this.setSearchValue(item.title);
     this.hideMenu();
     this.callbacks.onSearchSelect(item);
   }
 
-  private renderMenu(items: UnifiedSearchItem[], remoteError: boolean): void {
+  private renderMenu(
+    items: UnifiedSearchItem[],
+    options: {
+      remoteError: boolean;
+      footerMode: SearchMenuFooterMode;
+      query: string;
+    }
+  ): void {
     this.results = items;
     this.activeIdx = items.length > 0 ? 0 : -1;
 
     if (items.length === 0) {
       this.searchMenuEl.innerHTML = `<div class="tf-search-empty">${
-        remoteError
-          ? "Offline — enter lat,lon, MGRS, or a region name."
-          : "No matching tracks, POIs, or parks."
+        options.remoteError
+          ? "Offline — enter lat,lon, MGRS, or a town/region name."
+          : "No matching tracks, POIs, parks, or places."
       }</div>`;
       this.searchMenuEl.classList.remove("hidden");
       this.searchInputEl.setAttribute("aria-expanded", "true");
       return;
     }
 
-    this.searchMenuEl.innerHTML = items
+    const rowsHtml = items
       .map((item, idx) => {
+        const badgeClass =
+          item.kind === "place"
+            ? "tf-search-badge tf-search-badge-place"
+            : item.kind === "park"
+              ? "tf-search-badge tf-search-badge-park"
+              : item.kind === "preset"
+                ? "tf-search-badge tf-search-badge-preset"
+                : "tf-search-badge";
+
         const kindBadge =
           item.kind === "track" && item.grade
             ? `<span class="tf-search-badge" style="border-color:${getGradeColor(item.grade)};color:${getGradeColor(item.grade)}">${escapeHtml(item.grade)}</span>`
-            : `<span class="tf-search-badge">${escapeHtml(item.kind.toUpperCase())}</span>`;
+            : `<span class="${badgeClass}">${escapeHtml(item.kind.toUpperCase())}</span>`;
 
         const iconImg = item.iconKey
           ? `<img class="tf-search-item-icon" src="/icons/${escapeHtml(item.iconKey)}.svg" alt="" width="16" height="16" />`
@@ -815,6 +1201,22 @@ export class TopBar {
         `;
       })
       .join("");
+
+    let footerHtml = "";
+    if (options.footerMode === "searching") {
+      footerHtml = `
+        <div class="tf-search-pending-footer" data-role="search-pending-footer" role="status" aria-live="polite">
+          <span class="tf-search-inline-spinner" aria-hidden="true"></span>
+          <span class="tf-search-pending-footer-text">Searching tracks, POIs &amp; parks for “${escapeHtml(options.query)}”…</span>
+        </div>
+      `;
+    } else if (options.footerMode === "min_chars_hint") {
+      footerHtml = `
+        <div class="tf-search-hint-footer" data-role="search-hint-footer">${escapeHtml(MIN_CHARS_SEARCH_HINT)}</div>
+      `;
+    }
+
+    this.searchMenuEl.innerHTML = `${rowsHtml}${footerHtml}`;
 
     this.searchMenuEl
       .querySelectorAll<HTMLButtonElement>("[data-search-idx]")

@@ -183,6 +183,8 @@ button {
 }
 
 .tf-search-form {
+  position: relative;
+  overflow: hidden;
   display: flex;
   align-items: center;
   width: 100%;
@@ -193,6 +195,28 @@ button {
   padding: 0 8px 0 10px;
   gap: 7px;
   transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.tf-search-form::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  pointer-events: none;
+  opacity: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(56, 189, 248, 0.28) 20%,
+    var(--accent-cyan) 50%,
+    rgba(56, 189, 248, 0.28) 80%,
+    transparent 100%
+  );
+  background-size: 55% 100%;
+  background-repeat: no-repeat;
+  transition: opacity 0.16s ease;
 }
 
 .tf-search-form:hover {
@@ -206,14 +230,57 @@ button {
   box-shadow: 0 0 0 2px var(--accent-cyan-soft);
 }
 
+.tf-search-form.is-searching {
+  border-color: rgba(56, 189, 248, 0.62);
+}
+
+.tf-search-form.is-searching::after {
+  opacity: 1;
+  animation: tf-search-shimmer 1.15s ease-in-out infinite;
+}
+
+.tf-search-leading {
+  position: relative;
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  display: inline-grid;
+  place-items: center;
+}
+
 .tf-search-icon {
+  grid-area: 1 / 1;
   color: var(--text-muted);
   flex-shrink: 0;
-  transition: color 0.15s ease;
+  transition: opacity 0.14s ease, transform 0.14s ease, color 0.15s ease;
 }
 
 .tf-search-form:focus-within .tf-search-icon {
   color: var(--accent-cyan);
+}
+
+.tf-search-spinner {
+  grid-area: 1 / 1;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 1.8px solid rgba(56, 189, 248, 0.22);
+  border-top-color: var(--accent-cyan);
+  opacity: 0;
+  transform: scale(0.75);
+  pointer-events: none;
+  transition: opacity 0.14s ease, transform 0.14s ease;
+}
+
+.tf-search-form.is-searching .tf-search-icon {
+  opacity: 0;
+  transform: scale(0.72);
+}
+
+.tf-search-form.is-searching .tf-search-spinner {
+  opacity: 1;
+  transform: scale(1);
+  animation: tf-search-spin 0.72s linear infinite;
 }
 
 .tf-search-input {
@@ -347,10 +414,183 @@ button {
   background: var(--bg-base);
 }
 
+.tf-search-badge-place {
+  border-color: rgba(56, 189, 248, 0.42);
+  color: #7dd3fc;
+}
+
+.tf-search-badge-park {
+  border-color: rgba(34, 197, 94, 0.42);
+  color: #86efac;
+}
+
+.tf-search-badge-preset {
+  border-color: rgba(245, 158, 11, 0.42);
+  color: #fcd34d;
+}
+
 .tf-search-empty {
   padding: 10px 12px;
   font-size: 11.5px;
   color: var(--text-muted);
+}
+
+.tf-search-hint {
+  padding: 9px 11px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.tf-search-hint-footer {
+  padding: 6px 9px 4px;
+  margin-top: 2px;
+  border-top: 1px solid var(--border-subtle);
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.tf-search-inline-spinner {
+  width: 12px;
+  height: 12px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  border: 1.8px solid rgba(56, 189, 248, 0.24);
+  border-top-color: var(--accent-cyan);
+  animation: tf-search-spin 0.72s linear infinite;
+}
+
+.tf-search-pending-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  margin-top: 2px;
+  border-top: 1px solid var(--border-subtle);
+  border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+  background: rgba(56, 189, 248, 0.06);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.tf-search-pending-footer-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tf-search-loading-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 9px 6px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
+.tf-search-loading-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tf-search-skeleton-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-bottom: 2px;
+}
+
+.tf-search-skeleton-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 8px;
+  border-radius: var(--radius-sm);
+}
+
+.tf-search-skeleton-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  flex: 1;
+  min-width: 0;
+}
+
+.tf-search-skeleton-line,
+.tf-search-skeleton-pill {
+  display: block;
+  background: linear-gradient(
+    90deg,
+    rgba(148, 163, 184, 0.08) 0%,
+    rgba(56, 189, 248, 0.16) 50%,
+    rgba(148, 163, 184, 0.08) 100%
+  );
+  background-size: 220% 100%;
+  animation: tf-search-skeleton 1.3s ease-in-out infinite;
+}
+
+.tf-search-skeleton-title {
+  height: 10px;
+  border-radius: 4px;
+}
+
+.tf-search-skeleton-sub {
+  height: 8px;
+  border-radius: 4px;
+  opacity: 0.72;
+}
+
+.tf-search-skeleton-pill {
+  width: 44px;
+  height: 16px;
+  border-radius: 99px;
+  flex-shrink: 0;
+}
+
+@keyframes tf-search-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes tf-search-shimmer {
+  0% {
+    background-position: -65% 0;
+  }
+  100% {
+    background-position: 165% 0;
+  }
+}
+
+@keyframes tf-search-skeleton {
+  0% {
+    background-position: 180% 0;
+  }
+  100% {
+    background-position: -40% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tf-search-form.is-searching::after {
+    animation: none;
+    background: var(--accent-cyan);
+    opacity: 0.65;
+  }
+
+  .tf-search-form.is-searching .tf-search-spinner,
+  .tf-search-inline-spinner {
+    animation-duration: 1.6s;
+  }
+
+  .tf-search-skeleton-line,
+  .tf-search-skeleton-pill {
+    animation: none;
+    background: rgba(148, 163, 184, 0.12);
+  }
 }
 
 .tf-topbar-controls {
