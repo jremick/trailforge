@@ -5,10 +5,73 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine
+from starlette.requests import Request
 
 from trailforge.api.main import create_app
+from trailforge.auth.dependencies import (
+    _is_web_session_bearer,
+    _require_browser_queue_account,
+    require_expected_account,
+)
+from trailforge.auth.tokens import OAUTH_ACCESS_PREFIX, PAT_PREFIX
+from trailforge.db.models import User
+
+
+def _fake_request(headers: dict[str, str]) -> Request:
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/api/pins",
+        "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers.items()],
+    }
+    return Request(scope)
+
+
+def test_browser_queue_account_guard_unit_cookie_bearer_native_and_pat() -> None:
+    owner_id = uuid.uuid4()
+    user = User(id=owner_id, email="driver@example.test", display_name="Driver", password_hash="x")
+
+    # Stale account header -> 409; matching header -> OK
+    with pytest.raises(HTTPException) as stale:
+        require_expected_account(_fake_request({"X-TrailForge-Account": str(uuid.uuid4())}), user)
+    assert stale.value.status_code == 409
+    require_expected_account(_fake_request({"X-TrailForge-Account": str(owner_id)}), user)
+
+    # Cookie-only browser write without X-TrailForge-Account -> 428
+    with pytest.raises(HTTPException) as cookie_blocked:
+        _require_browser_queue_account(_fake_request({"Cookie": "tf_session=abc"}))
+    assert cookie_blocked.value.status_code == 428
+
+    # Cookie write with X-TrailForge-Account -> allowed
+    _require_browser_queue_account(
+        _fake_request({"Cookie": "tf_session=abc", "X-TrailForge-Account": str(owner_id)})
+    )
+
+    # Cross-origin web session bearer with Fetch Metadata -> 428 without header
+    cors_meta = {"Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "cross-site"}
+    web_req = _fake_request(
+        {"Authorization": "Bearer session.tok", **cors_meta, "Origin": "https://app.example.test"}
+    )
+    assert _is_web_session_bearer(web_req, "session.tok") is True
+    with pytest.raises(HTTPException) as web_blocked:
+        _require_browser_queue_account(web_req)
+    assert web_blocked.value.status_code == 428
+
+    # Native Capacitor origins, PAT/OAuth bearers, CLI without Fetch Metadata, and bad Origin -> OK
+    for origin in ("capacitor://localhost", "https://localhost", "http://127.0.0.1:5173", "http://[bad"):
+        req = _fake_request({"Authorization": "Bearer session.tok", **cors_meta, "Origin": origin})
+        assert _is_web_session_bearer(req, "session.tok") is False
+        _require_browser_queue_account(req)
+
+    for delegated in (f"{PAT_PREFIX}abc", f"{OAUTH_ACCESS_PREFIX}abc"):
+        req = _fake_request(
+            {"Authorization": f"Bearer {delegated}", **cors_meta, "Origin": "https://app.example.test"}
+        )
+        assert _is_web_session_bearer(req, delegated) is False
+        _require_browser_queue_account(req)
 
 _POINTS = [
     {"lon": 148.10, "lat": -36.50, "timestamp": "2026-11-25T01:00:00Z"},

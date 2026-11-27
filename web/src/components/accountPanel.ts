@@ -469,13 +469,17 @@ export class RigAccountPanel {
                   ${sharingPending ? `<p class="tf-inspector-muted">Confirm to contribute de-identified segment metrics from this trip.</p>` : ""}
                   <div class="tf-vehicle-actions">
                     ${sharingPending ? `<button type="button" class="tf-mini-btn" data-toggle-trip-vis="${escapeHtml(tid)}" data-next-vis="community_anonymous">Confirm community sharing</button>` : ""}
-                    <button
+                    ${
+                      sharingPending && nextVis === "community_anonymous"
+                        ? ""
+                        : `<button
                       type="button"
                       class="tf-mini-btn"
                       data-toggle-trip-vis="${escapeHtml(tid)}"
                       data-next-vis="${nextVis}"
                       title="${nextVis === "private" ? "Immediately revoke anonymized observations from public telemetry" : "Publish anonymized segment traversals (zero user ID)"}"
-                    >${nextVis === "private" ? "Make Private" : "Share anonymously"}</button>
+                    >${nextVis === "private" ? "Make Private" : "Share anonymously"}</button>`
+                    }
                     <button type="button" class="tf-mini-btn" data-export-trip="${escapeHtml(tid)}" data-export-fmt="gpx">GPX</button>
                     <button type="button" class="tf-mini-btn" data-export-trip="${escapeHtml(tid)}" data-export-fmt="geojson">GeoJSON</button>
                     <button type="button" class="tf-mini-btn danger" data-delete-trip="${escapeHtml(tid)}">Delete</button>

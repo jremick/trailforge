@@ -211,30 +211,28 @@ const DEMO_BANNER_DISMISSED_KEY = "trailforge.dismissed_demo_banner";
 const ACCOUNT_CHANGE_KEY = "trailforge.account_change";
 const PENDING_SIGN_OUT_KEY = "trailforge.pending_sign_out";
 
-function loadLocalSignOut(): boolean {
-  if (usesSessionBearer()) return false;
+function loadPendingSignOut(): string | null {
+  if (usesSessionBearer()) return null;
   try {
-    return window.localStorage.getItem(ACCOUNT_CHANGE_KEY)?.startsWith("signed-out:") ?? false;
+    const val = window.localStorage.getItem(PENDING_SIGN_OUT_KEY);
+    return val && val.trim() ? val.trim() : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
-function announceAccountChange(state: "signed-in" | "signed-out"): void {
+function loadLocalSignOut(): boolean {
+  return loadPendingSignOut() !== null;
+}
+
+function announceAccountChange(
+  state: "signed-in" | "signed-out" | "signed-out-complete"
+): void {
   if (usesSessionBearer()) return;
   try {
     window.localStorage.setItem(ACCOUNT_CHANGE_KEY, `${state}:${generateClientUuid()}`);
   } catch {
     // Visible tabs also recheck the session when they regain focus.
-  }
-}
-
-function loadPendingSignOut(): string | null {
-  if (usesSessionBearer() || !loadLocalSignOut()) return null;
-  try {
-    return window.localStorage.getItem(PENDING_SIGN_OUT_KEY);
-  } catch {
-    return null;
   }
 }
 
@@ -251,6 +249,16 @@ function persistPendingSignOut(ownerId: string | null): void {
 async function withBrowserAuthLock<T>(action: () => Promise<T>): Promise<T> {
   if (!usesSessionBearer() && navigator.locks) {
     return await navigator.locks.request("trailforge-auth", action);
+  }
+  return action();
+}
+
+async function withAccountSyncLock<T>(
+  ownerId: string,
+  action: () => Promise<T>
+): Promise<T> {
+  if (typeof navigator !== "undefined" && navigator.locks) {
+    return await navigator.locks.request(`trailforge-sync:${ownerId}`, action);
   }
   return action();
 }
@@ -367,6 +375,8 @@ class TrailForgeApp {
   private accountAbort = new AbortController();
   private authCheck: AbortController | null = null;
   private authChanging = false;
+  private authTransitionPromise: Promise<void> | null = null;
+  private pendingAuthRecheck = false;
   private signedOutLocally = loadLocalSignOut();
   private pendingSignOutOwner = loadPendingSignOut();
   private authConfig: AuthConfigResponse = { ...DEFAULT_AUTH_CONFIG };
@@ -1055,6 +1065,7 @@ class TrailForgeApp {
   }
 
   private clearAccountState(user: AuthUser | null, preserveStartupView = false): void {
+    const hadUser = this.user !== null;
     this.accountAbort.abort();
     this.accountAbort = new AbortController();
     this.user = user;
@@ -1128,6 +1139,9 @@ class TrailForgeApp {
     this.syncOfflinePanelState();
     if (!this.packsPanel?.isPanelOpen()) this.packsPanelEl.replaceChildren();
     this.syncRoutePlannerUiState();
+    if (hadUser && user === null) {
+      void this.refreshReportsGeoJson();
+    }
   }
 
   private buildAccountPanelState() {
@@ -1889,18 +1903,20 @@ class TrailForgeApp {
     this.isSyncingQueue = true;
     this.syncOfflinePanelState();
     try {
-      const result = await flushSyncQueue(request.ownerId, request.signal, {
-        syncTrip: async (payload) => {
-          await uploadMobileTripSync(payload, request);
-        },
-        syncReport: async (payload) => {
-          await createConditionReport(payload, request);
-        },
-        syncPin: async (payload) => {
-          const created = await createPin(payload, request);
-          if (!request.signal.aborted) this.pins = [created, ...this.pins];
-        },
-      });
+      const result = await withAccountSyncLock(request.ownerId, () =>
+        flushSyncQueue(request.ownerId, request.signal, {
+          syncTrip: async (payload) => {
+            await uploadMobileTripSync(payload, request);
+          },
+          syncReport: async (payload) => {
+            await createConditionReport(payload, request);
+          },
+          syncPin: async (payload) => {
+            const created = await createPin(payload, request);
+            if (!request.signal.aborted) this.pins = [created, ...this.pins];
+          },
+        })
+      );
       if (request.signal.aborted) return;
       await this.refreshOfflineLocalState();
       if (request.signal.aborted) return;
@@ -2680,13 +2696,29 @@ class TrailForgeApp {
       this.syncSidebarWidthForViewport();
     });
     window.addEventListener("storage", (event) => {
-      if (event.key !== ACCOUNT_CHANGE_KEY || usesSessionBearer()) return;
+      if (usesSessionBearer()) return;
+      if (event.key === PENDING_SIGN_OUT_KEY) {
+        this.pendingSignOutOwner = loadPendingSignOut();
+        this.signedOutLocally = this.pendingSignOutOwner !== null;
+        return;
+      }
+      if (event.key !== ACCOUNT_CHANGE_KEY) return;
       this.authCheck?.abort();
       this.authCheck = null;
-      this.signedOutLocally = loadLocalSignOut();
-      this.pendingSignOutOwner = null;
+      this.pendingSignOutOwner = loadPendingSignOut();
+      if (event.newValue?.startsWith("signed-out-complete:")) {
+        this.signedOutLocally = this.pendingSignOutOwner !== null;
+        if (this.user !== null) this.clearAccountState(null);
+        return;
+      }
+      this.signedOutLocally =
+        this.pendingSignOutOwner !== null ||
+        (event.newValue?.startsWith("signed-out:") ?? false);
       this.clearAccountState(null);
-      if (!this.signedOutLocally) void this.hydrateAuthSession();
+      if (!this.signedOutLocally) {
+        if (this.authChanging) this.pendingAuthRecheck = true;
+        else void this.hydrateAuthSession();
+      }
     });
     window.addEventListener("pageshow", (event) => {
       if (event.persisted) void this.hydrateAuthSession();
@@ -2880,28 +2912,40 @@ class TrailForgeApp {
     authenticate: () => Promise<{ user: AuthUser }>,
     success: (name: string) => string
   ): Promise<void> {
-    if (this.authChanging) return;
+    while (this.authTransitionPromise) {
+      await this.authTransitionPromise.catch(() => undefined);
+    }
     this.authChanging = true;
     this.authCheck?.abort();
     this.authCheck = null;
-    let user: AuthUser;
-    try {
+    let user: AuthUser | null = null;
+    const run = (async () => {
       user = await withBrowserAuthLock(async () => {
-        const { user } = await authenticate();
+        const res = await authenticate();
         this.signedOutLocally = false;
         this.pendingSignOutOwner = null;
         persistPendingSignOut(null);
-        this.clearAccountState(user);
+        this.clearAccountState(res.user);
         announceAccountChange("signed-in");
-        return user;
+        return res.user;
       });
+    })();
+    this.authTransitionPromise = run;
+    try {
+      await run;
     } finally {
+      if (this.authTransitionPromise === run) this.authTransitionPromise = null;
       this.authChanging = false;
+      if (this.pendingAuthRecheck) {
+        this.pendingAuthRecheck = false;
+        void this.hydrateAuthSession();
+      }
     }
-    if (this.user?.id !== user.id) return;
+    if (!user || this.user?.id !== (user as AuthUser).id) return;
+    const signedInUser = user as AuthUser;
     const signal = this.accountAbort.signal;
     await this.loadSignedInUserData();
-    if (!signal.aborted) this.showToast(success(user.display_name), "success");
+    if (!signal.aborted) this.showToast(success(signedInUser.display_name), "success");
   }
 
   private async signOut(): Promise<void> {
@@ -2916,15 +2960,26 @@ class TrailForgeApp {
     announceAccountChange("signed-out");
     this.clearAccountState(null);
     const signal = this.accountAbort.signal;
-    try {
-      await this.finishSignOut(ownerId);
-      if (!signal.aborted) this.showToast("Signed out", "info");
-    } catch {
-      if (!signal.aborted) {
-        this.showToast("Signed out in this browser", "info");
+    const run = (async () => {
+      try {
+        await this.finishSignOut(ownerId);
+        if (!signal.aborted) this.showToast("Signed out", "info");
+      } catch {
+        if (!signal.aborted) {
+          this.showToast("Signed out in this browser", "info");
+        }
       }
+    })();
+    this.authTransitionPromise = run;
+    try {
+      await run;
     } finally {
+      if (this.authTransitionPromise === run) this.authTransitionPromise = null;
       this.authChanging = false;
+      if (this.pendingAuthRecheck) {
+        this.pendingAuthRecheck = false;
+        void this.hydrateAuthSession();
+      }
     }
   }
 
@@ -2935,20 +2990,29 @@ class TrailForgeApp {
       } catch (err) {
         if (!(err instanceof ApiError) || ![401, 403, 409].includes(err.status)) throw err;
       }
-      this.pendingSignOutOwner = null;
       if (loadPendingSignOut() === ownerId) persistPendingSignOut(null);
+      this.pendingSignOutOwner = loadPendingSignOut();
+      this.signedOutLocally = this.pendingSignOutOwner !== null;
+      announceAccountChange("signed-out-complete");
     });
   }
 
   private async resumeOnlineSession(): Promise<void> {
-    const ownerId = this.pendingSignOutOwner;
+    const ownerId = this.pendingSignOutOwner ?? loadPendingSignOut();
     if (ownerId && !this.authChanging) {
       this.authChanging = true;
+      const run = (async () => {
+        try {
+          await this.finishSignOut(ownerId);
+        } catch {
+          // Retry while the browser is locally signed out.
+        }
+      })();
+      this.authTransitionPromise = run;
       try {
-        await this.finishSignOut(ownerId);
-      } catch {
-        // Retry while the browser is locally signed out.
+        await run;
       } finally {
+        if (this.authTransitionPromise === run) this.authTransitionPromise = null;
         this.authChanging = false;
       }
       if (this.signedOutLocally) return;

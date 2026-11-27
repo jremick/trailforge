@@ -468,4 +468,46 @@ describe("Slice 09 Offline Pack Snapshot store & Sync Queue flush", () => {
     expect(await listSyncQueue(owner)).toEqual([first, second]);
     expect(await listSyncQueue("owner-b")).toEqual([]);
   });
+
+  it("sets authRequired and halts sync on 409 account-changed conflicts but continues on other 409 errors", async () => {
+    setOfflineBackendForTesting(new MemoryOfflineBackend());
+    const owner = "owner-conflict";
+    await enqueueOfflineReport(owner, {
+      report_type: "fallen_tree",
+      lon: 148.12,
+      lat: -36.56,
+      notes: "Stale session report",
+    });
+    await enqueueOfflinePin(owner, {
+      name: "Follow-up Camp",
+      category: "camp",
+      lon: 148.13,
+      lat: -36.57,
+    });
+
+    const syncPin = vi.fn().mockResolvedValue(undefined);
+    const conflictRes = await flushSyncQueue(owner, new AbortController().signal, {
+      syncTrip: vi.fn(),
+      syncReport: vi.fn().mockRejectedValue(
+        Object.assign(new Error("The signed-in account has changed"), { status: 409 })
+      ),
+      syncPin,
+    });
+    expect(conflictRes.authRequired).toBe(true);
+    expect(conflictRes.failed).toBe(1);
+    expect(conflictRes.remaining).toBe(2);
+    expect(syncPin).not.toHaveBeenCalled();
+
+    const otherConflictRes = await flushSyncQueue(owner, new AbortController().signal, {
+      syncTrip: vi.fn(),
+      syncReport: vi.fn().mockRejectedValue(
+        Object.assign(new Error("Duplicate resource"), { status: 409 })
+      ),
+      syncPin,
+    });
+    expect(otherConflictRes.authRequired).toBe(false);
+    expect(otherConflictRes.synced).toBe(1);
+    expect(otherConflictRes.failed).toBe(1);
+    expect(syncPin).toHaveBeenCalledOnce();
+  });
 });
