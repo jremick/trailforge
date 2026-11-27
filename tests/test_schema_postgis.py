@@ -1,19 +1,24 @@
-"""Offline PostGIS integration tests verifying 35 tables, 21 GIST indexes, ODbL & privacy rules."""
+"""Offline PostGIS integration tests verifying schema, indexes, ODbL and privacy rules."""
 
 from __future__ import annotations
 
 import json
 import uuid
 from datetime import UTC, date, datetime
+from pathlib import Path
 
 import geoalchemy2  # noqa: F401 — register PostGIS Geometry type with SQLAlchemy reflection
 import pytest
+from alembic.script import ScriptDirectory
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, inspect, text
 from sqlalchemy.exc import IntegrityError
 
 from trailforge.api.main import create_app
 from trailforge.db.session import check_db_health
+
+MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "migrations"
+EXPECTED_REVISION = ScriptDirectory(str(MIGRATIONS_DIR)).get_current_head()
 
 EXPECTED_TABLES = frozenset(
     {
@@ -31,7 +36,7 @@ EXPECTED_TABLES = frozenset(
         "track_segments",
         "segment_reconciliation_log",
         "pois",
-        # Tier C — Independent TrailForge intelligence, community, UI & AI/auth tables (23)
+        # Tier C — Independent TrailForge intelligence, community, UI & AI/auth tables (24)
         "track_segment_grades",
         "closures_alerts",
         "segment_closure_links",
@@ -54,6 +59,7 @@ EXPECTED_TABLES = frozenset(
         "condition_report_votes",
         "rainfall_snapshots",
         "offline_packs",
+        "offline_pack_telemetry_revisions",
         "planned_routes",
     }
 )
@@ -101,7 +107,7 @@ def test_postgis_health_and_schema_revision(postgis_engine: Engine) -> None:
     assert status.db_ok is True
     assert status.postgis_version is not None
     assert status.postgis_version.startswith("3.")
-    assert status.schema_revision == "0009_search_trigram_track_grade"
+    assert status.schema_revision == EXPECTED_REVISION
 
 
 @pytest.mark.integration
@@ -116,12 +122,12 @@ def test_fastapi_health_against_live_postgis(postgis_engine: Engine) -> None:
     body = resp.json()
     assert body["status"] == "ok"
     assert body["db_ok"] is True
-    assert body["schema_revision"] == "0009_search_trigram_track_grade"
+    assert body["schema_revision"] == EXPECTED_REVISION
 
 
 @pytest.mark.integration
-def test_all_35_tables_and_21_gist_indexes_exist(postgis_engine: Engine) -> None:
-    assert len(EXPECTED_TABLES) == 35
+def test_required_tables_and_gist_indexes_exist(postgis_engine: Engine) -> None:
+    assert len(EXPECTED_TABLES) == 36
     assert len(EXPECTED_GIST_INDEXES) == 21
     inspector = inspect(postgis_engine)
     tables = set(inspector.get_table_names(schema="public"))
@@ -204,6 +210,7 @@ def test_odbl_and_privacy_column_invariants(postgis_engine: Engine) -> None:
         "condition_reports",
         "rainfall_snapshots",
         "offline_packs",
+        "offline_pack_telemetry_revisions",
         "planned_routes",
         "invite_codes",
         "usage_metrics_hourly",
