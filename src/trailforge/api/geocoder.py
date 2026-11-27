@@ -186,20 +186,48 @@ def _parse_nominatim_items(payload: Any, *, limit: int) -> list[GeocodedPlace]:
     return out
 
 
+_shared_client_lock = threading.Lock()
+_shared_client: httpx.Client | None = None
+_shared_client_timeout: float | None = None
+
+
+def _get_shared_geocoder_client(timeout_s: float) -> httpx.Client:
+    """Return a thread-safe pooled httpx.Client for Nominatim TLS/keep-alive reuse."""
+    global _shared_client, _shared_client_timeout
+    with _shared_client_lock:
+        if _shared_client is None or _shared_client_timeout != timeout_s:
+            if _shared_client is not None:
+                _shared_client.close()
+            _shared_client = httpx.Client(
+                timeout=httpx.Timeout(timeout_s, connect=min(2.0, timeout_s)),
+                follow_redirects=False,
+                headers={
+                    "User-Agent": GEOCODER_USER_AGENT,
+                    "Accept": "application/json",
+                },
+            )
+            _shared_client_timeout = timeout_s
+        return _shared_client
+
+
 def _acquire_rate_slot() -> bool:
-    """Enforce >= 1.05s between outbound Nominatim calls without stalling requests."""
+    """Enforce >= 1.05s between outbound Nominatim calls without sleeping under the lock."""
     global _last_request_monotonic
+    sleep_for = 0.0
     with _rate_lock:
         now = time.monotonic()
-        elapsed = now - _last_request_monotonic
-        if elapsed < MIN_REQUEST_INTERVAL_S:
-            remaining = MIN_REQUEST_INTERVAL_S - elapsed
+        target = _last_request_monotonic + MIN_REQUEST_INTERVAL_S
+        if now < target:
+            remaining = target - now
             if remaining > MAX_RATE_WAIT_S:
                 return False
-            time.sleep(remaining)
-            now = time.monotonic()
-        _last_request_monotonic = now
-        return True
+            sleep_for = remaining
+            _last_request_monotonic = target
+        else:
+            _last_request_monotonic = now
+    if sleep_for > 0.0:
+        time.sleep(sleep_for)
+    return True
 
 
 def geocode_au_places(
@@ -234,21 +262,10 @@ def geocode_au_places(
     if not bypass_rate_limit and not _acquire_rate_slot():
         return []
 
-    owns_client = client is None
     http = (
         client
         if client is not None
-        else httpx.Client(
-            timeout=httpx.Timeout(
-                settings.geocoder_timeout_s,
-                connect=min(2.0, settings.geocoder_timeout_s),
-            ),
-            follow_redirects=False,
-            headers={
-                "User-Agent": GEOCODER_USER_AGENT,
-                "Accept": "application/json",
-            },
-        )
+        else _get_shared_geocoder_client(settings.geocoder_timeout_s)
     )
     try:
         params = {
@@ -288,9 +305,6 @@ def geocode_au_places(
     except Exception as exc:
         logger.debug("AU place geocoder fallback unavailable for %r: %s", term, exc)
         return []
-    finally:
-        if owns_client:
-            http.close()
 
     with _cache_lock:
         _cache[cache_key] = (time.monotonic() + CACHE_TTL_SECONDS, list(places))

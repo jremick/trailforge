@@ -45,7 +45,7 @@ from trailforge.db.models import (
     TrackSegmentGrade,
 )
 from trailforge.feeds.queries import list_closures
-from trailforge.ingestion.terrain import DemSampler
+from trailforge.ingestion.terrain import read_raster_bounds
 from trailforge.packs.catalog import PACK_ATTRIBUTIONS, PackRegionSpec, get_pack_region
 from trailforge.reports.queries import list_reports
 from trailforge.tiles.builder import (
@@ -181,8 +181,7 @@ def _resolve_intersecting_dem(
         return None
 
     try:
-        with DemSampler(candidate) as sampler:
-            dem_bounds = sampler.bounds
+        dem_bounds = read_raster_bounds(candidate)
     except Exception as exc:
         logger.warning("Unable to inspect DEM bounds at %s (%s); skipping DEM", candidate, exc)
         return None
@@ -323,7 +322,7 @@ def _write_region_snapshot_streaming(
 ) -> dict[str, int]:
     """Stream a complete offline region snapshot JSON directly to disk (O(1) item memory)."""
     # Local import avoids circular imports with api/tracks
-    from trailforge.api.tracks import get_track_detail
+    from trailforge.api.tracks import get_track_details_batch
 
     env_geom = func.ST_MakeEnvelope(*region.bbox, 4326)
 
@@ -383,22 +382,21 @@ def _write_region_snapshot_streaming(
                 fh.write(",")
             fh.write(f"{json.dumps(key)}:{json.dumps(val, separators=(',', ':'))}")
 
-        # 2. Stream full Track Inspector payloads (one track at a time)
+        # 2. Stream full Track Inspector payloads in 50-track chunks (~50x fewer SQL queries)
         fh.write(',"tracks":[')
-        for idx, tid in enumerate(track_ids):
-            detail = get_track_detail(
-                track_id=tid,
-                vehicle_class=None,
-                current_user=None,
-                db=session,
-            )
-            track_dict = detail.model_dump(mode="json")
-            _enrich_track_with_live_grading(session, track_dict)
-            if idx > 0:
-                fh.write(",")
-            fh.write(json.dumps(track_dict, separators=(",", ":")))
-            counts["tracks"] += 1
-            counts["segments"] += len(track_dict.get("segments") or [])
+        batch_size = 50
+        written_tracks = 0
+        for start in range(0, len(track_ids), batch_size):
+            chunk_ids = track_ids[start : start + batch_size]
+            details = get_track_details_batch(session, chunk_ids)
+            for detail in details:
+                track_dict = detail.model_dump(mode="json")
+                if written_tracks > 0:
+                    fh.write(",")
+                fh.write(json.dumps(track_dict, separators=(",", ":")))
+                written_tracks += 1
+                counts["tracks"] += 1
+                counts["segments"] += len(track_dict.get("segments") or [])
         fh.write("]")
 
         # 3. Stream region POIs
@@ -545,14 +543,12 @@ def _write_region_snapshot_streaming(
             .where(
                 TrackSegment.is_active.is_(True),
                 func.ST_Intersects(TrackSegment.geom, env_geom),
-                TrackSegmentGrade.live_breakdown.is_not(None),
+                TrackSegmentGrade.is_obstacle_hotspot.is_(True),
             )
             .order_by(TrackSegment.track_id.asc(), TrackSegment.segment_seq.asc().nullslast())
         )
         for seg_id, tid, tname, geom_json, lon, lat, grd in hotspot_rows.yield_per(200):
-            lb = grd.live_breakdown or {}
-            if not isinstance(lb, dict) or not lb.get("is_obstacle_hotspot"):
-                continue
+            lb = grd.live_breakdown if isinstance(grd.live_breakdown, dict) else {}
             if counts["hotspots"] > 0:
                 fh.write(",")
             rc = grd.rainfall_context or {}

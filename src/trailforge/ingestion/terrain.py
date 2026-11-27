@@ -206,6 +206,24 @@ def _decode_pure_python_geotiff(
     return (arr, (origin_x, dx, origin_y, dy), crs_epsg, nodata)
 
 
+def read_raster_bounds(path: Path | str) -> tuple[float, float, float, float]:
+    """Read raster bounding box ``(min_x, min_y, max_x, max_y)`` without decoding pixels."""
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"DEM raster not found: {resolved}")
+    try:
+        import importlib
+
+        rasterio = importlib.import_module("rasterio")
+
+        with rasterio.open(resolved) as ds:
+            b = ds.bounds
+            return (float(b.left), float(b.bottom), float(b.right), float(b.top))
+    except ImportError:
+        with DemSampler(resolved) as sampler:
+            return sampler.bounds
+
+
 class DemSampler:
     """Reusable batch DEM elevation sampler with bilinear interpolation and nodata safety.
 

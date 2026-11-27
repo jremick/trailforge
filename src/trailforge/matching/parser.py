@@ -8,6 +8,7 @@ degenerate (<2 point) traces.
 
 from __future__ import annotations
 
+import io
 import json
 import math
 import re
@@ -22,6 +23,7 @@ from trailforge.matching.protocol import GpsPoint
 
 MAX_TRACE_POINTS: Final[int] = 50_000
 MAX_IMU_SAMPLES: Final[int] = 100_000
+MAX_XML_ELEMENTS: Final[int] = 250_000
 
 _UNSAFE_XML_PATTERN = re.compile(r"<!(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
 
@@ -193,66 +195,28 @@ def parse_gpx(raw: bytes | str) -> ParsedTrace:
     if _UNSAFE_XML_PATTERN.search(xml_text):
         raise ValueError("XML DOCTYPE/ENTITY declarations are not permitted in GPX input")
 
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError as exc:
-        raise ValueError(f"Malformed GPX XML: {exc}") from exc
-
-    if _local_tag(root.tag) != "gpx":
-        raise ValueError(f"Expected <gpx> root element, got <{root.tag}>")
-
     meta_name: str | None = None
     meta_time: datetime | None = None
     trk_name: str | None = None
     rte_name: str | None = None
-    trkpts: list[ET.Element] = []
-    rtepts: list[ET.Element] = []
-
-    for child in root:
-        tag = _local_tag(child.tag)
-        if tag == "metadata":
-            for m_el in child:
-                m_tag = _local_tag(m_el.tag)
-                m_text = (m_el.text or "").strip()
-                if m_tag == "name" and m_text and meta_name is None:
-                    meta_name = m_text
-                elif m_tag == "time" and m_text and meta_time is None:
-                    meta_time = _parse_timestamp(m_text)
-        elif tag == "trk":
-            for t_el in child:
-                t_tag = _local_tag(t_el.tag)
-                if t_tag == "name" and (t_el.text or "").strip() and trk_name is None:
-                    trk_name = (t_el.text or "").strip()
-                elif t_tag == "trkseg":
-                    for pt_el in t_el:
-                        if _local_tag(pt_el.tag) == "trkpt":
-                            if len(trkpts) >= MAX_TRACE_POINTS:
-                                raise ValueError(
-                                    f"GPX trace exceeds maximum allowed {MAX_TRACE_POINTS} points"
-                                )
-                            trkpts.append(pt_el)
-        elif tag == "rte":
-            for r_el in child:
-                r_tag = _local_tag(r_el.tag)
-                if r_tag == "name" and (r_el.text or "").strip() and rte_name is None:
-                    rte_name = (r_el.text or "").strip()
-                elif r_tag == "rtept":
-                    if len(rtepts) >= MAX_TRACE_POINTS:
-                        raise ValueError(
-                            f"GPX trace exceeds maximum allowed {MAX_TRACE_POINTS} points"
-                        )
-                    rtepts.append(r_el)
-
-    selected_pts = trkpts if trkpts else rtepts
-    if len(selected_pts) < 2:
-        raise ValueError("GPX trace must contain at least 2 trackpoints (<trkpt> or <rtept>)")
-    if len(selected_pts) > MAX_TRACE_POINTS:
-        raise ValueError(f"GPX trace exceeds maximum allowed {MAX_TRACE_POINTS} points")
-
-    raw_entries: list[
+    trk_entries: list[
         tuple[float, float, datetime | None, float | None, float | None, float | None, float | None]
     ] = []
-    for pt_el in selected_pts:
+    rte_entries: list[
+        tuple[float, float, datetime | None, float | None, float | None, float | None, float | None]
+    ] = []
+
+    def _extract_pt_entry(
+        pt_el: ET.Element,
+    ) -> tuple[
+        float,
+        float,
+        datetime | None,
+        float | None,
+        float | None,
+        float | None,
+        float | None,
+    ]:
         if "lat" not in pt_el.attrib or "lon" not in pt_el.attrib:
             raise ValueError("GPX trackpoint is missing required 'lat' or 'lon' attribute")
         lat = _parse_finite_float(pt_el.attrib["lat"], "lat")
@@ -282,7 +246,78 @@ def parse_gpx(raw: bytes | str) -> ParsedTrace:
         ext_acc, ext_speed, ext_rough = _extract_extensions(pt_el)
         accuracy_m = ext_acc if ext_acc is not None else hdop_acc
         speed_mps = ext_speed if ext_speed is not None else direct_speed
-        raw_entries.append((lat, lon, ts, elev_m, accuracy_m, speed_mps, ext_rough))
+        return (lat, lon, ts, elev_m, accuracy_m, speed_mps, ext_rough)
+
+    # Stream XML with iterparse + elem.clear() + hard element cap to prevent DOM RAM amplification
+    tag_stack: list[str] = []
+    elem_count = 0
+    saw_root = False
+    try:
+        stream = io.BytesIO(xml_text.encode("utf-8"))
+        for event, elem in ET.iterparse(stream, events=("start", "end")):
+            tag = _local_tag(elem.tag)
+            if event == "start":
+                elem_count += 1
+                if elem_count > MAX_XML_ELEMENTS:
+                    raise ValueError(
+                        f"GPX XML exceeds maximum allowed {MAX_XML_ELEMENTS} elements"
+                    )
+                if not saw_root:
+                    saw_root = True
+                    if tag != "gpx":
+                        raise ValueError(f"Expected <gpx> root element, got <{elem.tag}>")
+                tag_stack.append(tag)
+                continue
+
+            # event == "end"
+            depth = len(tag_stack)
+            parent = tag_stack[-2] if depth >= 2 else None
+            grandparent = tag_stack[-3] if depth >= 3 else None
+
+            if depth == 3 and parent == "metadata":
+                txt = (elem.text or "").strip()
+                if tag == "name" and txt and meta_name is None:
+                    meta_name = txt
+                elif tag == "time" and txt and meta_time is None:
+                    meta_time = _parse_timestamp(txt)
+                elem.clear()
+            elif depth == 3 and parent == "trk" and tag == "name":
+                txt = (elem.text or "").strip()
+                if txt and trk_name is None:
+                    trk_name = txt
+                elem.clear()
+            elif depth == 3 and parent == "rte" and tag == "name":
+                txt = (elem.text or "").strip()
+                if txt and rte_name is None:
+                    rte_name = txt
+                elem.clear()
+            elif depth == 4 and parent == "trkseg" and grandparent == "trk" and tag == "trkpt":
+                if len(trk_entries) >= MAX_TRACE_POINTS:
+                    raise ValueError(
+                        f"GPX trace exceeds maximum allowed {MAX_TRACE_POINTS} points"
+                    )
+                trk_entries.append(_extract_pt_entry(elem))
+                elem.clear()
+            elif depth == 3 and parent == "rte" and tag == "rtept":
+                if len(rte_entries) >= MAX_TRACE_POINTS:
+                    raise ValueError(
+                        f"GPX trace exceeds maximum allowed {MAX_TRACE_POINTS} points"
+                    )
+                rte_entries.append(_extract_pt_entry(elem))
+                elem.clear()
+            elif depth <= 2 or (depth == 3 and tag in ("trkseg", "metadata")):
+                elem.clear()
+
+            if tag_stack:
+                tag_stack.pop()
+    except ET.ParseError as exc:
+        raise ValueError(f"Malformed GPX XML: {exc}") from exc
+
+    raw_entries = trk_entries if trk_entries else rte_entries
+    if len(raw_entries) < 2:
+        raise ValueError("GPX trace must contain at least 2 trackpoints (<trkpt> or <rtept>)")
+    if len(raw_entries) > MAX_TRACE_POINTS:
+        raise ValueError(f"GPX trace exceeds maximum allowed {MAX_TRACE_POINTS} points")
 
     points = _finalize_points(raw_entries, fallback_start=meta_time)
     return ParsedTrace(name=trk_name or rte_name or meta_name, points=points)

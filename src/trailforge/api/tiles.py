@@ -46,7 +46,7 @@ DEFAULT_ATTRIBUTIONS: list[str] = [
     ATTRIBUTION_VIC_DEECA,
 ]
 
-_CHUNK_SIZE = 65_536
+_CHUNK_SIZE = 262_144
 _RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
 
 

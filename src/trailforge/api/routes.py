@@ -24,6 +24,7 @@ from trailforge.routes.planner import (
     build_gridforge_cli,
     plan_route_with_geometry,
     slugify_route_name,
+    summarize_saved_routes,
 )
 from trailforge.vehicles.classifier import normalize_capability_class
 
@@ -250,7 +251,7 @@ def _export_response(
         )
     gj = build_route_geojson(analysis, leg_tracks=leg_tracks, notes=notes)
     return Response(
-        content=json.dumps(gj, indent=2) + "\n",
+        content=json.dumps(gj, separators=(",", ":")),
         media_type="application/geo+json",
         headers={"Content-Disposition": f'attachment; filename="{slug}.geojson"'},
     )
@@ -309,30 +310,27 @@ def export_ad_hoc_route(
 
 @router.get("", response_model=list[SavedRouteSummaryResponse])
 def list_saved_routes(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[SavedRouteSummaryResponse]:
-    """List the signed-in user's saved multi-track routes with live summary metrics."""
+    """List the signed-in user's saved multi-track routes with batched live summary metrics."""
     routes = db.execute(
         select(PlannedRoute)
         .where(PlannedRoute.user_id == user.id)
         .order_by(PlannedRoute.updated_at.desc(), PlannedRoute.created_at.desc())
+        .offset(offset)
+        .limit(limit)
     ).scalars().all()
 
-    profile = _get_active_vehicle_profile(db, user)
+    batch_stats = summarize_saved_routes(db, routes)
     summaries: list[SavedRouteSummaryResponse] = []
     for route in routes:
         tids = list(route.track_ids or [])
         wps = _route_waypoints_from_model(route)
-        try:
-            analysis, _ = plan_route_with_geometry(
-                db,
-                tids,
-                vehicle_class=route.vehicle_class,
-                vehicle_profile=profile,
-                waypoints=wps,
-                name=route.name,
-            )
+        stats = batch_stats.get(route.id)
+        if stats is not None:
             summaries.append(
                 SavedRouteSummaryResponse(
                     id=str(route.id),
@@ -341,21 +339,21 @@ def list_saved_routes(
                     track_ids=tids,
                     waypoints=wps,
                     vehicle_class=route.vehicle_class,
-                    leg_count=len(analysis.legs),
-                    total_length_m=analysis.total_length_m,
-                    est_duration_min=analysis.est_duration_min,
-                    worst_grade=analysis.worst_grade,
-                    effective_grade=analysis.effective_grade,
-                    has_blocking_closure=analysis.safety_summary.has_blocking_closure,
-                    closure_count=analysis.safety_summary.closure_count,
-                    gate_warning_count=analysis.safety_summary.gate_warning_count,
-                    wet_risk_level=analysis.safety_summary.wet_risk_level,
-                    gridforge_cli=analysis.gridforge_cli,
+                    leg_count=stats["leg_count"],
+                    total_length_m=stats["total_length_m"],
+                    est_duration_min=stats["est_duration_min"],
+                    worst_grade=stats["worst_grade"],
+                    effective_grade=stats["effective_grade"],
+                    has_blocking_closure=stats["has_blocking_closure"],
+                    closure_count=stats["closure_count"],
+                    gate_warning_count=stats["gate_warning_count"],
+                    wet_risk_level=stats["wet_risk_level"],
+                    gridforge_cli=stats["gridforge_cli"],
                     created_at=route.created_at,
                     updated_at=route.updated_at,
                 )
             )
-        except ValueError:
+        else:
             # Saved route references a retired/missing track — still list gracefully
             summaries.append(
                 SavedRouteSummaryResponse(

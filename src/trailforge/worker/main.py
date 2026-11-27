@@ -29,6 +29,39 @@ from trailforge.grading.live import LiveGradingRecomputeSummary, recompute_live_
 logger = logging.getLogger("trailforge.worker")
 HEARTBEAT_PATH = Path("/tmp/worker-healthy")
 DEFAULT_LIVE_GRADING_INTERVAL_S = 900
+DEFAULT_OAUTH_MAINTENANCE_INTERVAL_S = 3600
+_last_oauth_maintenance_at: datetime | None = None
+
+
+def run_due_oauth_maintenance(
+    *,
+    now: datetime | None = None,
+    interval_s: int = DEFAULT_OAUTH_MAINTENANCE_INTERVAL_S,
+) -> int:
+    """Periodically prune stale unused OAuth DCR clients out of band from the API hot path."""
+    global _last_oauth_maintenance_at
+    current = now or datetime.now(UTC)
+    if (
+        _last_oauth_maintenance_at is not None
+        and (current - _last_oauth_maintenance_at) < timedelta(seconds=interval_s)
+    ):
+        return 0
+
+    from trailforge.auth.oauth import get_oauth_unused_client_ttl_days, prune_stale_oauth_clients
+
+    cfg = get_settings()
+    engine = get_engine()
+    with Session(engine) as session:
+        pruned = prune_stale_oauth_clients(
+            session,
+            now=current,
+            unused_ttl_days=get_oauth_unused_client_ttl_days(cfg),
+        )
+        session.commit()
+    _last_oauth_maintenance_at = current
+    if pruned > 0:
+        logger.info("Pruned %d stale unused OAuth clients", pruned)
+    return pruned
 
 
 def touch_heartbeat(path: Path = HEARTBEAT_PATH) -> None:
@@ -199,6 +232,10 @@ def run_worker_tick(heartbeat_path: Path = HEARTBEAT_PATH) -> DbHealthStatus:
             run_due_live_grading()
         except Exception:
             logger.exception("Live grading tick failed unexpectedly; worker remains healthy")
+        try:
+            run_due_oauth_maintenance()
+        except Exception:
+            logger.exception("OAuth maintenance tick failed unexpectedly; worker remains healthy")
     else:
         logger.warning("Worker DB health check failed; skipping scheduled jobs this cycle")
     return status

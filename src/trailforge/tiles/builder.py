@@ -57,7 +57,7 @@ from trailforge.ingestion.connectors.base import (
     ATTRIBUTION_VIC_DEECA,
     GDAL_STREAMING_ENV,
 )
-from trailforge.ingestion.terrain import DemSampler
+from trailforge.ingestion.terrain import DemSampler, read_raster_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -968,9 +968,8 @@ def build_terrain_pmtiles(
     if minzoom > maxzoom:
         raise ValueError(f"minzoom ({minzoom}) must be <= maxzoom ({maxzoom})")
 
-    with DemSampler(src) as sampler:
-        min_x, min_y, max_x, max_y = sampler.bounds
-        bounds_wgs84 = [min_x, min_y, max_x, max_y]
+    min_x, min_y, max_x, max_y = read_raster_bounds(src)
+    bounds_wgs84 = [min_x, min_y, max_x, max_y]
 
     out_pmtiles.parent.mkdir(parents=True, exist_ok=True)
     tmp_pmtiles = out_pmtiles.with_name(f".{out_pmtiles.stem}.tmp.pmtiles")
@@ -1158,8 +1157,7 @@ def build_tiles(
             )
             terrain_built = True
             if bounds_acc is None:
-                with DemSampler(resolved_dem) as sampler:
-                    bounds_acc = list(sampler.bounds)
+                bounds_acc = list(read_raster_bounds(resolved_dem))
 
     final_bounds = (
         [round(v, 6) for v in bounds_acc]

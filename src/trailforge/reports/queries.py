@@ -271,6 +271,7 @@ def list_reports(
     *,
     track_id: str | None = None,
     report_type: str | None = None,
+    bbox: tuple[float, float, float, float] | None = None,
     include_resolved: bool = False,
     limit: int = 100,
     current_user_id: uuid.UUID | None = None,
@@ -304,6 +305,11 @@ def list_reports(
                 ConditionReport.segment_id.in_(seg_ids_sq),
             )
         )
+
+    if bbox is not None:
+        min_lon, min_lat, max_lon, max_lat = bbox
+        env = func.ST_MakeEnvelope(min_lon, min_lat, max_lon, max_lat, 4326)
+        stmt = stmt.where(func.ST_Intersects(ConditionReport.geom, env))
 
     if report_type is not None:
         stmt = stmt.where(ConditionReport.report_type == report_type)
@@ -413,6 +419,97 @@ def get_reports_for_track(
         "condition_reports": reports,
         "community_gate_warnings": community_gate_warnings,
     }
+
+
+def get_reports_for_tracks(
+    session: Session,
+    track_ids: list[str] | tuple[str, ...],
+    *,
+    include_resolved: bool = False,
+    current_user_id: uuid.UUID | None = None,
+    now: datetime | None = None,
+) -> dict[str, dict[str, list[dict[str, Any]]]]:
+    """Batch-load condition reports and active gate warnings for multiple tracks in one query."""
+    unique_ids = list(dict.fromkeys(tid for tid in track_ids if tid))
+    result: dict[str, dict[str, list[dict[str, Any]]]] = {
+        tid: {"condition_reports": [], "community_gate_warnings": []} for tid in unique_ids
+    }
+    if not unique_ids:
+        return result
+
+    seg_rows = session.execute(
+        select(TrackSegment.segment_id, TrackSegment.track_id).where(
+            TrackSegment.track_id.in_(unique_ids)
+        )
+    ).all()
+    seg_to_track: dict[str, str] = {
+        seg_id: tid for seg_id, tid in seg_rows if seg_id and tid is not None
+    }
+
+    conditions = [ConditionReport.track_id.in_(unique_ids)]
+    if seg_to_track:
+        conditions.append(ConditionReport.segment_id.in_(list(seg_to_track.keys())))
+
+    stmt = (
+        select(
+            ConditionReport,
+            func.ST_X(ConditionReport.geom).label("lon"),
+            func.ST_Y(ConditionReport.geom).label("lat"),
+            User.display_name.label("author_display_name"),
+            Track.name.label("track_name"),
+        )
+        .join(User, ConditionReport.user_id == User.id)
+        .outerjoin(Track, ConditionReport.track_id == Track.track_id)
+        .where(ConditionReport.status != "hidden", or_(*conditions))
+        .order_by(ConditionReport.observed_at.desc(), ConditionReport.created_at.desc())
+    )
+    if not include_resolved:
+        stmt = stmt.where(ConditionReport.status != "resolved")
+
+    rows = session.execute(stmt).all()
+    if not rows:
+        return result
+
+    report_ids = [r[0].id for r in rows]
+    last_confirmed_map, user_vote_map = _load_vote_metadata(
+        session, report_ids, current_user_id=current_user_id
+    )
+
+    seen_per_track: dict[str, set[uuid.UUID]] = {tid: set() for tid in unique_ids}
+    for report, lon, lat, author_name, track_name in rows:
+        payload = serialize_condition_report(
+            report,
+            lon=float(lon),
+            lat=float(lat),
+            author_display_name=author_name,
+            track_name=track_name,
+            last_confirmed_at=last_confirmed_map.get(report.id),
+            user_vote=user_vote_map.get(report.id),
+            now=now,
+        )
+        if not include_resolved and payload["effective_status"] == "resolved":
+            continue
+
+        target_tids: set[str] = set()
+        if report.track_id in result:
+            target_tids.add(report.track_id)
+        if report.segment_id and report.segment_id in seg_to_track:
+            target_tids.add(seg_to_track[report.segment_id])
+
+        is_active_gate = bool(
+            payload["is_gate_warning"]
+            and payload["effective_status"] not in ("resolved", "hidden")
+        )
+        for tid in target_tids:
+            if report.id in seen_per_track[tid]:
+                continue
+            seen_per_track[tid].add(report.id)
+            if len(result[tid]["condition_reports"]) < 200:
+                result[tid]["condition_reports"].append(payload)
+                if is_active_gate:
+                    result[tid]["community_gate_warnings"].append(payload)
+
+    return result
 
 
 def get_reports_geojson(

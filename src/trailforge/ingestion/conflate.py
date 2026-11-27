@@ -325,6 +325,10 @@ def conflate_tracks(features: Sequence[Any]) -> ConflationResult:
     accepted: list[ConflatedWay] = []
     accepted_geoms: list[LineString] = []
     accepted_ranks: list[int] = []
+    buffer_cache: dict[int, Any] = {}
+    cached_rank: int | None = None
+    higher_indices: list[int] = []
+    higher_tree: STRtree | None = None
 
     deduplicated_count = 0
     partial_trimmed_count = 0
@@ -346,22 +350,32 @@ def conflate_tracks(features: Sequence[Any]) -> ConflationResult:
         if feat_class:
             source_ref["trail_class"] = feat_class
 
-        # Only deduplicate against strictly higher-priority sources (VIC vs OSM, NSW vs OSM/VIC)
-        higher_indices = [i for i, r in enumerate(accepted_ranks) if r < rank]
+        # Only deduplicate against strictly higher-priority sources (VIC vs OSM, NSW vs OSM/VIC).
+        # Because inputs are sorted by ascending rank, rebuild the higher-priority STRtree once
+        # per rank transition instead of once per lower-priority feature.
         matching_higher: list[tuple[int, float]] = []
 
-        if higher_indices:
-            higher_geoms = [accepted_geoms[i] for i in higher_indices]
-            tree = STRtree(higher_geoms)
-            cand_positions = tree.query(line_3577.buffer(CONFLATION_BUFFER_M))
+        if rank != cached_rank:
+            higher_indices = [i for i, r in enumerate(accepted_ranks) if r < rank]
+            higher_tree = (
+                STRtree([accepted_geoms[i] for i in higher_indices]) if higher_indices else None
+            )
+            cached_rank = rank
+
+        if higher_tree is not None and higher_indices:
+            cand_positions = higher_tree.query(
+                line_3577, predicate="dwithin", distance=CONFLATION_BUFFER_M
+            )
             for pos in cand_positions:
                 acc_idx = higher_indices[int(pos)]
                 acc_geom = accepted_geoms[acc_idx]
-                if line_3577.distance(acc_geom) > CONFLATION_BUFFER_M:
-                    continue
                 dtheta = overlap_heading_diff_deg(line_3577, acc_geom)
                 if dtheta <= MAX_HEADING_DIFF_DEG:
-                    inter_len = line_3577.intersection(acc_geom.buffer(CONFLATION_BUFFER_M)).length
+                    acc_buf = buffer_cache.get(acc_idx)
+                    if acc_buf is None:
+                        acc_buf = acc_geom.buffer(CONFLATION_BUFFER_M)
+                        buffer_cache[acc_idx] = acc_buf
+                    inter_len = line_3577.intersection(acc_buf).length
                     min_sig_overlap = max(
                         MIN_RESIDUAL_SLIVER_M,
                         0.15 * min(line_3577.length, acc_geom.length),
@@ -371,7 +385,7 @@ def conflate_tracks(features: Sequence[Any]) -> ConflationResult:
 
         if matching_higher:
             union_buf = unary_union(
-                [accepted_geoms[i].buffer(CONFLATION_BUFFER_M) for i, _ in matching_higher]
+                [buffer_cache[i] for i, _ in matching_higher]
             )
             overlap_ratio = line_3577.intersection(union_buf).length / max(line_3577.length, 1e-6)
 

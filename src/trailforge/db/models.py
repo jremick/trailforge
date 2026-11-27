@@ -30,7 +30,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, validates
 
 from trailforge.db.base import Base
 from trailforge.db.models_ai_auth import (
@@ -321,6 +321,12 @@ class CAPADPark(Base):
         ),
         Index("ix_capad_parks_geom", "geom", postgresql_using="gist"),
         Index("ix_capad_parks_state_lower_name", "state", text("lower(name)")),
+        Index(
+            "ix_capad_parks_name_trgm",
+            "name",
+            postgresql_using="gin",
+            postgresql_ops={"name": "gin_trgm_ops"},
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -361,6 +367,12 @@ class Track(Base):
         Index("ix_tracks_state_is_active", "state", "is_active"),
         Index("ix_tracks_lower_name", text("lower(name)")),
         Index("ix_tracks_alt_names", "alt_names", postgresql_using="gin"),
+        Index(
+            "ix_tracks_name_trgm",
+            "name",
+            postgresql_using="gin",
+            postgresql_ops={"name": "gin_trgm_ops"},
+        ),
     )
 
     track_id: Mapped[str] = mapped_column(Text, primary_key=True)
@@ -590,6 +602,12 @@ class POI(Base):
         Index("ix_pois_type_state", "poi_type", "state"),
         Index("ix_pois_lower_name", text("lower(name)")),
         Index("ix_pois_nearest_segment_id", "nearest_segment_id"),
+        Index(
+            "ix_pois_name_trgm",
+            "name",
+            postgresql_using="gin",
+            postgresql_ops={"name": "gin_trgm_ops"},
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -654,6 +672,11 @@ class TrackSegmentGrade(Base):
         Index("ix_track_segment_grades_confidence_level", "confidence_level"),
         Index("ix_track_segment_grades_last_driven_at", text("last_driven_at DESC")),
         Index("ix_track_segment_grades_wet_risk_level", "wet_risk_level"),
+        Index(
+            "ix_track_segment_grades_hotspot",
+            "segment_id",
+            postgresql_where=text("is_obstacle_hotspot = true"),
+        ),
     )
 
     segment_id: Mapped[str] = mapped_column(
@@ -683,12 +706,25 @@ class TrackSegmentGrade(Base):
     wet_risk_level: Mapped[str] = mapped_column(
         Text, nullable=False, server_default=text("'dry'")
     )
+    is_obstacle_hotspot: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     baseline_computed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     live_computed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+    @validates("live_breakdown")
+    def _sync_hotspot_from_breakdown(
+        self, _key: str, value: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        if value is None:
+            self.is_obstacle_hotspot = False
+        elif isinstance(value, dict) and "is_obstacle_hotspot" in value:
+            self.is_obstacle_hotspot = bool(value.get("is_obstacle_hotspot"))
+        return value
 
 
 class ClosureAlert(Base):
@@ -768,7 +804,6 @@ class SegmentClosureLink(Base):
             name="link_method_valid",
         ),
         Index("ix_segment_closure_links_closure_id", "closure_id"),
-        Index("ix_segment_closure_links_segment_id", "segment_id"),
     )
 
     segment_id: Mapped[str] = mapped_column(
@@ -816,13 +851,14 @@ class User(Base):
     __tablename__ = "users"
     __table_args__ = (
         CheckConstraint("role IN ('admin','member')", name="role_valid"),
-        Index("ix_users_lower_email", text("lower(email)")),
+        Index("uq_users_lower_email", text("lower(email)"), unique=True),
+        Index("ix_users_created_at", text("created_at DESC")),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
     )
-    email: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    email: Mapped[str] = mapped_column(Text, nullable=False)
     display_name: Mapped[str] = mapped_column(Text, nullable=False)
     password_hash: Mapped[str] = mapped_column(Text, nullable=False)
     role: Mapped[str] = mapped_column(String(16), nullable=False, server_default=text("'member'"))
@@ -849,7 +885,7 @@ class InviteCode(Base):
         CheckConstraint("max_uses >= 1", name="max_uses_min"),
         CheckConstraint("use_count >= 0", name="use_count_nonneg"),
         UniqueConstraint("code", name="uq_invite_codes_code"),
-        Index("ix_invite_codes_code", "code"),
+        Index("ix_invite_codes_created_at", text("created_at DESC")),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -869,12 +905,15 @@ class InviteCode(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
+    @validates("code")
+    def _normalize_code(self, _key: str, value: str) -> str:
+        return value.strip().upper()
+
 
 class UsageMetricHourly(Base):
     """Hourly aggregated API request, error, egress, and rate-limit metrics (Tier C)."""
 
     __tablename__ = "usage_metrics_hourly"
-    __table_args__ = (Index("ix_usage_metrics_hourly_bucket_hour", "bucket_hour"),)
 
     bucket_hour: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
     route_group: Mapped[str] = mapped_column(String(48), primary_key=True)
@@ -1078,10 +1117,10 @@ class Trip(Base):
         UUID(as_uuid=True), nullable=False, server_default=text("gen_random_uuid()")
     )
     raw_geom: Mapped[Any] = mapped_column(
-        Geometry("LINESTRING", srid=4326, spatial_index=False), nullable=False
+        Geometry("LINESTRING", srid=4326, spatial_index=False), nullable=False, deferred=True
     )
     trimmed_geom: Mapped[Any | None] = mapped_column(
-        Geometry("LINESTRING", srid=4326, spatial_index=False), nullable=True
+        Geometry("LINESTRING", srid=4326, spatial_index=False), nullable=True, deferred=True
     )
     raw_distance_m: Mapped[float] = mapped_column(Double, nullable=False, server_default=text("0"))
     trimmed_distance_m: Mapped[float] = mapped_column(
@@ -1226,6 +1265,17 @@ class ConditionReport(Base):
         ),
         Index("ix_condition_reports_type_status", "report_type", "status"),
         Index("ix_condition_reports_user_id", "user_id"),
+        Index(
+            "ix_condition_reports_track_status_created",
+            "track_id",
+            "status",
+            text("created_at DESC"),
+        ),
+        Index(
+            "ix_condition_reports_photo_url",
+            "photo_url",
+            postgresql_where=text("photo_url IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

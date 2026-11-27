@@ -608,6 +608,7 @@ def recompute_live_grades(
                     "vehicle_class_split": result.vehicle_class_split,
                     "rainfall_context": result.wet_adjustment.rainfall_context,
                     "wet_risk_level": result.wet_adjustment.db_wet_risk_level,
+                    "is_obstacle_hotspot": bool(result.is_obstacle_hotspot),
                     "live_computed_at": ref_now,
                 }
             )
@@ -658,7 +659,7 @@ def get_obstacle_hotspots_geojson(
         .where(
             TrackSegment.is_active.is_(True),
             TrackSegment.is_vehicular.is_(True),
-            TrackSegmentGrade.live_breakdown.is_not(None),
+            TrackSegmentGrade.is_obstacle_hotspot.is_(True),
         )
         .order_by(TrackSegment.track_id, TrackSegment.segment_seq, TrackSegment.segment_id)
     )
@@ -669,8 +670,6 @@ def get_obstacle_hotspots_geojson(
     features: list[dict[str, Any]] = []
     for row in rows:
         lb = row.live_breakdown if isinstance(row.live_breakdown, dict) else {}
-        if not lb.get("is_obstacle_hotspot"):
-            continue
         rc = row.rainfall_context if isinstance(row.rainfall_context, dict) else {}
         lon = round(float(row.lon), 6)
         lat = round(float(row.lat), 6)

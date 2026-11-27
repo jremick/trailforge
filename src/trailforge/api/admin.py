@@ -386,43 +386,57 @@ def get_admin_stats(
         )
     ]
 
-    users_total = int(db.execute(select(func.count(User.id))).scalar_one())
-    users_active = int(
-        db.execute(select(func.count(User.id)).where(User.is_active.is_(True))).scalar_one()
-    )
-    users_admins = int(
-        db.execute(select(func.count(User.id)).where(User.role == "admin")).scalar_one()
-    )
-    users_members = int(
-        db.execute(select(func.count(User.id)).where(User.role == "member")).scalar_one()
-    )
+    user_stats = db.execute(
+        select(
+            func.count(User.id).label("total"),
+            func.count(User.id).filter(User.is_active.is_(True)).label("active"),
+            func.count(User.id).filter(User.role == "admin").label("admins"),
+            func.count(User.id).filter(User.role == "member").label("members"),
+        )
+    ).one()
+    users_total = int(user_stats.total or 0)
+    users_active = int(user_stats.active or 0)
+    users_admins = int(user_stats.admins or 0)
+    users_members = int(user_stats.members or 0)
     users_suspended = users_total - users_active
 
-    invites_total = int(db.execute(select(func.count(InviteCode.id))).scalar_one())
-    invites_active = int(
-        db.execute(
-            select(func.count(InviteCode.id)).where(
+    invite_stats = db.execute(
+        select(
+            func.count(InviteCode.id).label("total"),
+            func.count(InviteCode.id)
+            .filter(
                 InviteCode.revoked_at.is_(None),
                 InviteCode.use_count < InviteCode.max_uses,
                 or_(InviteCode.expires_at.is_(None), InviteCode.expires_at > now),
             )
-        ).scalar_one()
-    )
+            .label("active"),
+        )
+    ).one()
+    invites_total = int(invite_stats.total or 0)
+    invites_active = int(invite_stats.active or 0)
 
-    tracks_count = int(
-        db.execute(select(func.count(Track.track_id)).where(Track.is_active.is_(True))).scalar_one()
-    )
-    segments_count = int(
-        db.execute(
-            select(func.count(TrackSegment.segment_id)).where(TrackSegment.is_active.is_(True))
-        ).scalar_one()
-    )
-    trips_count = int(db.execute(select(func.count(Trip.id))).scalar_one())
-    telemetry_count = int(
-        db.execute(select(func.count(TelemetryObservation.id))).scalar_one()
-    )
-    reports_count = int(db.execute(select(func.count(ConditionReport.id))).scalar_one())
-    planned_routes_count = int(db.execute(select(func.count(PlannedRoute.id))).scalar_one())
+    content_stats = db.execute(
+        select(
+            select(func.count(Track.track_id))
+            .where(Track.is_active.is_(True))
+            .scalar_subquery()
+            .label("tracks"),
+            select(func.count(TrackSegment.segment_id))
+            .where(TrackSegment.is_active.is_(True))
+            .scalar_subquery()
+            .label("segments"),
+            select(func.count(Trip.id)).scalar_subquery().label("trips"),
+            select(func.count(TelemetryObservation.id)).scalar_subquery().label("telemetry"),
+            select(func.count(ConditionReport.id)).scalar_subquery().label("reports"),
+            select(func.count(PlannedRoute.id)).scalar_subquery().label("planned_routes"),
+        )
+    ).one()
+    tracks_count = int(content_stats.tracks or 0)
+    segments_count = int(content_stats.segments or 0)
+    trips_count = int(content_stats.trips or 0)
+    telemetry_count = int(content_stats.telemetry or 0)
+    reports_count = int(content_stats.reports or 0)
+    planned_routes_count = int(content_stats.planned_routes or 0)
 
     cfg = get_settings()
     tiles_bytes = _dir_size_bytes(Path(cfg.tiles_dir))

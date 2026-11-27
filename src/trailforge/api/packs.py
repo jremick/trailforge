@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from collections.abc import Iterator
 from datetime import UTC
 from pathlib import Path
@@ -44,7 +45,18 @@ ALLOWED_PACK_TILE_FILENAMES: Final[frozenset[str]] = frozenset(
         TERRAIN_TILE_FILENAME,
     }
 )
-_CHUNK_SIZE: Final[int] = 65_536
+_CHUNK_SIZE: Final[int] = 262_144
+_PACK_BUILD_LOCKS_GUARD = threading.Lock()
+_PACK_BUILD_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _get_region_build_lock(region_id: str) -> threading.Lock:
+    with _PACK_BUILD_LOCKS_GUARD:
+        lock = _PACK_BUILD_LOCKS.get(region_id)
+        if lock is None:
+            lock = threading.Lock()
+            _PACK_BUILD_LOCKS[region_id] = lock
+        return lock
 _RANGE_RE: Final[re.Pattern[str]] = re.compile(r"^bytes=(\d*)-(\d*)$")
 _ALLOWED_DEM_ROOTS: Final[tuple[Path, ...]] = (
     Path("tests/fixtures").resolve(),
@@ -383,24 +395,33 @@ def build_pack_endpoint(
     packs_dir: Path = Depends(get_packs_dir_dep),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Build or refresh a regional offline pack streaming disk-to-disk."""
+    """Build or refresh a regional offline pack streaming disk-to-disk with per-region mutex."""
     region = _validate_region_id(region_id)
     req = body or PackBuildRequest()
     dem_path = _resolve_confined_dem_path(req.dem_path)
 
-    result = build_regional_pack(
-        db,
-        region.region_id,
-        packs_dir,
-        dem_path=dem_path,
-        version=req.version,
-        skip_tiles=req.skip_tiles,
-    )
-    db_row = db.get(OfflinePack, region.region_id)
-    summary = _build_region_summary(region, packs_dir, db_row)
-    summary["manifest_sha256"] = result.manifest_sha256
-    summary["manifest"] = result.manifest.model_dump(mode="json")
-    return summary
+    build_lock = _get_region_build_lock(region.region_id)
+    if not build_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"A pack build for region '{region.region_id}' is already in progress",
+        )
+    try:
+        result = build_regional_pack(
+            db,
+            region.region_id,
+            packs_dir,
+            dem_path=dem_path,
+            version=req.version,
+            skip_tiles=req.skip_tiles,
+        )
+        db_row = db.get(OfflinePack, region.region_id)
+        summary = _build_region_summary(region, packs_dir, db_row)
+        summary["manifest_sha256"] = result.manifest_sha256
+        summary["manifest"] = result.manifest.model_dump(mode="json")
+        return summary
+    finally:
+        build_lock.release()
 
 
 @router.get("/{region_id}/manifest.json")
@@ -420,18 +441,25 @@ def get_pack_manifest_endpoint(
 @router.get("/{region_id}/snapshot.json")
 def get_pack_snapshot_endpoint(
     region_id: str,
+    request: Request,
     packs_dir: Path = Depends(get_packs_dir_dep),
-) -> StreamingResponse:
-    """Stream a built regional pack's compact offline ``snapshot.json``."""
+) -> Response:
+    """Stream a built regional pack's compact offline ``snapshot.json`` with ETag/304 support."""
     snapshot_path = _resolve_pack_file(packs_dir, region_id, SNAPSHOT_FILENAME)
     etag, file_size = _compute_etag(snapshot_path)
+    headers = {
+        "ETag": etag,
+        "Cache-Control": "public, max-age=300",
+    }
+    if_none_match = (request.headers.get("if-none-match") or "").strip()
+    if if_none_match and (if_none_match == etag or if_none_match == f"W/{etag}"):
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=headers)
     return StreamingResponse(
         _stream_file_slice(snapshot_path, 0, file_size),
         media_type="application/json",
         headers={
+            **headers,
             "Content-Length": str(file_size),
-            "ETag": etag,
-            "Cache-Control": "public, max-age=300",
         },
     )
 

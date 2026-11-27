@@ -13,6 +13,10 @@ from trailforge.config import get_settings
 
 _engine: Engine | None = None
 _session_factory: sessionmaker[Session] | None = None
+_api_engine: Engine | None = None
+_api_session_factory: sessionmaker[Session] | None = None
+
+DEFAULT_POOL_RECYCLE_S = 1800
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,45 +28,76 @@ class DbHealthStatus:
     schema_revision: str | None = None
 
 
-def get_engine(database_url: str | None = None) -> Engine:
+def _build_engine(url: str, *, statement_timeout_ms: int | None = None) -> Engine:
+    """Construct a lean SQLAlchemy engine with pool recycling and optional PG statement timeout."""
+    connect_args: dict[str, str] = {}
+    if (
+        statement_timeout_ms is not None
+        and statement_timeout_ms > 0
+        and url.startswith("postgresql")
+    ):
+        connect_args["options"] = f"-c statement_timeout={int(statement_timeout_ms)}"
+    kwargs: dict[str, object] = {
+        "pool_pre_ping": True,
+        "pool_size": 5,
+        "max_overflow": 5,
+        "pool_recycle": DEFAULT_POOL_RECYCLE_S,
+        "future": True,
+    }
+    if connect_args:
+        kwargs["connect_args"] = connect_args
+    return create_engine(url, **kwargs)
+
+
+def get_engine(
+    database_url: str | None = None,
+    *,
+    statement_timeout_ms: int | None = None,
+) -> Engine:
     """Return a lean pooled SQLAlchemy engine sized for 16 GB homelab hosts."""
     global _engine, _session_factory
     if database_url is not None:
-        return create_engine(
-            database_url,
-            pool_pre_ping=True,
-            pool_size=5,
-            max_overflow=5,
-            future=True,
-        )
+        return _build_engine(database_url, statement_timeout_ms=statement_timeout_ms)
     if _engine is None:
         settings = get_settings()
-        _engine = create_engine(
-            settings.database_url,
-            pool_pre_ping=True,
-            pool_size=5,
-            max_overflow=5,
-            future=True,
-        )
+        _engine = _build_engine(settings.database_url, statement_timeout_ms=statement_timeout_ms)
         _session_factory = sessionmaker(bind=_engine, autoflush=False, expire_on_commit=False)
     return _engine
 
 
+def _get_api_session_factory() -> sessionmaker[Session]:
+    """Return API request sessionmaker enforcing PostgreSQL statement_timeout."""
+    global _api_engine, _api_session_factory
+    if _api_session_factory is None:
+        settings = get_settings()
+        timeout_ms = int(getattr(settings, "db_statement_timeout_ms", 15_000) or 0)
+        _api_engine = _build_engine(
+            settings.database_url,
+            statement_timeout_ms=timeout_ms if timeout_ms > 0 else None,
+        )
+        _api_session_factory = sessionmaker(
+            bind=_api_engine, autoflush=False, expire_on_commit=False
+        )
+    return _api_session_factory
+
+
 def reset_engine() -> None:
-    """Dispose and reset the module-level engine (used during shutdown and tests)."""
-    global _engine, _session_factory
+    """Dispose and reset module-level engines (used during shutdown and tests)."""
+    global _engine, _session_factory, _api_engine, _api_session_factory
     if _engine is not None:
         _engine.dispose()
+    if _api_engine is not None:
+        _api_engine.dispose()
     _engine = None
     _session_factory = None
+    _api_engine = None
+    _api_session_factory = None
 
 
 def get_db() -> Generator[Session, None, None]:
-    """FastAPI dependency yielding a managed database session."""
-    if _session_factory is None:
-        get_engine()
-    assert _session_factory is not None
-    session = _session_factory()
+    """FastAPI dependency yielding a managed database session with API statement_timeout."""
+    factory = _get_api_session_factory()
+    session = factory()
     try:
         yield session
     finally:

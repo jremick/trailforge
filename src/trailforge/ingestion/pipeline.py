@@ -638,7 +638,29 @@ def ingest_corridor_dataset(
         )
     ).scalars().all()
 
-    all_known_ids = set(session.execute(select(TrackSegment.segment_id)).scalars().all())
+    # Scope known segment IDs to the buffered tile bbox + candidate deterministic IDs
+    # instead of scanning the entire global track_segments table on every bake tile.
+    buffered_env = func.ST_Expand(env, 0.01)
+    all_known_ids: set[str] = {r.segment_id for r in existing_rows}
+    all_known_ids.update(
+        session.execute(
+            select(TrackSegment.segment_id).where(
+                func.ST_Intersects(TrackSegment.geom, buffered_env)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    cand_seg_ids = list({c.segment_id for c in segment_candidates if c.segment_id})
+    for idx in range(0, len(cand_seg_ids), 1000):
+        chunk = cand_seg_ids[idx : idx + 1000]
+        all_known_ids.update(
+            session.execute(
+                select(TrackSegment.segment_id).where(TrackSegment.segment_id.in_(chunk))
+            )
+            .scalars()
+            .all()
+        )
     existing_snapshots: list[ExistingSegmentSnapshot] = []
     for row in existing_rows:
         shp_wgs84 = to_shape(row.geom)

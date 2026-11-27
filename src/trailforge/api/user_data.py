@@ -113,21 +113,13 @@ class PinResponse(BaseModel):
     updated_at: datetime
 
 
-def _build_export_track_data(
-    db: Session, track: Track, *, notes: str | None = None
-) -> tuple[ExportTrackData, list[ExportPin]]:
-    """Assemble stitched coordinates (lon, lat, elev) & nearby POIs for GPX/GeoJSON export."""
-    seg_rows = db.execute(
-        select(
-            TrackSegment,
-            func.ST_AsGeoJSON(TrackSegment.geom).label("geom_json"),
-            TrackSegmentGrade.effective_grade,
-        )
-        .outerjoin(TrackSegmentGrade, TrackSegment.segment_id == TrackSegmentGrade.segment_id)
-        .where(TrackSegment.track_id == track.track_id, TrackSegment.is_active.is_(True))
-        .order_by(TrackSegment.segment_seq.asc().nullslast(), TrackSegment.segment_id.asc())
-    ).all()
-
+def _assemble_export_track_from_segments(
+    track: Track,
+    seg_rows: list[tuple[TrackSegment, str, str | None]],
+    *,
+    notes: str | None = None,
+) -> ExportTrackData:
+    """Stitch ordered segment coordinates & grade into an ``ExportTrackData``."""
     stitched_coords: list[tuple[float, float, float | None]] = []
     worst_rank = 0
     curr_exit: str | None = None
@@ -179,6 +171,81 @@ def _build_export_track_data(
                 ele = round(float(seg.elev_min_m), 2)
             stitched_coords.append((lon, lat, ele))
 
+    grade = _RANK_GRADE.get(worst_rank) if worst_rank else None
+    return ExportTrackData(
+        track_id=track.track_id,
+        name=track.name,
+        state=track.state,
+        grade=grade,
+        total_length_m=float(track.total_length_m or 0.0),
+        coords_lonlat_ele=stitched_coords,
+        has_osm_source=bool(track.has_osm_source),
+        notes=notes,
+        extra_props={
+            "trail_class": track.trail_class,
+            "elev_min_m": track.elev_min_m,
+            "elev_max_m": track.elev_max_m,
+            "max_slope_deg": track.max_slope_deg,
+        },
+    )
+
+
+def _build_export_tracks_batch(
+    db: Session,
+    fav_rows: list[tuple[UserFavorite, Track]],
+) -> list[ExportTrackData]:
+    """Batch-load segments for all favorited tracks in one SQL query (zero unused POI joins)."""
+    if not fav_rows:
+        return []
+    unique_tids = list(dict.fromkeys(trk.track_id for _, trk in fav_rows))
+    raw_segs = db.execute(
+        select(
+            TrackSegment,
+            func.ST_AsGeoJSON(TrackSegment.geom).label("geom_json"),
+            TrackSegmentGrade.effective_grade,
+        )
+        .outerjoin(TrackSegmentGrade, TrackSegment.segment_id == TrackSegmentGrade.segment_id)
+        .where(TrackSegment.track_id.in_(unique_tids), TrackSegment.is_active.is_(True))
+        .order_by(
+            TrackSegment.track_id.asc(),
+            TrackSegment.segment_seq.asc().nullslast(),
+            TrackSegment.segment_id.asc(),
+        )
+    ).all()
+    segs_by_track: dict[str, list[tuple[TrackSegment, str, str | None]]] = {
+        tid: [] for tid in unique_tids
+    }
+    for seg, geom_json, eff_grade in raw_segs:
+        if seg.track_id in segs_by_track:
+            segs_by_track[seg.track_id].append((seg, geom_json, eff_grade))
+
+    return [
+        _assemble_export_track_from_segments(
+            trk, segs_by_track.get(trk.track_id, []), notes=fav.notes
+        )
+        for fav, trk in fav_rows
+    ]
+
+
+def _build_export_track_data(
+    db: Session, track: Track, *, notes: str | None = None
+) -> tuple[ExportTrackData, list[ExportPin]]:
+    """Assemble stitched coordinates (lon, lat, elev) & nearby POIs for GPX/GeoJSON export."""
+    seg_rows = [
+        (r[0], r[1], r[2])
+        for r in db.execute(
+            select(
+                TrackSegment,
+                func.ST_AsGeoJSON(TrackSegment.geom).label("geom_json"),
+                TrackSegmentGrade.effective_grade,
+            )
+            .outerjoin(TrackSegmentGrade, TrackSegment.segment_id == TrackSegmentGrade.segment_id)
+            .where(TrackSegment.track_id == track.track_id, TrackSegment.is_active.is_(True))
+            .order_by(TrackSegment.segment_seq.asc().nullslast(), TrackSegment.segment_id.asc())
+        ).all()
+    ]
+    export_track = _assemble_export_track_from_segments(track, seg_rows, notes=notes)
+
     nearby_pins: list[ExportPin] = []
     if seg_rows:
         track_union_sq = (
@@ -220,23 +287,6 @@ def _build_export_track_data(
                 )
             )
 
-    grade = _RANK_GRADE.get(worst_rank) if worst_rank else None
-    export_track = ExportTrackData(
-        track_id=track.track_id,
-        name=track.name,
-        state=track.state,
-        grade=grade,
-        total_length_m=float(track.total_length_m or 0.0),
-        coords_lonlat_ele=stitched_coords,
-        has_osm_source=bool(track.has_osm_source),
-        notes=notes,
-        extra_props={
-            "trail_class": track.trail_class,
-            "elev_min_m": track.elev_min_m,
-            "elev_max_m": track.elev_max_m,
-            "max_slope_deg": track.max_slope_deg,
-        },
-    )
     return export_track, nearby_pins
 
 
@@ -247,6 +297,8 @@ def _build_export_track_data(
 
 @router.get("/favorites", response_model=list[FavoriteResponse])
 def list_favorites(
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[FavoriteResponse]:
@@ -256,6 +308,8 @@ def list_favorites(
         .join(Track, UserFavorite.track_id == Track.track_id)
         .where(UserFavorite.user_id == user.id, UserFavorite.track_id.is_not(None))
         .order_by(UserFavorite.created_at.desc())
+        .offset(offset)
+        .limit(limit)
     ).all()
 
     rank_by_track: dict[str, int] = {}
@@ -412,6 +466,8 @@ def _pin_to_response(pin: UserPin, lon: float, lat: float) -> PinResponse:
 
 @router.get("/pins", response_model=list[PinResponse])
 def list_pins(
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[PinResponse]:
@@ -424,6 +480,8 @@ def list_pins(
         )
         .where(UserPin.user_id == user.id)
         .order_by(UserPin.created_at.desc())
+        .offset(offset)
+        .limit(limit)
     ).all()
     return [_pin_to_response(pin, lon, lat) for pin, lon, lat in rows]
 
@@ -563,7 +621,7 @@ def export_track(
 
     gj = build_track_geojson(export_trk, nearby_pois)
     return Response(
-        content=json.dumps(gj, indent=2) + "\n",
+        content=json.dumps(gj, separators=(",", ":")),
         media_type="application/geo+json",
         headers={"Content-Disposition": f'attachment; filename="{slug}.geojson"'},
     )
@@ -576,21 +634,21 @@ def export_user_saved_data(
     db: Session = Depends(get_db),
 ) -> Response:
     """Export the signed-in user's favorite tracks and personal pins as GPX 1.1 or GeoJSON."""
-    fav_rows = db.execute(
-        select(UserFavorite, Track)
-        .join(Track, UserFavorite.track_id == Track.track_id)
-        .where(
-            UserFavorite.user_id == user.id,
-            UserFavorite.track_id.is_not(None),
-            Track.is_active.is_(True),
-        )
-        .order_by(UserFavorite.created_at.desc())
-    ).all()
+    fav_rows = [
+        (r[0], r[1])
+        for r in db.execute(
+            select(UserFavorite, Track)
+            .join(Track, UserFavorite.track_id == Track.track_id)
+            .where(
+                UserFavorite.user_id == user.id,
+                UserFavorite.track_id.is_not(None),
+                Track.is_active.is_(True),
+            )
+            .order_by(UserFavorite.created_at.desc())
+        ).all()
+    ]
 
-    tracks_data: list[ExportTrackData] = []
-    for fav, trk in fav_rows:
-        exp_trk, _ = _build_export_track_data(db, trk, notes=fav.notes)
-        tracks_data.append(exp_trk)
+    tracks_data = _build_export_tracks_batch(db, fav_rows)
 
     pin_rows = db.execute(
         select(
@@ -633,7 +691,7 @@ def export_user_saved_data(
         pins=pins_data,
     )
     return Response(
-        content=json.dumps(gj, indent=2) + "\n",
+        content=json.dumps(gj, separators=(",", ":")),
         media_type="application/geo+json",
         headers={"Content-Disposition": f'attachment; filename="{slug}.geojson"'},
     )

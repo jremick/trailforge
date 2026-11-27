@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Final, Literal
 
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from trailforge.api.tracks import ParkSummary, PoiResponse
@@ -39,7 +39,7 @@ from trailforge.grading.rainfall import (
     db_to_api_wet_risk,
 )
 from trailforge.ingestion.connectors.base import ATTRIBUTION_GA_HYDRO
-from trailforge.reports.queries import get_reports_for_track
+from trailforge.reports.queries import get_reports_for_tracks
 from trailforge.vehicles.classifier import (
     CapabilityClassLiteral,
     TrackSuitability,
@@ -745,13 +745,14 @@ def plan_route_with_geometry(
     # 3. Bulk-load live grading summaries, official closures, and community condition reports
     live_map = get_live_summaries_for_tracks(session, unique_ids)
     closures_map = get_closures_for_track_ids(session, unique_ids)
-    reports_by_track: dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {}
-    for tid in unique_ids:
-        rep_payload = get_reports_for_track(session, tid, include_resolved=False)
-        reports_by_track[tid] = (
-            list(rep_payload.get("condition_reports") or []),
-            list(rep_payload.get("community_gate_warnings") or []),
+    raw_reports_map = get_reports_for_tracks(session, unique_ids, include_resolved=False)
+    reports_by_track: dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {
+        tid: (
+            list(raw_reports_map.get(tid, {}).get("condition_reports") or []),
+            list(raw_reports_map.get(tid, {}).get("community_gate_warnings") or []),
         )
+        for tid in unique_ids
+    }
 
     # 4. Optimize per-leg orientation (start/end jump minimization via 2-state DP)
     leg_endpoints: list[tuple[tuple[float, float], tuple[float, float]] | None] = []
@@ -1420,6 +1421,168 @@ def plan_route_with_geometry(
     )
 
     return analysis, oriented_tracks
+
+
+def summarize_saved_routes(
+    session: Session,
+    routes: Sequence[Any],
+) -> dict[Any, dict[str, Any]]:
+    """Compute lightweight live summary metrics for many saved PlannedRoutes in batched queries.
+
+    Avoids running full geometry stitching, waterway spatial joins, elevation profile
+    resampling, and POI queries once per saved route on list endpoints.
+    """
+    if not routes:
+        return {}
+
+    all_tids: list[str] = []
+    for route in routes:
+        for tid in route.track_ids or []:
+            cleaned = str(tid).strip()
+            if cleaned:
+                all_tids.append(cleaned)
+    unique_ids = list(dict.fromkeys(all_tids))
+    if not unique_ids:
+        return {}
+
+    active_tracks = {
+        t.track_id: t
+        for t in session.execute(
+            select(Track).where(Track.track_id.in_(unique_ids), Track.is_active.is_(True))
+        )
+        .scalars()
+        .all()
+    }
+    active_ids = list(active_tracks.keys())
+    if not active_ids:
+        return {}
+
+    eff_rank_expr = case(
+        (TrackSegmentGrade.effective_grade == "Easy", 1),
+        (TrackSegmentGrade.effective_grade == "Medium", 2),
+        (TrackSegmentGrade.effective_grade == "Hard", 3),
+        (TrackSegmentGrade.effective_grade == "Extreme", 4),
+        else_=0,
+    )
+    base_rank_expr = case(
+        (TrackSegmentGrade.baseline_grade == "Easy", 1),
+        (TrackSegmentGrade.baseline_grade == "Medium", 2),
+        (TrackSegmentGrade.baseline_grade == "Hard", 3),
+        (TrackSegmentGrade.baseline_grade == "Extreme", 4),
+        else_=0,
+    )
+    wet_rank_expr = case(
+        (TrackSegmentGrade.wet_risk_level == "damp", 1),
+        (TrackSegmentGrade.wet_risk_level == "wet", 2),
+        (TrackSegmentGrade.wet_risk_level == "saturated", 3),
+        else_=0,
+    )
+    seg_stats_by_track: dict[str, Any] = {}
+    for row in session.execute(
+        select(
+            TrackSegment.track_id.label("track_id"),
+            func.coalesce(func.sum(TrackSegment.length_m), 0.0).label("seg_length_m"),
+            func.coalesce(func.max(eff_rank_expr), 0).label("eff_rank"),
+            func.coalesce(func.max(base_rank_expr), 0).label("base_rank"),
+            func.coalesce(func.max(wet_rank_expr), 0).label("wet_rank"),
+        )
+        .outerjoin(TrackSegmentGrade, TrackSegment.segment_id == TrackSegmentGrade.segment_id)
+        .where(TrackSegment.is_active.is_(True), TrackSegment.track_id.in_(active_ids))
+        .group_by(TrackSegment.track_id)
+    ).all():
+        if row.track_id is not None:
+            seg_stats_by_track[row.track_id] = row
+
+    live_map = get_live_summaries_for_tracks(session, active_ids)
+    closures_map = get_closures_for_track_ids(session, active_ids)
+    reports_map = get_reports_for_tracks(session, active_ids, include_resolved=False)
+
+    wet_by_rank: dict[int, ApiWetRiskLiteral] = {
+        0: "dry",
+        1: "damp",
+        2: "wet",
+        3: "heavy_rain",
+    }
+
+    summaries: dict[Any, dict[str, Any]] = {}
+    for route in routes:
+        tids = [str(tid).strip() for tid in (route.track_ids or []) if str(tid).strip()]
+        if not tids or any(tid not in active_tracks for tid in tids):
+            # Missing/retired track — caller falls back to basic metadata
+            continue
+
+        total_length_m = 0.0
+        total_duration_min = 0.0
+        worst_grade_rank = 0
+        worst_wet_rank = 0
+        seen_closure_ids: set[Any] = set()
+        has_blocking_closure = False
+        seen_gate_ids: set[Any] = set()
+
+        for tid in tids:
+            trk = active_tracks[tid]
+            s_row = seg_stats_by_track.get(tid)
+            seg_len = float(s_row.seg_length_m) if s_row and s_row.seg_length_m else 0.0
+            leg_length_m = seg_len if seg_len > 0.0 else float(trk.total_length_m or 0.0)
+            total_length_m += leg_length_m
+
+            live_s = live_map.get(tid, {})
+            live_grade = live_s.get("live_grade")
+            eff_from_segs = (
+                _RANK_GRADE.get(int(s_row.eff_rank)) if s_row and s_row.eff_rank else None
+            )
+            base_from_segs = (
+                _RANK_GRADE.get(int(s_row.base_rank)) if s_row and s_row.base_rank else "Medium"
+            )
+            leg_grade = live_grade or eff_from_segs or base_from_segs
+            worst_grade_rank = max(worst_grade_rank, _GRADE_RANK.get(leg_grade, 2))
+
+            rain_ctx = live_s.get("rainfall_context") or {}
+            seg_wet = wet_by_rank.get(int(s_row.wet_rank) if s_row else 0, "dry")
+            if isinstance(rain_ctx, dict) and rain_ctx.get("wet_risk_level"):
+                leg_wet = db_to_api_wet_risk(str(rain_ctx["wet_risk_level"]))
+            else:
+                leg_wet = seg_wet
+            worst_wet_rank = max(
+                worst_wet_rank,
+                _WET_RANK.get(leg_wet, 0),
+                _WET_RANK.get(seg_wet, 0),
+            )
+
+            live_speed = live_s.get("avg_speed_kmh")
+            if live_speed is not None and float(live_speed) > 0.5:
+                speed_kmh = float(live_speed)
+            else:
+                speed_kmh = GRADE_SPEED_KMH.get(leg_grade, 18.0)
+            total_duration_min += round((leg_length_m / 1000.0) / speed_kmh * 60.0, 1)
+
+            c_entry = closures_map.get(tid, {"closure_status": "open", "active_closures": []})
+            c_status = str(c_entry.get("closure_status", "open"))
+            if c_status in ("closed", "seasonal"):
+                has_blocking_closure = True
+            for cl in c_entry.get("active_closures") or []:
+                cl_id = cl.get("id") if isinstance(cl, dict) else getattr(cl, "id", None)
+                seen_closure_ids.add(cl_id if cl_id is not None else id(cl))
+
+            for gw in reports_map.get(tid, {}).get("community_gate_warnings") or []:
+                gw_id = gw.get("id") if isinstance(gw, dict) else id(gw)
+                seen_gate_ids.add(gw_id)
+
+        worst_grade = _RANK_GRADE.get(worst_grade_rank, "Medium")
+        summaries[route.id] = {
+            "leg_count": len(tids),
+            "total_length_m": round(total_length_m, 1),
+            "est_duration_min": round(total_duration_min, 1),
+            "worst_grade": worst_grade,
+            "effective_grade": worst_grade,
+            "has_blocking_closure": has_blocking_closure,
+            "closure_count": len(seen_closure_ids),
+            "gate_warning_count": len(seen_gate_ids),
+            "wet_risk_level": _RANK_WET.get(worst_wet_rank, "dry"),
+            "gridforge_cli": build_gridforge_cli(route.name),
+        }
+
+    return summaries
 
 
 def plan_route(

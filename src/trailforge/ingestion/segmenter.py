@@ -209,18 +209,27 @@ def _snap_endpoint_clusters(ways: list[ConflatedWay], tol_m: float = JUNCTION_SN
         endpoints.append((wi, 0, coords[0][0], coords[0][1]))
         endpoints.append((wi, -1, coords[-1][0], coords[-1][1]))
 
-    # Deterministic spatial clustering (round to tol_m buckets and merge neighbors within tol_m)
+    # Deterministic O(N) spatial-grid clustering (check only 3x3 neighboring tol_m cells)
+    cell_size = max(tol_m, 1e-6)
+    grid: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for idx, (_wi, _end, x, y) in enumerate(endpoints):
+        grid[(math.floor(x / cell_size), math.floor(y / cell_size))].append(idx)
+
     assigned: dict[int, tuple[float, float]] = {}
     for i, (_wi, _end, xi, yi) in enumerate(endpoints):
         if i in assigned:
             continue
+        gx = math.floor(xi / cell_size)
+        gy = math.floor(yi / cell_size)
         cluster = [i]
-        for j in range(i + 1, len(endpoints)):
-            if j in assigned:
-                continue
-            _, _, xj, yj = endpoints[j]
-            if math.hypot(xi - xj, yi - yj) <= tol_m:
-                cluster.append(j)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for j in grid.get((gx + dx, gy + dy), ()):
+                    if j <= i or j in assigned:
+                        continue
+                    _, _, xj, yj = endpoints[j]
+                    if math.hypot(xi - xj, yi - yj) <= tol_m:
+                        cluster.append(j)
         if len(cluster) > 1 and any(
             endpoints[k][2] != xi or endpoints[k][3] != yi for k in cluster[1:]
         ):
@@ -382,11 +391,12 @@ def _merge_degree2_continuations(ways: list[ConflatedWay]) -> list[ConflatedWay]
             incident[k0].append((idx, 0))
             incident[k1].append((idx, -1))
 
+        touched_this_pass: set[int] = set()
         for _node_k, edges in incident.items():
             if len(edges) != 2:
                 continue
             (i, end_i), (j, end_j) = edges
-            if i == j:
+            if i == j or i in touched_this_pass or j in touched_this_pass:
                 continue
             wi = active[i]
             wj = active[j]
@@ -426,8 +436,9 @@ def _merge_degree2_continuations(ways: list[ConflatedWay]) -> list[ConflatedWay]
             wi.source_refs = merged_refs
             wi.alt_names = merged_alts
             active[j] = None
+            touched_this_pass.add(i)
+            touched_this_pass.add(j)
             changed = True
-            break
 
     return [w for w in active if w is not None]
 

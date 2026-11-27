@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import html
+import io
+import ipaddress
 import os
 import re
+import socket
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -526,6 +529,40 @@ _WS_COLLAPSE_RE: Final[re.Pattern[str]] = re.compile(r"\s+")
 _UNSAFE_XML_PATTERN: Final[re.Pattern[str]] = re.compile(r"<!(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
 _SAFE_HTTP_URL_RE: Final[re.Pattern[str]] = re.compile(r"^https?://", re.IGNORECASE)
 MAX_FEED_BODY_BYTES: Final[int] = 10 * 1024 * 1024  # 10 MiB upstream feed response cap
+MAX_FEED_XML_ELEMENTS: Final[int] = 250_000
+
+
+def _assert_safe_feed_url(url: httpx.URL) -> None:
+    """SSRF guard blocking redirects or requests targeting non-public IP ranges."""
+    scheme = (url.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported upstream feed URL scheme: {scheme!r}")
+    host = (url.host or "").strip().lower()
+    if not host or host in ("localhost", "localhost.localdomain"):
+        raise ValueError(f"Upstream feed target host is not allowed: {host!r}")
+    try:
+        literal_ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        literal_ip = None
+    if literal_ip is not None:
+        if not literal_ip.is_global:
+            raise ValueError(f"Upstream feed target IP is not publicly routable: {literal_ip}")
+        return
+    try:
+        port = url.port or (443 if scheme == "https" else 80)
+        addr_infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError:
+        return
+    for info in addr_infos:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        try:
+            resolved_ip = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            continue
+        if not resolved_ip.is_global:
+            raise ValueError(f"Upstream feed target resolves to non-public IP: {resolved_ip}")
 
 
 def strip_html(raw: str) -> str:
@@ -536,10 +573,24 @@ def strip_html(raw: str) -> str:
 
 
 def parse_safe_xml(xml_text: str) -> ET.Element:
-    """Parse upstream XML feed text while rejecting ``<!DOCTYPE`` / ``<!ENTITY`` declarations."""
+    """Parse upstream XML feed text rejecting ``<!DOCTYPE``/``<!ENTITY`` and huge DOMs."""
     if _UNSAFE_XML_PATTERN.search(xml_text):
         raise ValueError("XML DOCTYPE/ENTITY declarations are not permitted in upstream XML feeds")
-    return ET.fromstring(xml_text)
+    stream = io.BytesIO(xml_text.encode("utf-8"))
+    root: ET.Element | None = None
+    elem_count = 0
+    for event, elem in ET.iterparse(stream, events=("start",)):
+        if event == "start":
+            elem_count += 1
+            if elem_count > MAX_FEED_XML_ELEMENTS:
+                raise ValueError(
+                    f"Upstream XML feed exceeds maximum allowed {MAX_FEED_XML_ELEMENTS} elements"
+                )
+            if root is None:
+                root = elem
+    if root is None:
+        raise ValueError("Upstream XML feed is empty")
+    return root
 
 
 def sanitize_source_url(url: Any, *, fallback: str | None = None) -> str | None:
@@ -600,7 +651,9 @@ class BaseHttpFeedAdapter:
             else httpx.Client(
                 timeout=httpx.Timeout(self.timeout_s, connect=min(8.0, self.timeout_s)),
                 follow_redirects=True,
+                max_redirects=5,
                 headers={"User-Agent": USER_AGENT},
+                event_hooks={"request": [lambda req: _assert_safe_feed_url(req.url)]},
             )
         )
         try:
