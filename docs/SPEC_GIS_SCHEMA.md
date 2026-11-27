@@ -600,6 +600,8 @@ Canonical protected area polygons for tenure attribution and park-level alert li
 | `visibility` | `TEXT` | `NOT NULL DEFAULT 'private' CHECK (visibility IN ('private','community_anonymous'))` | Private logbook vs. anonymous contribution |
 | `privacy_trim_m` | `DOUBLE PRECISION` | `NOT NULL DEFAULT 250.0 CHECK (privacy_trim_m >= 250.0 AND privacy_trim_m <= 5000.0)` | Enforced start/end privacy buffer |
 | `contribution_nonce` | `UUID` | `NOT NULL DEFAULT gen_random_uuid()` | Rotated on visibility toggle to compute/revoke `contribution_hash` |
+| `contribution_key_id` | `VARCHAR(32)` | `NULL` | Fingerprint of the server-held withdrawal key |
+| `community_consent_confirmed` | `BOOLEAN` | `NOT NULL DEFAULT FALSE` | Affirmative owner consent for public aggregation |
 | `raw_geom` | `GEOMETRY(LineString, 4326)` | `NOT NULL` | Strictly private full GPS trace (never exposed publicly) |
 | `trimmed_geom` | `GEOMETRY(LineString, 4326)` | `NULL` | Privacy-trimmed trace (`NULL` if trip `<= 2 * privacy_trim_m`) |
 | `raw_distance_m` | `DOUBLE PRECISION` | `NOT NULL DEFAULT 0` | Full distance (`EPSG:3577`) |
@@ -625,7 +627,7 @@ Publicly aggregatable segment traversals extracted strictly from privacy-trimmed
 | `contribution_hash` | `CHAR(64)` | `NOT NULL` | `HMAC_SHA256(server_secret, trip.contribution_nonce)` — internal revocation key only, never exposed on APIs |
 | `vehicle_capability_class` | `TEXT` | `NOT NULL CHECK (vehicle_capability_class IN ('AWD','Stock 4WD','Touring 4WD','Modified 4WD'))` | Normalized rig class |
 | `direction` | `TEXT` | `NOT NULL CHECK (direction IN ('forward','reverse'))` | Relative to canonical segment orientation |
-| `observed_at` | `TIMESTAMPTZ` | `NOT NULL` | Traversal timestamp (coarsened to hour in public aggregates) |
+| `observed_at` | `TIMESTAMPTZ` | `NOT NULL` | Private traversal timestamp. Public recency is corroborated and coarsened to the week. |
 | `observed_date` | `DATE` | `NOT NULL` | Calendar date for recency & last-driven display |
 | `traversal_duration_s` | `DOUBLE PRECISION` | `NOT NULL CHECK (traversal_duration_s > 0)` | Elapsed seconds over segment |
 | `avg_speed_kmh` | `DOUBLE PRECISION` | `NOT NULL CHECK (avg_speed_kmh >= 0 AND avg_speed_kmh <= 160)` | Mean speed along segment |
@@ -989,12 +991,12 @@ class TrackMatcher(Protocol):
 2. **Identity Stripping & Revocable Private/Community Toggle:**
    - Every trip defaults to `visibility = 'private'` (private logbook only; `raw_geom` is accessible strictly to the owning `user_id`).
    - Only when `visibility = 'community_anonymous'` does the worker run `TrackMatcher` on `trimmed_geom` and write rows to `telemetry_observations` / `unmapped_track_candidates`.
-   - Those public-aggregation tables store **no `user_id`** and **no `trip_id`**. They carry only `contribution_hash = HMAC_SHA256(TRAILFORGE_PRIVACY_SECRET, str(trip.contribution_nonce))`.
+   - Contribution tables use a keyed HMAC of the trip ID and nonce for withdrawal. The trip stores the key fingerprint. Public aggregation derives the private join with the server-held key, and each account supplies at most one traversal per segment.
    - When a user toggles a trip from `community_anonymous` back to `private` (or deletes the trip):
      1. Delete all `telemetry_observations` and `unmapped_track_candidates` matching `contribution_hash`.
      2. Rotate `trip.contribution_nonce = gen_random_uuid()`.
-     3. Enqueue grade recomputation for affected `segment_id`s.
-   - Public endpoints expose only aggregate `track_segment_grades` statistics (and suppress speed/roughness breakdowns when `sample_count < 3` with `confidence_level = 'low'`).
+     3. Refresh affected grades, hotspots and track grades in the same transaction, and invalidate affected local packs.
+   - Public telemetry requires three distinct consenting contributors. Off-network geometry is generalized to grid cells, and public archives for CDNs exclude trip telemetry. See [Community telemetry privacy](COMMUNITY_PRIVACY.md).
 
 ---
 
