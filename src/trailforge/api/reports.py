@@ -27,7 +27,11 @@ from sqlalchemy.orm import Session
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from trailforge.api.middleware import check_upload_quota
-from trailforge.auth.dependencies import get_current_user, get_optional_current_user
+from trailforge.auth.dependencies import (
+    get_current_user,
+    get_optional_current_user,
+    require_browser_queue_owner,
+)
 from trailforge.config import get_settings
 from trailforge.db.models import (
     ConditionReport,
@@ -384,7 +388,7 @@ def get_single_report(
 @router.post("", response_model=ConditionReportResponse, status_code=status.HTTP_201_CREATED)
 async def create_report(
     request: Request,
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_browser_queue_owner),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Create a structured condition report (supports JSON or multipart/form-data with photo)."""

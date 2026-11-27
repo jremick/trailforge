@@ -357,6 +357,7 @@ export class ElevationProfileModal {
           </div>
 
           <div class="tf-elev-stage">
+            ${norm.hasMultipleCourseSections ? `<p class="tf-inspector-muted">Distance combines the mapped track sections. Check the map for junctions and gaps.</p>` : ""}
             <div class="tf-elev-scrub-hud" data-role="scrub-hud">
               <span class="tf-elev-scrub-hint">${
                 hasCourse

@@ -20,7 +20,11 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from trailforge.api.middleware import check_upload_quota
-from trailforge.auth.dependencies import get_current_user, get_scoped_read_user
+from trailforge.auth.dependencies import (
+    get_current_user,
+    get_scoped_read_user,
+    require_browser_queue_owner,
+)
 from trailforge.config import get_settings
 from trailforge.db.models import (
     TelemetryObservation,
@@ -784,7 +788,7 @@ def _enforce_trip_upload_quota(request: Request, current_user: User) -> None:
 @router.post("/trips/upload", response_model=TripItemResponse, status_code=status.HTTP_201_CREATED)
 async def upload_trip(
     request: Request,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_browser_queue_owner),
     db: Session = Depends(get_db),
     matcher: TrackMatcher = Depends(get_track_matcher),
 ) -> TripItemResponse:
@@ -957,7 +961,7 @@ async def upload_trip(
 async def mobile_sync_trip(
     request: Request,
     payload: MobileSyncRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_browser_queue_owner),
     db: Session = Depends(get_db),
     matcher: TrackMatcher = Depends(get_track_matcher),
 ) -> MobileSyncResponse:

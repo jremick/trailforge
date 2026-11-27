@@ -68,6 +68,7 @@ import {
   uploadMobileTripSync,
   uploadTripGpx,
   uploadTripJson,
+  usesSessionBearer,
   voteConditionReport,
 } from "./api";
 import type {
@@ -99,22 +100,21 @@ import {
   triggerClientFileDownload,
 } from "./offline/exporters";
 import {
-  deleteOfflinePin,
   downloadRegionalPackToDevice,
   getActiveOfflinePackId,
   listDownloadedPacks,
-  listOfflinePins,
   removeOfflinePack,
-  saveOfflinePin,
   setActiveOfflinePackId,
 } from "./offline/packStore";
 import {
+  deleteQueuedPin,
   enqueueOfflinePin,
   enqueueOfflineReport,
   enqueueOfflineTrip,
   flushSyncQueue,
   generateClientUuid,
   listSyncQueue,
+  pinsFromSyncQueue,
 } from "./offline/syncQueue";
 import {
   CANONICAL_LAYER_ORDER,
@@ -187,6 +187,7 @@ import type {
   TripItem,
   UnifiedSearchItem,
   UserFavoriteItem,
+  UserPinInput,
   UserPinItem,
   VehicleCapabilityClass,
   VehicleProfileItem,
@@ -207,6 +208,65 @@ const HEALTH_POLL_INTERVAL_MS = 15000;
 const CLOSURES_POLL_INTERVAL_MS = 60000;
 const ANON_RIG_STORAGE_KEY = "trailforge.anon_rig_class";
 const DEMO_BANNER_DISMISSED_KEY = "trailforge.dismissed_demo_banner";
+const ACCOUNT_CHANGE_KEY = "trailforge.account_change";
+const PENDING_SIGN_OUT_KEY = "trailforge.pending_sign_out";
+
+function loadPendingSignOut(): string | null {
+  if (usesSessionBearer()) return null;
+  try {
+    const val = window.localStorage.getItem(PENDING_SIGN_OUT_KEY);
+    return val && val.trim() ? val.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+function loadLocalSignOut(): boolean {
+  return loadPendingSignOut() !== null;
+}
+
+function announceAccountChange(
+  state: "signed-in" | "signed-out" | "signed-out-complete"
+): void {
+  if (usesSessionBearer()) return;
+  try {
+    window.localStorage.setItem(ACCOUNT_CHANGE_KEY, `${state}:${generateClientUuid()}`);
+  } catch {
+    // Visible tabs also recheck the session when they regain focus.
+  }
+}
+
+function persistPendingSignOut(ownerId: string | null): void {
+  if (usesSessionBearer()) return;
+  try {
+    if (ownerId) window.localStorage.setItem(PENDING_SIGN_OUT_KEY, ownerId);
+    else window.localStorage.removeItem(PENDING_SIGN_OUT_KEY);
+  } catch {
+    // The current tab can still retry its own queued sign-out.
+  }
+}
+
+async function withBrowserAuthLock<T>(action: () => Promise<T>): Promise<T> {
+  if (!usesSessionBearer() && navigator.locks) {
+    return await navigator.locks.request("trailforge-auth", action);
+  }
+  return action();
+}
+
+async function withAccountSyncLock<T>(
+  ownerId: string,
+  action: () => Promise<T>
+): Promise<T> {
+  if (typeof navigator !== "undefined" && navigator.locks) {
+    return await navigator.locks.request(`trailforge-sync:${ownerId}`, action);
+  }
+  return action();
+}
+
+interface AccountRequest {
+  ownerId: string;
+  signal: AbortSignal;
+}
 
 function loadDismissedDemoBanner(): string {
   try {
@@ -308,9 +368,17 @@ class TrailForgeApp {
   private urlRigClass: VehicleCapabilityClass | null = null;
   private urlView: { lat: number; lon: number; zoom: number } | null = null;
   private suppressUrlSync = false;
+  private privateMapFocus = false;
 
   // Slice 05 + 06 + 08 + v1.1.0 User, Access Control, Admin & Vehicle state
   private user: AuthUser | null = null;
+  private accountAbort = new AbortController();
+  private authCheck: AbortController | null = null;
+  private authChanging = false;
+  private authTransitionPromise: Promise<void> | null = null;
+  private pendingAuthRecheck = false;
+  private signedOutLocally = loadLocalSignOut();
+  private pendingSignOutOwner = loadPendingSignOut();
   private authConfig: AuthConfigResponse = { ...DEFAULT_AUTH_CONFIG };
   private dismissedDemoBanner: string = loadDismissedDemoBanner();
   private adminStats: AdminStatsResponse | null = null;
@@ -335,8 +403,9 @@ class TrailForgeApp {
   private downloadedPacks: DownloadedPackRecord[] = [];
   private activeOfflinePackId: string | null = getActiveOfflinePackId();
   private syncQueue: SyncQueueItem[] = [];
-  private offlinePins: UserPinItem[] = [];
+  private guestPins: UserPinItem[] = [];
   private isSyncingQueue = false;
+  private offlineRefreshRevision = 0;
 
   // Phase A Interactive Multi-Track Route Planner state
   private routeName = "";
@@ -745,45 +814,35 @@ class TrailForgeApp {
           this.shellEl.classList.remove("inspector-open");
         },
         onSubmitReport: async (input) => {
-          if (!this.isOnline) {
-            const { photo: _omit, ...offlinePayload } = input;
-            await enqueueOfflineReport(offlinePayload);
-            await this.refreshOfflineLocalState();
-            this.pickedReportCoords = null;
-            this.showToast(
-              "Offline: condition report queued & will sync automatically when online",
-              "info"
-            );
-            return;
-          }
-          try {
-            await createConditionReport(input);
-            this.pickedReportCoords = null;
-            this.showToast("Trail condition report published", "success");
-            await this.refreshReportsGeoJson();
-            this.refreshOpenInspectorForRig();
-          } catch (err) {
-            const status =
-              err && typeof err === "object" && "status" in err
-                ? Number((err as { status: unknown }).status)
-                : null;
-            if (status === null || status === 503) {
-              const { photo: _omit, ...offlinePayload } = input;
-              await enqueueOfflineReport(offlinePayload);
-              await this.refreshOfflineLocalState();
+          const request = this.requireAccountRequest();
+          const report = { ...input, client_uuid: input.client_uuid ?? generateClientUuid() };
+          if (this.isOnline) {
+            try {
+              await createConditionReport(report, request);
+              if (request.signal.aborted) return;
               this.pickedReportCoords = null;
-              this.showToast(
-                "Network unavailable — condition report queued for automatic sync",
-                "info"
-              );
+              this.showToast("Trail condition report published", "success");
+              await this.refreshReportsGeoJson();
+              if (!request.signal.aborted) this.refreshOpenInspectorForRig();
               return;
+            } catch (err) {
+              if (request.signal.aborted) return;
+              if (err instanceof ApiError && err.status !== 503 && err.status !== 0) throw err;
             }
-            throw err;
           }
+          const { photo: _omit, ...offlinePayload } = report;
+          await enqueueOfflineReport(request.ownerId, offlinePayload);
+          await this.refreshOfflineLocalState();
+          if (request.signal.aborted) return;
+          this.pickedReportCoords = null;
+          this.showToast("Condition report queued to sync when online", "info");
         },
         onVoteReport: async (reportId, vote) => {
+          const request = this.accountRequest();
+          if (!request) return;
           try {
-            await voteConditionReport(reportId, vote);
+            await voteConditionReport(reportId, vote, request);
+            if (request.signal.aborted) return;
             this.showToast(
               vote === "confirm"
                 ? "Report confirmed — freshness refreshed"
@@ -791,8 +850,9 @@ class TrailForgeApp {
               "success"
             );
             await this.refreshReportsGeoJson();
-            this.refreshOpenInspectorForRig();
+            if (!request.signal.aborted) this.refreshOpenInspectorForRig();
           } catch (err) {
+            if (request.signal.aborted) return;
             const msg = err instanceof Error ? err.message : "Vote failed";
             this.showToast(msg, "error");
           }
@@ -841,6 +901,7 @@ class TrailForgeApp {
           this.updateCursorReadout(lat, lon);
         },
         onSaveRecordedTrip: async (params) => {
+          const request = this.requireAccountRequest();
           const clientUuid = generateClientUuid();
           const payload = {
             name: params.name,
@@ -857,16 +918,25 @@ class TrailForgeApp {
             recording_source: params.recording_source,
             vehicle_profile_id: params.vehicle_profile_id,
             visibility: params.visibility,
+            confirm_community: params.visibility === "community_anonymous" ? true : undefined,
             privacy_trim_m: params.privacy_trim_m,
             client_uuid: clientUuid,
             client_session_id: clientUuid,
           };
 
-          if (this.isOnline && this.user) {
+          if (this.isOnline) {
+            let uploaded: TripItem | null = null;
             try {
-              const uploaded = await uploadMobileTripSync(payload);
+              uploaded = await uploadMobileTripSync(payload, request);
+            } catch (err) {
+              if (request.signal.aborted) return;
+              if (err instanceof ApiError && err.status !== 503 && err.status !== 0) throw err;
+            }
+            if (request.signal.aborted) return;
+            if (uploaded) {
               this.latestUploadedTrip = uploaded;
-              await this.reloadTrips();
+              await this.reloadTrips(request).catch(() => undefined);
+              if (request.signal.aborted) return;
               void this.refreshUnmappedCandidates();
               void this.refreshHotspotsGeoJson();
               const shockSuffix =
@@ -878,25 +948,13 @@ class TrailForgeApp {
                 "success"
               );
               return;
-            } catch (err) {
-              const status =
-                err && typeof err === "object" && "status" in err
-                  ? Number((err as { status: unknown }).status)
-                  : null;
-              if (status !== null && status !== 503 && status !== 0) {
-                throw err;
-              }
             }
           }
 
-          await enqueueOfflineTrip(payload);
+          await enqueueOfflineTrip(request.ownerId, payload);
           await this.refreshOfflineLocalState();
-          this.showToast(
-            this.user
-              ? "Offline: recorded trip & IMU telemetry queued for automatic sync"
-              : "Trip queued locally — sign in & sync when online (or export GPX anytime)",
-            "info"
-          );
+          if (request.signal.aborted) return;
+          this.showToast("Recorded trip queued to sync when online", "info");
         },
         onToast: (msg, kind) => this.showToast(msg, kind),
       }
@@ -909,7 +967,7 @@ class TrailForgeApp {
       {
         onCursorMove: (lat, lon) => this.updateCursorReadout(lat, lon),
         onMapMoveEnd: (lat, lon, zoom) => {
-          this.syncUrlState({ lat, lon, zoom }, "replace");
+          if (!this.privateMapFocus) this.syncUrlState({ lat, lon, zoom }, "replace");
         },
         onBasemapTileError: () => {
           this.offlineBannerEl.textContent =
@@ -934,6 +992,7 @@ class TrailForgeApp {
           this.handlePlaceClick(payload);
         },
         onPinDropClick: (lat, lon) => {
+          this.setPrivateMapFocus();
           this.pendingPinCoords = { lat, lon };
           this.setCoordPickMode(null);
           this.openAccountPanel("saved");
@@ -943,6 +1002,7 @@ class TrailForgeApp {
           );
         },
         onReportPickClick: (lat, lon) => {
+          this.setPrivateMapFocus();
           this.pickedReportCoords = { lat, lon };
           this.setCoordPickMode(null);
           this.shellEl.classList.add("inspector-open");
@@ -985,6 +1045,105 @@ class TrailForgeApp {
     };
   }
 
+  private accountRequest(): AccountRequest | undefined {
+    return this.user ? { ownerId: this.user.id, signal: this.accountAbort.signal } : undefined;
+  }
+
+  private requireAccountRequest(): AccountRequest {
+    const request = this.accountRequest();
+    if (!request) throw new Error("Sign in to continue");
+    return request;
+  }
+
+  private get offlinePins(): UserPinItem[] {
+    return this.user ? pinsFromSyncQueue(this.syncQueue) : this.guestPins;
+  }
+
+  private setPrivateMapFocus(): void {
+    this.privateMapFocus = true;
+    this.syncUrlState({ lat: null, lon: null, zoom: null }, "replace");
+  }
+
+  private clearAccountState(user: AuthUser | null, preserveStartupView = false): void {
+    const hadUser = this.user !== null;
+    this.accountAbort.abort();
+    this.accountAbort = new AbortController();
+    this.user = user;
+    this.vehicles = [];
+    this.trips = [];
+    this.latestUploadedTrip = null;
+    this.favorites = [];
+    this.pins = [];
+    this.guestPins = [];
+    this.syncQueue = [];
+    this.isSyncingQueue = false;
+    this.savedRoutes = [];
+    this.savedRoutesLoading = false;
+    this.adminStats = null;
+    this.adminInvites = [];
+    this.adminUsers = [];
+    this.adminUiSettings = null;
+    this.latestCreatedInvite = null;
+    this.closeAdminPanel();
+    this.adminPanel?.updateState({
+      currentUserId: user?.id ?? null,
+      stats: null,
+      invites: [],
+      users: [],
+      uiSettings: null,
+      latestCreatedInvite: null,
+      loading: false,
+      busyAction: null,
+      error: null,
+    });
+    this.adminPanelEl.replaceChildren();
+    if (this.userPrefsSaveTimer !== null) {
+      window.clearTimeout(this.userPrefsSaveTimer);
+      this.userPrefsSaveTimer = null;
+    }
+    this.userLayerPrefs = { layerOrder: null, layerVisibility: null };
+    clearStoredUserLayerPrefs();
+    this.applyResolvedLayerPreferences();
+    this.pendingPinCoords = null;
+    this.pickedReportCoords = null;
+    this.setCoordPickMode(null);
+    this.recorderHud.resetForAccountChange();
+    if (preserveStartupView) this.inspector.resetReportForm();
+    this.toastContainerEl.replaceChildren();
+
+    if (!preserveStartupView) {
+      this.inspectorAbort?.abort();
+      this.inspector.close();
+      this.currentTrackDetail = null;
+      this.shellEl.classList.remove("inspector-open");
+      this.map.setSelectedTrackId(null);
+      this.clearPlannedRoute();
+      this.closeRoutePlanner();
+      this.routePanelEl.replaceChildren();
+      const wasPrivateMapFocus = this.privateMapFocus;
+      this.privateMapFocus = false;
+      this.map.clearLocationPopups();
+      if (wasPrivateMapFocus) {
+        const { center, zoom } = this.activePreset;
+        this.map.setView(center[1], center[0], zoom);
+        this.updateCursorReadout(center[1], center[0]);
+      } else {
+        this.cursorCoordsEl.textContent = "—";
+        this.cursorMgrsEl.textContent = "—";
+      }
+      this.suppressUrlSync = false;
+      this.syncUrlState({ trackId: null, routeTrackIds: [], lat: null, lon: null, zoom: null });
+    }
+    this.renderCombinedPinsOnMap();
+    this.syncRigUiState();
+    this.syncOfflinePanelState();
+    if (!this.packsPanel?.isPanelOpen()) this.packsPanelEl.replaceChildren();
+    this.syncRoutePlannerUiState();
+    if (hadUser && user === null) {
+      void this.refreshReportsGeoJson();
+    }
+  }
+
   private buildAccountPanelState() {
     return {
       user: this.user,
@@ -1024,77 +1183,42 @@ class TrailForgeApp {
                 this.refreshOpenInspectorForRig();
                 this.refreshPlannedRouteForRig();
               },
-              onLogin: async (email, password) => {
-                const res = await loginAccount({ email, password });
-                this.user = res.user;
-                await this.loadSignedInUserData();
-                this.showToast(`Signed in as ${res.user.display_name}`, "success");
-                this.refreshOpenInspectorForRig();
-                this.refreshPlannedRouteForRig();
-              },
-              onRegister: async (displayName, email, password, inviteCode) => {
-                const res = await registerAccount({
+              onLogin: (email, password) => this.signIn(
+                () => loginAccount({ email, password }),
+                (name) => `Signed in as ${name}`
+              ),
+              onRegister: (displayName, email, password, inviteCode) => this.signIn(
+                () => registerAccount({
                   display_name: displayName,
                   email,
                   password,
                   invite_code: inviteCode ?? null,
-                });
-                this.user = res.user;
-                await this.loadSignedInUserData();
-                this.showToast(
-                  `Account created for ${res.user.display_name}`,
-                  "success"
-                );
-                this.refreshOpenInspectorForRig();
-                this.refreshPlannedRouteForRig();
-              },
-              onLogout: async () => {
-                await logoutAccount();
-                this.user = null;
-                this.vehicles = [];
-                this.trips = [];
-                this.latestUploadedTrip = null;
-                this.favorites = [];
-                this.pins = [];
-                this.savedRoutes = [];
-                this.activeSavedRouteId = null;
-                this.adminStats = null;
-                this.adminInvites = [];
-                this.adminUsers = [];
-                this.adminUiSettings = null;
-                this.latestCreatedInvite = null;
-                if (this.userPrefsSaveTimer !== null) {
-                  window.clearTimeout(this.userPrefsSaveTimer);
-                  this.userPrefsSaveTimer = null;
-                }
-                this.userLayerPrefs = { layerOrder: null, layerVisibility: null };
-                clearStoredUserLayerPrefs();
-                this.applyResolvedLayerPreferences();
-                this.closeAdminPanel();
-                this.setCoordPickMode(null);
-                this.map.setUserPins([]);
-                this.syncRigUiState();
-                this.syncOfflinePanelState();
-                this.syncRoutePlannerUiState();
-                this.showToast("Signed out — anonymous browsing active", "info");
-                this.refreshOpenInspectorForRig();
-                this.refreshPlannedRouteForRig();
-              },
+                }),
+                (name) => `Account created for ${name}`
+              ),
+              onLogout: () => this.signOut(),
               onSaveVehicle: async (payload, editingId) => {
+                const request = this.requireAccountRequest();
                 if (editingId) {
-                  await updateVehicle(editingId, payload);
+                  await updateVehicle(editingId, payload, request);
+                  if (request.signal.aborted) return;
                   this.showToast(`Updated ${payload.name}`, "success");
                 } else {
-                  await createVehicle(payload);
+                  await createVehicle(payload, request);
+                  if (request.signal.aborted) return;
                   this.showToast(`Saved vehicle profile ${payload.name}`, "success");
                 }
-                await this.reloadVehicles();
+                await this.reloadVehicles(request);
+                if (request.signal.aborted) return;
                 this.refreshOpenInspectorForRig();
                 this.refreshPlannedRouteForRig();
               },
               onActivateVehicle: async (id) => {
-                const updated = await activateVehicle(id);
-                await this.reloadVehicles();
+                const request = this.requireAccountRequest();
+                const updated = await activateVehicle(id, request);
+                if (request.signal.aborted) return;
+                await this.reloadVehicles(request);
+                if (request.signal.aborted) return;
                 this.showToast(
                   `Active rig: ${updated.name} (${updated.capability_class})`,
                   "success"
@@ -1103,16 +1227,22 @@ class TrailForgeApp {
                 this.refreshPlannedRouteForRig();
               },
               onDeleteVehicle: async (id) => {
-                await deleteVehicle(id);
-                await this.reloadVehicles();
+                const request = this.requireAccountRequest();
+                await deleteVehicle(id, request);
+                if (request.signal.aborted) return;
+                await this.reloadVehicles(request);
+                if (request.signal.aborted) return;
                 this.showToast("Vehicle profile deleted", "info");
                 this.refreshOpenInspectorForRig();
                 this.refreshPlannedRouteForRig();
               },
               onUploadTripGpx: async (file, params) => {
-                const uploaded = await uploadTripGpx(file, params);
+                const request = this.requireAccountRequest();
+                const uploaded = await uploadTripGpx(file, params, request);
+                if (request.signal.aborted) return;
                 this.latestUploadedTrip = uploaded;
-                await this.reloadTrips();
+                await this.reloadTrips(request);
+                if (request.signal.aborted) return;
                 if (this.layerState.unmapped) void this.refreshUnmappedCandidates();
                 this.showToast(
                   `Matched ${uploaded.matched_segment_count ?? 0} segments (${uploaded.observations_published ?? 0} published)`,
@@ -1120,9 +1250,12 @@ class TrailForgeApp {
                 );
               },
               onUploadTripJson: async (payload) => {
-                const uploaded = await uploadTripJson(payload);
+                const request = this.requireAccountRequest();
+                const uploaded = await uploadTripJson(payload, request);
+                if (request.signal.aborted) return;
                 this.latestUploadedTrip = uploaded;
-                await this.reloadTrips();
+                await this.reloadTrips(request);
+                if (request.signal.aborted) return;
                 if (this.layerState.unmapped) void this.refreshUnmappedCandidates();
                 this.showToast(
                   `Matched ${uploaded.matched_segment_count ?? 0} segments`,
@@ -1130,8 +1263,11 @@ class TrailForgeApp {
                 );
               },
               onToggleTripVisibility: async (tripId, nextVis) => {
-                await updateTrip(tripId, { visibility: nextVis });
-                await this.reloadTrips();
+                const request = this.requireAccountRequest();
+                await updateTrip(tripId, { visibility: nextVis }, request);
+                if (request.signal.aborted) return;
+                await this.reloadTrips(request);
+                if (request.signal.aborted) return;
                 if (this.layerState.unmapped) void this.refreshUnmappedCandidates();
                 this.showToast(
                   nextVis === "private"
@@ -1141,15 +1277,20 @@ class TrailForgeApp {
                 );
               },
               onExportTrip: async (tripId, fmt) => {
+                const request = this.requireAccountRequest();
                 const url = buildTripExportUrl(tripId, fmt);
                 await downloadAuthenticatedExport(
                   url,
-                  `trip_${tripId}.${fmt === "gpx" ? "gpx" : "geojson"}`
+                  `trip_${tripId}.${fmt === "gpx" ? "gpx" : "geojson"}`,
+                  request
                 );
+                if (request.signal.aborted) return;
                 this.showToast(`Exported trip (${fmt.toUpperCase()})`, "success");
               },
               onDeleteTrip: async (tripId) => {
-                await deleteTrip(tripId);
+                const request = this.requireAccountRequest();
+                await deleteTrip(tripId, request);
+                if (request.signal.aborted) return;
                 this.trips = this.trips.filter((t) => getTripId(t) !== tripId);
                 if (
                   this.latestUploadedTrip &&
@@ -1169,7 +1310,9 @@ class TrailForgeApp {
                 void this.openTrackInspector(trackId);
               },
               onRemoveFavorite: async (trackId) => {
-                await removeFavorite(trackId);
+                const request = this.requireAccountRequest();
+                await removeFavorite(trackId, request);
+                if (request.signal.aborted) return;
                 this.favorites = this.favorites.filter(
                   (f) => f.track_id !== trackId
                 );
@@ -1182,73 +1325,9 @@ class TrailForgeApp {
                   this.shellEl.classList.remove("account-open");
                 }
               },
-              onCreatePin: async (payload) => {
-                if (!this.isOnline || !this.user) {
-                  const localPin: UserPinItem = {
-                    id: `offline-pin-${generateClientUuid()}`,
-                    name: payload.name,
-                    category: payload.category,
-                    notes: payload.notes ?? null,
-                    lon: payload.lon,
-                    lat: payload.lat,
-                    track_id: payload.track_id ?? null,
-                    created_at: new Date().toISOString(),
-                  };
-                  await saveOfflinePin(localPin);
-                  if (this.user) {
-                    await enqueueOfflinePin(payload, localPin.id);
-                  }
-                  this.pendingPinCoords = null;
-                  this.setCoordPickMode(null);
-                  await this.refreshOfflineLocalState();
-                  this.showToast(
-                    `Saved offline pin "${payload.name}"${this.user ? " (queued to sync)" : ""}`,
-                    "success"
-                  );
-                  return;
-                }
-                try {
-                  const created = await createPin(payload);
-                  this.pins = [created, ...this.pins];
-                  this.pendingPinCoords = null;
-                  this.setCoordPickMode(null);
-                  this.renderCombinedPinsOnMap();
-                  this.syncRigUiState();
-                  this.showToast(
-                    `Dropped pin "${created.name ?? created.title ?? payload.name}"`,
-                    "success"
-                  );
-                } catch (err) {
-                  const status =
-                    err && typeof err === "object" && "status" in err
-                      ? Number((err as { status: unknown }).status)
-                      : null;
-                  if (status === null || status === 503) {
-                    const localPin: UserPinItem = {
-                      id: `offline-pin-${generateClientUuid()}`,
-                      name: payload.name,
-                      category: payload.category,
-                      notes: payload.notes ?? null,
-                      lon: payload.lon,
-                      lat: payload.lat,
-                      track_id: payload.track_id ?? null,
-                      created_at: new Date().toISOString(),
-                    };
-                    await saveOfflinePin(localPin);
-                    await enqueueOfflinePin(payload, localPin.id);
-                    this.pendingPinCoords = null;
-                    this.setCoordPickMode(null);
-                    await this.refreshOfflineLocalState();
-                    this.showToast(
-                      `Network unreachable — saved pin "${payload.name}" offline & queued to sync`,
-                      "info"
-                    );
-                    return;
-                  }
-                  throw err;
-                }
-              },
+              onCreatePin: (payload) => this.handleCreatePin(payload),
               onSelectPin: (pin) => {
+                this.setPrivateMapFocus();
                 this.map.flyToCoordinate(
                   pin.lat,
                   pin.lon,
@@ -1258,24 +1337,35 @@ class TrailForgeApp {
                 this.updateCursorReadout(pin.lat, pin.lon);
               },
               onDeletePin: async (id) => {
+                const request = this.accountRequest();
+                const signal = this.accountAbort.signal;
                 if (id.startsWith("offline-pin-")) {
-                  await deleteOfflinePin(id);
+                  if (request) {
+                    await deleteQueuedPin(request.ownerId, id);
+                  } else {
+                    this.guestPins = this.guestPins.filter((pin) => pin.id !== id);
+                  }
                   await this.refreshOfflineLocalState();
-                  this.showToast("Offline pin deleted", "info");
+                  if (!signal.aborted) this.showToast("Offline pin deleted", "info");
                   return;
                 }
-                await deletePin(id);
+                if (!request) return;
+                await deletePin(id, request);
+                if (signal.aborted) return;
                 this.pins = this.pins.filter((p) => p.id !== id);
                 this.renderCombinedPinsOnMap();
                 this.syncRigUiState();
                 this.showToast("Personal pin deleted", "info");
               },
               onExportUser: async (fmt) => {
+                const request = this.requireAccountRequest();
                 const url = buildUserExportUrl(fmt);
                 await downloadAuthenticatedExport(
                   url,
-                  `trailforge_saved.${fmt === "gpx" ? "gpx" : "geojson"}`
+                  `trailforge_saved.${fmt === "gpx" ? "gpx" : "geojson"}`,
+                  request
                 );
+                if (request.signal.aborted) return;
                 this.showToast(
                   `Exported saved tracks & pins (${fmt.toUpperCase()})`,
                   "success"
@@ -1289,6 +1379,50 @@ class TrailForgeApp {
       );
     }
     return this.accountPanelPromise;
+  }
+
+  private async handleCreatePin(payload: UserPinInput): Promise<void> {
+    const request = this.accountRequest();
+    const signal = this.accountAbort.signal;
+    const input = { ...payload, client_uuid: payload.client_uuid ?? generateClientUuid() };
+    if (request && this.isOnline) {
+      let created: UserPinItem | null = null;
+      try {
+        created = await createPin(input, request);
+      } catch (err) {
+        if (signal.aborted) return;
+        if (err instanceof ApiError && err.status !== 503 && err.status !== 0) throw err;
+      }
+      if (signal.aborted) return;
+      if (created) {
+        this.pins = [created, ...this.pins];
+        this.pendingPinCoords = null;
+        this.setCoordPickMode(null);
+        this.renderCombinedPinsOnMap();
+        this.syncRigUiState();
+        this.showToast(`Dropped pin "${payload.name}"`, "success");
+        return;
+      }
+    }
+
+    if (request) {
+      await enqueueOfflinePin(request.ownerId, input);
+    } else {
+      this.guestPins = [{
+        ...payload,
+        id: `offline-pin-${generateClientUuid()}`,
+        created_at: new Date().toISOString(),
+      }, ...this.guestPins];
+    }
+    if (signal.aborted) return;
+    this.pendingPinCoords = null;
+    this.setCoordPickMode(null);
+    await this.refreshOfflineLocalState();
+    if (signal.aborted) return;
+    this.showToast(
+      request ? `Queued pin "${payload.name}" to sync` : `Dropped pin "${payload.name}" in this tab`,
+      "success"
+    );
   }
 
   private ensureAdminPanel(): Promise<AdminConsolePanel> {
@@ -1314,9 +1448,11 @@ class TrailForgeApp {
               onClose: () => this.closeAdminPanel(),
               onRefresh: () => this.refreshAdminConsoleData(),
               onCreateInvite: async (payload) => {
+                const request = this.requireAccountRequest();
                 panel.updateState({ busyAction: "create-invite", error: null });
                 try {
-                  const created = await createAdminInvite(payload);
+                  const created = await createAdminInvite(payload, request);
+                  if (request.signal.aborted) return;
                   this.latestCreatedInvite = created;
                   this.adminInvites = [created, ...this.adminInvites];
                   panel.updateState({
@@ -1326,25 +1462,30 @@ class TrailForgeApp {
                   this.showToast(`Created invite code ${created.code}`, "success");
                   void this.refreshAdminConsoleData();
                 } catch (err) {
+                  if (request.signal.aborted) return;
                   const msg = formatFriendlyApiError(err, "Failed to create invite");
                   panel.updateState({ error: msg });
                   this.showToast(msg, "error");
                 } finally {
-                  panel.updateState({ busyAction: null });
+                  if (!request.signal.aborted) panel.updateState({ busyAction: null });
                 }
               },
               onRevokeInvite: async (inviteId) => {
+                const request = this.requireAccountRequest();
                 panel.updateState({ busyAction: `revoke-${inviteId}`, error: null });
                 try {
-                  await revokeAdminInvite(inviteId);
+                  await revokeAdminInvite(inviteId, request);
+                  if (request.signal.aborted) return;
                   await this.refreshAdminConsoleData();
+                  if (request.signal.aborted) return;
                   this.showToast("Invite code revoked", "info");
                 } catch (err) {
+                  if (request.signal.aborted) return;
                   const msg = formatFriendlyApiError(err, "Failed to revoke invite");
                   panel.updateState({ error: msg });
                   this.showToast(msg, "error");
                 } finally {
-                  panel.updateState({ busyAction: null });
+                  if (!request.signal.aborted) panel.updateState({ busyAction: null });
                 }
               },
               onCopyInviteCode: async (code) => {
@@ -1355,9 +1496,11 @@ class TrailForgeApp {
                 );
               },
               onPatchUser: async (userId, patch) => {
+                const request = this.requireAccountRequest();
                 panel.updateState({ busyAction: `user-${userId}`, error: null });
                 try {
-                  const updated = await patchAdminUser(userId, patch);
+                  const updated = await patchAdminUser(userId, patch, request);
+                  if (request.signal.aborted) return;
                   this.adminUsers = this.adminUsers.map((u) =>
                     u.id === updated.id ? updated : u
                   );
@@ -1368,41 +1511,50 @@ class TrailForgeApp {
                   );
                   void this.refreshAdminConsoleData();
                 } catch (err) {
+                  if (request.signal.aborted) return;
                   const msg = formatFriendlyApiError(err, "Failed to update user");
                   panel.updateState({ error: msg });
                   this.showToast(msg, "error");
                 } finally {
-                  panel.updateState({ busyAction: null });
+                  if (!request.signal.aborted) panel.updateState({ busyAction: null });
                 }
               },
               onSyncClosures: async () => {
+                const request = this.requireAccountRequest();
                 panel.updateState({ busyAction: "sync-closures", error: null });
                 try {
-                  await triggerAdminClosuresSync();
+                  await triggerAdminClosuresSync(request);
+                  if (request.signal.aborted) return;
                   await Promise.all([
                     this.refreshClosures(false),
                     this.refreshAdminConsoleData(),
                   ]);
+                  if (request.signal.aborted) return;
                   this.showToast("Agency closure feeds synced", "success");
                 } catch (err) {
+                  if (request.signal.aborted) return;
                   const msg = formatFriendlyApiError(err, "Closure sync failed");
                   panel.updateState({ error: msg });
                   this.showToast(msg, "error");
                 } finally {
-                  panel.updateState({ busyAction: null });
+                  if (!request.signal.aborted) panel.updateState({ busyAction: null });
                 }
               },
               onRecomputeGrades: async () => {
+                const request = this.requireAccountRequest();
                 panel.updateState({ busyAction: "recompute-grades", error: null });
                 try {
-                  await triggerAdminGradingRecompute();
+                  await triggerAdminGradingRecompute(request);
+                  if (request.signal.aborted) return;
                   await Promise.all([
                     this.refreshHotspotsGeoJson(),
                     this.refreshAdminConsoleData(),
                   ]);
+                  if (request.signal.aborted) return;
                   this.refreshOpenInspectorForRig();
                   this.showToast("Live crowdsourced grades recomputed", "success");
                 } catch (err) {
+                  if (request.signal.aborted) return;
                   const msg = formatFriendlyApiError(
                     err,
                     "Live grade recomputation failed"
@@ -1410,16 +1562,18 @@ class TrailForgeApp {
                   panel.updateState({ error: msg });
                   this.showToast(msg, "error");
                 } finally {
-                  panel.updateState({ busyAction: null });
+                  if (!request.signal.aborted) panel.updateState({ busyAction: null });
                 }
               },
               onSaveUiSettings: async (payload) => {
+                const request = this.requireAccountRequest();
                 panel.updateState({
                   busyAction: "save-ui-settings",
                   error: null,
                 });
                 try {
-                  const updated = await updateAdminUiSettings(payload);
+                  const updated = await updateAdminUiSettings(payload, request);
+                  if (request.signal.aborted) return;
                   this.adminUiSettings = updated;
                   this.uiConfig = {
                     default_layer_order: [...updated.default_layer_order],
@@ -1437,6 +1591,7 @@ class TrailForgeApp {
                     "success"
                   );
                 } catch (err) {
+                  if (request.signal.aborted) return;
                   const msg = formatFriendlyApiError(
                     err,
                     "Failed to save instance UI settings"
@@ -1446,12 +1601,14 @@ class TrailForgeApp {
                 }
               },
               onResetUiSettings: async () => {
+                const request = this.requireAccountRequest();
                 panel.updateState({
                   busyAction: "reset-ui-settings",
                   error: null,
                 });
                 try {
-                  const reset = await resetAdminUiSettings();
+                  const reset = await resetAdminUiSettings(request);
+                  if (request.signal.aborted) return;
                   this.adminUiSettings = reset;
                   this.uiConfig = {
                     default_layer_order: [...reset.default_layer_order],
@@ -1469,6 +1626,7 @@ class TrailForgeApp {
                     "info"
                   );
                 } catch (err) {
+                  if (request.signal.aborted) return;
                   const msg = formatFriendlyApiError(
                     err,
                     "Failed to reset instance UI settings"
@@ -1512,20 +1670,24 @@ class TrailForgeApp {
               onClose: () => this.closePacksPanel(),
               onRefresh: () => this.refreshPacksCatalog(),
               onBuildPack: async (regionId) => {
+                const request = this.requireAccountRequest();
                 panel.updateState({ buildingRegionId: regionId, error: null });
                 try {
-                  await buildRegionPack(regionId);
+                  await buildRegionPack(regionId, request);
+                  if (request.signal.aborted) return;
                   await this.refreshPacksCatalog();
+                  if (request.signal.aborted) return;
                   this.showToast(
                     `Built offline regional pack: ${regionId}`,
                     "success"
                   );
                 } catch (err) {
+                  if (request.signal.aborted) return;
                   const msg = formatFriendlyApiError(err, "Failed to build pack");
                   panel.updateState({ error: msg });
                   this.showToast(msg, "error");
                 } finally {
-                  panel.updateState({ buildingRegionId: null });
+                  if (!request.signal.aborted) panel.updateState({ buildingRegionId: null });
                 }
               },
               onDownloadPack: async (region) => {
@@ -1641,19 +1803,7 @@ class TrailForgeApp {
                 void this.recomputePlannedRoute(false);
               },
               onClearRoute: () => {
-                this.routePlanAbort?.abort();
-                this.routeTrackIds = [];
-                this.routeWaypoints = [];
-                this.routeAnalysis = null;
-                this.routeName = "";
-                this.routeNotes = "";
-                this.activeSavedRouteId = null;
-                this.routeError = null;
-                this.setRoutePlanMode(false);
-                this.map.setPlannedRoute(null, null);
-                this.syncUrlState({ routeTrackIds: [] }, "replace");
-                this.syncRoutePlannerUiState();
-                this.syncRigUiState();
+                this.clearPlannedRoute();
                 this.showToast("Cleared active route", "info");
               },
               onInspectTrack: (trackId) => {
@@ -1661,9 +1811,11 @@ class TrailForgeApp {
                 void this.openTrackInspector(trackId);
               },
               onZoomToRoute: (bbox) => {
+                if (this.user) this.setPrivateMapFocus();
                 this.map.fitBBox(bbox, this.getMapLeftPadding(24), 420);
               },
               onPoiSelect: (poi) => {
+                if (this.user) this.setPrivateMapFocus();
                 this.map.flyToCoordinate(poi.lat, poi.lon, poi.name, 14);
                 this.updateCursorReadout(poi.lat, poi.lon);
                 this.showToast(`Located ${poi.name}`, "info");
@@ -1715,14 +1867,16 @@ class TrailForgeApp {
   }
 
   private async refreshOfflineLocalState(): Promise<void> {
-    const [downloaded, queue, offPins] = await Promise.all([
+    const revision = ++this.offlineRefreshRevision;
+    const signal = this.accountAbort.signal;
+    const ownerId = this.user?.id;
+    const [downloaded, queue] = await Promise.all([
       listDownloadedPacks().catch(() => []),
-      listSyncQueue().catch(() => []),
-      listOfflinePins().catch(() => []),
+      ownerId ? listSyncQueue(ownerId).catch(() => []) : [],
     ]);
+    if (signal.aborted || revision !== this.offlineRefreshRevision) return;
     this.downloadedPacks = downloaded;
     this.syncQueue = queue;
-    this.offlinePins = offPins;
     this.renderCombinedPinsOnMap();
     this.syncOfflinePanelState();
     this.syncRigUiState();
@@ -1742,51 +1896,60 @@ class TrailForgeApp {
   }
 
   private async handleFlushSyncQueue(announce: boolean): Promise<void> {
-    if (this.isSyncingQueue || !this.isOnline) return;
+    const request = this.accountRequest();
+    if (!request || this.isSyncingQueue || !this.isOnline) return;
     if (this.syncQueue.length === 0) return;
 
     this.isSyncingQueue = true;
     this.syncOfflinePanelState();
     try {
-      const result = await flushSyncQueue({
-        syncTrip: async (payload) => {
-          await uploadMobileTripSync(payload);
-        },
-        syncReport: async (payload) => {
-          await createConditionReport(payload);
-        },
-        syncPin: async (payload, localPinId) => {
-          const created = await createPin(payload);
-          this.pins = [created, ...this.pins];
-          if (localPinId) {
-            await deleteOfflinePin(localPinId);
-          }
-        },
-      });
+      const result = await withAccountSyncLock(request.ownerId, () =>
+        flushSyncQueue(request.ownerId, request.signal, {
+          syncTrip: async (payload) => {
+            await uploadMobileTripSync(payload, request);
+          },
+          syncReport: async (payload) => {
+            await createConditionReport(payload, request);
+          },
+          syncPin: async (payload) => {
+            const created = await createPin(payload, request);
+            if (!request.signal.aborted) this.pins = [created, ...this.pins];
+          },
+        })
+      );
+      if (request.signal.aborted) return;
       await this.refreshOfflineLocalState();
+      if (request.signal.aborted) return;
       if (result.synced > 0) {
-        void this.reloadTrips().catch(() => undefined);
+        void this.reloadTrips(request).catch(() => undefined);
         void this.refreshReportsGeoJson();
         void this.refreshHotspotsGeoJson();
         this.showToast(
           `Synced ${result.synced} queued offline item${result.synced === 1 ? "" : "s"}`,
           "success"
         );
-      } else if (result.authRequired && announce) {
-        this.showToast(
-          "Sign in to complete syncing queued trips/reports",
-          "info"
-        );
-        this.openAccountPanel("account");
+      }
+      if (result.authRequired) {
+        await this.hydrateAuthSession();
+        if (announce && !this.user) {
+          this.showToast("Sign in to sync your queued items", "info");
+          this.openAccountPanel("account");
+        }
       } else if (result.failed > 0 && announce) {
         this.showToast(
           `${result.failed} queued item(s) could not sync yet`,
           "error"
         );
       }
+    } catch (err) {
+      if (announce && !request.signal.aborted) {
+        this.showToast(formatFriendlyApiError(err, "Could not sync offline items"), "error");
+      }
     } finally {
-      this.isSyncingQueue = false;
-      this.syncOfflinePanelState();
+      if (!request.signal.aborted) {
+        this.isSyncingQueue = false;
+        this.syncOfflinePanelState();
+      }
     }
   }
 
@@ -1895,6 +2058,25 @@ class TrailForgeApp {
     this.syncRoutePlannerUiState();
   }
 
+  private clearPlannedRoute(): void {
+    this.routePlanAbort?.abort();
+    this.routePlanAbort = null;
+    this.routeTrackIds = [];
+    this.routeWaypoints = [];
+    this.routeAnalysis = null;
+    this.routeName = "";
+    this.routeNotes = "";
+    this.activeSavedRouteId = null;
+    this.routeError = null;
+    this.routeLoading = false;
+    this.routeExporting = null;
+    this.routeSaving = false;
+    this.setRoutePlanMode(false);
+    this.map.setPlannedRoute(null, null);
+    this.syncUrlState({ routeTrackIds: [] });
+    this.syncRigUiState();
+  }
+
   private async handleAddTrackToRoute(
     trackId: string,
     trackLabel?: string
@@ -1965,7 +2147,7 @@ class TrailForgeApp {
     try {
       const analysis = await planRoute(
         this.buildRoutePlanRequestPayload(),
-        controller.signal
+        { signal: controller.signal, ownerId: this.user?.id, anonymous: !this.user }
       );
       if (controller.signal.aborted) return;
 
@@ -1977,6 +2159,7 @@ class TrailForgeApp {
       if (fitMap) {
         const bbox = extractAnalysisBBox(analysis);
         if (bbox) {
+          if (this.user) this.setPrivateMapFocus();
           this.map.fitBBox(bbox, this.getMapLeftPadding(24), 420);
         }
       }
@@ -1994,7 +2177,8 @@ class TrailForgeApp {
   }
 
   private async refreshSavedRoutes(): Promise<void> {
-    if (!this.user) {
+    const request = this.accountRequest();
+    if (!request) {
       this.savedRoutes = [];
       this.syncRoutePlannerUiState();
       return;
@@ -2002,12 +2186,15 @@ class TrailForgeApp {
     this.savedRoutesLoading = true;
     this.syncRoutePlannerUiState();
     try {
-      this.savedRoutes = await listSavedRoutes();
+      const routes = await listSavedRoutes(request);
+      if (!request.signal.aborted) this.savedRoutes = routes;
     } catch {
       // Preserve last loaded saved routes if offline
     } finally {
-      this.savedRoutesLoading = false;
-      this.syncRoutePlannerUiState();
+      if (!request.signal.aborted) {
+        this.savedRoutesLoading = false;
+        this.syncRoutePlannerUiState();
+      }
     }
   }
 
@@ -2015,30 +2202,37 @@ class TrailForgeApp {
     format: "gpx" | "geojson"
   ): Promise<void> {
     if (this.routeTrackIds.length === 0) return;
+    const signal = this.accountAbort.signal;
     this.routeExporting = format;
     this.syncRoutePlannerUiState();
     try {
       await exportPlannedRoute(
         this.buildRoutePlanRequestPayload(),
         format,
-        this.routeAnalysis
+        this.routeAnalysis,
+        { signal, ownerId: this.user?.id, anonymous: !this.user }
       );
+      if (signal.aborted) return;
       this.showToast(
         `Exported planned route (${format.toUpperCase()})`,
         "success"
       );
     } catch (err) {
+      if (signal.aborted) return;
       const msg =
         err instanceof Error ? err.message : "Route export failed";
       this.showToast(msg, "error");
     } finally {
-      this.routeExporting = null;
-      this.syncRoutePlannerUiState();
+      if (!signal.aborted) {
+        this.routeExporting = null;
+        this.syncRoutePlannerUiState();
+      }
     }
   }
 
   private async handleSavePlannedRoute(asNew: boolean): Promise<void> {
-    if (!this.user) {
+    const request = this.accountRequest();
+    if (!request) {
       this.showToast("Sign in to save routes to your account", "info");
       this.openAccountPanel("account");
       return;
@@ -2055,26 +2249,19 @@ class TrailForgeApp {
     this.syncRoutePlannerUiState();
 
     try {
-      let saved: SavedRouteItem;
-      if (this.activeSavedRouteId && !asNew) {
-        saved = await updateSavedRoute(this.activeSavedRouteId, {
-          name: finalName,
-          notes: this.routeNotes.trim() || null,
-          track_ids: [...this.routeTrackIds],
-          waypoints: [...this.routeWaypoints],
-          vehicle_class: rig.vehicleClass,
-        });
-        this.showToast(`Updated saved route "${saved.name}"`, "success");
-      } else {
-        saved = await saveRoute({
-          name: finalName,
-          notes: this.routeNotes.trim() || null,
-          track_ids: [...this.routeTrackIds],
-          waypoints: [...this.routeWaypoints],
-          vehicle_class: rig.vehicleClass,
-        });
-        this.showToast(`Saved route "${saved.name}"`, "success");
-      }
+      const input = {
+        name: finalName,
+        notes: this.routeNotes.trim() || null,
+        track_ids: [...this.routeTrackIds],
+        waypoints: [...this.routeWaypoints],
+        vehicle_class: rig.vehicleClass,
+      };
+      const routeId = asNew ? null : this.activeSavedRouteId;
+      const saved = routeId
+        ? await updateSavedRoute(routeId, input, request)
+        : await saveRoute(input, request);
+      if (request.signal.aborted) return;
+      this.showToast(`${routeId ? "Updated saved route" : "Saved route"} "${saved.name}"`, "success");
 
       this.activeSavedRouteId = getSavedRouteId(saved);
       this.routeName = saved.name;
@@ -2085,28 +2272,36 @@ class TrailForgeApp {
       }
       await this.refreshSavedRoutes();
     } catch (err) {
+      if (request.signal.aborted) return;
       const msg =
         err instanceof Error ? err.message : "Failed to save route";
       this.routeError = msg;
       this.showToast(msg, "error");
     } finally {
-      this.routeSaving = false;
-      this.syncRoutePlannerUiState();
+      if (!request.signal.aborted) {
+        this.routeSaving = false;
+        this.syncRoutePlannerUiState();
+      }
     }
   }
 
   private async handleLoadSavedRoute(routeId: string): Promise<void> {
+    const request = this.accountRequest();
+    if (!request) return;
+    this.routePlanAbort?.abort();
     this.routeLoading = true;
     this.routeError = null;
     this.syncRoutePlannerUiState();
     try {
-      const loaded = await getSavedRoute(routeId);
+      const loaded = await getSavedRoute(routeId, request);
+      if (request.signal.aborted) return;
       this.activeSavedRouteId = getSavedRouteId(loaded);
       this.routeName = loaded.name;
       this.routeNotes = loaded.notes ?? "";
       this.routeTrackIds = [...(loaded.track_ids ?? [])];
       this.routeWaypoints = getSavedRouteWaypoints(loaded);
       this.syncUrlState({ routeTrackIds: [...this.routeTrackIds] }, "replace");
+      this.setPrivateMapFocus();
 
       if (loaded.analysis) {
         this.routeAnalysis = loaded.analysis;
@@ -2122,8 +2317,9 @@ class TrailForgeApp {
       } else {
         await this.recomputePlannedRoute(true);
       }
-      this.showToast(`Loaded route "${loaded.name}"`, "success");
+      if (!request.signal.aborted) this.showToast(`Loaded route "${loaded.name}"`, "success");
     } catch (err) {
+      if (request.signal.aborted) return;
       this.routeLoading = false;
       const msg =
         err instanceof Error ? err.message : "Failed to load saved route";
@@ -2134,8 +2330,11 @@ class TrailForgeApp {
   }
 
   private async handleDeleteSavedRoute(routeId: string): Promise<void> {
+    const request = this.accountRequest();
+    if (!request) return;
     try {
-      await deleteSavedRoute(routeId);
+      await deleteSavedRoute(routeId, request);
+      if (request.signal.aborted) return;
       this.savedRoutes = this.savedRoutes.filter(
         (r) => getSavedRouteId(r) !== routeId
       );
@@ -2145,6 +2344,7 @@ class TrailForgeApp {
       this.syncRoutePlannerUiState();
       this.showToast("Saved route deleted", "info");
     } catch (err) {
+      if (request.signal.aborted) return;
       const msg =
         err instanceof Error ? err.message : "Failed to delete route";
       this.showToast(msg, "error");
@@ -2155,14 +2355,19 @@ class TrailForgeApp {
     routeId: string,
     format: "gpx" | "geojson"
   ): Promise<void> {
+    const request = this.accountRequest();
+    if (!request) return;
     try {
       const url = getSavedRouteExportUrl(routeId, format);
       await downloadAuthenticatedExport(
         url,
-        `route_${routeId}.${format === "gpx" ? "gpx" : "geojson"}`
+        `route_${routeId}.${format === "gpx" ? "gpx" : "geojson"}`,
+        request
       );
+      if (request.signal.aborted) return;
       this.showToast(`Downloaded route (${format.toUpperCase()})`, "success");
     } catch (err) {
+      if (request.signal.aborted) return;
       const msg =
         err instanceof Error ? err.message : "Failed to download route";
       this.showToast(msg, "error");
@@ -2322,7 +2527,8 @@ class TrailForgeApp {
       this.hasCustomLayerPrefs
     );
 
-    if (this.user && this.isOnline) {
+    const request = this.accountRequest();
+    if (request && this.isOnline) {
       if (this.userPrefsSaveTimer !== null) {
         window.clearTimeout(this.userPrefsSaveTimer);
       }
@@ -2332,15 +2538,16 @@ class TrailForgeApp {
       };
       this.userPrefsSaveTimer = window.setTimeout(() => {
         this.userPrefsSaveTimer = null;
-        if (!this.user) return;
-        void updateUserPreferences(snapshot).catch((err) => {
-          console.warn("Failed to persist map layer preferences to account:", err);
+        if (request.signal.aborted) return;
+        void updateUserPreferences(snapshot, request).catch((err) => {
+          if (!request.signal.aborted) console.warn("Failed to persist map layer preferences to account:", err);
         });
       }, 250);
     }
   }
 
   private async handleResetUserLayerPreferences(): Promise<void> {
+    const request = this.accountRequest();
     if (this.userPrefsSaveTimer !== null) {
       window.clearTimeout(this.userPrefsSaveTimer);
       this.userPrefsSaveTimer = null;
@@ -2349,14 +2556,16 @@ class TrailForgeApp {
     clearStoredUserLayerPrefs();
     this.applyResolvedLayerPreferences();
     let syncedRemote = true;
-    if (this.user && this.isOnline) {
+    if (request && this.isOnline) {
       try {
-        await resetUserPreferences();
+        await resetUserPreferences(request);
       } catch (err) {
+        if (request.signal.aborted) return;
         syncedRemote = false;
         console.warn("Failed to clear saved server layer preferences:", err);
       }
     }
+    if (request?.signal.aborted) return;
     this.showToast(
       syncedRemote
         ? "Map layers reset to instance defaults"
@@ -2386,7 +2595,8 @@ class TrailForgeApp {
   }
 
   private async openAdminPanel(tab?: AdminPanelTab): Promise<void> {
-    if (!isAdminUser(this.user)) {
+    const request = this.accountRequest();
+    if (!request || !isAdminUser(this.user)) {
       this.showToast("Admin privileges required", "error");
       return;
     }
@@ -2399,6 +2609,8 @@ class TrailForgeApp {
     this.closePacksPanel();
     this.closeRoutePlanner();
     const panel = await this.ensureAdminPanel();
+    if (request.signal.aborted) return;
+    panel.updateState({ currentUserId: request.ownerId });
     panel.open(tab);
     this.shellEl.classList.add("admin-open");
     this.topbar.updateAdminAccess(true, true);
@@ -2412,15 +2624,17 @@ class TrailForgeApp {
   }
 
   private async refreshAdminConsoleData(): Promise<void> {
-    if (!isAdminUser(this.user)) return;
+    const request = this.accountRequest();
+    if (!request || !isAdminUser(this.user)) return;
     this.adminPanel?.updateState({ loading: true, error: null });
     try {
       const [stats, invites, users, uiSettings] = await Promise.all([
-        fetchAdminStats(),
-        fetchAdminInvites(),
-        fetchAdminUsers(),
-        fetchAdminUiSettings().catch(() => this.adminUiSettings),
+        fetchAdminStats(request),
+        fetchAdminInvites(request),
+        fetchAdminUsers(request),
+        fetchAdminUiSettings(request).catch(() => this.adminUiSettings),
       ]);
+      if (request.signal.aborted) return;
       this.adminStats = stats;
       this.adminInvites = invites;
       this.adminUsers = users;
@@ -2435,11 +2649,12 @@ class TrailForgeApp {
           stats.registration_mode ?? this.authConfig.registration_mode,
       });
     } catch (err) {
+      if (request.signal.aborted) return;
       this.adminPanel?.updateState({
         error: formatFriendlyApiError(err, "Failed to load admin console data"),
       });
     } finally {
-      this.adminPanel?.updateState({ loading: false });
+      if (!request.signal.aborted) this.adminPanel?.updateState({ loading: false });
     }
   }
 
@@ -2479,6 +2694,34 @@ class TrailForgeApp {
 
     window.addEventListener("resize", () => {
       this.syncSidebarWidthForViewport();
+    });
+    window.addEventListener("storage", (event) => {
+      if (usesSessionBearer()) return;
+      if (event.key === PENDING_SIGN_OUT_KEY) {
+        this.pendingSignOutOwner = loadPendingSignOut();
+        this.signedOutLocally = this.pendingSignOutOwner !== null;
+        return;
+      }
+      if (event.key !== ACCOUNT_CHANGE_KEY) return;
+      this.authCheck?.abort();
+      this.authCheck = null;
+      this.pendingSignOutOwner = loadPendingSignOut();
+      if (event.newValue?.startsWith("signed-out-complete:")) {
+        this.signedOutLocally = this.pendingSignOutOwner !== null;
+        if (this.user !== null) this.clearAccountState(null);
+        return;
+      }
+      this.signedOutLocally =
+        this.pendingSignOutOwner !== null ||
+        (event.newValue?.startsWith("signed-out:") ?? false);
+      this.clearAccountState(null);
+      if (!this.signedOutLocally) {
+        if (this.authChanging) this.pendingAuthRecheck = true;
+        else void this.hydrateAuthSession();
+      }
+    });
+    window.addEventListener("pageshow", (event) => {
+      if (event.persisted) void this.hydrateAuthSession();
     });
 
     this.basemapButtons.forEach((btn) => {
@@ -2566,7 +2809,7 @@ class TrailForgeApp {
         void this.refreshClosures(false);
         void this.refreshReportsGeoJson();
         void this.refreshHotspotsGeoJson();
-        void this.handleFlushSyncQueue(false);
+        void this.resumeOnlineSession();
       }
     });
   }
@@ -2594,7 +2837,8 @@ class TrailForgeApp {
     if (this.layerState.unmapped) {
       void this.refreshUnmappedCandidates();
     }
-    void this.hydrateAuthSession();
+    if (this.pendingSignOutOwner && this.isOnline) void this.resumeOnlineSession();
+    else void this.hydrateAuthSession(true);
 
     if (this.initialUrlState.routeTrackIds.length > 0) {
       void this.openRoutePlanner();
@@ -2625,6 +2869,7 @@ class TrailForgeApp {
       document.addEventListener("visibilitychange", () => {
         if (document.visibilityState === "visible" && this.isOnline) {
           void this.refreshHealth(false);
+          void this.resumeOnlineSession();
         }
       });
     }
@@ -2663,37 +2908,161 @@ class TrailForgeApp {
     }
   }
 
-  private async hydrateAuthSession(): Promise<void> {
-    clearLegacyStoredAuthToken();
+  private async signIn(
+    authenticate: () => Promise<{ user: AuthUser }>,
+    success: (name: string) => string
+  ): Promise<void> {
+    while (this.authTransitionPromise) {
+      await this.authTransitionPromise.catch(() => undefined);
+    }
+    this.authChanging = true;
+    this.authCheck?.abort();
+    this.authCheck = null;
+    let user: AuthUser | null = null;
+    const run = (async () => {
+      user = await withBrowserAuthLock(async () => {
+        const res = await authenticate();
+        this.signedOutLocally = false;
+        this.pendingSignOutOwner = null;
+        persistPendingSignOut(null);
+        this.clearAccountState(res.user);
+        announceAccountChange("signed-in");
+        return res.user;
+      });
+    })();
+    this.authTransitionPromise = run;
     try {
-      const me = await fetchAuthMe();
-      if (me.authenticated && me.user) {
-        this.user = me.user;
+      await run;
+    } finally {
+      if (this.authTransitionPromise === run) this.authTransitionPromise = null;
+      this.authChanging = false;
+      if (this.pendingAuthRecheck) {
+        this.pendingAuthRecheck = false;
+        void this.hydrateAuthSession();
+      }
+    }
+    if (!user || this.user?.id !== (user as AuthUser).id) return;
+    const signedInUser = user as AuthUser;
+    const signal = this.accountAbort.signal;
+    await this.loadSignedInUserData();
+    if (!signal.aborted) this.showToast(success(signedInUser.display_name), "success");
+  }
+
+  private async signOut(): Promise<void> {
+    const ownerId = this.user?.id;
+    if (!ownerId || this.authChanging) return;
+    this.authChanging = true;
+    this.authCheck?.abort();
+    this.authCheck = null;
+    this.signedOutLocally = true;
+    this.pendingSignOutOwner = usesSessionBearer() ? null : ownerId;
+    persistPendingSignOut(this.pendingSignOutOwner);
+    announceAccountChange("signed-out");
+    this.clearAccountState(null);
+    const signal = this.accountAbort.signal;
+    const run = (async () => {
+      try {
+        await this.finishSignOut(ownerId);
+        if (!signal.aborted) this.showToast("Signed out", "info");
+      } catch {
+        if (!signal.aborted) {
+          this.showToast("Signed out in this browser", "info");
+        }
+      }
+    })();
+    this.authTransitionPromise = run;
+    try {
+      await run;
+    } finally {
+      if (this.authTransitionPromise === run) this.authTransitionPromise = null;
+      this.authChanging = false;
+      if (this.pendingAuthRecheck) {
+        this.pendingAuthRecheck = false;
+        void this.hydrateAuthSession();
+      }
+    }
+  }
+
+  private async finishSignOut(ownerId: string): Promise<void> {
+    await withBrowserAuthLock(async () => {
+      try {
+        await logoutAccount({ ownerId });
+      } catch (err) {
+        if (!(err instanceof ApiError) || ![401, 403, 409].includes(err.status)) throw err;
+      }
+      if (loadPendingSignOut() === ownerId) persistPendingSignOut(null);
+      this.pendingSignOutOwner = loadPendingSignOut();
+      this.signedOutLocally = this.pendingSignOutOwner !== null;
+      announceAccountChange("signed-out-complete");
+    });
+  }
+
+  private async resumeOnlineSession(): Promise<void> {
+    const ownerId = this.pendingSignOutOwner ?? loadPendingSignOut();
+    if (ownerId && !this.authChanging) {
+      this.authChanging = true;
+      const run = (async () => {
+        try {
+          await this.finishSignOut(ownerId);
+        } catch {
+          // Retry while the browser is locally signed out.
+        }
+      })();
+      this.authTransitionPromise = run;
+      try {
+        await run;
+      } finally {
+        if (this.authTransitionPromise === run) this.authTransitionPromise = null;
+        this.authChanging = false;
+      }
+      if (this.signedOutLocally) return;
+    }
+    await this.hydrateAuthSession();
+    void this.handleFlushSyncQueue(false);
+  }
+
+  private async hydrateAuthSession(startup = false): Promise<void> {
+    if (!this.isOnline || this.signedOutLocally || this.authChanging || this.authCheck) return;
+    const controller = new AbortController();
+    this.authCheck = controller;
+    try {
+      const me = await fetchAuthMe(controller.signal);
+      if (controller.signal.aborted) return;
+      const user = me.authenticated ? me.user : null;
+      if (user?.id === this.user?.id) return;
+      const preserveStartupView = startup && !this.privateMapFocus &&
+        this.routeName === "" && this.routeNotes === "" &&
+        this.routeTrackIds.join(",") === this.initialUrlState.routeTrackIds.join(",");
+      this.clearAccountState(user, preserveStartupView);
+      if (user) {
         await this.loadSignedInUserData();
-      } else {
-        this.user = null;
-        this.syncRigUiState();
+        if (!controller.signal.aborted && preserveStartupView) this.refreshPlannedRouteForRig();
       }
     } catch (err) {
-      if (err instanceof ApiError && err.status === 403) {
-        this.user = null;
+      if (!controller.signal.aborted && err instanceof ApiError && [401, 403].includes(err.status)) {
+        if (this.user) this.clearAccountState(null);
         this.showToast(formatFriendlyApiError(err), "error");
       }
-      this.syncRigUiState();
+    } finally {
+      if (this.authCheck === controller) this.authCheck = null;
     }
   }
 
   private async loadSignedInUserData(): Promise<void> {
+    const request = this.accountRequest();
+    if (!request) return;
     try {
       const [vehicles, trips, favorites, pins, savedRoutes, serverPrefs] =
         await Promise.all([
-          fetchVehicles().catch(() => []),
-          fetchTrips().catch(() => []),
-          fetchFavorites().catch(() => []),
-          fetchPins().catch(() => []),
-          listSavedRoutes().catch(() => []),
-          fetchUserPreferences().catch(() => null),
+          fetchVehicles(request).catch(() => []),
+          fetchTrips(request).catch(() => []),
+          fetchFavorites(request).catch(() => []),
+          fetchPins(request).catch(() => []),
+          listSavedRoutes(request).catch(() => []),
+          fetchUserPreferences(request).catch(() => null),
+          this.refreshOfflineLocalState(),
         ]);
+      if (request.signal.aborted) return;
       this.vehicles = vehicles;
       this.trips = trips;
       this.favorites = favorites;
@@ -2708,21 +3077,26 @@ class TrailForgeApp {
         this.applyResolvedLayerPreferences();
       }
       this.renderCombinedPinsOnMap();
+      void this.refreshReportsGeoJson();
     } finally {
-      this.syncRigUiState();
-      if (this.isOnline && this.syncQueue.length > 0) {
-        void this.handleFlushSyncQueue(false);
+      if (!request.signal.aborted) {
+        this.syncRigUiState();
+        if (this.isOnline && this.syncQueue.length > 0) void this.handleFlushSyncQueue(false);
       }
     }
   }
 
-  private async reloadVehicles(): Promise<void> {
-    this.vehicles = await fetchVehicles();
+  private async reloadVehicles(request: AccountRequest): Promise<void> {
+    const vehicles = await fetchVehicles(request);
+    if (request.signal.aborted) return;
+    this.vehicles = vehicles;
     this.syncRigUiState();
   }
 
-  private async reloadTrips(): Promise<void> {
-    this.trips = await fetchTrips();
+  private async reloadTrips(request: AccountRequest): Promise<void> {
+    const trips = await fetchTrips(request);
+    if (request.signal.aborted) return;
+    this.trips = trips;
     this.syncRigUiState();
   }
 
@@ -2736,9 +3110,10 @@ class TrailForgeApp {
   }
 
   private async refreshReportsGeoJson(): Promise<void> {
+    const signal = this.accountAbort.signal;
     try {
-      const fc = await fetchReportsGeoJson();
-      this.map.setReportsGeoJson(fc);
+      const fc = await fetchReportsGeoJson({ signal, ownerId: this.user?.id, anonymous: !this.user });
+      if (!signal.aborted) this.map.setReportsGeoJson(fc);
     } catch {
       // Reports layer stays empty gracefully offline
     }
@@ -2945,6 +3320,8 @@ class TrailForgeApp {
       const detail = await fetchTrackDetail(trackId, {
         vehicleClass: queryVehicleClass,
         signal: controller.signal,
+        ownerId: this.user?.id,
+        anonymous: !this.user,
       });
       if (controller.signal.aborted) return;
 
@@ -2980,7 +3357,8 @@ class TrailForgeApp {
     trackId: string,
     currentlyFavorite: boolean
   ): Promise<void> {
-    if (!this.user) {
+    const request = this.accountRequest();
+    if (!request) {
       this.showToast("Sign in to save favorite tracks across sessions", "info");
       this.openAccountPanel("account");
       return;
@@ -2988,16 +3366,19 @@ class TrailForgeApp {
 
     try {
       if (currentlyFavorite) {
-        await removeFavorite(trackId);
+        await removeFavorite(trackId, request);
+        if (request.signal.aborted) return;
         this.favorites = this.favorites.filter((f) => f.track_id !== trackId);
         this.showToast("Removed track from favorites", "info");
       } else {
-        const added = await addFavorite(trackId);
+        const added = await addFavorite(trackId, null, request);
+        if (request.signal.aborted) return;
         this.favorites = [added, ...this.favorites];
         this.showToast("Saved track to favorites", "success");
       }
       this.syncRigUiState();
     } catch (err) {
+      if (request.signal.aborted) return;
       const msg =
         err instanceof Error ? err.message : "Failed to update favorite";
       this.showToast(msg, "error");
@@ -3188,7 +3569,8 @@ class TrailForgeApp {
       lon: number | null;
       zoom: number | null;
     }>,
-    mode: "push" | "replace" = "replace"
+    mode: "push" | "replace" = "replace",
+    shareRoute = false
   ): void {
     if (this.suppressUrlSync || typeof window === "undefined") return;
 
@@ -3205,7 +3587,7 @@ class TrailForgeApp {
       this.urlProfileOpen = Boolean(this.urlTrackId && patch.profileOpen);
     }
     if ("routeTrackIds" in patch) {
-      this.urlRouteTrackIds = Array.isArray(patch.routeTrackIds)
+      this.urlRouteTrackIds = (!this.user || shareRoute) && Array.isArray(patch.routeTrackIds)
         ? [...patch.routeTrackIds]
         : [];
     }
@@ -3230,7 +3612,7 @@ class TrailForgeApp {
       } else {
         this.urlView = null;
       }
-    } else if (!this.urlView && (this.urlTrackId || this.urlRegionId) && this.map) {
+    } else if (!this.privateMapFocus && !this.urlView && (this.urlTrackId || this.urlRegionId) && this.map) {
       this.urlView = this.map.getView();
     }
 
@@ -3381,7 +3763,8 @@ class TrailForgeApp {
         lon: view.lon,
         zoom: view.zoom,
       },
-      "replace"
+      "replace",
+      true
     );
     await this.copyTextToClipboard(
       window.location.href,

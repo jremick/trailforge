@@ -7,7 +7,7 @@ import {
 } from "./exporters";
 import {
   MemoryOfflineBackend,
-  deleteOfflinePin,
+  downloadRegionalPackToDevice,
   getOfflineClosuresGeoJson,
   getOfflineHotspotsGeoJson,
   getOfflinePois,
@@ -15,9 +15,7 @@ import {
   getOfflineTileManifest,
   getOfflineTrackDetail,
   getOfflineTracksGeoJson,
-  listOfflinePins,
   saveOfflinePackData,
-  saveOfflinePin,
   searchOfflineSnapshots,
   setActiveOfflinePackId,
   setOfflineBackendForTesting,
@@ -39,11 +37,13 @@ import {
   haversineDistanceM,
 } from "./recorderEngine";
 import {
+  deleteQueuedPin,
   enqueueOfflinePin,
   enqueueOfflineReport,
   enqueueOfflineTrip,
   flushSyncQueue,
   listSyncQueue,
+  pinsFromSyncQueue,
 } from "./syncQueue";
 
 describe("Slice 09 HTTP 206 Range slicing & SHA-256 verification", () => {
@@ -200,9 +200,29 @@ describe("Slice 09 In-Cab Breadcrumb Recorder & One-Tap Backtrack math", () => {
 describe("Slice 09 Offline Pack Snapshot store & Sync Queue flush", () => {
   afterEach(() => {
     setOfflineBackendForTesting(null);
+    vi.unstubAllGlobals();
   });
 
-  it("stores and queries offline pack snapshots (tracks, POIs, parks, closures, reports, hotspots, pins)", async () => {
+  it("rejects an offline pack manifest when it belongs to an older telemetry revision", async () => {
+    const fetchManifest = vi.fn().mockResolvedValue(Response.json({
+      region_id: "australian-alps",
+      community_telemetry_policy: "test-policy",
+      community_telemetry_revision: null,
+    }));
+    vi.stubGlobal("fetch", fetchManifest);
+    await expect(downloadRegionalPackToDevice({
+      region_id: "australian-alps",
+      name: "Australian Alps",
+      description: "Synthetic region",
+      bbox: [148, -37, 149, -36],
+      status: "ready",
+      community_telemetry_policy: "test-policy",
+      community_telemetry_revision: "22222222-2222-4222-8222-222222222222",
+    })).rejects.toThrow("Pack contents have changed");
+    expect(fetchManifest).toHaveBeenCalledOnce();
+  });
+
+  it("stores and queries offline pack snapshots (tracks, POIs, parks, closures, reports, hotspots)", async () => {
     setOfflineBackendForTesting(new MemoryOfflineBackend());
 
     const snapshot: OfflinePackSnapshot = {
@@ -329,23 +349,49 @@ describe("Slice 09 Offline Pack Snapshot store & Sync Queue flush", () => {
     expect((await getOfflineReportsGeoJson())?.features).toHaveLength(1);
     expect((await getOfflineHotspotsGeoJson())?.features).toHaveLength(1);
 
-    await saveOfflinePin({
-      id: "offline-pin-1",
+  });
+
+  it("keeps ownerless legacy records and another account's pending data out of the queue and pin list", async () => {
+    const legacy = new MemoryOfflineBackend();
+    setOfflineBackendForTesting(legacy);
+    await legacy.put("offline_pins", "offline-pin-legacy", {
+      id: "offline-pin-legacy",
+      name: "Legacy Camp",
+      category: "camp",
+      lon: 148.12,
+      lat: -36.565,
+    });
+    await legacy.put("sync_queue", "report:legacy", {
+      id: "report:legacy",
+      kind: "report",
+      created_at: "2026-11-26T02:05:00Z",
+      label: "Legacy report",
+      payload: { report_type: "fallen_tree", lon: 148.12, lat: -36.565, notes: "Legacy" },
+    });
+
+    const pin = await enqueueOfflinePin("owner-a", {
       name: "Creek Camp",
       category: "camp",
       lon: 148.12,
       lat: -36.565,
-      created_at: "2026-11-26T02:05:00Z",
     });
-    expect(await listOfflinePins()).toHaveLength(1);
-    await deleteOfflinePin("offline-pin-1");
-    expect(await listOfflinePins()).toHaveLength(0);
+
+    expect(await listSyncQueue("owner-b")).toEqual([]);
+    await deleteQueuedPin("owner-b", pin.id);
+    expect(pinsFromSyncQueue(await listSyncQueue("owner-a"))).toEqual([
+      expect.objectContaining({ id: pin.id, name: "Creek Camp" }),
+    ]);
+    await deleteQueuedPin("owner-a", pin.id);
+    expect(await listSyncQueue("owner-a")).toEqual([]);
+    expect(await legacy.getAll("offline_pins")).toHaveLength(1);
+    expect(await legacy.getAll("sync_queue")).toHaveLength(1);
   });
 
   it("queues offline trips, reports, and pins and flushes idempotently on reconnect", async () => {
     setOfflineBackendForTesting(new MemoryOfflineBackend());
 
-    await enqueueOfflineTrip({
+    const owner = "owner-a";
+    await enqueueOfflineTrip(owner, {
       name: "Alpine Climb",
       visibility: "community_anonymous",
       privacy_trim_m: 250,
@@ -354,49 +400,114 @@ describe("Slice 09 Offline Pack Snapshot store & Sync Queue flush", () => {
         { lon: 148.13, lat: -36.57, timestamp: "2026-11-26T01:10:00Z" },
       ],
     });
-    await enqueueOfflineReport({
+    await enqueueOfflineReport(owner, {
       report_type: "fallen_tree",
       lon: 148.122,
       lat: -36.564,
       notes: "Tree across ridge",
     });
     await enqueueOfflinePin(
-      { name: "Camp Spot", category: "camp", lon: 148.121, lat: -36.562 },
-      "offline-pin-local-1"
+      owner,
+      { name: "Camp Spot", category: "camp", lon: 148.121, lat: -36.562 }
     );
 
-    expect(await listSyncQueue()).toHaveLength(3);
+    expect(await listSyncQueue(owner)).toHaveLength(3);
 
-    // First flush: report fails with 401 -> stays queued with authRequired=true while trip & pin succeed
+    // An authentication failure retains both the current item and future writes.
     const syncTrip = vi.fn().mockResolvedValue(undefined);
     const syncPin = vi.fn().mockResolvedValue(undefined);
     const syncReportFail = vi
       .fn()
       .mockRejectedValue(Object.assign(new Error("Unauthorized"), { status: 401 }));
 
-    const first = await flushSyncQueue({
+    const first = await flushSyncQueue(owner, new AbortController().signal, {
       syncTrip,
       syncReport: syncReportFail,
       syncPin,
     });
-    expect(first.synced).toBe(2);
+    expect(first.synced).toBe(1);
     expect(first.failed).toBe(1);
-    expect(first.remaining).toBe(1);
+    expect(first.remaining).toBe(2);
     expect(first.authRequired).toBe(true);
     expect(syncTrip).toHaveBeenCalledTimes(1);
-    expect(syncPin).toHaveBeenCalledWith(
-      expect.objectContaining({ name: "Camp Spot" }),
-      "offline-pin-local-1"
-    );
+    expect(syncPin).not.toHaveBeenCalled();
 
     // Second flush after sign-in succeeds and empties the queue
-    const second = await flushSyncQueue({
+    const second = await flushSyncQueue(owner, new AbortController().signal, {
       syncTrip,
       syncReport: vi.fn().mockResolvedValue(undefined),
       syncPin,
     });
-    expect(second.synced).toBe(1);
+    expect(second.synced).toBe(2);
     expect(second.remaining).toBe(0);
     expect(second.authRequired).toBe(false);
+    expect(syncPin).toHaveBeenCalledWith(expect.objectContaining({ name: "Camp Spot" }));
+  });
+
+  it("stops dispatching an old account's queue when the session changes", async () => {
+    setOfflineBackendForTesting(new MemoryOfflineBackend());
+    const owner = "owner-a";
+    const first = await enqueueOfflineReport(owner, {
+      report_type: "fallen_tree", lon: 148.12, lat: -36.56, notes: "First report",
+    });
+    const second = await enqueueOfflinePin(owner, {
+      name: "Ridge Camp", category: "camp", lon: 148.13, lat: -36.57,
+    });
+    const controller = new AbortController();
+    const syncPin = vi.fn().mockResolvedValue(undefined);
+    const syncReport = vi.fn().mockImplementation(async () => {
+      controller.abort();
+      throw controller.signal.reason;
+    });
+
+    await flushSyncQueue(owner, controller.signal, {
+      syncTrip: vi.fn(), syncReport, syncPin,
+    });
+    expect(syncReport).toHaveBeenCalledOnce();
+    expect(syncPin).not.toHaveBeenCalled();
+    expect(await listSyncQueue(owner)).toEqual([first, second]);
+    expect(await listSyncQueue("owner-b")).toEqual([]);
+  });
+
+  it("sets authRequired and halts sync on 409 account-changed conflicts but continues on other 409 errors", async () => {
+    setOfflineBackendForTesting(new MemoryOfflineBackend());
+    const owner = "owner-conflict";
+    await enqueueOfflineReport(owner, {
+      report_type: "fallen_tree",
+      lon: 148.12,
+      lat: -36.56,
+      notes: "Stale session report",
+    });
+    await enqueueOfflinePin(owner, {
+      name: "Follow-up Camp",
+      category: "camp",
+      lon: 148.13,
+      lat: -36.57,
+    });
+
+    const syncPin = vi.fn().mockResolvedValue(undefined);
+    const conflictRes = await flushSyncQueue(owner, new AbortController().signal, {
+      syncTrip: vi.fn(),
+      syncReport: vi.fn().mockRejectedValue(
+        Object.assign(new Error("The signed-in account has changed"), { status: 409 })
+      ),
+      syncPin,
+    });
+    expect(conflictRes.authRequired).toBe(true);
+    expect(conflictRes.failed).toBe(1);
+    expect(conflictRes.remaining).toBe(2);
+    expect(syncPin).not.toHaveBeenCalled();
+
+    const otherConflictRes = await flushSyncQueue(owner, new AbortController().signal, {
+      syncTrip: vi.fn(),
+      syncReport: vi.fn().mockRejectedValue(
+        Object.assign(new Error("Duplicate resource"), { status: 409 })
+      ),
+      syncPin,
+    });
+    expect(otherConflictRes.authRequired).toBe(false);
+    expect(otherConflictRes.synced).toBe(1);
+    expect(otherConflictRes.failed).toBe(1);
+    expect(syncPin).toHaveBeenCalledOnce();
   });
 });

@@ -33,6 +33,7 @@ export interface NormalizedTrackSummary {
   canonicalSegments: SegmentSummaryItem[];
   courseVertices: TrackCourseVertex[];
   courseBBox: [number, number, number, number] | null;
+  hasMultipleCourseSections: boolean;
 }
 
 export interface FormattedBreakdownFactor {
@@ -223,15 +224,11 @@ export function normalizeTrackInspector(
   const maxElevM =
     elevCandidatesMax.length > 0 ? Math.max(...elevCandidatesMax) : null;
 
-  const is4wdOnly =
-    detail.is_4wd_only ?? canonicalSegments.some((s) => Boolean(s.is_4wd_only));
-  const hasGateBarrier =
-    detail.has_gate_barrier ?? canonicalSegments.some((s) => Boolean(s.has_gate_barrier));
+  const is4wdOnly = Boolean(detail.is_4wd_only) || segments.some((s) => Boolean(s.is_4wd_only));
+  const hasGateBarrier = Boolean(detail.has_gate_barrier) || segments.some((s) => Boolean(s.has_gate_barrier));
   const accessStatus =
-    detail.access_status ??
-    canonicalSegments.find(
-      (s) => s.access_status && s.access_status !== "public"
-    )?.access_status ??
+    [detail.access_status, ...segments.map((s) => s.access_status)]
+      .find((access) => access && access !== "public") ??
     "public";
 
   const elevGainM = corridor.rebuiltFromSegments
@@ -250,12 +247,12 @@ export function normalizeTrackInspector(
         ? segLossSumM
         : null;
 
-  const sustainedSlopeDeg =
-    detail.sustained_slope_deg ??
-    canonicalSegments.reduce<number | null>((best, s) => {
-      if (typeof s.sustained_slope_deg !== "number") return best;
-      return best === null ? s.sustained_slope_deg : Math.max(best, s.sustained_slope_deg);
-    }, null);
+  const sustainedSlopeDeg = segments.reduce((best, s) => {
+    const slope = s.sustained_slope_deg;
+    return typeof slope === "number" && Number.isFinite(slope)
+      ? Math.max(best ?? slope, slope)
+      : best;
+  }, detail.sustained_slope_deg ?? null);
 
   const slopeCandidates = [
     detail.max_slope_deg,
@@ -266,9 +263,13 @@ export function normalizeTrackInspector(
   const maxSlopeDeg =
     slopeCandidates.length > 0 ? Math.max(...slopeCandidates) : null;
 
-  const reconciledLengthM = corridor.rebuiltFromSegments
-    ? Math.max(segLengthSumM, profileMaxDistM)
-    : Math.max(detail.total_length_m || 0, segLengthSumM, profileMaxDistM);
+  const courseLengthM = corridor.vertices.at(-1)?.distM ?? 0;
+  const reconciledLengthM = Math.max(
+    corridor.rebuiltFromSegments ? 0 : detail.total_length_m || 0,
+    segLengthSumM,
+    profileMaxDistM,
+    courseLengthM
+  );
   const waterwayCrossingCount = Math.max(
     detail.waterway_crossing_count || 0,
     crossings.length
@@ -299,6 +300,7 @@ export function normalizeTrackInspector(
     canonicalSegments,
     courseVertices: corridor.vertices,
     courseBBox: corridor.bbox,
+    hasMultipleCourseSections: corridor.vertices[0]?.polylineId !== corridor.vertices.at(-1)?.polylineId,
   };
 }
 
@@ -497,8 +499,10 @@ export function sampleElevationAtDistance(
   const b = points[hi]!;
   const span = Math.max(1e-6, b.dist_m - a.dist_m);
   const t = Math.max(0, Math.min(1, (clamped - a.dist_m) / span));
-  const elevM = a.elev_m + (b.elev_m - a.elev_m) * t;
   const nearer = t < 0.5 ? a : b;
+  const elevM = a.section_id === b.section_id
+    ? a.elev_m + (b.elev_m - a.elev_m) * t
+    : nearer.elev_m;
   const slopeDeg =
     typeof nearer.slope_deg === "number"
       ? nearer.slope_deg
@@ -619,27 +623,33 @@ export function buildElevationProfileSvg(
   const toY = (elevM: number): number =>
     padT + (1 - (elevM - yMin) / Math.max(1, yMax - yMin)) * plotH;
 
-  const polylinePts = points
-    .map((p) => `${toX(p.dist_m).toFixed(1)},${toY(p.elev_m).toFixed(1)}`)
-    .join(" ");
-
-  const firstX = toX(points[0]!.dist_m).toFixed(1);
-  const lastX = toX(points[points.length - 1]!.dist_m).toFixed(1);
+  const profileSections: ElevationProfilePoint[][] = [];
+  for (const point of points) {
+    const previous = profileSections.at(-1);
+    if (previous && previous[0]!.section_id === point.section_id) previous.push(point);
+    else profileSections.push([point]);
+  }
   const baseY = (padT + plotH).toFixed(1);
-  const areaPath = `M ${firstX},${baseY} L ${polylinePts.replace(/ /g, " L ")} L ${lastX},${baseY} Z`;
+  const areaPath = profileSections.map((section) => {
+    const firstX = toX(section[0]!.dist_m).toFixed(1);
+    const lastX = toX(section.at(-1)!.dist_m).toFixed(1);
+    const line = section.map((p) => `L ${toX(p.dist_m).toFixed(1)},${toY(p.elev_m).toFixed(1)}`).join(" ");
+    return `M ${firstX},${baseY} ${line} L ${lastX},${baseY} Z`;
+  }).join(" ");
 
-  const gradeRuns: { color: string; coords: string[] }[] = [];
+  const gradeRuns: { color: string; coords: string[]; sectionId?: number }[] = [];
   for (let i = 1; i < points.length; i += 1) {
     const prev = points[i - 1]!;
     const curr = points[i]!;
+    if (prev.section_id !== curr.section_id) continue;
     const color = getGradeColor(curr.grade ?? prev.grade);
     const p1 = `${toX(prev.dist_m).toFixed(1)},${toY(prev.elev_m).toFixed(1)}`;
     const p2 = `${toX(curr.dist_m).toFixed(1)},${toY(curr.elev_m).toFixed(1)}`;
     const lastRun = gradeRuns[gradeRuns.length - 1];
-    if (lastRun && lastRun.color === color) {
+    if (lastRun && lastRun.sectionId === curr.section_id && lastRun.color === color) {
       lastRun.coords.push(p2);
     } else {
-      gradeRuns.push({ color, coords: [p1, p2] });
+      gradeRuns.push({ color, coords: [p1, p2], sectionId: curr.section_id });
     }
   }
 
@@ -663,6 +673,10 @@ export function buildElevationProfileSvg(
   let activeZone: RawSteepZone | null = null;
 
   for (const p of points) {
+    if (activeZone && activeZone.peak.section_id !== p.section_id) {
+      rawZones.push(activeZone);
+      activeZone = null;
+    }
     const isSteep =
       typeof p.slope_deg === "number" && p.slope_deg >= steepThreshold;
     if (isSteep) {
@@ -939,23 +953,26 @@ function polylineArcLength(coords: readonly [number, number][]): number {
   return total;
 }
 
-function polylineTrueMidpoint(coords: readonly [number, number][]): [number, number] {
+function polylinePointAtFraction(
+  coords: readonly [number, number][],
+  total: number,
+  fraction: number
+): [number, number] {
   if (coords.length === 0) return [0, 0];
   if (coords.length === 1) return coords[0]!;
-  const total = polylineArcLength(coords);
   if (total <= 1e-6) {
     const a = coords[0]!;
     const b = coords[coords.length - 1]!;
     return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
   }
-  const half = total / 2;
+  const target = total * fraction;
   let acc = 0;
   for (let i = 1; i < coords.length; i += 1) {
     const a = coords[i - 1]!;
     const b = coords[i]!;
     const step = haversineMeters(a[0], a[1], b[0], b[1]);
-    if (acc + step >= half && step > 1e-6) {
-      const t = (half - acc) / step;
+    if (acc + step >= target && step > 1e-6) {
+      const t = (target - acc) / step;
       return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
     }
     acc += step;
@@ -993,10 +1010,9 @@ interface CanonicalTrackCorridorResult {
 }
 
 /**
- * Deduplicate overlapping multi-tile / multi-source segments and extract a single continuous,
- * spatially chained corridor (via graph-diameter Dijkstra on clustered endpoints). Guarantees a
- * strict 1-to-1 monotonic mapping between cumulative elevation distance `dist_m` and geographic
- * coordinates `(lon, lat)` with zero cursor flickering.
+ * Deduplicate overlapping source geometry and retain every distinct track segment.
+ * Junctions divide the result into separate sections so loops and branches stay visible
+ * without drawing an invented connection across the course or elevation profile.
  */
 export function buildCanonicalTrackCorridor(
   segments: readonly SegmentSummaryItem[],
@@ -1007,7 +1023,7 @@ export function buildCanonicalTrackCorridor(
     seg: SegmentSummaryItem;
     coords: Array<[number, number]>;
     start: [number, number];
-    mid: [number, number];
+    interior: Array<[number, number]>;
     end: [number, number];
     arcLenM: number;
     elevPts: Array<[number, number]>;
@@ -1020,19 +1036,20 @@ export function buildCanonicalTrackCorridor(
     seenSegIds.add(seg.segment_id);
     const lines = extractSegmentCoordinateLines(seg.geometry);
     if (lines.length === 0) continue;
-    // Use longest part for MultiLineString segments
-    let coords = lines[0]!;
-    for (let i = 1; i < lines.length; i += 1) {
-      if (lines[i]!.length > coords.length) coords = lines[i]!;
-    }
+    // The API gives canonical segments as LineStrings. Use the longest
+    // connected line when older offline payloads supply MultiLineStrings.
+    const { coords, arcLenM } = lines.map((coords) => ({
+      coords,
+      arcLenM: polylineArcLength(coords),
+    })).sort((a, b) => b.arcLenM - a.arcLenM)[0]!;
     if (coords.length < 2) continue;
     geomSegs.push({
       seg,
       coords,
       start: coords[0]!,
-      mid: polylineTrueMidpoint(coords),
+      interior: [0.25, 0.5, 0.75].map((frac) => polylinePointAtFraction(coords, arcLenM, frac)),
       end: coords[coords.length - 1]!,
-      arcLenM: polylineArcLength(coords),
+      arcLenM,
       elevPts: parseSegmentElevProfile(seg.elevation_profile_m),
     });
   }
@@ -1058,37 +1075,36 @@ export function buildCanonicalTrackCorridor(
   };
 
   const kept: GeomSeg[] = [];
-  const dupToKeptId = new Map<string, string>();
+  const duplicateOf = new Map<string, { id: string; reversed: boolean }>();
   const sortedByPrio = [...geomSegs].sort((a, b) => segPriority(b) - segPriority(a));
 
   for (const cand of sortedByPrio) {
-    let matchedKept: GeomSeg | null = null;
+    let match: { id: string; reversed: boolean } | undefined;
     for (const k of kept) {
-      const midDist = haversineMeters(cand.mid[0], cand.mid[1], k.mid[0], k.mid[1]);
-      if (midDist < 25) {
-        const dFwd = Math.max(
-          haversineMeters(cand.start[0], cand.start[1], k.start[0], k.start[1]),
-          haversineMeters(cand.end[0], cand.end[1], k.end[0], k.end[1])
-        );
-        const dRev = Math.max(
-          haversineMeters(cand.start[0], cand.start[1], k.end[0], k.end[1]),
-          haversineMeters(cand.end[0], cand.end[1], k.start[0], k.start[1])
-        );
-        if (Math.min(dFwd, dRev) < 40 || midDist < 14) {
-          matchedKept = k;
-          break;
-        }
-      }
+      const toleranceM = Math.min(18, Math.max(4, Math.min(cand.arcLenM, k.arcLenM) * 0.2));
+      if (Math.abs(cand.arcLenM - k.arcLenM) > toleranceM) continue;
+      const candidateSamples = [cand.start, ...cand.interior, cand.end];
+      const keptSamples = [k.start, ...k.interior, k.end];
+      const matches = (reversed: boolean): boolean => candidateSamples.every(([lon, lat], idx) => {
+        const [otherLon, otherLat] = keptSamples[reversed ? keptSamples.length - idx - 1 : idx]!;
+        return haversineMeters(lon, lat, otherLon, otherLat) < toleranceM;
+      });
+      const reversed = !matches(false);
+      if (reversed && !matches(true)) continue;
+      match = { id: k.seg.segment_id, reversed };
+      break;
     }
-    if (matchedKept) {
-      dupToKeptId.set(cand.seg.segment_id, matchedKept.seg.segment_id);
+    if (match) {
+      duplicateOf.set(cand.seg.segment_id, match);
     } else {
       kept.push(cand);
     }
   }
 
-  // Step 2: Cluster endpoints within 28 m into topological graph nodes & extract clean corridor spine
+  // Join neighboring endpoints, and stop each section at forks. A closed
+  // component has no open endpoint, so a second pass also walks the loops.
   const nodes: Array<[number, number]> = [];
+  const adjacency: number[][] = [];
   const getNode = (pt: [number, number]): number => {
     let bestIdx = -1;
     let bestDist = 28;
@@ -1102,413 +1118,202 @@ export function buildCanonicalTrackCorridor(
     }
     if (bestIdx >= 0) return bestIdx;
     nodes.push(pt);
+    adjacency.push([]);
     return nodes.length - 1;
   };
 
-  interface Edge {
-    to: number;
-    keptIdx: number;
-    reversed: boolean;
-    weight: number;
-  }
-  const adj = new Map<number, Edge[]>();
-  const addEdge = (u: number, edge: Edge): void => {
-    const list = adj.get(u);
-    if (list) list.push(edge);
-    else adj.set(u, [edge]);
-  };
-
-  const singletons: GeomSeg[] = [];
-  for (let idx = 0; idx < kept.length; idx += 1) {
-    const g = kept[idx]!;
-    const u = getNode(g.start);
-    const v = getNode(g.end);
-    if (u === v) {
-      singletons.push(g);
-      continue;
-    }
-    const baseLen = Math.max(
-      1,
-      typeof g.seg.length_m === "number" && g.seg.length_m > 0
-        ? g.seg.length_m
-        : g.arcLenM
-    );
-    const srcFactor = g.seg.primary_source === "osm" ? 1.0 : 1.04;
-    const profFactor = g.elevPts.length >= 2 ? 1.0 : 1.25;
-    const weight = baseLen * srcFactor * profFactor;
-    addEdge(u, { to: v, keptIdx: idx, reversed: false, weight });
-    addEdge(v, { to: u, keptIdx: idx, reversed: true, weight });
-  }
-
-  const dijkstra = (
-    src: number
-  ): {
-    dist: Map<number, number>;
-    prev: Map<number, { from: number; keptIdx: number; reversed: boolean }>;
-  } => {
-    const dist = new Map<number, number>([[src, 0]]);
-    const prev = new Map<number, { from: number; keptIdx: number; reversed: boolean }>();
-    const visitedNodes = new Set<number>();
-
-    while (true) {
-      let bestNode = -1;
-      let bestD = Infinity;
-      dist.forEach((d, nodeId) => {
-        if (!visitedNodes.has(nodeId) && d < bestD) {
-          bestD = d;
-          bestNode = nodeId;
-        }
-      });
-      if (bestNode < 0) break;
-      visitedNodes.add(bestNode);
-      const edges = adj.get(bestNode) ?? [];
-      for (const e of edges) {
-        const nd = bestD + e.weight;
-        if (nd < (dist.get(e.to) ?? Infinity)) {
-          dist.set(e.to, nd);
-          prev.set(e.to, { from: bestNode, keptIdx: e.keptIdx, reversed: e.reversed });
-        }
-      }
-    }
-    return { dist, prev };
-  };
+  const edges = kept.map((g, idx) => {
+    const start = getNode(g.start);
+    const end = getNode(g.end);
+    adjacency[start]!.push(idx);
+    adjacency[end]!.push(idx);
+    return { g, start, end };
+  });
+  const available = new Set(edges.keys());
 
   interface OrderedStep {
     g: GeomSeg;
     reversed: boolean;
   }
 
-  const visitedCompNodes = new Set<number>();
-  const componentSpines: Array<{ steps: OrderedStep[]; totalLenM: number }> = [];
-
-  adj.forEach((_edges, startNode) => {
-    if (visitedCompNodes.has(startNode)) return;
-    const d1 = dijkstra(startNode);
-    let endA = startNode;
-    let maxD1 = -1;
-    d1.dist.forEach((d, nid) => {
-      visitedCompNodes.add(nid);
-      if (d > maxD1) {
-        maxD1 = d;
-        endA = nid;
-      }
-    });
-
-    const d2 = dijkstra(endA);
-    let endB = endA;
-    let maxD2 = -1;
-    d2.dist.forEach((d, nid) => {
-      if (d > maxD2) {
-        maxD2 = d;
-        endB = nid;
-      }
-    });
-
+  const sections: Array<{ steps: OrderedStep[]; lengthM: number }> = [];
+  const walkSection = (startNode: number, startEdge: number): void => {
     const steps: OrderedStep[] = [];
-    let cur = endB;
-    while (cur !== endA) {
-      const p = d2.prev.get(cur);
-      if (!p) break;
-      steps.push({ g: kept[p.keptIdx]!, reversed: p.reversed });
-      cur = p.from;
+    let node = startNode;
+    let edgeIdx: number | undefined = startEdge;
+    let lengthM = 0;
+    while (edgeIdx !== undefined && available.delete(edgeIdx)) {
+      const edge = edges[edgeIdx]!;
+      const reversed = node === edge.end && node !== edge.start;
+      steps.push({ g: edge.g, reversed });
+      lengthM += edge.g.seg.length_m ?? edge.g.arcLenM;
+      node = reversed ? edge.start : edge.end;
+      const next = adjacency[node]!;
+      edgeIdx = next.length === 2 ? next.find((id) => available.has(id)) : undefined;
     }
-    steps.reverse();
-
-    if (steps.length > 0) {
-      const totalLenM = steps.reduce(
-        (acc, st) => acc + (st.g.seg.length_m ?? st.g.arcLenM),
-        0
-      );
-      componentSpines.push({ steps, totalLenM });
-    }
-  });
-
-  componentSpines.sort((a, b) => b.totalLenM - a.totalLenM);
-
-  const orderedSteps: OrderedStep[] = [];
-  if (componentSpines.length > 0) {
-    const primary = componentSpines[0]!;
-    orderedSteps.push(...primary.steps);
-
-    // Append genuine non-overlapping disconnected components (>= 200 m and > 80 m away from primary)
-    for (let ci = 1; ci < componentSpines.length; ci += 1) {
-      const comp = componentSpines[ci]!;
-      if (comp.totalLenM < 200) continue;
-      let nearPrimaryCount = 0;
-      for (const st of comp.steps) {
-        let minDist = Infinity;
-        for (const pst of primary.steps) {
-          const d = haversineMeters(
-            st.g.mid[0],
-            st.g.mid[1],
-            pst.g.mid[0],
-            pst.g.mid[1]
-          );
-          if (d < minDist) minDist = d;
-        }
-        if (minDist < 80) nearPrimaryCount += 1;
-      }
-      if (nearPrimaryCount / comp.steps.length >= 0.4) continue;
-
-      const tailStep = orderedSteps[orderedSteps.length - 1]!;
-      const tailExit = tailStep.reversed ? tailStep.g.start : tailStep.g.end;
-      const compStart = comp.steps[0]!.reversed
-        ? comp.steps[0]!.g.end
-        : comp.steps[0]!.g.start;
-      const compEnd = comp.steps[comp.steps.length - 1]!.reversed
-        ? comp.steps[comp.steps.length - 1]!.g.start
-        : comp.steps[comp.steps.length - 1]!.g.end;
-      if (
-        haversineMeters(tailExit[0], tailExit[1], compEnd[0], compEnd[1]) <
-        haversineMeters(tailExit[0], tailExit[1], compStart[0], compStart[1])
-      ) {
-        for (let si = comp.steps.length - 1; si >= 0; si -= 1) {
-          orderedSteps.push({
-            g: comp.steps[si]!.g,
-            reversed: !comp.steps[si]!.reversed,
-          });
-        }
-      } else {
-        orderedSteps.push(...comp.steps);
-      }
-    }
-  } else if (singletons.length > 0) {
-    for (const g of singletons) {
-      orderedSteps.push({ g, reversed: false });
-    }
-  }
-
-  // Orient consistently: start at the lower original `segment_seq` endpoint (or southernmost if tied)
-  if (orderedSteps.length >= 2) {
-    const first = orderedSteps[0]!;
-    const last = orderedSteps[orderedSteps.length - 1]!;
+    if (steps.length === 0) return;
+    const first = steps[0]!;
+    const last = steps[steps.length - 1]!;
     const firstSeq = first.g.seg.segment_seq;
     const lastSeq = last.g.seg.segment_seq;
     const firstCoord = first.reversed ? first.g.end : first.g.start;
     const lastCoord = last.reversed ? last.g.start : last.g.end;
-    const shouldFlip =
+    const shouldFlip = steps.length > 1 && (
       typeof firstSeq === "number" &&
       typeof lastSeq === "number" &&
       firstSeq !== lastSeq
         ? firstSeq > lastSeq
-        : firstCoord[1] > lastCoord[1];
-
+        : firstCoord[1] > lastCoord[1]
+    );
     if (shouldFlip) {
-      orderedSteps.reverse();
-      for (const st of orderedSteps) {
-        st.reversed = !st.reversed;
-      }
+      steps.reverse();
+      for (const step of steps) step.reversed = !step.reversed;
     }
+    sections.push({ steps, lengthM });
+  };
+
+  adjacency.forEach((edgesAtNode, node) => {
+    if (edgesAtNode.length === 2) return;
+    for (const edgeIdx of edgesAtNode) walkSection(node, edgeIdx);
+  });
+  for (const edgeIdx of available) walkSection(edges[edgeIdx]!.start, edgeIdx);
+
+  sections.sort((a, b) => b.lengthM - a.lengthM);
+  const orderedSteps = sections.flatMap(({ steps }, idx) => {
+    return steps.map((step) => ({ ...step, section: idx + 1 }));
+  });
+
+  // Use the server's original cumulative segment intervals to locate crossings.
+  // The server currently reports a segment midpoint, including segments with no DEM.
+  const rawRanges: Array<{ id: string; start: number; length: number }> = [];
+  const geometryLength = new Map(geomSegs.map((g) => [g.seg.segment_id, g.arcLenM]));
+  let rawDistance = 0;
+  for (const seg of segments) {
+    const length = seg.length_m ?? geometryLength.get(seg.segment_id) ?? 0;
+    if (!Number.isFinite(length) || length <= 0) continue;
+    rawRanges.push({ id: seg.segment_id, start: rawDistance, length });
+    rawDistance += length;
   }
-
-  // Step 3: Build strictly monotonic, 1-to-1 aligned elevation profile & course vertices
-  const profCount = orderedSteps.filter((st) => st.g.elevPts.length >= 2).length;
-  const shouldRebuildProfile =
-    orderedSteps.length >= 2 && profCount / orderedSteps.length >= 0.6;
-
-  // Map fallback profile spans per segment_id for payloads without per-segment elevation_profile_m
-  const fallbackSpanMap = new Map<string, { start: number; end: number }>();
+  const rawRangeById = new Map(rawRanges.map((range) => [range.id, range]));
+  const fallbackSamples = new Map<string, Array<[number, number]>>();
   for (const pt of fallbackProfile) {
-    if (!pt.segment_id) continue;
-    const prev = fallbackSpanMap.get(pt.segment_id);
-    if (!prev) {
-      fallbackSpanMap.set(pt.segment_id, { start: pt.dist_m, end: pt.dist_m });
-    } else {
-      prev.start = Math.min(prev.start, pt.dist_m);
-      prev.end = Math.max(prev.end, pt.dist_m);
-    }
+    const range = pt.segment_id ? rawRangeById.get(pt.segment_id) : undefined;
+    if (!range) continue;
+    const list = fallbackSamples.get(range.id) ?? [];
+    list.push([pt.dist_m - range.start, pt.elev_m]);
+    fallbackSamples.set(range.id, list);
   }
 
   const rebuiltProfile: ElevationProfilePoint[] = [];
   const vertices: TrackCourseVertex[] = [];
-  const newSegMidDist = new Map<string, number>();
+  const newRanges = new Map<string, { start: number; length: number; reversed: boolean }>();
 
   let cumDist = 0;
-  let polylineId = 1;
-  let prevExitCoord: [number, number] | null = null;
+  let profileSection = 0;
+  let previousSection: number | undefined;
   let minLon = Infinity;
   let maxLon = -Infinity;
   let minLat = Infinity;
   let maxLat = -Infinity;
 
-  for (let stepIdx = 0; stepIdx < orderedSteps.length; stepIdx += 1) {
-    const { g, reversed } = orderedSteps[stepIdx]!;
+  for (const { g, reversed, section } of orderedSteps) {
     const coords = reversed ? [...g.coords].reverse() : g.coords;
-    const segLen =
-      typeof g.seg.length_m === "number" && g.seg.length_m > 0
-        ? g.seg.length_m
-        : Math.max(1, g.arcLenM);
+    const length = typeof g.seg.length_m === "number" && g.seg.length_m > 0
+      ? g.seg.length_m
+      : Math.max(1, g.arcLenM);
     const grade = extractSegmentGrade(g.seg) ?? "Easy";
+    newRanges.set(g.seg.segment_id, { start: cumDist, length, reversed });
 
-    // Start a fresh polylineId only on genuine spatial gaps (> 60 m)
-    if (prevExitCoord) {
-      const gap = haversineMeters(
-        prevExitCoord[0],
-        prevExitCoord[1],
-        coords[0]![0],
-        coords[0]![1]
-      );
-      if (gap > 60) polylineId += 1;
+    const slopeDeg = g.seg.max_slope_deg ?? null;
+    const fallback = fallbackSamples.get(g.seg.segment_id) ?? [];
+    const elevationM = g.seg.elev_min_m ?? g.seg.elev_max_m;
+    const elevationSamples = g.elevPts.length > 0 ? g.elevPts : fallback;
+    const connectedProfile = section === previousSection;
+    if (!connectedProfile) profileSection += 1;
+    const span = g.elevPts.length > 0
+      ? Math.max(1e-6, g.elevPts[g.elevPts.length - 1]![0])
+      : length;
+    const samples = elevationSamples.length > 0
+      ? elevationSamples
+      : typeof elevationM === "number"
+        ? [[0, elevationM], [span, elevationM]]
+        : [];
+    const orderedSamples = reversed ? [...samples].reverse() : samples;
+
+    for (const [idx, sample] of orderedSamples.entries()) {
+      const [localDist, z] = sample;
+      const fraction = Math.max(0, Math.min(1, localDist! / span));
+      const dist = cumDist + (reversed ? 1 - fraction : fraction) * length;
+      if (idx === 0 && connectedProfile && rebuiltProfile.at(-1)?.dist_m === dist) continue;
+      rebuiltProfile.push({
+        dist_m: dist,
+        elev_m: z!,
+        slope_deg: slopeDeg,
+        grade,
+        segment_id: g.seg.segment_id,
+        section_id: profileSection,
+      });
     }
+    previousSection = samples.length > 0 ? section : undefined;
 
-    let segStartDist = cumDist;
-    let segEndDist = cumDist + segLen;
-
-    if (!shouldRebuildProfile) {
-      const span = fallbackSpanMap.get(g.seg.segment_id);
-      if (stepIdx === 0 && span) {
-        segStartDist = Math.min(cumDist, span.start);
+    let arc = 0;
+    for (const [idx, [lon, lat]] of coords.entries()) {
+      if (idx > 0) {
+        const [prevLon, prevLat] = coords[idx - 1]!;
+        arc += haversineMeters(prevLon, prevLat, lon, lat);
       }
-      if (span && span.end > segStartDist + 0.5) {
-        segEndDist = span.end;
-      }
-    }
-
-    newSegMidDist.set(g.seg.segment_id, (segStartDist + segEndDist) / 2);
-
-    // Emit elevation profile samples for this exact corridor segment
-    if (shouldRebuildProfile) {
-      const rawPts = g.elevPts;
-      const slopeDeg =
-        typeof g.seg.max_slope_deg === "number"
-          ? Math.round(g.seg.max_slope_deg * 100) / 100
-          : null;
-      if (rawPts.length >= 2) {
-        const span = Math.max(1e-6, rawPts[rawPts.length - 1]![0]);
-        const orderedPts: Array<[number, number]> = reversed
-          ? [...rawPts]
-              .reverse()
-              .map(([d, z]) => [Math.max(0, span - d), z] as [number, number])
-          : rawPts;
-        for (let pi = 0; pi < orderedPts.length; pi += 1) {
-          if (stepIdx > 0 && pi === 0 && rebuiltProfile.length > 0) continue;
-          const [localD, elevM] = orderedPts[pi]!;
-          const frac = Math.max(0, Math.min(1, localD / span));
-          rebuiltProfile.push({
-            dist_m: Math.round((segStartDist + frac * (segEndDist - segStartDist)) * 10) / 10,
-            elev_m: Math.round(elevM * 100) / 100,
-            slope_deg: slopeDeg,
-            segment_id: g.seg.segment_id,
-            grade,
-          });
-        }
-      } else if (typeof g.seg.elev_min_m === "number" || typeof g.seg.elev_max_m === "number") {
-        const z = g.seg.elev_min_m ?? g.seg.elev_max_m ?? 0;
-        if (stepIdx === 0) {
-          rebuiltProfile.push({
-            dist_m: Math.round(segStartDist * 10) / 10,
-            elev_m: z,
-            slope_deg: slopeDeg,
-            segment_id: g.seg.segment_id,
-            grade,
-          });
-        }
-        rebuiltProfile.push({
-          dist_m: Math.round(segEndDist * 10) / 10,
-          elev_m: z,
-          slope_deg: slopeDeg,
-          segment_id: g.seg.segment_id,
-          grade,
-        });
-      }
-    }
-
-    // Emit geographically aligned TrackCourseVertex entries along exact haversine arc fraction
-    const cumArc: number[] = [0];
-    let arcTotal = 0;
-    for (let i = 1; i < coords.length; i += 1) {
-      arcTotal += haversineMeters(
-        coords[i - 1]![0],
-        coords[i - 1]![1],
-        coords[i]![0],
-        coords[i]![1]
-      );
-      cumArc.push(arcTotal);
-    }
-
-    for (let i = 0; i < coords.length; i += 1) {
-      const [lon, lat] = coords[i]!;
-      if (lon < minLon) minLon = lon;
-      if (lon > maxLon) maxLon = lon;
-      if (lat < minLat) minLat = lat;
-      if (lat > maxLat) maxLat = lat;
-
-      const frac =
-        arcTotal > 1e-6 ? cumArc[i]! / arcTotal : i / Math.max(1, coords.length - 1);
+      const fraction = g.arcLenM > 1e-6 ? arc / g.arcLenM : idx / (coords.length - 1);
+      minLon = Math.min(minLon, lon);
+      maxLon = Math.max(maxLon, lon);
+      minLat = Math.min(minLat, lat);
+      maxLat = Math.max(maxLat, lat);
       vertices.push({
-        distM: segStartDist + frac * (segEndDist - segStartDist),
+        distM: cumDist + fraction * length,
         lon,
         lat,
         x: 0,
         y: 0,
         grade,
         segmentId: g.seg.segment_id,
-        polylineId,
+        polylineId: section,
       });
     }
-
-    prevExitCoord = coords[coords.length - 1]!;
-    cumDist = segEndDist;
+    cumDist += length;
   }
 
-  // Remap waterway crossing distances cleanly onto the deduplicated corridor when profile was rebuilt
-  let mappedCrossings: WaterwayCrossingItem[] = [...rawCrossings];
-  if (shouldRebuildProfile && rawCrossings.length > 0 && fallbackProfile.length >= 2) {
-    const oldMaxDist = Math.max(
-      1,
-      fallbackProfile[fallbackProfile.length - 1]!.dist_m
-    );
-    const newMaxDist = Math.max(
-      1,
-      rebuiltProfile.length > 0
-        ? rebuiltProfile[rebuiltProfile.length - 1]!.dist_m
-        : cumDist
-    );
+  const mappedCrossings = rawCrossings.map((crossing) => {
+    const dist = crossing.dist_m;
+    if (typeof dist !== "number" || !Number.isFinite(dist)) return crossing;
+    const raw = rawRanges.find((range) => dist >= range.start && dist <= range.start + range.length);
+    if (!raw) return { ...crossing, dist_m: null };
+    const duplicate = duplicateOf.get(raw.id);
+    const mapped = newRanges.get(duplicate?.id ?? raw.id);
+    if (!mapped) return { ...crossing, dist_m: null };
+    const fraction = (dist - raw.start) / raw.length;
+    const reversed = mapped.reversed !== Boolean(duplicate?.reversed);
+    return {
+      ...crossing,
+      dist_m: Math.round((mapped.start + (reversed ? 1 - fraction : fraction) * mapped.length) * 10) / 10,
+    };
+  });
 
-    mappedCrossings = rawCrossings.map((c) => {
-      if (typeof c.dist_m !== "number" || !Number.isFinite(c.dist_m)) return c;
-      // Locate segment in raw profile closest to old dist_m
-      let nearestSegId: string | null = null;
-      let bestDelta = Infinity;
-      for (const pt of fallbackProfile) {
-        if (!pt.segment_id) continue;
-        const delta = Math.abs(pt.dist_m - c.dist_m);
-        if (delta < bestDelta) {
-          bestDelta = delta;
-          nearestSegId = pt.segment_id;
-        }
-      }
-      if (nearestSegId) {
-        const direct = newSegMidDist.get(nearestSegId);
-        if (typeof direct === "number") {
-          return { ...c, dist_m: Math.round(direct * 10) / 10 };
-        }
-        const remappedId = dupToKeptId.get(nearestSegId);
-        if (remappedId) {
-          const remapped = newSegMidDist.get(remappedId);
-          if (typeof remapped === "number") {
-            return { ...c, dist_m: Math.round(remapped * 10) / 10 };
-          }
-        }
-      }
-      const scaled = Math.max(
-        0,
-        Math.min(newMaxDist, (c.dist_m / oldMaxDist) * newMaxDist)
-      );
-      return { ...c, dist_m: Math.round(scaled * 10) / 10 };
-    });
+  const canonicalSegments = orderedSteps.map(({ g }) => g.seg);
+  for (const seg of segments) {
+    if (geometryLength.has(seg.segment_id)) continue;
+    if (!canonicalSegments.some((canonical) => canonical.segment_id === seg.segment_id)) {
+      canonicalSegments.push(seg);
+    }
   }
-
   return {
-    segments: orderedSteps.map((st) => st.g.seg),
-    profile: shouldRebuildProfile ? rebuiltProfile : [...fallbackProfile],
+    segments: canonicalSegments,
+    profile: rebuiltProfile.length >= 2 ? rebuiltProfile : [...fallbackProfile],
     crossings: mappedCrossings,
     vertices,
     bbox:
       Number.isFinite(minLon) && Number.isFinite(minLat)
         ? [minLon, minLat, maxLon, maxLat]
         : null,
-    rebuiltFromSegments: shouldRebuildProfile,
+    rebuiltFromSegments: rebuiltProfile.length >= 2,
   };
 }
 

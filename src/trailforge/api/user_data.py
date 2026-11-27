@@ -13,12 +13,14 @@ from geoalchemy2.shape import from_shape
 from pydantic import AliasChoices, BaseModel, Field, StringConstraints
 from shapely.geometry import Point
 from sqlalchemy import case, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from trailforge.auth.dependencies import (
     get_current_user,
     get_scoped_read_user,
     get_scoped_write_user,
+    require_browser_queue_write_owner,
 )
 from trailforge.db.models import (
     POI,
@@ -493,7 +495,7 @@ def list_pins(
 @router.post("/pins", response_model=PinResponse, status_code=status.HTTP_201_CREATED)
 def create_pin(
     payload: PinCreateRequest,
-    user: User = Depends(get_scoped_write_user),
+    user: User = Depends(require_browser_queue_write_owner),
     db: Session = Depends(get_db),
 ) -> PinResponse:
     """Create a personal waypoint/camp/hazard pin persisted in PostGIS."""
@@ -520,7 +522,23 @@ def create_pin(
         geom=from_shape(Point(payload.lon, payload.lat), srid=4326),
     )
     db.add(pin)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        if payload.client_uuid is not None:
+            existing = db.execute(
+                select(
+                    UserPin,
+                    func.ST_X(UserPin.geom).label("lon"),
+                    func.ST_Y(UserPin.geom).label("lat"),
+                )
+                .where(UserPin.user_id == user.id, UserPin.client_uuid == payload.client_uuid)
+                .limit(1)
+            ).first()
+            if existing is not None:
+                return _pin_to_response(existing[0], existing[1], existing[2])
+        raise
     db.refresh(pin)
     return _pin_to_response(pin, payload.lon, payload.lat)
 

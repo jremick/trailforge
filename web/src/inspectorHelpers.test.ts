@@ -12,7 +12,7 @@ import {
   sampleElevationAtDistance,
   sampleTrackCourseAtDistance,
 } from "./inspectorHelpers";
-import type { BaselineBreakdown, TrackInspectorDetail } from "./types";
+import type { BaselineBreakdown, SegmentSummaryItem, TrackInspectorDetail } from "./types";
 
 const SAMPLE_BREAKDOWN: BaselineBreakdown = {
   formula_version: "baseline_v1",
@@ -493,5 +493,44 @@ describe("Track Inspector explainable helpers", () => {
       prevLat = pt!.lat;
       prevLon = pt!.lon;
     }
+  });
+
+  it("retains a closed loop, a signed spur and its crossing at the right location", () => {
+    const a = [147.05, -37.43];
+    const b = [147.052, -37.43];
+    const c = [147.052, -37.428];
+    const d = [147.05, -37.428];
+    const spur = [147.054, -37.43];
+    const legs = [[a, b], [b, c], [c, d], [d, a], [b, spur]];
+    const segments = legs.map((coordinates, index): SegmentSummaryItem => ({
+      segment_id: `test-${index}`,
+      segment_seq: index,
+      length_m: 200,
+      grade: index === 4 ? "Hard" : "Easy",
+      has_gate_barrier: index === 4,
+      access_status: index === 4 ? "closed" : "public",
+      max_slope_deg: index === 4 ? 22 : 1,
+      elevation_profile_m: [[0, 200], [100, 240], [200, 200]],
+      geometry: { type: "LineString", coordinates },
+    }));
+    const fallback = segments.flatMap((segment, index) => [
+      { dist_m: index * 200, elev_m: 200, segment_id: segment.segment_id },
+      { dist_m: (index + 1) * 200, elev_m: 200, segment_id: segment.segment_id },
+    ]);
+    const corridor = buildCanonicalTrackCorridor(segments, fallback, [
+      { name: "Spur Creek", dist_m: 850, perennial: true },
+    ]);
+    expect(corridor.segments).toHaveLength(5);
+    expect(corridor.segments).toEqual(expect.arrayContaining(segments));
+    expect(new Set(corridor.vertices.map((v) => v.polylineId)).size).toBeGreaterThan(1);
+    expect(corridor.vertices.at(-1)?.distM).toBeCloseTo(1000);
+    expect(corridor.profile.at(-1)?.dist_m).toBeCloseTo(1000);
+
+    const crossing = sampleTrackCourseAtDistance(
+      corridor.vertices, corridor.crossings[0]!.dist_m!
+    );
+    expect(crossing?.grade).toBe("Hard");
+    expect(crossing?.lon).toBeCloseTo(147.0525, 5);
+    expect(corridor.profile.some((p) => p.slope_deg === 22)).toBe(true);
   });
 });
