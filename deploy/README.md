@@ -74,18 +74,70 @@ Once the stack is running, create your first admin with `docker compose -f docke
 HTTPS is mandatory for in-cab mobile/tablet PWA features (**Service Worker offline packs**, **Geolocation API**, **Screen Wake Lock**, and **`AUTH_COOKIE_SECURE=true`**). Pick one of the three included setups:
 
 - **Private Tailnet (zero port forwarding, recommended for personal/club rigs):** follow [`deploy/tailscale-serve.md`](./tailscale-serve.md).
-- **Automatic public HTTPS via Caddy v2:** adapt [`deploy/Caddyfile.example`](./Caddyfile.example) (preserves `Host`, `X-Forwarded-Proto`, `Range` / HTTP `206 Partial Content`, strips untrusted `CF-Connecting-IP`, enforces `X-Frame-Options: DENY`, and sets a `17MB` upload limit).
-- **Existing Traefik v3 stack:** layer [`deploy/traefik-compose.override.yml`](./traefik-compose.override.yml):
+- **Automatic public HTTPS via Caddy v2:** set up the private socket below and adapt
+  [`deploy/Caddyfile.example`](./Caddyfile.example). It forwards `Range` and preserves
+  HTTP `206 Partial Content` for tiles and packs.
+- **Existing Traefik v3 stack:** save `TRAILFORGE_HOST` and
+  `TRAILFORGE_TRAEFIK_PROXY_IP` in `.env` with your hostname and Traefik's reserved
+  address. Then layer [`deploy/traefik-compose.override.yml`](./traefik-compose.override.yml).
   ```bash
-  TRAILFORGE_HOST=trails.example.com \
   docker compose -f docker-compose.ghcr.yml -f deploy/traefik-compose.override.yml up -d
   ```
 
+#### Per-client tile and pack downloads
+
+The direct web port remains loopback-bound and counts the connection's peer address. To
+count clients individually behind a proxy, use one of the trusted ingress paths below.
+Tile and pack requests still share the 24-connection global ceiling.
+
+- **Traefik.** Reserve a stable IPv4 address for the Traefik container on the existing `traefik`
+  network and use that exact IP for `TRAILFORGE_TRAEFIK_PROXY_IP`. TrailForge trusts only
+  that peer and uses the rightmost address it forwards. Keep Traefik's default
+  `X-Forwarded-For` append behavior. A proxy in front of Traefik shares one allowance
+  for the requests Traefik receives from it. If the reserved address changes, update
+  the setting and recreate the web container before reassigning the old address.
+  [Traefik entrypoint forwarding](https://doc.traefik.io/traefik/reference/install-configuration/entrypoints/#forwarded-headers)
+- **Caddy on a Linux Docker host.** Create a directory owned by the unprivileged Nginx user
+  (UID 101 in the default image) with access for only Caddy's service group and the owner.
+  Start the web service with the socket override and use the default Unix upstream in
+  the example Caddyfile. The command uses the standard Caddy service's primary group.
+  For containerized Caddy, mount that directory at the same path and give its service
+  process the numeric group ID with directory search access.
+  [Caddy Unix upstreams](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#upstream-addresses)
+
+  ```bash
+  sudo install -d -m 0710 -o 101 -g "$(id -g caddy)" /var/lib/trailforge-ingress
+  docker compose -f docker-compose.ghcr.yml -f deploy/download-socket-compose.override.yml up -d
+  ```
+
+- **Tailscale Serve on Linux.** Follow the [private socket setup](./tailscale-serve.md#3-publish-over-tailnet-https).
+
+The socket directory is the trust boundary. Use one web container per directory and
+share it only with the proxy that supplies the client address. If an ungraceful shutdown
+leaves a stale socket, confirm the web container is stopped before removing `web.sock`.
+Set the owner to the mapped Nginx UID if Docker uses rootless mode or user namespace
+remapping. When the proxy and web container use
+different kernels, such as a host proxy and Docker Desktop, use Traefik's exact-peer
+configuration or put the proxy and web service in the same Linux VM with a protected
+shared socket. The original loopback TCP route remains available and groups clients
+arriving from the same proxy.
+
 ### 3. Start the Stack & Verify Health
+
+Use the Compose files selected above for every subsequent `up`, including upgrades.
+For a direct installation, use the base file alone.
+
+```bash
+# Example for the private socket setup. Keep the -f options you used to start the stack.
+docker compose -f docker-compose.ghcr.yml -f deploy/download-socket-compose.override.yml ps
+curl -fsS https://trails.example.com/api/health
+```
+
+Use the configured Tailnet or public HTTPS name. Direct installs can check
+the loopback health endpoint:
 
 ```bash
 docker compose -f docker-compose.ghcr.yml up -d
-docker compose -f docker-compose.ghcr.yml ps
 curl -fsS http://127.0.0.1:5173/api/health
 ```
 
@@ -154,22 +206,31 @@ docker compose -f docker-compose.ghcr.yml exec -T api \
 
 ## Low-Downtime Upgrades & Rollbacks
 
+Keep the Compose file list from your original setup. These examples use the Caddy
+or Tailscale socket override. Substitute the Traefik override for that setup, or
+use only the base file for a direct install.
+
 1. **Back up PostGIS** (command above) before jumping across minor/major versions.
 2. **Pre-pull the target images** while the current stack keeps serving traffic:
    ```bash
    # Update TRAILFORGE_IMAGE_TAG in .env (e.g. v1.0.0) or keep :latest for stable releases
-   docker compose -f docker-compose.ghcr.yml pull
+   compose_args=(-f docker-compose.ghcr.yml -f deploy/download-socket-compose.override.yml)
+   docker compose "${compose_args[@]}" pull
    ```
 3. **Recreate containers in dependency order** (Alembic migrations run automatically when `api` boots):
    ```bash
-   docker compose -f docker-compose.ghcr.yml up -d --remove-orphans
+   docker compose "${compose_args[@]}" up -d --remove-orphans
    ```
 4. **Verify post-upgrade health:**
    ```bash
-   docker compose -f docker-compose.ghcr.yml ps
-   curl -fsS http://127.0.0.1:5173/api/health
+   docker compose "${compose_args[@]}" ps
+   curl -fsS https://trails.example.com/api/health
    ```
-5. **Rollback:** restore your pre-upgrade `pg_dump` if a schema downgrade is required, pin the previous `TRAILFORGE_IMAGE_TAG`, and run `docker compose -f docker-compose.ghcr.yml up -d`.
+   Use your configured HTTPS hostname or the loopback endpoint for a direct install.
+5. **Rollback.** Restore your pre-upgrade `pg_dump` if a schema downgrade is required,
+   pin the previous `TRAILFORGE_IMAGE_TAG`, and run `docker compose "${compose_args[@]}" up -d`.
+   For an image from before socket support, point Caddy or Tailscale Serve back to its
+   TCP upstream and omit the socket override.
 
 ---
 

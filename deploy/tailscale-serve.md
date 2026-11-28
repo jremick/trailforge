@@ -63,7 +63,23 @@ Expected response:
 
 ## 3. Publish Over Tailnet HTTPS
 
-Ensure **MagicDNS** and **HTTPS Certificates** are enabled in the Tailscale admin console, then run:
+Enable **MagicDNS** and **HTTPS Certificates** in the Tailscale admin console.
+
+On a Linux Docker host, use a private Unix socket so each Tailnet client gets its own
+tile and pack download allowance. This path requires Tailscale 1.104.4 or newer.
+Use the web container's mapped UID as directory owner if Docker uses rootless mode
+or user namespace remapping. [Tailscale Unix backend security guidance](https://tailscale.com/security-bulletins#ts-2026-016)
+
+```bash
+sudo install -d -m 0700 -o 101 -g 101 /var/lib/trailforge-ingress
+docker compose -f docker-compose.ghcr.yml -f deploy/download-socket-compose.override.yml up -d
+sudo tailscale serve --bg unix:/var/lib/trailforge-ingress/web.sock
+```
+
+If the host proxy and the web container use different kernels, put both in the same
+Linux VM with a protected shared socket to retain per-client limits. The loopback
+command below remains available on other platforms. Its download allowance is shared
+among requests from the same proxy peer.
 
 ```bash
 tailscale serve --bg http://127.0.0.1:5173

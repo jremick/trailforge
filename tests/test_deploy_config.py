@@ -283,6 +283,34 @@ def test_nginx_tile_and_pack_proxies_enforce_per_ip_limits_and_bounded_buffering
 
 
 @requires_repo_checkout
+def test_download_proxy_trust_is_opt_in_and_packaged_for_supported_ingress() -> None:
+    nginx = (REPO_ROOT / "web" / "nginx.conf").read_text(encoding="utf-8")
+    dockerfile = (REPO_ROOT / "web" / "Dockerfile").read_text(encoding="utf-8")
+    assert "real_ip_header X-Forwarded-For;" in nginx
+    assert "real_ip_recursive off;" in nginx
+    assert "set_real_ip_from" not in nginx
+    assert "include /etc/nginx/trailforge-ingress/ingress.conf;" in nginx
+    assert "/docker-entrypoint.d/19-trailforge-ingress.sh" in dockerfile
+
+    for name in ("docker-compose.yml", "docker-compose.ghcr.yml"):
+        web = _load_yaml(REPO_ROOT / name)["services"]["web"]
+        assert web["ports"] == ["127.0.0.1:${WEB_PORT:-5173}:8080"]
+        assert "TRAILFORGE_NGINX_PROXY_SOCKET" not in _env_keys(web)
+        assert "TRAILFORGE_NGINX_TRUSTED_PROXY_IP" not in _env_keys(web)
+
+    socket_web = _load_yaml(REPO_ROOT / "deploy" / "download-socket-compose.override.yml")[
+        "services"
+    ]["web"]
+    assert socket_web["environment"] == {"TRAILFORGE_NGINX_PROXY_SOCKET": "true"}
+    assert socket_web["volumes"][0]["target"] == "/run/trailforge-ingress"
+    assert socket_web["volumes"][0]["bind"]["create_host_path"] is False
+
+    traefik = _load_yaml(REPO_ROOT / "deploy" / "traefik-compose.override.yml")
+    traefik_ip = traefik["services"]["web"]["environment"]["TRAILFORGE_NGINX_TRUSTED_PROXY_IP"]
+    assert traefik_ip.startswith("${TRAILFORGE_TRAEFIK_PROXY_IP:?")
+
+
+@requires_repo_checkout
 def test_deploy_kit_files_https_range_and_upload_limits() -> None:
     deploy_dir = REPO_ROOT / "deploy"
     caddy_path = deploy_dir / "Caddyfile.example"
@@ -295,6 +323,9 @@ def test_deploy_kit_files_https_range_and_upload_limits() -> None:
 
     # Caddy v2 checks
     caddy = caddy_path.read_text(encoding="utf-8")
+    assert re.search(
+        r"^\s*reverse_proxy unix//var/lib/trailforge-ingress/web\.sock \{", caddy, re.M
+    )
     assert "127.0.0.1:5173" in caddy
     assert "max_size 17MB" in caddy
     assert "X-Frame-Options \"DENY\"" in caddy

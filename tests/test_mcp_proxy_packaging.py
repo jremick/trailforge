@@ -408,7 +408,7 @@ def test_nginx_conf_mcp_and_oauth_unbuffered_proxy_blocks() -> None:
         assert "proxy_buffering off;" in block
         assert "proxy_request_buffering off;" in block
         assert "proxy_pass_header WWW-Authenticate;" in block
-        assert "proxy_set_header X-Forwarded-Host $host;" in block
+        assert "proxy_set_header X-Forwarded-Host $trailforge_upstream_host;" in block
         assert "proxy_set_header Authorization $http_authorization;" in block
         assert "proxy_set_header Accept $http_accept;" in block
 
@@ -433,8 +433,8 @@ def test_nginx_conf_mcp_and_oauth_unbuffered_proxy_blocks() -> None:
         'add_header Permissions-Policy "camera=(), microphone=(), geolocation=(self)" always;'
         in authorize_block
     )
-    assert "proxy_set_header X-Forwarded-Host $host;" in authorize_block
-    assert "proxy_set_header X-Forwarded-Proto $scheme;" in authorize_block
+    assert "proxy_set_header X-Forwarded-Host $trailforge_upstream_host;" in authorize_block
+    assert "proxy_set_header X-Forwarded-Proto $trailforge_upstream_proto;" in authorize_block
 
     # Existing blocks preserved intact
     for existing in (

@@ -1,7 +1,8 @@
 # TrailForge Automatic HTTPS Reverse Proxy Example (Caddy v2)
 #
-# Copy to /etc/caddy/Caddyfile (or mount into a Caddy container on the same
-# Docker network as TrailForge) and replace `trails.example.com` with your domain.
+# Create and mount the private ingress socket directory using deploy/README.md.
+# Copy to /etc/caddy/Caddyfile (or mount into a Caddy container sharing the
+# socket directory) and replace `trails.example.com` with your domain.
 #
 # Required TrailForge `.env` settings behind HTTPS:
 #   CORS_ORIGINS=https://trails.example.com
@@ -46,9 +47,10 @@ trails.example.com {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
 	}
 
-	# Use `web:8080` if Caddy shares the Docker Compose network, or
-	# `127.0.0.1:5173` when running Caddy directly on the Docker host.
-	reverse_proxy 127.0.0.1:5173 {
+	# The private socket applies download limits per client. For the TCP fallback,
+	# use 127.0.0.1:5173 on the host or web:8080 on the shared Docker network.
+	# TCP fallback uses a shared Caddy-peer allowance.
+	reverse_proxy unix//var/lib/trailforge-ingress/web.sock {
 		flush_interval -1
 		header_up -CF-Connecting-IP
 		header_up Host {http.request.host}
