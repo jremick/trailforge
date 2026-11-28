@@ -34,7 +34,7 @@ Explore Pan-Australia 4WD tracks right now at **[mytrailforge.com](https://mytra
 - **Explainable 2-Stage Track Grading:** Combines a deterministic Day-1 DEM/OSM baseline (`surface`, `tracktype`, slope degrees, waterway crossings, `4wd_only`) with recency-weighted, rig-normalized telemetry and 72-hour rainfall context — exposing every factor, sample count, and obstacle hotspot instead of a black-box score.
 - **Interactive Multi-Track Route Planner & Print Handoff:** Chain tracks with automatic leg orientation, combined 4-grade elevation profile, worst-grade & rig suitability rollup, closure/gate warnings, GPX 1.1 / GeoJSON export, and one-click **[GridForge](https://github.com/jremick/gridforge)** 300 DPI waterproof strip atlas CLI handoff.
 - **Pan-Australia Open Data & 11 Live Closure Feeds:** Conflates OSM with all 8 Australian state trail agencies into deterministic 50–100 m segments alongside CAPAD 2025 parks, click-to-inspect emergency/park incidents, and community hazard/gate reports with one-click OSM access fixes.
-- **Offline-First PWA, Vector Basemaps & 15 Regional Packs:** Streaming `< 300 MB` RAM offline packs (`PMTiles` HTTP `206` byte-range serving + normalized `sharded_v2` gzipped track shards for 50k+ track regions in IndexedDB), self-hosted Noto Sans glyphs, Pan-AU places/regions/highways & park labels, optional split-stack OpenMapTiles vector basemap (`TRAILFORGE_VECTOR_BASEMAP_URL`), and an in-cab GPS + 50 Hz IMU / 4WD clinometer recorder with one-tap Backtrack.
+- **Offline-First PWA, Dual Themes & 15 Regional Packs:** Daylight Topo (high-sunlight outdoor palette) and Alpine Dark (night-cab) themes, draggable mobile bottom sheets, streaming `< 300 MB` RAM offline packs (`PMTiles` HTTP `206` byte-range serving + normalized `sharded_v2` gzipped track shards for 50k+ track regions in IndexedDB), self-hosted Noto Sans glyphs, Pan-AU places/regions/highways & park labels, optional split-stack OpenMapTiles vector basemap (`TRAILFORGE_VECTOR_BASEMAP_URL`), and an in-cab GPS + 50 Hz IMU / 4WD clinometer recorder with one-tap Backtrack.
 - **Privacy-by-Design Telemetry & Pluggable Map-Matching:** Enforces mandatory `≥ 250 m` start/end buffer trimming on GPS + IMU uploads, stores zero `user_id`/`trip_id` on public aggregates, matches traces with an in-PostGIS HMM by default, and supports an optional **Valhalla** sidecar ([`deploy/valhalla.md`](deploy/valhalla.md)).
 - **Native AI / MCP Server & Interactive Explorer:** Built-in stateless Streamable HTTP MCP server (`18` tools, Pillow PNG trail/elevation visuals, interactive SEP-1865 MCP App) with self-hosted **OAuth 2.1 + PKCE** & Personal Access Tokens for ChatGPT, Claude, Antigravity, Gemini, and Cursor ([`docs/AI_INTEGRATION.md`](docs/AI_INTEGRATION.md)).
 - **Lean Self-Hosting & ODbL-Clean Architecture:** Runs in **`~350 MiB` idle RAM** (zero Redis/Kafka, zero PyQGIS) with multi-arch (`amd64`/`arm64`) GHCR images, strict 3-tier OSM ODbL table separation, and a hardened ~$5–$10/mo Railway + Cloudflare Pages/R2/WAF deploy kit.
@@ -43,12 +43,12 @@ Explore Pan-Australia 4WD tracks right now at **[mytrailforge.com](https://mytra
 
 ## Screenshots
 
-![TrailForge Pan-Australia 4WD Map and Track Inspector](docs/images/trailforge-hero.png)
+![TrailForge Daylight Topo Map, Grouped Layers and Track Inspector](docs/images/trailforge-hero.png)
 
-| **Multi-Track Route Planner & GridForge Handoff** | **Rig Suitability, Closures & Gate Warnings** |
+| **Multi-Track Route Planner & GridForge Handoff (Alpine Dark)** | **Rig Suitability & Live Agency Closures (Daylight Topo)** |
 | :---: | :---: |
 | ![Interactive Multi-Track Route Planner](docs/images/trailforge-route-planner.png) | ![Rig Suitability, Closures and Gate Warnings](docs/images/trailforge-rig-closures.png) |
-| **Streaming Offline Regional Packs** | **In-Cab PWA Recorder & Backtrack** |
+| **Streaming Offline Regional Packs (Alpine Dark)** | **In-Cab PWA Recorder, Clinometer & Backtrack** |
 | ![Streaming Offline Regional Packs](docs/images/trailforge-offline-packs.png) | ![In-Cab PWA Breadcrumb Recorder](docs/images/trailforge-recorder.png) |
 
 ---
