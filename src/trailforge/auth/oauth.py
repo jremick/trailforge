@@ -1161,6 +1161,12 @@ def build_redirect_url(redirect_uri: str, query_params: dict[str, str]) -> str:
 # -----------------------------------------------------------------------------
 
 
+def _lock_oauth_user(db: Session, user_id: uuid.UUID) -> User | None:
+    """Serialize OAuth credential changes with other credential changes and logout."""
+    # FOR NO KEY UPDATE conflicts with the session version update while allowing FK reads.
+    return db.get(User, user_id, populate_existing=True, with_for_update={"key_share": True})
+
+
 def issue_authorization_code(
     db: Session,
     *,
@@ -1171,8 +1177,13 @@ def issue_authorization_code(
     commit: bool = True,
 ) -> str:
     """Mint a single-use 60 s OAuth authorization code (`tf_oac_...`) stored as SHA-256 hash."""
-    if not user.is_active:
+    # Consent was verified against this version before waiting for the account lock.
+    approved_version = user.token_version
+    current_user = _lock_oauth_user(db, user.id)
+    if current_user is None or not current_user.is_active:
         raise OAuthError("access_denied", "Account is suspended", status_code=403)
+    if current_user.token_version != approved_version:
+        raise OAuthError("access_denied", "Sign in again before granting consent", status_code=403)
     cfg = settings or get_settings()
     current_now = as_utc(now) if now is not None else datetime.now(UTC)
     ttl_s = get_oauth_auth_code_ttl_s(cfg)
@@ -1181,7 +1192,8 @@ def issue_authorization_code(
     row = OAuthAuthorizationCode(
         code_hash=hash_token(raw_code),
         client_id=params.client.client_id,
-        user_id=user.id,
+        user_id=current_user.id,
+        user_token_version=approved_version,
         redirect_uri=params.redirect_uri,
         scope=params.scope,
         code_challenge=params.code_challenge,
@@ -1251,7 +1263,6 @@ def exchange_authorization_code(
 ) -> TokenResponsePayload:
     """Exchange a single-use authorization code + PKCE S256 verifier for access & refresh tokens."""
     cfg = settings or get_settings()
-    current_now = as_utc(now) if now is not None else datetime.now(UTC)
 
     client = authenticate_oauth_client(db, client_id=client_id, client_secret=client_secret)
     if not code or not code.startswith(OAUTH_CODE_PREFIX):
@@ -1269,6 +1280,14 @@ def exchange_authorization_code(
         raise OAuthError("invalid_grant", "Authorization code was not issued to this client")
     if code_row.redirect_uri != redirect_uri:
         raise OAuthError("invalid_grant", "redirect_uri mismatch")
+    user = _lock_oauth_user(db, code_row.user_id)
+    if user is None:
+        raise OAuthError("invalid_grant", "User account is no longer active")
+    # A parallel exchange or grant revocation can change the code while the lock waits.
+    code_row = db.get(OAuthAuthorizationCode, code_digest, populate_existing=True)
+    if code_row is None:
+        raise OAuthError("invalid_grant", "Invalid or expired authorization code")
+    current_now = as_utc(now) if now is not None else datetime.now(UTC)
     if code_row.consumed_at is not None:
         # OAuth 2.1 §4.1.2 / RFC 6749 §10.5: revoke entire token family on auth-code replay
         if code_row.token_family_id is not None:
@@ -1282,6 +1301,11 @@ def exchange_authorization_code(
         raise OAuthError("invalid_grant", "Authorization code has expired")
     if not verify_pkce_s256(code_verifier, code_row.code_challenge):
         raise OAuthError("invalid_grant", "PKCE code_verifier verification failed")
+    if not user.is_active:
+        raise OAuthError("invalid_grant", "User account is no longer active")
+    approved_version = code_row.user_token_version
+    if approved_version is None or approved_version != user.token_version:
+        raise OAuthError("invalid_grant", "Session has been revoked")
 
     # Atomically consume single-use authorization code and bind its minted token_family_id
     family_id = uuid.uuid4()
@@ -1294,18 +1318,14 @@ def exchange_authorization_code(
         .values(consumed_at=current_now, token_family_id=family_id)
     )
     if int(consumed.rowcount or 0) != 1:
-        db.rollback()
-        replayed_row = db.get(OAuthAuthorizationCode, code_digest)
+        replayed_row = db.get(OAuthAuthorizationCode, code_digest, populate_existing=True)
         if replayed_row is not None and replayed_row.token_family_id is not None:
             revoke_token_family(db, replayed_row.token_family_id, now=current_now)
             if commit:
                 db.commit()
+            else:
+                db.flush()
         raise OAuthError("invalid_grant", "Authorization code has already been used")
-
-    user = db.get(User, code_row.user_id)
-    if user is None or not user.is_active:
-        db.rollback()
-        raise OAuthError("invalid_grant", "User account is no longer active")
 
     access_ttl_s = get_oauth_access_token_ttl_s(cfg)
     refresh_ttl_s = get_oauth_refresh_token_ttl_s(cfg)
@@ -1320,7 +1340,7 @@ def exchange_authorization_code(
         token_family_id=family_id,
         client_id=client.client_id,
         user_id=user.id,
-        user_token_version=int(getattr(user, "token_version", 1) or 1),
+        user_token_version=approved_version,
         access_token_hash=hash_token(raw_access),
         refresh_token_hash=hash_token(raw_refresh) if raw_refresh is not None else None,
         scope=code_row.scope,
@@ -1360,7 +1380,6 @@ def refresh_oauth_token(
 ) -> TokenResponsePayload:
     """Rotate a refresh token atomically; revokes the entire token family if reuse is detected."""
     cfg = settings or get_settings()
-    current_now = as_utc(now) if now is not None else datetime.now(UTC)
 
     client = authenticate_oauth_client(db, client_id=client_id, client_secret=client_secret)
     if "refresh_token" not in list(client.grant_types or []):
@@ -1378,6 +1397,13 @@ def refresh_oauth_token(
         raise OAuthError("invalid_grant", "Invalid refresh token")
     if token_row.client_id != client.client_id:
         raise OAuthError("invalid_grant", "Refresh token was not issued to this client")
+    user = _lock_oauth_user(db, token_row.user_id)
+    if user is None:
+        raise OAuthError("invalid_grant", "User account is no longer active")
+    token_row = db.get(OAuthToken, token_row.id, populate_existing=True)
+    if token_row is None:
+        raise OAuthError("invalid_grant", "Invalid refresh token")
+    current_now = as_utc(now) if now is not None else datetime.now(UTC)
 
     # Spec Section 5.3 #4: presenting an already-revoked refresh token revokes the whole family!
     if token_row.revoked_at is not None:
@@ -1391,11 +1417,9 @@ def refresh_oauth_token(
     if token_row.refresh_expires_at is None or as_utc(token_row.refresh_expires_at) <= current_now:
         raise OAuthError("invalid_grant", "Refresh token has expired")
 
-    user = db.get(User, token_row.user_id)
-    if user is None or not user.is_active:
+    if not user.is_active:
         raise OAuthError("invalid_grant", "User account is no longer active")
-    user_tv = int(getattr(user, "token_version", 1) or 1)
-    if int(token_row.user_token_version) != user_tv:
+    if token_row.user_token_version != user.token_version:
         raise OAuthError("invalid_grant", "Session has been revoked")
 
     granted_scopes = set(normalize_scopes(token_row.scope))
@@ -1439,7 +1463,7 @@ def refresh_oauth_token(
         token_family_id=token_row.token_family_id,
         client_id=client.client_id,
         user_id=user.id,
-        user_token_version=user_tv,
+        user_token_version=token_row.user_token_version,
         access_token_hash=hash_token(raw_access),
         refresh_token_hash=hash_token(raw_refresh),
         scope=effective_scope,
@@ -1475,8 +1499,6 @@ def revoke_oauth_token(
     commit: bool = True,
 ) -> bool:
     """Revoke an OAuth access or refresh token per RFC 7009."""
-    current_now = as_utc(now) if now is not None else datetime.now(UTC)
-
     authenticated_client: OAuthClient | None = None
     if client_id is not None and client_id.strip():
         authenticated_client = authenticate_oauth_client(
@@ -1505,11 +1527,18 @@ def revoke_oauth_token(
         return False
     if authenticated_client is not None and matched_row.client_id != authenticated_client.client_id:
         return False
+    if _lock_oauth_user(db, matched_row.user_id) is None:
+        return False
+    current_now = as_utc(now) if now is not None else datetime.now(UTC)
 
     if matched_kind == "refresh":
         revoke_token_family(db, matched_row.token_family_id, now=current_now)
-    elif matched_row.revoked_at is None:
-        matched_row.revoked_at = current_now
+    else:
+        db.execute(
+            update(OAuthToken)
+            .where(OAuthToken.id == matched_row.id, OAuthToken.revoked_at.is_(None))
+            .values(revoked_at=current_now)
+        )
 
     if commit:
         db.commit()
@@ -1592,6 +1621,8 @@ def revoke_user_oauth_grant(
     commit: bool = True,
 ) -> int:
     """Revoke all active OAuth tokens and unconsumed auth codes for ``(user_id, client_id)``."""
+    if _lock_oauth_user(db, user_id) is None:
+        return 0
     current_now = as_utc(now) if now is not None else datetime.now(UTC)
     tok_res = db.execute(
         update(OAuthToken)

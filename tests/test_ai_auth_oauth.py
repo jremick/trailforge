@@ -14,7 +14,9 @@ import pytest
 import sqlalchemy as sa
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.testclient import TestClient
+from psycopg.errors import LockNotAvailable
 from sqlalchemy import Engine, inspect, select, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -30,8 +32,10 @@ from trailforge.auth.oauth import (
     exchange_authorization_code,
     issue_authorization_code,
     prune_stale_oauth_clients,
+    refresh_oauth_token,
     register_oauth_client,
     resolve_public_origin,
+    revoke_user_oauth_grant,
     validate_authorize_request,
     validate_code_challenge,
     validate_redirect_uri,
@@ -137,6 +141,7 @@ def _create_sqlite_ai_auth_schema(engine: Engine) -> None:
             code_hash VARCHAR(64) PRIMARY KEY,
             client_id VARCHAR(64) NOT NULL REFERENCES oauth_clients(client_id) ON DELETE CASCADE,
             user_id CHAR(32) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            user_token_version INTEGER,
             redirect_uri TEXT NOT NULL,
             scope TEXT NOT NULL,
             code_challenge VARCHAR(128) NOT NULL,
@@ -1397,6 +1402,224 @@ def test_confidential_client_expired_code_and_dcr_bounds(
     sqlite_db.commit()
     after_logout = now + timedelta(seconds=20)
     assert resolve_bearer_token(tok.access_token, sqlite_db, now=after_logout) is None
+
+
+def test_oauth_pending_codes_do_not_survive_logout(sqlite_db: Session) -> None:
+    password = "LocalOAuthFixture2026!"
+    user = _create_user(sqlite_db, password=password)
+    verifier = "TrailForge_Synthetic_OAuth_Verifier_ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    redirect_uri = "https://oauth-client.example.test/callback"
+
+    with TestClient(_build_test_app(sqlite_db), follow_redirects=False) as client:
+        registration = client.post(
+            "/api/oauth/register",
+            json={
+                "client_name": "Offline OAuth fixture",
+                "redirect_uris": [redirect_uri],
+                "grant_types": ["authorization_code", "refresh_token"],
+            },
+        )
+        assert registration.status_code == 201
+        client_id = registration.json()["client_id"]
+        authorize_params = {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": SCOPE_READ,
+            "code_challenge": compute_pkce_s256(verifier),
+            "code_challenge_method": "S256",
+        }
+
+        def sign_in() -> None:
+            response = client.post(
+                "/api/auth/login", json={"email": user.email, "password": password}
+            )
+            assert response.status_code == 200
+
+        def approve() -> str:
+            consent = client.get("/api/oauth/authorize", params=authorize_params)
+            assert consent.status_code == 200
+            approval = client.post(
+                "/api/oauth/authorize",
+                data={
+                    **authorize_params,
+                    "action": "consent",
+                    "decision": "approve",
+                    "csrf_token": _extract_csrf(consent.text),
+                },
+            )
+            assert approval.status_code == 302
+            return parse_qs(urlsplit(approval.headers["location"]).query)["code"][0]
+
+        def exchange(code: str):
+            return client.post(
+                "/api/oauth/token",
+                data={
+                    "grant_type": "authorization_code",
+                    "client_id": client_id,
+                    "redirect_uri": redirect_uri,
+                    "code": code,
+                    "code_verifier": verifier,
+                },
+            )
+
+        sign_in()
+        old_grant = exchange(approve())
+        assert old_grant.status_code == 200
+        old_tokens = old_grant.json()
+        latest_pending = approve()
+        pending_row = sqlite_db.get(OAuthAuthorizationCode, hash_token(latest_pending))
+        assert pending_row is not None
+        assert pending_row.user_token_version == user.token_version
+
+        legacy_pending = approve()
+        legacy_row = sqlite_db.get(OAuthAuthorizationCode, hash_token(legacy_pending))
+        assert legacy_row is not None
+        legacy_row.user_token_version = None
+        sqlite_db.commit()
+        legacy_exchange = exchange(legacy_pending)
+        assert legacy_exchange.status_code == 400
+        assert legacy_exchange.json()["error"] == "invalid_grant"
+        assert client.get(
+            "/mcp/auth", headers={"Authorization": f"Bearer {old_tokens['access_token']}"}
+        ).status_code == 200
+
+        legacy_used = approve()
+        legacy_grant = exchange(legacy_used)
+        assert legacy_grant.status_code == 200
+        legacy_used_row = sqlite_db.get(OAuthAuthorizationCode, hash_token(legacy_used))
+        assert legacy_used_row is not None
+        legacy_used_row.user_token_version = None
+        sqlite_db.commit()
+        legacy_replay = exchange(legacy_used)
+        assert legacy_replay.status_code == 400
+        assert legacy_replay.json()["error"] == "invalid_grant"
+        legacy_access = legacy_grant.json()["access_token"]
+        assert client.get(
+            "/mcp/auth", headers={"Authorization": f"Bearer {legacy_access}"}
+        ).status_code == 401
+        assert client.get(
+            "/mcp/auth", headers={"Authorization": f"Bearer {old_tokens['access_token']}"}
+        ).status_code == 200
+
+        assert client.post("/api/auth/logout").status_code == 200
+        sign_in()
+        stale_exchange = exchange(latest_pending)
+        assert stale_exchange.status_code == 400
+        assert stale_exchange.json()["error"] == "invalid_grant"
+        assert client.get(
+            "/mcp/auth", headers={"Authorization": f"Bearer {old_tokens['access_token']}"}
+        ).status_code == 401
+        refresh_request = {
+            "grant_type": "refresh_token",
+            "client_id": client_id,
+            "refresh_token": old_tokens["refresh_token"],
+        }
+        denied_refresh = client.post("/api/oauth/token", data=refresh_request)
+        assert denied_refresh.status_code == 400
+        assert denied_refresh.json()["error"] == "invalid_grant"
+
+        approved = exchange(approve())
+        assert approved.status_code == 200
+        refresh_request["refresh_token"] = approved.json()["refresh_token"]
+        rotated = client.post("/api/oauth/token", data=refresh_request)
+        assert rotated.status_code == 200
+        assert rotated.json()["refresh_token"] != refresh_request["refresh_token"]
+        assert rotated.json()["scope"] == SCOPE_READ
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("revoke_first", [True, False], ids=["revoke-first", "mint-first"])
+@pytest.mark.parametrize("mint_via", ["code", "refresh"])
+@pytest.mark.parametrize("revoke_via", ["logout", "disconnect"])
+def test_oauth_minting_serializes_with_account_revocation(
+    postgis_engine: Engine, revoke_first: bool, mint_via: str, revoke_via: str,
+) -> None:
+    session_factory = sessionmaker(bind=postgis_engine, expire_on_commit=False)
+    verifier = "TrailForge_PostgreSQL_Verifier_ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    redirect_uri = "https://oauth-client.example.test/callback"
+    with session_factory() as setup:
+        user = _create_user(setup, email=f"oauth-{uuid.uuid4().hex}@example.test")
+        registration = register_oauth_client(
+            setup,
+            client_name="PostgreSQL OAuth fixture",
+            redirect_uris=[redirect_uri],
+            grant_types=["authorization_code", "refresh_token"],
+        )
+        user_id = user.id
+        client_id = registration.client.client_id
+        params = validate_authorize_request(
+            setup,
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            response_type="code",
+            scope=SCOPE_READ,
+            code_challenge=compute_pkce_s256(verifier),
+            code_challenge_method="S256",
+        )
+        exchange_params = {
+            "code": issue_authorization_code(setup, params=params, user=user),
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "code_verifier": verifier,
+        }
+        initial = (
+            exchange_authorization_code(setup, **exchange_params) if mint_via == "refresh" else None
+        )
+
+    def mint(db: Session, *, commit: bool = True):
+        if initial is not None:
+            return refresh_oauth_token(
+                db, client_id=client_id, refresh_token=initial.refresh_token, commit=commit
+            )
+        return exchange_authorization_code(db, **exchange_params, commit=commit)
+
+    def revoke(db: Session) -> None:
+        if revoke_via == "logout":
+            db.execute(
+                sa.update(User)
+                .where(User.id == user_id)
+                .values(token_version=User.token_version + 1)
+            )
+        else:
+            assert revoke_user_oauth_grant(
+                db, user_id=user_id, client_id=client_id, commit=False
+            ) == 1
+
+    try:
+        with session_factory() as revoker, session_factory() as minter:
+            if revoke_first:
+                revoke(revoker)
+                minter.execute(text("SET LOCAL lock_timeout = '200ms'"))
+                with pytest.raises(OperationalError) as blocked:
+                    mint(minter)
+                assert isinstance(blocked.value.orig, LockNotAvailable)
+                minter.rollback()
+                revoker.commit()
+
+                with pytest.raises(OAuthError) as denied:
+                    mint(minter)
+            else:
+                tokens = mint(minter, commit=False)
+                revoker.execute(text("SET LOCAL lock_timeout = '200ms'"))
+                with pytest.raises(OperationalError) as blocked:
+                    revoke(revoker)
+                assert isinstance(blocked.value.orig, LockNotAvailable)
+                revoker.rollback()
+                minter.commit()
+                revoke(revoker)
+                revoker.commit()
+
+                assert resolve_bearer_token(tokens.access_token, revoker) is None
+                with pytest.raises(OAuthError) as denied:
+                    refresh_oauth_token(
+                        revoker, client_id=client_id, refresh_token=tokens.refresh_token
+                    )
+            assert denied.value.error == "invalid_grant"
+    finally:
+        with session_factory.begin() as cleanup:
+            cleanup.execute(sa.delete(User).where(User.id == user_id))
+            cleanup.execute(sa.delete(OAuthClient).where(OAuthClient.client_id == client_id))
 
 
 def test_public_origin_proxy_header_trust(monkeypatch: pytest.MonkeyPatch) -> None:

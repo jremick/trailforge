@@ -113,6 +113,7 @@ class OAuthAuthorizationCode(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
+    user_token_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     redirect_uri: Mapped[str] = mapped_column(Text, nullable=False)
     scope: Mapped[str] = mapped_column(Text, nullable=False)
     code_challenge: Mapped[str] = mapped_column(String(128), nullable=False)

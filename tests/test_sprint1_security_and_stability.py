@@ -452,6 +452,7 @@ def test_sec_h5_and_m2_oauth_login_nonce_cookie_and_strict_json_types() -> None:
                 code_hash VARCHAR(64) PRIMARY KEY,
                 client_id VARCHAR(64) NOT NULL REFERENCES oauth_clients(client_id),
                 user_id CHAR(32) NOT NULL REFERENCES users(id),
+                user_token_version INTEGER,
                 redirect_uri TEXT NOT NULL,
                 scope TEXT NOT NULL,
                 code_challenge VARCHAR(128) NOT NULL,
