@@ -106,6 +106,12 @@ describe("Cloudflare R2 PMTiles, pack assets & VITE_API_BASE_URL resolution", ()
     expect(buildOfflinePackTileCachePath("australian-alps", "terrain")).toBe(
       "/api/packs/australian-alps/tiles/terrain.pmtiles"
     );
+    expect(buildOfflinePackTileCachePath("australian-alps", "vector", "a1b2c3d4")).toBe(
+      "/api/packs/australian-alps/tiles/a1b2c3d4/vector.pmtiles"
+    );
+    expect(buildOfflinePackTileCachePath("vic/alps", "terrain", "gen 1")).toBe(
+      "/api/packs/vic%2Falps/tiles/gen%201/terrain.pmtiles"
+    );
 
     // Protocol-relative URLs (//evil.example/...) must be rejected and fall back safely
     expect(

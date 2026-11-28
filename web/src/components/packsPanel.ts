@@ -272,7 +272,7 @@ export class OfflinePacksPanel {
                   ? canBuild
                     ? `<button type="button" class="tf-btn-primary" data-build-pack="${escapeHtml(region.region_id)}" ${isBuilding || !this.state.online ? "disabled" : ""}>${uiIcon("sliders", 13)}<span>${isBuilding ? "Building…" : "Build pack"}</span></button>`
                     : `<span class="tf-pack-admin-note">Not yet built by instance admin</span>`
-                  : `<button type="button" class="tf-btn-primary" data-download-pack="${escapeHtml(region.region_id)}" ${isDownloading || !this.state.online ? "disabled" : ""}>${uiIcon(cached ? "refresh" : "download", 13)}<span>${cached ? "Update offline copy" : "Download offline"}</span></button>`
+                  : `<button type="button" class="tf-btn-primary" data-download-pack="${escapeHtml(region.region_id)}" ${this.state.downloadingRegionId !== null || !this.state.online ? "disabled" : ""}>${uiIcon(cached ? "refresh" : "download", 13)}<span>${cached ? "Update offline copy" : "Download offline"}</span></button>`
               }
               ${
                 cached

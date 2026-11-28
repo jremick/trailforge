@@ -9,6 +9,7 @@ import {
 } from "./exporters";
 import {
   MemoryOfflineBackend,
+  clearOfflinePackMemoryCache,
   downloadRegionalPackToDevice,
   fnv1a32,
   getDownloadedPack,
@@ -810,6 +811,144 @@ describe("offline pack replacement", () => {
       "https://api.example.test/api/tiles/manifest.json",
       expect.any(Object)
     );
+  });
+
+  it("rejects stale service-worker cache hits and cleanly upgrades a legacy unversioned pack", async () => {
+    const backend = new MemoryOfflineBackend();
+    const tiles = new Map<string, string>();
+    const cache = {
+      put: vi.fn(async (key: string, response: Response) => { tiles.set(key, await response.text()); }),
+      delete: vi.fn(async (key: string | Request) => tiles.delete(
+        typeof key === "string" ? key : new URL(key.url).pathname
+      )),
+      keys: vi.fn(async () => Array.from(tiles.keys(), (key) => new Request(`https://app.example.test${key}`))),
+    };
+    setOfflineBackendForTesting(backend);
+    vi.stubGlobal("caches", { open: async () => cache });
+
+    const legacyVector = `/api/packs/${regionId}/tiles/vector.pmtiles`;
+    const legacyTerrain = `/api/packs/${regionId}/tiles/terrain.pmtiles`;
+    const legacyTrack = {
+      track_id: trackId,
+      name: "Alps Loop Legacy",
+      state: "VIC",
+      total_length_m: 600,
+      coords: [[148.1, -36.6], [148.11, -36.61]],
+      closure_status: "seasonal",
+    };
+    const legacyRecord = {
+      region_id: regionId,
+      name: "Australian Alps",
+      version: "legacy",
+      downloaded_at: "2026-11-26T00:00:00Z",
+      snapshot_format: "sharded_v2" as const,
+      shard_count: 1,
+      total_size_bytes: 1234,
+      track_count: 1,
+      segment_count: 1,
+      poi_count: 0,
+      bbox: [148, -37, 149, -36] as [number, number, number, number],
+      vector_pmtiles_url: legacyVector,
+      terrain_pmtiles_url: legacyTerrain,
+      has_vector_pmtiles: true,
+      has_terrain_pmtiles: true,
+      snowline_bands_m: [1000],
+      attributions: [],
+      sha256_verified: true,
+    };
+    await backend.put("packs", regionId, legacyRecord);
+    await backend.put("snapshots", regionId, {
+      schema_version: "trailforge_pack_snapshot_v2",
+      region_id: regionId,
+      version: "legacy",
+      shard_count: 1,
+      tracks: [legacyTrack],
+    });
+    await backend.put("pack_shards", `${regionId}:0`, await gzipJson({
+      schema_version: "trailforge_pack_shard_v2",
+      region_id: regionId,
+      shard_index: 0,
+      tracks: { [trackId]: legacyTrack },
+    }));
+    tiles.set(legacyVector, "legacy vector");
+    tiles.set(legacyTerrain, "legacy terrain");
+    setActiveOfflinePackId(regionId);
+
+    const b = await packFixture("B", 1);
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.endsWith("/B/vector.pmtiles")) {
+        return new Response("vector B", {
+          status: 200,
+          headers: { "X-TrailForge-Offline-Cache": "HIT" },
+        });
+      }
+      return b.respond(url);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(downloadRegionalPackToDevice(b.region)).rejects.toThrow(/Reload TrailForge/i);
+    expect(await getDownloadedPack(regionId)).toEqual(legacyRecord);
+    expect((await getOfflineTrackDetail(trackId))?.name).toBe("Alps Loop Legacy");
+    expect(tiles.get(legacyVector)).toBe("legacy vector");
+    expect(tiles.get(legacyTerrain)).toBe("legacy terrain");
+    expect(await backend.get("snapshots", regionId)).not.toBeNull();
+    expect(await backend.get("pack_shards", `${regionId}:0`)).not.toBeNull();
+
+    fetchMock.mockImplementation(async (url: string) => b.respond(url));
+    const upgraded = await downloadRegionalPackToDevice(b.region);
+    expect(upgraded.storage_generation).toMatch(/^[a-f0-9]{32}$/);
+    expect((await getOfflineTrackDetail(trackId))?.name).toBe("Alps Loop B");
+    expect(await backend.get("snapshots", regionId)).toBeNull();
+    expect(await backend.get("pack_shards", `${regionId}:0`)).toBeNull();
+    expect(tiles.has(legacyVector)).toBe(false);
+    expect(tiles.has(legacyTerrain)).toBe(false);
+    expect(tiles.get(upgraded.vector_pmtiles_url!)).toBe("vector B");
+    expect(tiles.get(upgraded.terrain_pmtiles_url!)).toBe("terrain B");
+    expect(tiles.size).toBe(2);
+  });
+
+  it("retries track detail reads against a newly installed generation when the prior shard is removed mid-read", async () => {
+    const { b, backend, previous } = await setupReplacement();
+    const origGet = backend.get.bind(backend);
+    let swapped = false;
+    const getSpy = vi.spyOn(backend, "get").mockImplementation(async (store, key) => {
+      if (!swapped && store === "pack_shards" && key.startsWith(`${regionId}:${previous.storage_generation}:`)) {
+        swapped = true;
+        await downloadRegionalPackToDevice(b.region);
+        return null;
+      }
+      return origGet(store, key);
+    });
+
+    try {
+      const detail = await getOfflineTrackDetail(trackId);
+      expect(detail?.name).toBe("Alps Loop B");
+      expect(swapped).toBe(true);
+    } finally {
+      getSpy.mockRestore();
+    }
+  });
+
+  it("fails fast before fetching declared PMTiles when CacheStorage is unavailable", async () => {
+    const { b, fetchMock, previous } = await setupReplacement();
+    vi.stubGlobal("caches", undefined);
+    fetchMock.mockClear();
+
+    await expect(downloadRegionalPackToDevice(b.region)).rejects.toThrow(
+      /Offline tile storage is unavailable/i
+    );
+    const fetchedUrls = fetchMock.mock.calls.map(([url]) => String(url));
+    expect(fetchedUrls.some((url) => url.endsWith(".pmtiles"))).toBe(false);
+    expect(await getDownloadedPack(regionId)).toEqual(previous);
+  });
+
+  it("clears in-memory snapshot cache when notified of another tab's removal", async () => {
+    const { backend, previous } = await setupReplacement();
+    expect((await getOfflineTrackDetail(trackId))?.name).toBe("Alps Loop A");
+
+    await backend.delete("snapshots", `${regionId}:${previous.storage_generation}`);
+    clearOfflinePackMemoryCache();
+    expect(await getOfflineTrackDetail(trackId)).toBeNull();
   });
 });
 

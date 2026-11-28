@@ -270,7 +270,7 @@ class IndexedDbOfflineBackend implements OfflineKvBackend {
       const tx = db.transaction(["packs", "snapshots", "pack_shards"], "readonly");
       const snapshots = tx.objectStore("snapshots");
       const prefix = `${regionId}:`;
-      const namespaced = IDBKeyRange.bound(prefix, `${prefix}\uffff`);
+      const namespaced = IDBKeyRange.bound(prefix, `${regionId};`, false, true);
       const record = tx.objectStore("packs").get(regionId);
       const pending = snapshots.get(packOperationKey(regionId));
       const snapshotKeys = snapshots.getAllKeys(namespaced);
@@ -297,16 +297,32 @@ class IndexedDbOfflineBackend implements OfflineKvBackend {
       const packs = tx.objectStore("packs");
       const opKey = packOperationKey(regionId);
       let result: { previous: DownloadedPackRecord | null } | null = null;
+      const abortWith = (err: unknown): void => {
+        try {
+          tx.abort();
+        } catch {
+          // Transaction may already be aborting.
+        }
+        reject(err);
+      };
       const pending = snapshots.get(opKey);
       pending.onsuccess = () => {
-        if (pending.result !== operation) return;
-        const current = packs.get(regionId);
-        current.onsuccess = () => {
-          if (record) packs.put(record, regionId);
-          else if (record === null) packs.delete(regionId);
-          snapshots.delete(opKey);
-          result = { previous: current.result ?? null };
-        };
+        try {
+          if (pending.result !== operation) return;
+          const current = packs.get(regionId);
+          current.onsuccess = () => {
+            try {
+              if (record) packs.put(record, regionId);
+              else if (record === null) packs.delete(regionId);
+              snapshots.delete(opKey);
+              result = { previous: current.result ?? null };
+            } catch (err) {
+              abortWith(err);
+            }
+          };
+        } catch (err) {
+          abortWith(err);
+        }
       };
       tx.oncomplete = () => resolve(result);
       tx.onabort = () => reject(tx.error ?? new Error("Offline pack activation aborted"));
@@ -793,6 +809,10 @@ async function reclaimAbandonedPackStorage(backend: OfflineKvBackend, regionId: 
   if (drops.length > 0) notifySwInvalidatePackCache(regionId);
 }
 
+export function clearOfflinePackMemoryCache(regionId?: string): void {
+  clearSnapshotMemCache(regionId);
+}
+
 function notifyPackChange(regionId: string, operation: string): void {
   clearSnapshotMemCache(regionId);
   try {
@@ -867,11 +887,11 @@ export async function downloadRegionalPackToDevice(
     terrain_pmtiles_url: buildOfflinePackTileCachePath(regionId, "terrain", generation),
   };
   await backend.put("snapshots", packOperationKey(regionId), generation);
-  await reclaimAbandonedPackStorage(backend, regionId);
 
   let record: DownloadedPackRecord;
   let previous: DownloadedPackRecord | null;
   try {
+    await reclaimAbandonedPackStorage(backend, regionId);
     const manifestUrl = resolvePackAssetUrl(region.manifest_url, `/api/packs/${rid}/manifest.json`);
     const snapshotUrl = resolvePackAssetUrl(region.snapshot_url, `/api/packs/${rid}/snapshot.json`);
 
@@ -966,6 +986,9 @@ export async function downloadRegionalPackToDevice(
       const filename = `${kind}.pmtiles`;
       const declared = declaredAvailable === true || Boolean(findManifestFileEntry(manifest, filename));
       if (declaredAvailable === false && !declared) return null;
+      if (declared && typeof caches === "undefined") {
+        throw new Error("Offline tile storage is unavailable in this browser");
+      }
       const livePath = buildOfflinePackTileCachePath(regionId, kind);
       const tileUrl = resolvePackAssetUrl(offeredUrl, livePath);
       onProgress?.({ stage, pct });
@@ -1061,7 +1084,7 @@ async function readPackSnapshot<T>(
   pack: DownloadedPackRecord,
   read: (pack: DownloadedPackRecord, snapshot: OfflinePackSnapshot) => Promise<T | null>
 ): Promise<T | null> {
-  while (true) {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
     const snapshot = await loadSnapshotCached(pack);
     const result = snapshot ? await read(pack, snapshot) : null;
     if (result !== null) return result;
@@ -1072,6 +1095,7 @@ async function readPackSnapshot<T>(
     if (!latest || latest.storage_generation === pack.storage_generation) return null;
     pack = latest;
   }
+  return null;
 }
 
 async function resolvePreferredPackAndSnapshot(regionId?: string | null): Promise<{
@@ -1089,7 +1113,7 @@ export async function getOfflineTileManifest(
 ): Promise<TileManifestResponse | null> {
   const pack = await resolvePreferredPack(regionId);
   if (!pack) return null;
-  const origin = typeof window === "undefined" ? "" : window.location.origin;
+  const origin = typeof window === "undefined" ? "" : (window.location?.origin ?? "");
   const cacheUrl = (url: string): string => /^https?:\/\//.test(origin)
     ? new URL(url, origin).href
     : url;
