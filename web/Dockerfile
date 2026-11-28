@@ -17,6 +17,11 @@ RUN npm run build
 FROM nginxinc/nginx-unprivileged:1.27-alpine AS runtime
 
 COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY --chmod=755 nginx-ingress.sh /docker-entrypoint.d/19-trailforge-ingress.sh
+USER root
+RUN install -d -m 700 -o 101 -g 101 /etc/nginx/trailforge-ingress \
+    && install -m 600 -o 101 -g 101 /dev/null /etc/nginx/trailforge-ingress/ingress.conf
+USER 101
 COPY --from=builder /app/dist /usr/share/nginx/html
 
 EXPOSE 8080

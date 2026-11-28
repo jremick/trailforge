@@ -1,0 +1,12 @@
+# Optional private ingress for Caddy or Tailscale Serve on a Linux Docker host.
+# Provision the directory with owner/group permissions before applying this override.
+services:
+  web:
+    environment:
+      TRAILFORGE_NGINX_PROXY_SOCKET: "true"
+    volumes:
+      - type: bind
+        source: ${TRAILFORGE_PROXY_SOCKET_DIR:-/var/lib/trailforge-ingress}
+        target: /run/trailforge-ingress
+        bind:
+          create_host_path: false

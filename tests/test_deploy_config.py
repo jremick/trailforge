@@ -283,6 +283,244 @@ def test_nginx_tile_and_pack_proxies_enforce_per_ip_limits_and_bounded_buffering
 
 
 @requires_repo_checkout
+def test_download_proxy_trust_is_opt_in_and_packaged_for_supported_ingress() -> None:
+    nginx = (REPO_ROOT / "web" / "nginx.conf").read_text(encoding="utf-8")
+    dockerfile = (REPO_ROOT / "web" / "Dockerfile").read_text(encoding="utf-8")
+    assert "real_ip_header X-Forwarded-For;" in nginx
+    assert "real_ip_recursive off;" in nginx
+    assert "set_real_ip_from" not in nginx
+    assert "include /etc/nginx/trailforge-ingress/ingress.conf;" in nginx
+
+    # Trust-boundary maps must only trust forwarded headers/scheme on the private Unix socket.
+    assert 'map $http_x_forwarded_for $trailforge_tcp_forwarded_for {' in nginx
+    assert 'default "$http_x_forwarded_for, $realip_remote_addr";' in nginx
+    assert 'map $realip_remote_addr $trailforge_forwarded_for {' in nginx
+    assert '"unix:" $remote_addr;' in nginx
+    assert "default $trailforge_tcp_forwarded_for;" in nginx
+    assert 'map "$realip_remote_addr|$http_x_forwarded_host" $trailforge_upstream_host {' in nginx
+    assert '"~^unix:\\|(?<trailforge_socket_host>[A-Za-z0-9.-]+(?::[0-9]+)?)$"' in nginx
+    assert 'map "$realip_remote_addr|$http_x_forwarded_proto" $trailforge_upstream_proto {' in nginx
+    proto_map = nginx.split(
+        'map "$realip_remote_addr|$http_x_forwarded_proto" $trailforge_upstream_proto {', 1
+    )[1].split("}", 1)[0]
+    assert "default $scheme;" in proto_map
+    assert '"unix:|https" https;' in proto_map
+    assert "~" not in proto_map
+
+    # Every proxied download/API block must forward the normalized client chain.
+    assert nginx.count("proxy_set_header X-Forwarded-For $trailforge_forwarded_for;") >= 6
+    assert "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;" not in nginx
+
+    assert "/docker-entrypoint.d/19-trailforge-ingress.sh" in dockerfile
+    assert dockerfile.index("USER root") < dockerfile.index("USER 101")
+    assert "-m 700 -o 101 -g 101 /etc/nginx/trailforge-ingress" in dockerfile
+    assert "-m 600 -o 101 -g 101 /dev/null /etc/nginx/trailforge-ingress/ingress.conf" in dockerfile
+
+    for name in ("docker-compose.yml", "docker-compose.ghcr.yml"):
+        web = _load_yaml(REPO_ROOT / name)["services"]["web"]
+        assert web["ports"] == ["127.0.0.1:${WEB_PORT:-5173}:8080"]
+        assert "TRAILFORGE_NGINX_PROXY_SOCKET" not in _env_keys(web)
+        assert "TRAILFORGE_NGINX_TRUSTED_PROXY_IP" not in _env_keys(web)
+
+    socket_web = _load_yaml(REPO_ROOT / "deploy" / "download-socket-compose.override.yml")[
+        "services"
+    ]["web"]
+    assert socket_web["environment"] == {"TRAILFORGE_NGINX_PROXY_SOCKET": "true"}
+    assert socket_web["volumes"][0]["target"] == "/run/trailforge-ingress"
+    assert socket_web["volumes"][0]["bind"]["create_host_path"] is False
+
+    traefik_path = REPO_ROOT / "deploy" / "traefik-compose.override.yml"
+    traefik_raw = traefik_path.read_text(encoding="utf-8")
+    usage_header = traefik_raw.split("# Prerequisites:", 1)[0]
+    assert "TRAILFORGE_TRAEFIK_PROXY_IP=" in usage_header
+    traefik = _load_yaml(traefik_path)
+    traefik_ip = traefik["services"]["web"]["environment"]["TRAILFORGE_NGINX_TRUSTED_PROXY_IP"]
+    assert traefik_ip.startswith("${TRAILFORGE_TRAEFIK_PROXY_IP:?")
+
+    readme = (REPO_ROOT / "deploy" / "README.md").read_text(encoding="utf-8")
+    upgrades_section = readme.split("## Low-Downtime Upgrades & Rollbacks", 1)[1]
+    assert "TRAILFORGE_TRAEFIK_PROXY_IP" in upgrades_section
+
+
+@requires_repo_checkout
+def test_nginx_ingress_entrypoint_script_validation_and_socket_recovery(tmp_path: Path) -> None:
+    import os
+    import shutil
+    import socket
+    import subprocess
+    import tempfile
+    import threading
+
+    script_src = REPO_ROOT / "web" / "nginx-ingress.sh"
+    assert script_src.is_file()
+
+    # Syntax-check the unmodified POSIX entrypoint script.
+    syntax = subprocess.run(["sh", "-n", str(script_src)], capture_output=True, text=True)
+    assert syntax.returncode == 0, syntax.stderr
+
+    # Create a temp-path copy of the script (production keeps hardcoded paths with no env override).
+    # Use a short temp path for socket_dir so AF_UNIX bind stays well under macOS's 104-byte cap.
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="tf_sock_") as short_dir:
+        config_file = tmp_path / "ingress.conf"
+        config_file.write_text("", encoding="utf-8")
+        socket_dir = Path(short_dir)
+        os.chmod(socket_dir, 0o700)
+
+        test_script = tmp_path / "nginx-ingress.test.sh"
+        raw = script_src.read_text(encoding="utf-8")
+        patched = raw.replace(
+            "config=/etc/nginx/trailforge-ingress/ingress.conf", f"config={config_file}", 1
+        ).replace(
+            "socket_dir=/run/trailforge-ingress", f"socket_dir={socket_dir}", 1
+        )
+        assert patched != raw
+        test_script.write_text(patched, encoding="utf-8")
+        os.chmod(test_script, 0o755)
+
+        # Provide a portable `stat -c '%a'` shim when running on BSD/macOS where stat lacks `-c`.
+        shim_bin = tmp_path / "bin"
+        shim_bin.mkdir()
+        gnu_stat_check = subprocess.run(
+            ["stat", "-c", "%a", str(socket_dir)], capture_output=True, text=True
+        )
+        if gnu_stat_check.returncode != 0:
+            stat_shim = shim_bin / "stat"
+            stat_shim.write_text(
+                "#!/bin/sh\n"
+                'if [ "$1" = "-c" ] && [ "$2" = "%a" ]; then\n'
+                '  exec /usr/bin/stat -f "%Lp" "$3"\n'
+                "fi\n"
+                'exec /usr/bin/stat "$@"\n',
+                encoding="utf-8",
+            )
+            os.chmod(stat_shim, 0o755)
+
+        def run_ingress(**env_overrides: str) -> subprocess.CompletedProcess[str]:
+            env = {
+                "PATH": f"{shim_bin}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                **env_overrides,
+            }
+            return subprocess.run(
+                ["sh", str(test_script)], env=env, capture_output=True, text=True
+            )
+
+        # 1. Default (disabled) leaves config empty; disabling later truncates stale config.
+        assert run_ingress().returncode == 0
+        assert config_file.read_text(encoding="utf-8") == ""
+
+        res = run_ingress(TRAILFORGE_NGINX_PROXY_SOCKET="yes")
+        assert res.returncode != 0
+
+        # 2. Unsafe socket directory permissions must be rejected (0755, 0701, 0600).
+        for bad_mode in (0o755, 0o701, 0o600):
+            os.chmod(socket_dir, bad_mode)
+            try:
+                res = run_ingress(TRAILFORGE_NGINX_PROXY_SOCKET="true")
+                assert res.returncode != 0, f"Mode {oct(bad_mode)} unexpectedly succeeded"
+            finally:
+                os.chmod(socket_dir, 0o700)
+
+        # 3. Safe socket directory modes (0700, 0710) write the unix listener and real_ip directive.
+        for ok_mode in (0o700, 0o710):
+            os.chmod(socket_dir, ok_mode)
+            res = run_ingress(TRAILFORGE_NGINX_PROXY_SOCKET="true")
+            assert res.returncode == 0, res.stderr
+            assert config_file.read_text(encoding="utf-8") == (
+                f"listen unix:{socket_dir}/web.sock;\nset_real_ip_from unix:;\n"
+            )
+        os.chmod(socket_dir, 0o700)
+
+        # Non-socket entry at web.sock is rejected.
+        sock_path = socket_dir / "web.sock"
+        sock_path.write_text("not a socket", encoding="utf-8")
+        res = run_ingress(TRAILFORGE_NGINX_PROXY_SOCKET="true")
+        assert res.returncode != 0
+        sock_path.unlink()
+
+        # Stale vs live Unix socket handling (when curl is available).
+        if shutil.which("curl"):
+            # Stale dead socket (bound then closed without unlink) is probed and cleaned up.
+            stale_srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            stale_srv.bind(str(sock_path))
+            stale_srv.close()
+            assert sock_path.exists()
+            res = run_ingress(TRAILFORGE_NGINX_PROXY_SOCKET="true")
+            assert res.returncode == 0, res.stderr
+            assert not sock_path.exists()
+
+            # Live listening socket must NOT be unlinked and must cause startup failure.
+            live_srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            live_srv.bind(str(sock_path))
+            live_srv.listen(1)
+
+            def _accept_once() -> None:
+                try:
+                    conn, _ = live_srv.accept()
+                    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    conn.close()
+                except OSError:
+                    pass
+
+            t = threading.Thread(target=_accept_once, daemon=True)
+            t.start()
+            try:
+                res = run_ingress(TRAILFORGE_NGINX_PROXY_SOCKET="true")
+                assert res.returncode != 0
+                assert "already in use" in res.stderr
+                assert sock_path.exists()
+            finally:
+                live_srv.close()
+                t.join(timeout=2)
+                if sock_path.exists():
+                    sock_path.unlink()
+
+        # 4. Valid IPv4 and IPv6 literals produce exact /32 and /128 directives.
+        for ip, expected_mask in (
+            ("192.0.2.10", "32"),
+            ("0.0.0.0", "32"),
+            ("fd7a:115c:a1e0::1", "128"),
+            ("::1", "128"),
+            ("::ffff:192.0.2.10", "128"),
+            ("2001:db8:1:2:3:4:5:6", "128"),
+        ):
+            res = run_ingress(TRAILFORGE_NGINX_TRUSTED_PROXY_IP=ip)
+            assert res.returncode == 0, f"{ip} failed: {res.stderr}"
+            assert (
+                config_file.read_text(encoding="utf-8")
+                == f"set_real_ip_from {ip}/{expected_mask};\n"
+            )
+
+        # Disabling both clears previously written ingress.conf.
+        assert run_ingress().returncode == 0
+        assert config_file.read_text(encoding="utf-8") == ""
+
+        # 5. Malformed IPs, CIDRs, leading-zero octets, and injection payloads are rejected.
+        for bad_ip in (
+            "192.0.2.10/24",
+            "999.999.999.999",
+            "010.0.0.1",
+            "....",
+            "1.2.3.4.5",
+            "1.2.3",
+            ":",
+            ":::",
+            ":1",
+            "1:",
+            "1::2::3",
+            "12345::1",
+            "1:2:3",
+            "1:2:3:4:5:6:7::8",
+            "::ffff:999.0.0.1",
+            "192.0.2.10; set_real_ip_from all",
+            "all",
+            "unix:",
+        ):
+            res = run_ingress(TRAILFORGE_NGINX_TRUSTED_PROXY_IP=bad_ip)
+            assert res.returncode != 0, f"Malformed IP {bad_ip!r} unexpectedly passed"
+            assert config_file.read_text(encoding="utf-8") == ""
+
+
+@requires_repo_checkout
 def test_deploy_kit_files_https_range_and_upload_limits() -> None:
     deploy_dir = REPO_ROOT / "deploy"
     caddy_path = deploy_dir / "Caddyfile.example"
@@ -295,6 +533,9 @@ def test_deploy_kit_files_https_range_and_upload_limits() -> None:
 
     # Caddy v2 checks
     caddy = caddy_path.read_text(encoding="utf-8")
+    assert re.search(
+        r"^\s*reverse_proxy unix//var/lib/trailforge-ingress/web\.sock \{", caddy, re.M
+    )
     assert "127.0.0.1:5173" in caddy
     assert "max_size 17MB" in caddy
     assert "X-Frame-Options \"DENY\"" in caddy
