@@ -1,4 +1,4 @@
-# Cloudflare Free-Tier WAF, Rate Limiting, R2 Cache & Analytics Recipe
+# Cloudflare Free-Tier WAF, Rate Limiting, R2 Cache & Traffic Metrics
 
 This guide configures free Cloudflare edge protections in front of a public **TrailForge** instance (`https://trails.example.com` on Cloudflare Pages + `https://tiles.example.com` on Cloudflare R2 + Railway backend).
 
@@ -130,19 +130,10 @@ Open **Cloudflare Dashboard -> Caching -> Cache Rules -> Create rule**:
 
 ---
 
-## 4. Free Cookie-Free Cloudflare Web Analytics
+## 4. Edge Traffic Metrics
 
-Cloudflare Web Analytics provides real-user pageviews, referrers, countries, and Core Web Vitals for **$0** with **zero cookies and zero PII**, matching TrailForge's privacy-by-design architecture.
+The TrailForge Pages CSP permits scripts from the application origin. Keep automatic Cloudflare Web Analytics injection disabled on the Pages project and for its proxied hostname. The browser blocks the injected `static.cloudflareinsights.com` beacon under this policy. [Cloudflare Web Analytics setup](https://developers.cloudflare.com/web-analytics/get-started/) and [beacon source](https://developers.cloudflare.com/web-analytics/data-metrics/data-origin-and-collection/).
 
-### Option A: One-Click Enable on Cloudflare Pages (Recommended)
+Vite copies [`web/public/_headers`](../../web/public/_headers) to `dist/_headers`. Preserve `script-src 'self'` in custom build commands and response-header rules. Check the delivered CSP at `/` and a nested frontend route after deployment. [Cloudflare Pages custom headers](https://developers.cloudflare.com/pages/configuration/headers/).
 
-1. Open **Cloudflare Dashboard -> Workers & Pages -> `trailforge` Pages project -> Metrics**.
-2. Click **Enable Web Analytics**.
-3. Cloudflare automatically injects the lightweight, cookie-free beacon on HTML pages served by Pages without modifying `web/` source files.
-
-### Option B: Zone-Wide Automatic Setup
-
-1. Open **Cloudflare Dashboard -> Analytics & Logs -> Web Analytics -> Add a site**.
-2. Enter your proxied hostname (`trails.example.com`) and select **Automatic setup**.
-
-Pair Cloudflare Web Analytics (frontend pageviews & edge hits) with TrailForge's built-in **Admin Console** (`GET /api/admin/stats`) to monitor 24h/7d API route counts, error rates, `429` rate-limit hits, active accounts/invites, and `/data/uploads` disk quota usage from one place.
+Use **Analytics → HTTP Traffic** on the proxied Cloudflare domain for edge request volume and bandwidth. TrailForge’s **Admin Console** (`GET /api/admin/stats`) reports API requests and errors, `429` rate-limit hits, active accounts and invites, and `/data/uploads` disk usage. [Cloudflare zone analytics](https://developers.cloudflare.com/analytics/account-and-zone-analytics/zone-analytics/).
