@@ -235,7 +235,7 @@ def test_checkpoint_c_full_v1_pipeline_end_to_end(
                 tracks = client.get("/api/tracks", headers=headers).json()
                 davies = next(t for t in tracks if t["name"] == "Davies Plain Track Lower")
                 davies_id = davies["track_id"]
-                assert davies["sample_count"] >= 6
+                assert davies["sample_count"] == 5
                 assert davies["live_grade"] in ("Easy", "Medium", "Hard", "Extreme")
                 assert davies["confidence_level"] in ("medium", "high")
 
@@ -262,7 +262,7 @@ def test_checkpoint_c_full_v1_pipeline_end_to_end(
                 assert det["baseline_breakdown"] is not None
                 assert det["live_breakdown"] is not None
                 assert det["live_grade"] in ("Easy", "Medium", "Hard", "Extreme")
-                assert det["sample_count"] >= 6
+                assert det["sample_count"] == 5
                 assert det["avg_speed_kmh"] is not None and det["avg_speed_kmh"] > 0
                 assert det["est_duration_min"] is not None and det["est_duration_min"] > 0
                 assert all(cell["count"] == 0 for cell in det["vehicle_class_split"].values())

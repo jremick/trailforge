@@ -15,6 +15,7 @@ from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from trailforge.auth.community_trust import revoke_community_trust
 from trailforge.auth.dependencies import require_admin
 from trailforge.auth.invites import (
     classify_invite_status,
@@ -561,12 +562,12 @@ def update_admin_user(
                 select(User.id)
                 .where(User.role == "admin", User.is_active.is_(True))
                 .order_by(User.id.asc())
-                .with_for_update()
+                .with_for_update(key_share=True)
             )
             .scalars()
             .all()
         )
-        db.refresh(target)
+        db.refresh(target, with_for_update={"key_share": True})
         was_active_admin = target.role == "admin" and bool(target.is_active)
         if was_active_admin and len(locked_admin_ids) <= 1:
             raise HTTPException(
@@ -574,7 +575,9 @@ def update_admin_user(
                 detail="Cannot suspend or demote the last active admin",
             )
     else:
-        db.execute(select(User.id).where(User.id == user_id).with_for_update()).scalar_one_or_none()
+        db.execute(
+            select(User.id).where(User.id == user_id).with_for_update(key_share=True)
+        ).scalar_one_or_none()
         db.refresh(target)
 
     now = datetime.now(UTC)
@@ -591,6 +594,8 @@ def update_admin_user(
     if role_changed or active_changed:
         target.token_version = int(getattr(target, "token_version", 1) or 1) + 1
     target.updated_at = now
+    if payload.is_active is False:
+        revoke_community_trust(db, target)
 
     db.commit()
     db.refresh(target)

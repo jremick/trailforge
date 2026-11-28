@@ -77,7 +77,6 @@ REPORT_TYPE_LABELS: Final[dict[ReportTypeLiteral, str]] = {
 
 STALE_FRESHNESS_THRESHOLD: Final[float] = 0.35
 MIN_RESOLVE_VOTES: Final[int] = 3
-MIN_RESOLVE_ACCOUNT_AGE: Final[timedelta] = timedelta(days=7)
 _RESOLVE_DECAY_MULTIPLIER: Final[float] = 0.8
 _OSM_WAY_RE: Final[re.Pattern[str]] = re.compile(r"^(?:way/)?(\d+)$")
 
@@ -141,10 +140,11 @@ def evaluate_report_decay(
     """Evaluate deterministic report freshness, staleness, and auto-resolution state.
 
     Freshness decays exponentially from ``last_confirmed_at or created_at`` using the
-    per-type half-life, with an additional decay factor for qualifying resolve
-    votes. Reports become stale when ``freshness_score < 0.35`` and resolve
-    automatically when at least three qualifying resolve votes outnumber confirmations (or
-    when stored ``status == "resolved"``).
+    per-type half-life, with an additional decay factor for eligible resolve
+    votes. The supplied confirmation and resolution totals count eligible votes
+    only. Reports become stale when ``freshness_score < 0.35`` and resolve when
+    at least three eligible resolve votes outnumber eligible confirmations or
+    when the stored operator status is ``"resolved"``.
     """
     half_life = get_half_life_days(report_type)
     current = _as_utc(now or datetime.now(UTC))

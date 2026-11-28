@@ -86,6 +86,7 @@ def _create_sqlite_ai_auth_schema(engine: Engine) -> None:
     ddl_statements = (
         """
         CREATE TABLE users (
+            community_trusted_at DATETIME,
             id CHAR(32) PRIMARY KEY,
             email TEXT NOT NULL UNIQUE,
             display_name TEXT NOT NULL,

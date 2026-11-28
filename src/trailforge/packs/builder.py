@@ -82,7 +82,7 @@ SNAPSHOT_FILENAME: Final[str] = "snapshot.json"
 SHARDS_DIRNAME: Final[str] = "shards"
 VECTOR_TILE_FILENAME: Final[str] = "vector.pmtiles"
 TERRAIN_TILE_FILENAME: Final[str] = "terrain.pmtiles"
-STATIC_PACK_TELEMETRY_POLICY: Final[str] = "static_v1"
+STATIC_PACK_TELEMETRY_POLICY: Final[str] = "static_v2"
 BUNDLE_FILENAME: Final[str] = "bundle.tar.gz"
 
 SNAPSHOT_FORMAT_INLINE: Final[Literal["inline_v1"]] = "inline_v1"
@@ -236,14 +236,26 @@ def _is_current_static_vector(path: Path) -> bool:
 def pack_manifest_is_current(manifest: PackManifest, revision: uuid.UUID | None) -> bool:
     if manifest.community_telemetry_policy == LIVE_FORMULA_VERSION:
         return manifest.community_telemetry_revision == revision
-    if manifest.community_telemetry_policy == STATIC_PACK_TELEMETRY_POLICY:
-        return True
-    # A legacy pack with no grades or vector tiles cannot contain trip telemetry.
-    return (
-        not manifest.vector_available
-        and VECTOR_TILE_FILENAME not in manifest.files
-        and all(manifest.counts.get(key) == 0 for key in ("tracks", "segments", "hotspots"))
+    return manifest.community_telemetry_policy == STATIC_PACK_TELEMETRY_POLICY
+
+
+def _invalidate_pack_regions(session: Session, region_ids: list[str]) -> None:
+    if not region_ids:
+        return
+    replacement = uuid.uuid4()
+    session.execute(
+        pg_insert(OfflinePackTelemetryRevision)
+        .values([{"region_id": rid, "revision": replacement} for rid in region_ids])
+        .on_conflict_do_update(
+            index_elements=[OfflinePackTelemetryRevision.region_id],
+            set_={"revision": replacement},
+        )
     )
+
+
+def invalidate_all_pack_telemetry(session: Session) -> None:
+    """Expire every downloadable pack that contains live telemetry."""
+    _invalidate_pack_regions(session, list(PACK_REGIONS))
 
 
 def invalidate_pack_telemetry(
@@ -267,16 +279,7 @@ def invalidate_pack_telemetry(
         ).exists()
         if session.scalar(select(or_(segment_hit, track_hit))):
             affected_regions.append(region.region_id)
-    if affected_regions:
-        replacement = uuid.uuid4()
-        session.execute(
-            pg_insert(OfflinePackTelemetryRevision)
-            .values([{"region_id": rid, "revision": replacement} for rid in affected_regions])
-            .on_conflict_do_update(
-                index_elements=[OfflinePackTelemetryRevision.region_id],
-                set_={"revision": replacement},
-            )
-        )
+    _invalidate_pack_regions(session, affected_regions)
 
 
 def get_packs_dir(override: Path | str | None = None) -> Path:
@@ -702,7 +705,9 @@ def _stream_region_auxiliary_sections(
     )
     if region_report_ids:
         region_report_id_strs = {str(rid) for rid in region_report_ids}
-        for rep in list_reports(session, include_resolved=False, limit=500):
+        for rep in list_reports(
+            session, include_resolved=False, include_vote_assessment=False, limit=500
+        ):
             if rep.get("id") not in region_report_id_strs:
                 continue
             if counts["reports"] > 0:
@@ -1352,7 +1357,9 @@ def _write_region_sharded_snapshot_streaming(
                     )
                     peak_score = round(float(track_grade_result.score), 1)
                 else:
-                    eff_grade = _RANK_GRADE.get(worst_rank) if worst_rank else trk.effective_grade
+                    eff_grade = _RANK_GRADE.get(worst_rank) or (
+                        trk.effective_grade if include_community else None
+                    )
                     peak_score = round(rep_score, 1) if rep_score is not None else None
 
                 computed_grade_by_track[tid] = eff_grade
@@ -1529,7 +1536,7 @@ def _write_region_sharded_snapshot_streaming(
                     "state": row.state,
                     "total_length_m": round(float(row.total_length_m or 0.0), 1),
                     "effective_grade": computed_grade_by_track.get(row.track_id)
-                    or row.effective_grade,
+                    or (row.effective_grade if include_community else None),
                     "primary_park_name": row.primary_park_name,
                     "bbox": bbox_val,
                 }

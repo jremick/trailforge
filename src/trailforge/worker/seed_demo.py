@@ -19,7 +19,7 @@ from typing import Any
 
 from geoalchemy2.shape import from_shape
 from shapely.geometry import Point
-from sqlalchemy import delete, select
+from sqlalchemy import and_, delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -136,20 +136,45 @@ def seed_demo_telemetry(
         trip_id = uuid.uuid5(uuid.NAMESPACE_URL, f"trailforge:demo:trip:{prof['tag']}")
         nonce = uuid.uuid5(uuid.NAMESPACE_URL, f"trailforge:demo:nonce:{prof['tag']}")
         chash = compute_contribution_hash(key, trip_id, nonce)
+        demo_email = f"demo-{prof['tag']}@example.invalid"
+        demo_identity = session.scalar(
+            pg_insert(User)
+            .values(
+                id=user_id,
+                email=demo_email,
+                display_name="Synthetic Demo Driver",
+                password_hash="disabled",
+                role="member",
+                is_active=True,
+                community_trusted_at=func.now(),
+            )
+            .on_conflict_do_update(
+                index_elements=[User.id],
+                where=and_(
+                    User.email == demo_email,
+                    User.display_name == "Synthetic Demo Driver",
+                    User.password_hash == "disabled",
+                    User.role == "member",
+                ),
+                set_={
+                    "is_active": True,
+                    "disabled_at": None,
+                    "community_trusted_at": func.coalesce(User.community_trusted_at, func.now()),
+                },
+            )
+            .returning(User.id)
+        )
+        if demo_identity is None:
+            raise ValueError("Synthetic demo identity belongs to an unrelated account")
         prior_trip = session.get(Trip, trip_id)
         if prior_trip is not None:
+            if prior_trip.user_id != demo_identity:
+                raise ValueError("Synthetic demo trip is already assigned to an unrelated account")
             session.execute(delete(TelemetryObservation).where(
                 TelemetryObservation.contribution_hash == trip_contribution_hash(prior_trip)
             ))
-        # Synthetic accounts cannot sign in. Their logbook placeholder is public canonical
-        # geometry, so passing a custom demo input never adds a raw GPS trace to the logbook.
-        session.execute(pg_insert(User).values(
-            id=user_id,
-            email=f"demo-{prof['tag']}@example.invalid",
-            display_name="Synthetic Demo Driver",
-            password_hash="disabled",
-            is_active=False,
-        ).on_conflict_do_nothing(index_elements=[User.id]))
+        # The active synthetic member has an unusable password. Its raw geometry field
+        # contains only a public canonical placeholder for this explicit operator fixture.
         session.execute(pg_insert(Trip).values(
             id=trip_id,
             user_id=user_id,
@@ -167,6 +192,7 @@ def seed_demo_telemetry(
                 "community_consent_confirmed": True,
                 "contribution_key_id": contribution_key_id(key),
                 "contribution_nonce": nonce,
+                "created_at": func.now(),
             },
         ))
         obs_base = ref_now - timedelta(days=int(prof["days_ago"]))

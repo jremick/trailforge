@@ -895,6 +895,9 @@ class User(Base):
         Integer, nullable=False, default=1, server_default=text("1")
     )
     disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    community_trusted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     invited_by_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     ui_preferences: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
@@ -1374,9 +1377,6 @@ class ConditionReport(Base):
     )
     confirm_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     resolve_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
-    eligible_resolve_count: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("0")
-    )
     decay_score: Mapped[float] = mapped_column(Double, nullable=False, server_default=text("1.0"))
     osm_edit_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     observed_at: Mapped[datetime] = mapped_column(
