@@ -1,6 +1,6 @@
 # Deploying TrailForge on Railway + Cloudflare (~$5–$10/mo Hard-Capped)
 
-This playbook walks through running a hardened, public-facing **TrailForge** instance on **Railway** (PostGIS + FastAPI API + background Worker) paired with **Cloudflare** (Pages frontend + Pages Function `/api/*` proxy + R2 `$0`-egress `PMTiles` & offline pack storage + Free WAF & Web Analytics).
+This playbook walks through running a hardened, public-facing **TrailForge** instance on **Railway** (PostGIS + FastAPI API + background Worker) paired with **Cloudflare** (Pages frontend + Pages Function `/api/*` proxy + R2 `$0`-egress `PMTiles` & offline pack storage + free WAF and edge traffic metrics).
 
 Anonymous visitors can browse tracks, live difficulty grades, closures, elevation profiles, and route planning freely, while account registration stays locked to **`invite_only`** and expensive compute endpoints (`POST /api/packs/*/build`, `POST /api/closures/sync`, `POST /api/grading/recompute`, `/api/admin/*`) are strictly **admin-only**.
 
@@ -12,7 +12,7 @@ Anonymous visitors can browse tracks, live difficulty grades, closures, elevatio
 | --- | --- | --- | --- |
 | Frontend PWA + `/api/*` proxy | Cloudflare Pages + Functions (Free) | **$0** | MapLibre GL JS 6 PWA, Service Worker, same-origin API proxy |
 | Vector/Terrain `PMTiles` & Offline Packs | Cloudflare R2 (Free: 10 GB, 10M reads, **$0 egress**) | **$0** | HTTP `206 Partial Content` tile streaming & `.tar.gz` downloads offloaded from Railway |
-| Edge DDoS, Rate Limiting & Analytics | Cloudflare Free WAF + Web Analytics | **$0** | Edge IP throttling, Bot Fight Mode, cookie-free traffic stats |
+| Edge DDoS, Rate Limiting & Traffic Metrics | Cloudflare Free WAF + zone analytics | **$0** | Edge IP throttling, Bot Fight Mode, request volume and bandwidth |
 | Service 1: `postgis` | Railway (`imresamu/postgis:16-3.4`, `/var/lib/postgresql/data`) | Included in Hobby | Lean PostgreSQL 16 + PostGIS 3.4 on private network |
 | Service 2: `api` | Railway (`Dockerfile` / `railway.toml` or GHCR image, `/data`) | Included in Hobby | FastAPI + Alembic + in-process rate limiter + usage metrics |
 | Service 3: `worker` | Railway (same backend image, `python -m trailforge.worker.main`) | ~$0–$5 overage | Background agency closure sync & live rainfall grading ticks |
@@ -152,13 +152,14 @@ When running `api` and `worker` on `ghcr.io/jremick/trailforge-backend:latest`, 
    *(Replace `RAILWAY_API_ORIGIN` with your Railway `api` service HTTPS origin, with no trailing slash. `ORIGIN_SHARED_SECRET` is injected as `X-TrailForge-Origin-Secret` on every proxied request so direct hits to Railway are blocked with `403`.)*
 4. Attach your custom domain `trails.example.com` to the Pages project. Same-origin `/api/*` requests now forward `CF-Connecting-IP`, `X-TrailForge-Origin-Secret`, `Cookie`, `Authorization`, and `Range` headers cleanly while preserving `Set-Cookie`, rewriting upstream `307` redirect `Location` headers back to `https://trails.example.com`, emitting global security response headers, and streaming unbuffered `206 Partial Content` slices.
 
-### 3.3 Cloudflare WAF, Rate Limits, R2 Cache Rule & Web Analytics
+### 3.3 Cloudflare WAF, Rate Limits, R2 Cache Rule & Traffic Metrics
 
-Follow [`deploy/cloudflare/waf-rules.md`](../cloudflare/waf-rules.md) to enable:
+Follow the [Cloudflare configuration guide](../cloudflare/waf-rules.md) to set up these controls and metrics.
+
 - Per-IP edge rate limiting (`/api/auth/*`, `/api/trips/*`, `/api/reports`, `/api/*`)
 - Bot Fight Mode + Managed Challenge custom rules
 - Cache Rules for `tiles.example.com/*` (`*.pmtiles` with HTTP `Range` support)
-- Free cookie-free **Cloudflare Web Analytics**
+- Edge HTTP Traffic metrics for requests and bandwidth. Keep Cloudflare Web Analytics injection disabled for the Pages project and proxied hostname so the site uses its same-origin script policy.
 
 ---
 

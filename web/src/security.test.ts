@@ -346,7 +346,6 @@ describe("M-3: Security headers & CSP in Cloudflare Pages _headers and Nginx", (
     expect(fs.existsSync(headersUrl)).toBe(true);
 
     const content = fs.readFileSync(headersUrl, "utf8");
-    expect(content).toContain("/*");
     expect(content).toContain("X-Content-Type-Options: nosniff");
     expect(content).toContain("X-Frame-Options: DENY");
     expect(content).toContain(
@@ -357,14 +356,23 @@ describe("M-3: Security headers & CSP in Cloudflare Pages _headers and Nginx", (
     );
     expect(content).toContain("Strict-Transport-Security:");
 
-    const cspLine = content
-      .split(/\r?\n/)
-      .find((line: string) =>
-        line.trim().startsWith("Content-Security-Policy:")
-      );
+    const rules = content.trim().split(/\r?\n\s*\r?\n/).map((block) =>
+      block.split(/\r?\n/).map((line) => line.trim()).filter((line) => !line.startsWith("#"))
+    );
+    const wildcardRule = rules.find(([route]) => route === "/*");
+    const cspLine = wildcardRule?.find((line) => line.startsWith("Content-Security-Policy:"));
     expect(cspLine).toBeDefined();
+    expect(rules.flat().filter((line) =>
+      /^(?:!\s*)?content-security-policy(?:\s*:|$)/i.test(line)
+    )).toEqual([cspLine]);
+
+    const scriptDirectives = (cspLine ?? "")
+      .slice("Content-Security-Policy:".length)
+      .split(";")
+      .map((directive) => directive.trim())
+      .filter((directive) => /^script-src(?:-(?:elem|attr))?(?:\s|$)/i.test(directive));
+    expect(scriptDirectives).toEqual(["script-src 'self'"]);
     expect(cspLine).toContain("default-src 'self'");
-    expect(cspLine).toContain("script-src 'self' https://static.cloudflareinsights.com");
     expect(cspLine).toContain("style-src 'self' 'unsafe-inline'");
     expect(cspLine).toContain("worker-src 'self' blob:");
     expect(cspLine).toContain("img-src 'self' data: blob: https:");
