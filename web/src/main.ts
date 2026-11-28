@@ -367,6 +367,7 @@ class TrailForgeApp {
   private activeBasemap: BasemapId;
   private currentTileManifest: TileManifestResponse | null = null;
   private tileLoadAbort: AbortController | null = null;
+  private packOverlayAbort = new AbortController();
   private uiConfig: PublicUiConfigResponse = {
     default_layer_order: [...DEFAULT_PUBLIC_UI_CONFIG.default_layer_order],
     default_layer_visibility: {
@@ -1765,6 +1766,7 @@ class TrailForgeApp {
                     }
                   );
                   await this.refreshOfflineLocalState();
+                  if (currentDownload !== download) return;
                   this.showToast(
                     `Downloaded ${record.name} for offline use (${record.track_count} tracks)`,
                     "success"
@@ -2526,7 +2528,7 @@ class TrailForgeApp {
       pickedReportCoords: this.pickedReportCoords,
       activeBasemap: this.activeBasemap,
       tileManifest: this.currentTileManifest,
-      isOfflinePack: Boolean(this.activeOfflinePackId) || !this.isOnline,
+      isOfflinePack: this.isUsingOfflinePack(),
     });
     this.syncRoutePlannerUiState();
     this.syncTelemetrySectionVisibility();
@@ -3212,23 +3214,24 @@ class TrailForgeApp {
   }
 
   private async refreshHotspotsGeoJson(): Promise<void> {
+    const signal = this.packOverlayAbort.signal;
     try {
-      const fc = await fetchHotspotsGeoJson();
-      this.map.setHotspotsGeoJson(fc);
+      const fc = await fetchHotspotsGeoJson(signal);
+      if (!signal.aborted) this.map.setHotspotsGeoJson(fc);
     } catch (err) {
-      // Obstacle hotspots layer stays empty gracefully offline
-      console.debug("Unable to refresh obstacle hotspots layer:", err);
+      if (!signal.aborted) console.debug("Unable to refresh obstacle hotspots layer:", err);
     }
   }
 
   private async refreshReportsGeoJson(): Promise<void> {
     const signal = this.accountAbort.signal;
+    const packSignal = this.packOverlayAbort.signal;
     try {
       const fc = await fetchReportsGeoJson({ signal, ownerId: this.user?.id, anonymous: !this.user });
-      if (!signal.aborted) this.map.setReportsGeoJson(fc);
+      if (!signal.aborted && !packSignal.aborted) this.map.setReportsGeoJson(fc);
     } catch (err) {
       // Reports layer stays empty gracefully offline
-      if (!signal.aborted) {
+      if (!signal.aborted && !packSignal.aborted) {
         console.debug("Unable to refresh condition reports layer:", err);
       }
     }
@@ -3245,29 +3248,32 @@ class TrailForgeApp {
   }
 
   private async refreshClosures(announce: boolean): Promise<void> {
-    try {
-      const [status, geojson] = await Promise.all([
-        fetchClosuresStatus(),
-        fetchClosuresGeoJson().catch(() => null),
-      ]);
-      this.topbar.updateFeedStatus(status);
-      this.sidebar.updateFeedStatus(status);
-      if (geojson) {
-        this.map.setClosuresGeoJson(geojson);
-      }
-      if (announce) {
-        this.showToast(
-          `Closure feeds status: ${status.overall_status.toUpperCase()}`,
-          status.overall_status === "healthy" ? "success" : "info"
-        );
-      }
-    } catch {
-      this.topbar.updateFeedStatus(null);
-      this.sidebar.updateFeedStatus(null);
-    }
+    const signal = this.packOverlayAbort.signal;
+    await Promise.all([
+      fetchClosuresStatus(signal).catch(() => null).then((status) => {
+        if (signal.aborted) return;
+        this.topbar.updateFeedStatus(status);
+        this.sidebar.updateFeedStatus(status);
+        if (announce && status) {
+          this.showToast(
+            `Closure feeds status: ${status.overall_status.toUpperCase()}`,
+            status.overall_status === "healthy" ? "success" : "info"
+          );
+        }
+      }),
+      fetchClosuresGeoJson(signal).catch(() => null).then((geojson) => {
+        if (!signal.aborted && geojson) this.map.setClosuresGeoJson(geojson);
+      }),
+    ]);
   }
 
   private async refreshPackLayers(): Promise<void> {
+    this.packOverlayAbort.abort();
+    this.packOverlayAbort = new AbortController();
+    this.map.setClosuresGeoJson(null);
+    this.map.setReportsGeoJson(null);
+    this.map.setHotspotsGeoJson(null);
+    this.map.setFallbackData(null, null);
     await Promise.all([
       this.loadVectorAndTerrainLayers(),
       this.refreshClosures(false),
@@ -3277,12 +3283,17 @@ class TrailForgeApp {
   }
 
   private applyOfflinePackChange(): void {
-    const wasUsingOfflinePack = this.activeOfflinePackId !== null;
+    const wasUsingOfflinePack = this.isUsingOfflinePack();
     this.activeOfflinePackId = getActiveOfflinePackId();
     void this.refreshOfflineLocalState();
     if (wasUsingOfflinePack || this.activeOfflinePackId || !this.isOnline) {
       void this.refreshPackLayers();
     }
+  }
+
+  private isUsingOfflinePack(): boolean {
+    if (this.currentTileManifest) return this.currentTileManifest.offline_pack === true;
+    return this.activeOfflinePackId !== null || !this.isOnline;
   }
 
   private async loadVectorAndTerrainLayers(): Promise<void> {
@@ -3295,9 +3306,10 @@ class TrailForgeApp {
       const manifest = await fetchTileManifest(signal);
       if (signal.aborted) return;
       this.currentTileManifest = manifest;
+      const isOfflinePack = this.isUsingOfflinePack();
       this.inspector.updateContext({
         tileManifest: manifest,
-        isOfflinePack: Boolean(this.activeOfflinePackId) || !this.isOnline,
+        isOfflinePack,
       });
       if (manifest.snowline_bands_m && manifest.snowline_bands_m.length > 0) {
         this.sidebar.setSnowLineBands(
@@ -3306,8 +3318,6 @@ class TrailForgeApp {
         );
       }
 
-      const isOfflinePack =
-        Boolean(this.activeOfflinePackId) || !this.isOnline;
       if (manifest.vector_available || manifest.terrain_available) {
         this.map.applyTileManifest(manifest, { isOfflinePack });
         const modeLabel =
@@ -3328,7 +3338,7 @@ class TrailForgeApp {
     } catch {
       if (signal.aborted) return;
       this.currentTileManifest = null;
-      this.inspector.updateContext({ tileManifest: null });
+      this.inspector.updateContext({ tileManifest: null, isOfflinePack: this.isUsingOfflinePack() });
       this.map.applyTileManifest({
         vector_url: "", terrain_url: "", vector_available: false, terrain_available: false,
       }, { isOfflinePack: !this.isOnline });
@@ -3483,7 +3493,7 @@ class TrailForgeApp {
         pickedReportCoords: this.pickedReportCoords,
         activeBasemap: this.activeBasemap,
         tileManifest: this.currentTileManifest,
-        isOfflinePack: Boolean(this.activeOfflinePackId) || !this.isOnline,
+        isOfflinePack: this.isUsingOfflinePack(),
       });
 
       if (options?.autoZoomIfNoCoords && detail.bbox) {

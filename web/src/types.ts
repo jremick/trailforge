@@ -155,6 +155,7 @@ export interface TileManifestResponse {
   vector_basemap_url?: string | null;
   vector_available: boolean;
   terrain_available: boolean;
+  offline_pack?: boolean;
   cdn_offload?: boolean;
   layers?: string[];
   snowline_bands_m?: number[];

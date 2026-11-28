@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { fetchTileManifest } from "../api";
 import { buildPlannedRouteMapGeoJson, planRouteFromOfflineStore } from "../routeHelpers";
 import type { OfflinePackRegionItem, OfflinePackSnapshot, RecordedBreadcrumbPoint } from "../types";
 import {
@@ -601,6 +602,7 @@ describe("offline pack replacement", () => {
   afterEach(() => {
     setOfflineBackendForTesting(null);
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
   });
 
   async function packFixture(version: string, shardCount = 2) {
@@ -789,6 +791,25 @@ describe("offline pack replacement", () => {
     expect(await backend.get("snapshots", `${regionId}:${abandoned}`)).toBeNull();
     expect(await backend.get("pack_shards", `${regionId}:${abandoned}:0`)).toBeNull();
     expect(await backend.getAll("pack_shards")).toHaveLength(1);
+  });
+
+  it("uses the browser's cache origin when a configured API becomes unreachable", async () => {
+    const { fetchMock, previous } = await setupReplacement();
+    setActiveOfflinePackId(null);
+    vi.stubEnv("VITE_API_BASE_URL", "https://api.example.test");
+    vi.stubGlobal("navigator", { onLine: true });
+    vi.stubGlobal("window", { location: { origin: "https://app.example.test" } });
+    fetchMock.mockRejectedValueOnce(new Error("Synthetic API connection interruption"));
+
+    await expect(fetchTileManifest()).resolves.toMatchObject({
+      offline_pack: true,
+      vector_url: `https://app.example.test${previous.vector_pmtiles_url}`,
+      terrain_url: `https://app.example.test${previous.terrain_pmtiles_url}`,
+    });
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "https://api.example.test/api/tiles/manifest.json",
+      expect.any(Object)
+    );
   });
 });
 

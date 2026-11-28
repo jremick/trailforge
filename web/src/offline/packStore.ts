@@ -1089,15 +1089,20 @@ export async function getOfflineTileManifest(
 ): Promise<TileManifestResponse | null> {
   const pack = await resolvePreferredPack(regionId);
   if (!pack) return null;
+  const origin = typeof window === "undefined" ? "" : window.location.origin;
+  const cacheUrl = (url: string): string => /^https?:\/\//.test(origin)
+    ? new URL(url, origin).href
+    : url;
   return {
     generated_at: pack.downloaded_at,
     bounds: pack.bbox,
     minzoom: 6,
     maxzoom: 15,
-    vector_url: pack.vector_pmtiles_url ?? buildOfflinePackTileCachePath(pack.region_id, "vector"),
-    terrain_url: pack.terrain_pmtiles_url ?? buildOfflinePackTileCachePath(pack.region_id, "terrain"),
+    vector_url: cacheUrl(pack.vector_pmtiles_url ?? buildOfflinePackTileCachePath(pack.region_id, "vector")),
+    terrain_url: cacheUrl(pack.terrain_pmtiles_url ?? buildOfflinePackTileCachePath(pack.region_id, "terrain")),
     vector_available: pack.has_vector_pmtiles,
     terrain_available: pack.has_terrain_pmtiles,
+    offline_pack: true,
     snowline_bands_m: pack.snowline_bands_m,
     attributions: pack.attributions,
   };

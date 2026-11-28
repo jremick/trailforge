@@ -1363,31 +1363,16 @@ export class TrailForgeMap {
   }
 
   private applyFallbackData(): void {
-    if (this.fallbackTracks) {
-      const tracksSrc = this.map.getSource("tf-tracks") as
-        | maplibregl.GeoJSONSource
-        | undefined;
-      tracksSrc?.setData(this.fallbackTracks);
+    const tracks = this.fallbackTracks ?? EMPTY_FEATURE_COLLECTION;
+    const tracksSrc = this.map.getSource<maplibregl.GeoJSONSource>("tf-tracks");
+    tracksSrc?.setData(tracks);
 
-      const steepFeatures = this.fallbackTracks.features.filter((f) => {
-        const props = (f.properties ?? {}) as Record<string, unknown>;
-        return props.is_steep_highlight === true;
-      });
-      const steepSrc = this.map.getSource("tf-steep") as
-        | maplibregl.GeoJSONSource
-        | undefined;
-      steepSrc?.setData({
-        type: "FeatureCollection",
-        features: steepFeatures,
-      });
-    }
+    const steepFeatures = tracks.features.filter((f) => f.properties?.is_steep_highlight === true);
+    const steepSrc = this.map.getSource<maplibregl.GeoJSONSource>("tf-steep");
+    steepSrc?.setData({ type: "FeatureCollection", features: steepFeatures });
 
-    if (this.fallbackPois) {
-      const poisSrc = this.map.getSource("tf-pois") as
-        | maplibregl.GeoJSONSource
-        | undefined;
-      poisSrc?.setData(poisToGeoJson(this.fallbackPois));
-    }
+    const poisSrc = this.map.getSource<maplibregl.GeoJSONSource>("tf-pois");
+    poisSrc?.setData(this.fallbackPois ? poisToGeoJson(this.fallbackPois) : EMPTY_FEATURE_COLLECTION);
   }
 
   private applyClosuresData(): void {
