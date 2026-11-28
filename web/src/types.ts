@@ -155,6 +155,7 @@ export interface TileManifestResponse {
   vector_basemap_url?: string | null;
   vector_available: boolean;
   terrain_available: boolean;
+  offline_pack?: boolean;
   cdn_offload?: boolean;
   layers?: string[];
   snowline_bands_m?: number[];
@@ -850,6 +851,8 @@ export interface OfflinePackManifest {
   counts?: Record<string, number>;
   attributions?: string[];
   files?: Record<string, OfflinePackFileEntry> | OfflinePackFileEntry[];
+  vector_available?: boolean;
+  terrain_available?: boolean;
   vector_pmtiles_url?: string | null;
   terrain_pmtiles_url?: string | null;
   snapshot_url?: string | null;
@@ -936,6 +939,7 @@ export interface OfflinePackSnapshot {
 
 export interface DownloadedPackRecord {
   region_id: string;
+  storage_generation?: string;
   name: string;
   version: string;
   downloaded_at: string;

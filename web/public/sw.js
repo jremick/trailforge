@@ -11,6 +11,7 @@ let packsCachePromise = null;
 // Small in-memory LRU cache of active PMTiles blobs so rapid MapLibre Range 206 pan/zoom
 // requests don't re-open CacheStorage and re-materialize Response.blob() 50x per gesture.
 const packBlobCache = new Map();
+let packCacheRevision = 0;
 
 function getPacksCache() {
   if (!packsCachePromise) {
@@ -23,6 +24,7 @@ function getPacksCache() {
 }
 
 function clearPackBlobCache(regionId) {
+  packCacheRevision += 1;
   if (!regionId) {
     packBlobCache.clear();
     return;
@@ -161,6 +163,7 @@ async function loadCachedPackBlob(request, pathname) {
     return memHit;
   }
 
+  const revision = packCacheRevision;
   const cache = await getPacksCache();
   const cached = (await cache.match(pathname)) || (await cache.match(request.url));
   if (!cached) {
@@ -171,6 +174,7 @@ async function loadCachedPackBlob(request, pathname) {
   const contentType =
     cached.headers.get("Content-Type") || "application/octet-stream";
   const entry = { blob, contentType };
+  if (revision !== packCacheRevision) return entry;
   packBlobCache.set(pathname, entry);
   while (packBlobCache.size > MAX_MEM_PACK_BLOBS) {
     const oldestKey = packBlobCache.keys().next().value;
@@ -241,6 +245,14 @@ function isPackPmtilesPath(pathname) {
   );
 }
 
+function isLivePackDownload(request, pathname) {
+  // The unversioned same-origin URL can still hold a legacy installed pack.
+  // A full no-store request to that URL explicitly fetches the server artifact.
+  return request.method === "GET" && request.cache === "no-store" &&
+    !request.headers.has("Range") &&
+    /^\/api\/packs\/[^/]+\/tiles\/(vector|terrain)\.pmtiles$/.test(pathname);
+}
+
 self.addEventListener("fetch", (event) => {
   const { request } = event;
   if (request.method !== "GET" && request.method !== "HEAD") return;
@@ -263,8 +275,11 @@ self.addEventListener("fetch", (event) => {
 
   // Offline regional PMTiles: serve Range 206 directly from PACKS_CACHE when downloaded!
   if (isPackPmtilesPath(url.pathname)) {
+    const cached = isLivePackDownload(request, url.pathname)
+      ? Promise.resolve(null)
+      : respondFromCachedPackTile(request).catch(() => null);
     event.respondWith(
-      respondFromCachedPackTile(request).then((hit) => {
+      cached.then((hit) => {
         if (hit) return hit;
         return fetch(request).catch(
           () =>
