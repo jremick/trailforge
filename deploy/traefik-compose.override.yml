@@ -2,13 +2,14 @@
 #
 # Usage:
 #   TRAILFORGE_HOST=trails.example.com \
+#   TRAILFORGE_TRAEFIK_PROXY_IP=<traefik-container-ip> \
 #   CORS_ORIGINS=https://trails.example.com \
 #   AUTH_COOKIE_SECURE=true \
 #   docker compose -f docker-compose.ghcr.yml -f deploy/traefik-compose.override.yml up -d
 #
 # Prerequisites:
 #   - An existing Traefik v3 reverse proxy attached to the external `traefik` Docker network
-#   - TRAILFORGE_TRAEFIK_PROXY_IP set to Traefik's reserved IPv4 address on that network
+#   - TRAILFORGE_TRAEFIK_PROXY_IP set to Traefik's reserved IP address (IPv4 or IPv6) on that network
 #   - A certificate resolver named `letsencrypt` (override via TRAEFIK_CERTRESOLVER)
 #   - Strong production secrets in `.env` (`AUTH_SECRET_KEY`, `TRAILFORGE_PRIVACY_SECRET`,
 #     `POSTGRES_PASSWORD`, and matching `DATABASE_URL`)

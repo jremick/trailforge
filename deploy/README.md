@@ -90,7 +90,7 @@ The direct web port remains loopback-bound and counts the connection's peer addr
 count clients individually behind a proxy, use one of the trusted ingress paths below.
 Tile and pack requests still share the 24-connection global ceiling.
 
-- **Traefik.** Reserve a stable IPv4 address for the Traefik container on the existing `traefik`
+- **Traefik.** Reserve a stable IP address (IPv4 or IPv6) for the Traefik container on the existing `traefik`
   network and use that exact IP for `TRAILFORGE_TRAEFIK_PROXY_IP`. TrailForge trusts only
   that peer and uses the rightmost address it forwards. Keep Traefik's default
   `X-Forwarded-For` append behavior. A proxy in front of Traefik shares one allowance
@@ -113,8 +113,10 @@ Tile and pack requests still share the 24-connection global ceiling.
 - **Tailscale Serve on Linux.** Follow the [private socket setup](./tailscale-serve.md#3-publish-over-tailnet-https).
 
 The socket directory is the trust boundary. Use one web container per directory and
-share it only with the proxy that supplies the client address. If an ungraceful shutdown
-leaves a stale socket, confirm the web container is stopped before removing `web.sock`.
+share it only with the proxy that supplies the client address. On startup, the web
+entrypoint probes any leftover `web.sock` from an ungraceful shutdown and removes it only
+if no process is listening; if another container is actively bound to `web.sock`, startup
+fails rather than displacing it.
 Set the owner to the mapped Nginx UID if Docker uses rootless mode or user namespace
 remapping. When the proxy and web container use
 different kernels, such as a host proxy and Docker Desktop, use Traefik's exact-peer
@@ -208,7 +210,10 @@ docker compose -f docker-compose.ghcr.yml exec -T api \
 
 Keep the Compose file list from your original setup. These examples use the Caddy
 or Tailscale socket override. Substitute the Traefik override for that setup, or
-use only the base file for a direct install.
+use only the base file for a direct install. If you are upgrading an existing Traefik
+deployment to a release with per-client download limits, reserve a stable Traefik
+container IP on the `traefik` network and add `TRAILFORGE_TRAEFIK_PROXY_IP` to `.env`
+before running `docker compose ... up -d` (the Traefik override rejects an unset value).
 
 1. **Back up PostGIS** (command above) before jumping across minor/major versions.
 2. **Pre-pull the target images** while the current stack keeps serving traffic:
