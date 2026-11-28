@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildPlannedRouteMapGeoJson, planRouteFromOfflineStore } from "../routeHelpers";
-import type { OfflinePackSnapshot, RecordedBreadcrumbPoint } from "../types";
+import type { OfflinePackRegionItem, OfflinePackSnapshot, RecordedBreadcrumbPoint } from "../types";
 import {
   buildClientGeoJson,
   buildClientGpx,
@@ -10,6 +10,7 @@ import {
   MemoryOfflineBackend,
   downloadRegionalPackToDevice,
   fnv1a32,
+  getDownloadedPack,
   getOfflineClosuresGeoJson,
   getOfflineHotspotsGeoJson,
   getOfflinePois,
@@ -20,7 +21,6 @@ import {
   packShardFilename,
   packShardStorageKey,
   removeOfflinePack,
-  saveOfflinePackData,
   searchOfflineSnapshots,
   setActiveOfflinePackId,
   setOfflineBackendForTesting,
@@ -230,6 +230,7 @@ describe("Slice 09 Offline Pack Snapshot store & Sync Queue flush", () => {
 
   it("prefers region R2 PMTiles URLs over relative manifest URLs during pack download", async () => {
     setOfflineBackendForTesting(new MemoryOfflineBackend());
+    vi.stubGlobal("caches", { open: async () => ({ put: vi.fn() }) });
     const requestedUrls: string[] = [];
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
@@ -281,10 +282,15 @@ describe("Slice 09 Offline Pack Snapshot store & Sync Queue flush", () => {
       "https://tiles.example.test/packs/australian-alps/static_v1/vector.pmtiles",
       "https://tiles.example.test/packs/australian-alps/static_v1/terrain.pmtiles",
     ]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://tiles.example.test/packs/australian-alps/static_v1/vector.pmtiles",
+      { cache: "no-store" }
+    );
   });
 
   it("stores and queries offline pack snapshots (tracks, POIs, parks, closures, reports, hotspots)", async () => {
-    setOfflineBackendForTesting(new MemoryOfflineBackend());
+    const backend = new MemoryOfflineBackend();
+    setOfflineBackendForTesting(backend);
 
     const snapshot: OfflinePackSnapshot = {
       region_id: "australian-alps",
@@ -364,8 +370,7 @@ describe("Slice 09 Offline Pack Snapshot store & Sync Queue flush", () => {
       },
     };
 
-    await saveOfflinePackData(
-      {
+    await backend.put("packs", snapshot.region_id, {
         region_id: "australian-alps",
         name: "Australian Alps",
         version: "2026.11.26",
@@ -382,9 +387,8 @@ describe("Slice 09 Offline Pack Snapshot store & Sync Queue flush", () => {
         snowline_bands_m: [800, 1000, 1200],
         attributions: ["© OpenStreetMap contributors (ODbL)"],
         sha256_verified: true,
-      },
-      snapshot
-    );
+    });
+    await backend.put("snapshots", snapshot.region_id, snapshot);
     setActiveOfflinePackId("australian-alps");
 
     const manifest = await getOfflineTileManifest();
@@ -589,6 +593,204 @@ async function gzipJson(payload: unknown): Promise<Uint8Array<ArrayBuffer>> {
   const buf = await new Response(stream).arrayBuffer();
   return new Uint8Array(buf);
 }
+
+describe("offline pack replacement", () => {
+  const regionId = "australian-alps";
+  const trackId = "trk_alps_loop";
+
+  afterEach(() => {
+    setOfflineBackendForTesting(null);
+    vi.unstubAllGlobals();
+  });
+
+  async function packFixture(version: string, shardCount = 2) {
+    const source = `https://tiles.example.test/${version}`;
+    const track = {
+      track_id: trackId,
+      name: `Alps Loop ${version}`,
+      state: "VIC",
+      total_length_m: 600,
+      coords: [[148.1, -36.6], [148.11, -36.61]],
+      closure_status: version === "A" ? "seasonal" : "open",
+    };
+    const snapshot = {
+      schema_version: "trailforge_pack_snapshot_v2",
+      region_id: regionId,
+      version,
+      shard_count: shardCount,
+      tracks: [track],
+    };
+    const contents = new Map<string, Uint8Array<ArrayBuffer>>([
+      ["snapshot.json", new TextEncoder().encode(JSON.stringify(snapshot))],
+      ["vector.pmtiles", new TextEncoder().encode(`vector ${version}`)],
+      ["terrain.pmtiles", new TextEncoder().encode(`terrain ${version}`)],
+    ]);
+    for (let idx = 0; idx < shardCount; idx += 1) {
+      contents.set(`shards/${packShardFilename(idx)}`, await gzipJson({
+        schema_version: "trailforge_pack_shard_v2",
+        region_id: regionId,
+        shard_index: idx,
+        tracks: idx === shardIndexForTrack(trackId, shardCount) ? { [trackId]: track } : {},
+      }));
+    }
+    const files = Object.fromEntries(await Promise.all(
+      Array.from(contents, async ([name, bytes]) => [name, {
+        path: name,
+        size_bytes: bytes.byteLength,
+        sha256: await computeSha256Hex(bytes),
+      }])
+    ));
+    const region: OfflinePackRegionItem = {
+      region_id: regionId,
+      name: "Australian Alps",
+      description: "Synthetic region",
+      bbox: [148, -37, 149, -36],
+      status: "ready",
+      version,
+      manifest_url: `${source}/manifest.json`,
+      snapshot_url: `${source}/snapshot.json`,
+      shards_base_url: `${source}/shards`,
+      vector_pmtiles_url: `${source}/vector.pmtiles`,
+      terrain_pmtiles_url: `${source}/terrain.pmtiles`,
+    };
+    return {
+      region,
+      respond(url: string) {
+        const file = url.slice(source.length + 1);
+        if (file === "manifest.json") return Response.json({
+          region_id: regionId, version, snapshot_format: "sharded_v2", shard_count: shardCount,
+          vector_available: true, terrain_available: true, files,
+        });
+        const bytes = contents.get(file);
+        return bytes ? new Response(bytes.buffer) : new Response(null, { status: 404 });
+      },
+    };
+  }
+
+  async function setupReplacement() {
+    const backend = new MemoryOfflineBackend();
+    const tiles = new Map<string, string>();
+    const cache = {
+      put: vi.fn(async (key: string, response: Response) => { tiles.set(key, await response.text()); }),
+      delete: vi.fn(async (key: string | Request) => tiles.delete(
+        typeof key === "string" ? key : new URL(key.url).pathname
+      )),
+      keys: vi.fn(async () => Array.from(tiles.keys(), (key) => new Request(`https://app.example.test${key}`))),
+    };
+    setOfflineBackendForTesting(backend);
+    vi.stubGlobal("caches", { open: async () => cache });
+    const a = await packFixture("A");
+    const b = await packFixture("B", 1);
+    const fetchPack = async (url: string) => (url.includes("/A/") ? a : b).respond(url);
+    const fetchMock = vi.fn(fetchPack);
+    vi.stubGlobal("fetch", fetchMock);
+    const previous = await downloadRegionalPackToDevice(a.region);
+    setActiveOfflinePackId(regionId);
+    return { b, backend, cache, fetchMock, fetchPack, previous, tiles };
+  }
+
+  it("keeps the installed shard, manifest, and both tile URLs readable after a late checksum failure", async () => {
+    const { b, backend, fetchMock, fetchPack, previous, tiles } = await setupReplacement();
+    const installedTiles = await getOfflineTileManifest();
+    fetchMock.mockImplementation((url) => url.endsWith("/B/terrain.pmtiles")
+      ? Promise.resolve(new Response("wrong B bytes"))
+      : fetchPack(url));
+
+    await expect(downloadRegionalPackToDevice(b.region)).rejects.toThrow("SHA-256");
+
+    setOfflineBackendForTesting(backend);
+    setActiveOfflinePackId(regionId);
+    expect(await getDownloadedPack(regionId)).toEqual(previous);
+    expect(await getOfflineTileManifest()).toEqual(installedTiles);
+    expect(await getOfflineTrackDetail(trackId)).toMatchObject({
+      name: "Alps Loop A",
+      closure_status: "seasonal",
+    });
+    expect(tiles.get(installedTiles!.vector_url)).toBe("vector A");
+    expect(tiles.get(installedTiles!.terrain_url)).toBe("terrain A");
+    expect(tiles.size).toBe(2);
+    expect(await backend.getAll("pack_shards")).toHaveLength(2);
+  });
+
+  it("keeps the installed pack across snapshot and tile storage failures, then replaces it as a complete set", async () => {
+    const { b, backend, cache, previous, tiles } = await setupReplacement();
+    const quota = new DOMException("Fixture capacity exceeded", "QuotaExceededError");
+    const put = backend.put.bind(backend);
+    const write = vi.spyOn(backend, "put").mockImplementation(async (store, key, value) => {
+      if (store === "snapshots" && (value as OfflinePackSnapshot)?.version === "B") throw quota;
+      await put(store, key, value);
+    });
+    await expect(downloadRegionalPackToDevice(b.region)).rejects.toThrow(/storage|capacity|quota/i);
+    expect(await getDownloadedPack(regionId)).toEqual(previous);
+    expect((await getOfflineTrackDetail(trackId))?.name).toBe("Alps Loop A");
+    write.mockRestore();
+
+    cache.put.mockRejectedValueOnce(quota);
+    await expect(downloadRegionalPackToDevice(b.region)).rejects.toThrow(/storage|capacity|quota/i);
+    expect(await getDownloadedPack(regionId)).toEqual(previous);
+    expect(tiles.get(previous.vector_pmtiles_url!)).toBe("vector A");
+    expect(tiles.get(previous.terrain_pmtiles_url!)).toBe("terrain A");
+
+    const updated = await downloadRegionalPackToDevice(b.region);
+    expect(updated).toMatchObject({ version: "B", sha256_verified: true, shard_count: 1 });
+    expect(updated.vector_pmtiles_url).not.toBe(previous.vector_pmtiles_url);
+    expect((await getOfflineTrackDetail(trackId))?.name).toBe("Alps Loop B");
+    expect(tiles.get(updated.vector_pmtiles_url!)).toBe("vector B");
+    expect(tiles.get(updated.terrain_pmtiles_url!)).toBe("terrain B");
+    expect(tiles.size).toBe(2);
+    expect(await backend.getAll("pack_shards")).toHaveLength(1);
+  });
+
+  it("keeps an explicit removal from being undone by an in-progress replacement", async () => {
+    const { b, backend, fetchMock, fetchPack, tiles } = await setupReplacement();
+    let finishTerrain!: () => void;
+    let terrainStarted!: () => void;
+    const pendingTerrain = new Promise<void>((resolve) => { finishTerrain = resolve; });
+    const started = new Promise<void>((resolve) => { terrainStarted = resolve; });
+    fetchMock.mockImplementation(async (url) => {
+      if (url.endsWith("/B/terrain.pmtiles")) {
+        terrainStarted();
+        await pendingTerrain;
+      }
+      return fetchPack(url);
+    });
+
+    const replacement = downloadRegionalPackToDevice(b.region);
+    const outcome = expect(replacement).rejects.toThrow(/another|superseded/i);
+    await started;
+    try {
+      await removeOfflinePack(regionId);
+    } finally {
+      finishTerrain();
+    }
+    await outcome;
+
+    expect(await getDownloadedPack(regionId)).toBeNull();
+    expect(await getOfflineTrackDetail(trackId)).toBeNull();
+    expect(await getOfflineTileManifest()).toBeNull();
+    expect(tiles.size).toBe(0);
+    expect(await backend.getAll("pack_shards")).toEqual([]);
+  });
+
+  it("reclaims abandoned generation keys when retrying the region", async () => {
+    const { b, backend, previous, tiles } = await setupReplacement();
+    const abandoned = "a".repeat(32);
+    const abandonedPath = `/api/packs/${regionId}/tiles/${abandoned}/vector.pmtiles`;
+    await backend.put("snapshots", `${regionId}:${abandoned}`, { region_id: regionId, shard_count: 1 });
+    await backend.put("pack_shards", `${regionId}:${abandoned}:0`, new Uint8Array([1]));
+    await backend.put("snapshots", `!operation:${regionId}`, abandoned);
+    tiles.set(abandonedPath, "Partial pack bytes");
+
+    await downloadRegionalPackToDevice(b.region, (progress) => {
+      if (progress.pct === 10) expect(tiles.get(previous.vector_pmtiles_url!)).toBe("vector A");
+    });
+
+    expect(tiles.has(abandonedPath)).toBe(false);
+    expect(await backend.get("snapshots", `${regionId}:${abandoned}`)).toBeNull();
+    expect(await backend.get("pack_shards", `${regionId}:${abandoned}:0`)).toBeNull();
+    expect(await backend.getAll("pack_shards")).toHaveLength(1);
+  });
+});
 
 describe("sharded_v2 compact offline packs & IndexedDB v2 shard hydration", () => {
   afterEach(() => {
@@ -922,7 +1124,7 @@ describe("sharded_v2 compact offline packs & IndexedDB v2 shard hydration", () =
     await removeOfflinePack("australian-alps");
     for (let i = 0; i < shardCount; i += 1) {
       expect(
-        await backend.get("pack_shards", packShardStorageKey("australian-alps", i))
+        await backend.get("pack_shards", packShardStorageKey("australian-alps", i, record.storage_generation))
       ).toBeNull();
     }
   });
@@ -1002,5 +1204,6 @@ describe("sharded_v2 compact offline packs & IndexedDB v2 shard hydration", () =
     // Rolled back: neither shard remains orphaned in pack_shards
     expect(await backend.get("pack_shards", "australian-alps:0")).toBeNull();
     expect(await backend.get("pack_shards", "australian-alps:1")).toBeNull();
+    expect(await backend.getAll("pack_shards")).toEqual([]);
   });
 });

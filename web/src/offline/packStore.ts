@@ -7,7 +7,6 @@ import { DEFAULT_SNOWLINE_BANDS_M } from "../presets";
 import type {
   ApiSearchResponse,
   ApiSearchResultItem,
-  BBoxTuple,
   ClosureItem,
   ConditionReportItem,
   DownloadedPackRecord,
@@ -31,8 +30,11 @@ export const OFFLINE_DB_NAME = "trailforge-offline-v1";
 export const OFFLINE_DB_VERSION = 2;
 export const PACKS_CACHE_NAME = "trailforge-packs-v1";
 const ACTIVE_PACK_KEY = "trailforge.active_offline_pack";
+export const OFFLINE_PACK_CHANGE_KEY = "trailforge.offline_pack_change";
 const MAX_SHARD_CACHE_ENTRIES = 4;
 const SHARD_DOWNLOAD_CONCURRENCY = 4;
+// Matches MAX_SHARD_COUNT in the pack builder.
+const MAX_PACK_SHARDS = 64;
 const NEARBY_POI_RADIUS_M = 1500;
 const MAX_NEARBY_POIS = 25;
 
@@ -65,8 +67,22 @@ export function packShardFilename(shardIndex: number): string {
   return `tracks_${String(shardIndex).padStart(2, "0")}.json.gz`;
 }
 
-export function packShardStorageKey(regionId: string, shardIndex: number): string {
-  return `${regionId}:${shardIndex}`;
+function packSnapshotStorageKey(regionId: string, generation?: string): string {
+  return generation ? `${regionId}:${generation}` : regionId;
+}
+
+export function packShardStorageKey(regionId: string, shardIndex: number, generation?: string): string {
+  return `${packSnapshotStorageKey(regionId, generation)}:${shardIndex}`;
+}
+
+function packOperationKey(regionId: string): string {
+  // This local key shares the snapshot store without changing legacy stores or records.
+  return `!operation:${regionId}`;
+}
+
+function newPackGeneration(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 async function gunzipToJson<T>(bytes: Uint8Array): Promise<T> {
@@ -96,11 +112,24 @@ function isShardedSnapshot(snap: OfflinePackSnapshot | null | undefined): boolea
   );
 }
 
+interface PackStorageState {
+  installed: string | undefined;
+  pending: string | undefined;
+  snapshotKeys: string[];
+  shardKeys: string[];
+}
+
 export interface OfflineKvBackend {
   get<T>(store: OfflineStoreName, key: string): Promise<T | null>;
   getAll<T>(store: OfflineStoreName): Promise<T[]>;
   put<T>(store: OfflineStoreName, key: string, value: T): Promise<void>;
   delete(store: OfflineStoreName, key: string): Promise<void>;
+  inspectPackStorage(regionId: string): Promise<PackStorageState>;
+  completePackOperation(
+    regionId: string,
+    operation: string,
+    record?: DownloadedPackRecord | null
+  ): Promise<{ previous: DownloadedPackRecord | null } | null>;
 }
 
 /**
@@ -132,6 +161,35 @@ export class MemoryOfflineBackend implements OfflineKvBackend {
 
   async delete(store: OfflineStoreName, key: string): Promise<void> {
     this.tables.get(store)?.delete(key);
+  }
+
+  async inspectPackStorage(regionId: string): Promise<PackStorageState> {
+    const prefix = `${regionId}:`;
+    const snapshots = this.tables.get("snapshots")!;
+    const shards = this.tables.get("pack_shards")!;
+    const record = this.tables.get("packs")!.get(regionId) as DownloadedPackRecord | undefined;
+    return {
+      installed: record?.storage_generation,
+      pending: snapshots.get(packOperationKey(regionId)) as string | undefined,
+      snapshotKeys: Array.from(snapshots.keys()).filter((key) => key.startsWith(prefix)),
+      shardKeys: Array.from(shards.keys()).filter((key) => key.startsWith(prefix)),
+    };
+  }
+
+  async completePackOperation(
+    regionId: string,
+    operation: string,
+    record?: DownloadedPackRecord | null
+  ): Promise<{ previous: DownloadedPackRecord | null } | null> {
+    const snapshots = this.tables.get("snapshots")!;
+    const packs = this.tables.get("packs")!;
+    const opKey = packOperationKey(regionId);
+    if (snapshots.get(opKey) !== operation) return null;
+    const previous = (packs.get(regionId) as DownloadedPackRecord | undefined) ?? null;
+    if (record) packs.set(regionId, structuredClone(record));
+    else if (record === null) packs.delete(regionId);
+    snapshots.delete(opKey);
+    return { previous: structuredClone(previous) };
   }
 }
 
@@ -192,7 +250,7 @@ class IndexedDbOfflineBackend implements OfflineKvBackend {
       const tx = db.transaction(store, "readwrite");
       tx.objectStore(store).put(value, key);
       tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error("Offline storage write aborted"));
     });
   }
 
@@ -202,7 +260,56 @@ class IndexedDbOfflineBackend implements OfflineKvBackend {
       const tx = db.transaction(store, "readwrite");
       tx.objectStore(store).delete(key);
       tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error ?? new Error("Offline storage removal aborted"));
+    });
+  }
+
+  async inspectPackStorage(regionId: string): Promise<PackStorageState> {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(["packs", "snapshots", "pack_shards"], "readonly");
+      const snapshots = tx.objectStore("snapshots");
+      const prefix = `${regionId}:`;
+      const namespaced = IDBKeyRange.bound(prefix, `${prefix}\uffff`);
+      const record = tx.objectStore("packs").get(regionId);
+      const pending = snapshots.get(packOperationKey(regionId));
+      const snapshotKeys = snapshots.getAllKeys(namespaced);
+      const shardKeys = tx.objectStore("pack_shards").getAllKeys(namespaced);
+      tx.oncomplete = () => resolve({
+        installed: (record.result as DownloadedPackRecord | undefined)?.storage_generation,
+        pending: pending.result as string | undefined,
+        snapshotKeys: snapshotKeys.result.filter((key) => typeof key === "string"),
+        shardKeys: shardKeys.result.filter((key) => typeof key === "string"),
+      });
+      tx.onabort = () => reject(tx.error ?? new Error("Offline pack storage query aborted"));
+    });
+  }
+
+  async completePackOperation(
+    regionId: string,
+    operation: string,
+    record?: DownloadedPackRecord | null
+  ): Promise<{ previous: DownloadedPackRecord | null } | null> {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(["packs", "snapshots"], "readwrite");
+      const snapshots = tx.objectStore("snapshots");
+      const packs = tx.objectStore("packs");
+      const opKey = packOperationKey(regionId);
+      let result: { previous: DownloadedPackRecord | null } | null = null;
+      const pending = snapshots.get(opKey);
+      pending.onsuccess = () => {
+        if (pending.result !== operation) return;
+        const current = packs.get(regionId);
+        current.onsuccess = () => {
+          if (record) packs.put(record, regionId);
+          else if (record === null) packs.delete(regionId);
+          snapshots.delete(opKey);
+          result = { previous: current.result ?? null };
+        };
+      };
+      tx.oncomplete = () => resolve(result);
+      tx.onabort = () => reject(tx.error ?? new Error("Offline pack activation aborted"));
     });
   }
 }
@@ -212,30 +319,24 @@ const privateBackends = new Map<string, OfflineKvBackend>();
 let memoryActivePackId: string | null = null;
 // In-memory cache of deserialized offline pack snapshots so rapid search keystrokes and
 // track clicks do not structured-clone multi-MB IndexedDB objects on every interaction.
-const snapshotMemCache = new Map<string, OfflinePackSnapshot | null>();
-const trackIndexMemCache = new Map<
-  string,
+const snapshotMemCache = new Map<string, { key: string; snapshot: OfflinePackSnapshot }>();
+const trackIndexMemCache = new WeakMap<
+  OfflinePackSnapshot,
   Map<string, TrackInspectorDetail | OfflinePackTrackIndexEntry>
 >();
 const shardMemCache = new Map<string, OfflinePackShard>();
-const parkIndexMemCache = new Map<string, Map<number, ParkTenureItem>>();
-const closureIndexMemCache = new Map<string, Map<number, ClosureItem>>();
+const parkIndexMemCache = new WeakMap<OfflinePackSnapshot, Map<number, ParkTenureItem>>();
+const closureIndexMemCache = new WeakMap<OfflinePackSnapshot, Map<number, ClosureItem>>();
 
 function clearSnapshotMemCache(regionId?: string): void {
   if (regionId) {
     snapshotMemCache.delete(regionId);
-    trackIndexMemCache.delete(regionId);
-    parkIndexMemCache.delete(regionId);
-    closureIndexMemCache.delete(regionId);
     const prefix = `${regionId}:`;
     for (const key of Array.from(shardMemCache.keys())) {
       if (key.startsWith(prefix)) shardMemCache.delete(key);
     }
   } else {
     snapshotMemCache.clear();
-    trackIndexMemCache.clear();
-    parkIndexMemCache.clear();
-    closureIndexMemCache.clear();
     shardMemCache.clear();
   }
 }
@@ -258,42 +359,34 @@ function notifySwInvalidatePackCache(regionId?: string): void {
 }
 
 async function loadSnapshotCached(
-  regionId: string
+  pack: DownloadedPackRecord
 ): Promise<OfflinePackSnapshot | null> {
-  if (snapshotMemCache.has(regionId)) {
-    return snapshotMemCache.get(regionId) ?? null;
-  }
-  const snap = await getOfflineBackend().get<OfflinePackSnapshot>(
-    "snapshots",
-    regionId
-  );
-  snapshotMemCache.set(regionId, snap);
-  trackIndexMemCache.delete(regionId);
-  parkIndexMemCache.delete(regionId);
-  closureIndexMemCache.delete(regionId);
-  return snap;
+  const key = packSnapshotStorageKey(pack.region_id, pack.storage_generation);
+  const cached = snapshotMemCache.get(pack.region_id);
+  if (cached?.key === key) return cached.snapshot;
+  const snapshot = await getOfflineBackend().get<OfflinePackSnapshot>("snapshots", key);
+  if (snapshot) snapshotMemCache.set(pack.region_id, { key, snapshot });
+  return snapshot;
 }
 
 function getTrackIndexForSnapshot(
-  regionId: string,
   snap: OfflinePackSnapshot
 ): Map<string, TrackInspectorDetail | OfflinePackTrackIndexEntry> {
-  let idx = trackIndexMemCache.get(regionId);
+  let idx = trackIndexMemCache.get(snap);
   if (!idx) {
     idx = new Map();
     for (const trk of snap.tracks ?? []) {
       idx.set(trk.track_id, trk);
     }
-    trackIndexMemCache.set(regionId, idx);
+    trackIndexMemCache.set(snap, idx);
   }
   return idx;
 }
 
 function getParkIndexForSnapshot(
-  regionId: string,
   snap: OfflinePackSnapshot
 ): Map<number, ParkTenureItem> {
-  let idx = parkIndexMemCache.get(regionId);
+  let idx = parkIndexMemCache.get(snap);
   if (!idx) {
     idx = new Map();
     for (const park of snap.capad_parks ?? []) {
@@ -301,16 +394,15 @@ function getParkIndexForSnapshot(
         idx.set(park.id, park);
       }
     }
-    parkIndexMemCache.set(regionId, idx);
+    parkIndexMemCache.set(snap, idx);
   }
   return idx;
 }
 
 function getClosureIndexForSnapshot(
-  regionId: string,
   snap: OfflinePackSnapshot
 ): Map<number, ClosureItem> {
-  let idx = closureIndexMemCache.get(regionId);
+  let idx = closureIndexMemCache.get(snap);
   if (!idx) {
     idx = new Map();
     if (Array.isArray(snap.closures)) {
@@ -321,16 +413,16 @@ function getClosureIndexForSnapshot(
         }
       }
     }
-    closureIndexMemCache.set(regionId, idx);
+    closureIndexMemCache.set(snap, idx);
   }
   return idx;
 }
 
 async function loadShardCached(
-  regionId: string,
+  pack: DownloadedPackRecord,
   shardIndex: number
 ): Promise<OfflinePackShard | null> {
-  const key = packShardStorageKey(regionId, shardIndex);
+  const key = packShardStorageKey(pack.region_id, shardIndex, pack.storage_generation);
   const cached = shardMemCache.get(key);
   if (cached) {
     // Move to MRU position
@@ -419,12 +511,11 @@ function computeNearbyPoisForShardedTrack(
 }
 
 function hydrateShardedTrack(
-  regionId: string,
   snap: OfflinePackSnapshot,
   raw: OfflinePackShardTrack
 ): TrackInspectorDetail {
-  const parkIndex = getParkIndexForSnapshot(regionId, snap);
-  const closureIndex = getClosureIndexForSnapshot(regionId, snap);
+  const parkIndex = getParkIndexForSnapshot(snap);
+  const closureIndex = getClosureIndexForSnapshot(snap);
 
   const primaryPark =
     typeof raw.primary_park_id === "number"
@@ -631,56 +722,101 @@ export async function getDownloadedPack(
   return getOfflineBackend().get<DownloadedPackRecord>("packs", regionId);
 }
 
-export async function saveOfflinePackData(
-  record: DownloadedPackRecord,
-  snapshot: OfflinePackSnapshot
-): Promise<void> {
-  const backend = getOfflineBackend();
-  await backend.put("packs", record.region_id, record);
-  await backend.put("snapshots", record.region_id, snapshot);
-  snapshotMemCache.set(record.region_id, snapshot);
-  trackIndexMemCache.delete(record.region_id);
-  notifySwInvalidatePackCache(record.region_id);
+type PackStorage = Pick<DownloadedPackRecord,
+  | "region_id"
+  | "storage_generation"
+  | "shard_count"
+  | "vector_pmtiles_url"
+  | "terrain_pmtiles_url"
+>;
+
+async function discardPackStorage(backend: OfflineKvBackend, storage: PackStorage): Promise<void> {
+  const { region_id: regionId, storage_generation: generation } = storage;
+  const snapshotKey = packSnapshotStorageKey(regionId, generation);
+  const oldSnapshot = generation === undefined
+    ? await backend.get<OfflinePackSnapshot>("snapshots", snapshotKey).catch(() => null)
+    : null;
+  const count = Math.min(MAX_PACK_SHARDS, Math.max(storage.shard_count ?? 0, oldSnapshot?.shard_count ?? 0));
+
+  const deletes = [backend.delete("snapshots", snapshotKey)];
+  for (let idx = 0; idx < count; idx += 1) {
+    deletes.push(backend.delete("pack_shards", packShardStorageKey(regionId, idx, generation)));
+  }
+  if (typeof caches !== "undefined") {
+    const paths = new Set([
+      storage.vector_pmtiles_url ?? buildOfflinePackTileCachePath(regionId, "vector", generation),
+      storage.terrain_pmtiles_url ?? buildOfflinePackTileCachePath(regionId, "terrain", generation),
+    ]);
+    deletes.push(caches.open(PACKS_CACHE_NAME).then(async (cache) => {
+      await Promise.all(Array.from(paths, (path) => cache.delete(path)));
+    }));
+  }
+  await Promise.allSettled(deletes);
+}
+
+async function reclaimAbandonedPackStorage(backend: OfflineKvBackend, regionId: string): Promise<void> {
+  let cache: Cache | undefined;
+  let tileKeys: readonly Request[] = [];
+  if (typeof caches !== "undefined") {
+    try {
+      cache = await caches.open(PACKS_CACHE_NAME);
+      tileKeys = await cache.keys();
+    } catch {
+      // IndexedDB cleanup can still run when CacheStorage is unavailable.
+    }
+  }
+
+  // Read both protected generations atomically. A generation collected here
+  // can never be installed later because its operation token is already stale.
+  const state = await backend.inspectPackStorage(regionId).catch(() => null);
+  if (!state) return;
+  const abandoned = (generation: string): boolean =>
+    /^[a-f0-9]{32}$/.test(generation) &&
+    generation !== state.installed && generation !== state.pending;
+  const prefix = `${regionId}:`;
+  const drops: Promise<unknown>[] = [];
+  for (const key of state.snapshotKeys) {
+    if (abandoned(key.slice(prefix.length))) drops.push(backend.delete("snapshots", key));
+  }
+  for (const key of state.shardKeys) {
+    const [generation] = key.slice(prefix.length).split(":", 1);
+    if (generation && abandoned(generation)) drops.push(backend.delete("pack_shards", key));
+  }
+  const tilePrefix = `/api/packs/${encodeURIComponent(regionId)}/tiles/`;
+  for (const key of tileKeys) {
+    const { pathname } = new URL(key.url);
+    if (!pathname.startsWith(tilePrefix)) continue;
+    const match = /^([a-f0-9]{32})\/(vector|terrain)\.pmtiles$/.exec(pathname.slice(tilePrefix.length));
+    if (match && abandoned(match[1]!)) drops.push(cache!.delete(key));
+  }
+  await Promise.allSettled(drops);
+  if (drops.length > 0) notifySwInvalidatePackCache(regionId);
+}
+
+function notifyPackChange(regionId: string, operation: string): void {
+  clearSnapshotMemCache(regionId);
+  try {
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new Event(OFFLINE_PACK_CHANGE_KEY));
+      window.localStorage.setItem(OFFLINE_PACK_CHANGE_KEY, operation);
+    }
+  } catch {
+    // Other tabs can still resolve the installed generation on their next read.
+  }
 }
 
 export async function removeOfflinePack(regionId: string): Promise<void> {
   const backend = getOfflineBackend();
-  const existing = await getDownloadedPack(regionId);
-  const existingSnap = await backend.get<OfflinePackSnapshot>("snapshots", regionId);
-  const shardCount = Math.max(
-    existing?.shard_count ?? 0,
-    existingSnap?.shard_count ?? 0
-  );
-  await backend.delete("packs", regionId);
-  await backend.delete("snapshots", regionId);
-  if (shardCount > 0) {
-    await Promise.all(
-      Array.from({ length: shardCount }, (_, idx) =>
-        backend.delete("pack_shards", packShardStorageKey(regionId, idx))
-      )
-    );
-  }
-  clearSnapshotMemCache(regionId);
+  const operation = newPackGeneration();
+  await backend.put("snapshots", packOperationKey(regionId), operation);
+  const committed = await backend.completePackOperation(regionId, operation, null);
+  if (!committed) throw new Error("Another operation has taken over this offline pack");
+  if (getActiveOfflinePackId() === regionId) setActiveOfflinePackId(null);
+  notifyPackChange(regionId, operation);
+
+  if (committed.previous) await discardPackStorage(backend, committed.previous);
+  await reclaimAbandonedPackStorage(backend, regionId);
   notifySwInvalidatePackCache(regionId);
-
-  if (getActiveOfflinePackId() === regionId) {
-    setActiveOfflinePackId(null);
-  }
-
-  if (typeof caches !== "undefined") {
-    try {
-      const cache = await caches.open(PACKS_CACHE_NAME);
-      const urlsToDrop = [
-        existing?.vector_pmtiles_url,
-        existing?.terrain_pmtiles_url,
-        `/api/packs/${encodeURIComponent(regionId)}/tiles/vector.pmtiles`,
-        `/api/packs/${encodeURIComponent(regionId)}/tiles/terrain.pmtiles`,
-      ].filter((u): u is string => Boolean(u));
-      await Promise.all(urlsToDrop.map((u) => cache.delete(u)));
-    } catch {
-      // Ignore CacheStorage errors
-    }
-  }
 }
 
 function findManifestFileEntry(
@@ -712,297 +848,254 @@ export interface PackDownloadProgress {
 }
 
 /**
- * Download an offline regional pack from TrailForge API into IndexedDB + CacheStorage.
- * Stores full PMTiles archives in `trailforge-packs-v1` so `sw.js` serves HTTP 206
- * Range slices 100% offline.
+ * Download under fresh keys, then publish the installed pointer in one IndexedDB
+ * transaction. A later download or removal can supersede the pending operation.
  */
 export async function downloadRegionalPackToDevice(
   region: OfflinePackRegionItem,
   onProgress?: (progress: PackDownloadProgress) => void
 ): Promise<DownloadedPackRecord> {
-  const rid = encodeURIComponent(region.region_id);
-  const manifestUrl = resolvePackAssetUrl(
-    region.manifest_url,
-    `/api/packs/${rid}/manifest.json`
-  );
-  const snapshotUrl = resolvePackAssetUrl(
-    region.snapshot_url,
-    `/api/packs/${rid}/snapshot.json`
-  );
-
-  onProgress?.({ stage: "Fetching pack manifest…", pct: 10 });
-  const manifestRes = await fetch(manifestUrl, { cache: "no-store" });
-  if (!manifestRes.ok) {
-    throw new Error(`Manifest fetch failed (HTTP ${manifestRes.status})`);
-  }
-  const manifest = (await manifestRes.json()) as OfflinePackManifest;
-  if (region.community_telemetry_policy && (
-    manifest.community_telemetry_policy !== region.community_telemetry_policy ||
-    (manifest.community_telemetry_revision ?? null) !== (region.community_telemetry_revision ?? null)
-  )) {
-    throw new Error("Pack contents have changed. Refresh the catalog and try the download again.");
-  }
-
-  onProgress?.({ stage: "Downloading offline track & POI snapshot…", pct: 32 });
-  const snapRes = await fetch(snapshotUrl, { cache: "no-store" });
-  if (!snapRes.ok) {
-    throw new Error(`Snapshot fetch failed (HTTP ${snapRes.status})`);
-  }
-  const snapBuf = await snapRes.arrayBuffer();
-  const snapEntry = findManifestFileEntry(manifest, "snapshot.json");
-  const snapCheck = await verifySha256Hex(snapBuf, snapEntry?.sha256);
-  if (snapCheck === "mismatch") {
-    throw new Error("Offline snapshot SHA-256 verification failed");
-  }
-  const snapshot = JSON.parse(
-    new TextDecoder().decode(snapBuf)
-  ) as OfflinePackSnapshot;
-
-  const isSharded =
-    manifest.snapshot_format === "sharded_v2" || isShardedSnapshot(snapshot);
-  const shardCount = isSharded
-    ? Math.max(0, Number(manifest.shard_count ?? snapshot.shard_count ?? 0))
-    : 0;
+  const regionId = region.region_id;
+  const rid = encodeURIComponent(regionId);
+  const generation = newPackGeneration();
   const backend = getOfflineBackend();
-  const existingPack = await getDownloadedPack(region.region_id);
+  const storage: PackStorage = {
+    region_id: regionId,
+    storage_generation: generation,
+    shard_count: 0,
+    vector_pmtiles_url: buildOfflinePackTileCachePath(regionId, "vector", generation),
+    terrain_pmtiles_url: buildOfflinePackTileCachePath(regionId, "terrain", generation),
+  };
+  await backend.put("snapshots", packOperationKey(regionId), generation);
+  await reclaimAbandonedPackStorage(backend, regionId);
 
-  let allVerified = snapCheck === "verified";
-  let cachedBytes = snapBuf.byteLength;
-  const writtenShardKeys: string[] = [];
+  let record: DownloadedPackRecord;
+  let previous: DownloadedPackRecord | null;
+  try {
+    const manifestUrl = resolvePackAssetUrl(region.manifest_url, `/api/packs/${rid}/manifest.json`);
+    const snapshotUrl = resolvePackAssetUrl(region.snapshot_url, `/api/packs/${rid}/snapshot.json`);
 
-  if (shardCount > 0) {
-    const shardsBaseUrl = resolvePackAssetUrl(
-      region.shards_base_url ?? manifest.shards_base_url,
-      `/api/packs/${rid}/shards`
-    ).replace(/\/+$/, "");
+    onProgress?.({ stage: "Fetching pack manifest…", pct: 10 });
+    const manifestRes = await fetch(manifestUrl, { cache: "no-store" });
+    if (!manifestRes.ok) throw new Error(`Manifest fetch failed (HTTP ${manifestRes.status})`);
+    const manifest = (await manifestRes.json()) as OfflinePackManifest;
+    if (manifest.region_id !== regionId || (region.community_telemetry_policy && (
+      manifest.community_telemetry_policy !== region.community_telemetry_policy ||
+      (manifest.community_telemetry_revision ?? null) !== (region.community_telemetry_revision ?? null)
+    ))) {
+      throw new Error("Pack contents have changed. Refresh the catalog and try the download again.");
+    }
 
-    let nextIdx = 0;
-    let completed = 0;
-    const workerCount = Math.min(SHARD_DOWNLOAD_CONCURRENCY, shardCount);
-
-    const downloadWorker = async (): Promise<void> => {
-      while (true) {
-        const idx = nextIdx;
-        nextIdx += 1;
-        if (idx >= shardCount) return;
-
-        const fname = packShardFilename(idx);
-        const shardUrl = `${shardsBaseUrl}/${fname}`;
-        const res = await fetch(shardUrl, { cache: "no-store" });
-        if (!res.ok) {
-          throw new Error(`Shard ${fname} fetch failed (HTTP ${res.status})`);
-        }
-        const buf = await res.arrayBuffer();
-        const entry = findManifestFileEntry(manifest, `shards/${fname}`);
-        const check = await verifySha256Hex(buf, entry?.sha256);
-        if (check === "mismatch") {
-          allVerified = false;
-          throw new Error(`Shard ${fname} SHA-256 verification failed`);
-        }
-        if (check !== "verified") {
-          allVerified = false;
-        }
-        const key = packShardStorageKey(region.region_id, idx);
-        await backend.put("pack_shards", key, new Uint8Array(buf));
-        writtenShardKeys.push(key);
-        cachedBytes += buf.byteLength;
-        completed += 1;
-        const pct = Math.round(32 + (completed / shardCount) * 26);
-        onProgress?.({
-          stage: `Downloading track shards (${completed}/${shardCount})…`,
-          pct,
-        });
+    let allVerified = true;
+    let cachedBytes = 0;
+    const verifyFile = async (name: string, bytes: ArrayBuffer): Promise<void> => {
+      const entry = findManifestFileEntry(manifest, name);
+      const check = await verifySha256Hex(bytes, entry?.sha256);
+      if (check === "mismatch") throw new Error(`${name} SHA-256 verification failed`);
+      if (entry?.size_bytes !== undefined && bytes.byteLength !== entry.size_bytes) {
+        throw new Error(`${name} size does not match the pack manifest`);
       }
+      allVerified &&= check === "verified";
+      cachedBytes += bytes.byteLength;
     };
 
-    try {
-      await Promise.all(Array.from({ length: workerCount }, () => downloadWorker()));
-    } catch (err) {
-      await Promise.all(
-        writtenShardKeys.map((k) => backend.delete("pack_shards", k))
-      );
-      clearSnapshotMemCache(region.region_id);
-      throw err;
+    onProgress?.({ stage: "Downloading offline track & POI snapshot…", pct: 32 });
+    const snapRes = await fetch(snapshotUrl, { cache: "no-store" });
+    if (!snapRes.ok) throw new Error(`Snapshot fetch failed (HTTP ${snapRes.status})`);
+    const snapBuf = await snapRes.arrayBuffer();
+    await verifyFile("snapshot.json", snapBuf);
+    const snapshot = JSON.parse(new TextDecoder().decode(snapBuf)) as OfflinePackSnapshot;
+    if (snapshot.region_id !== regionId || (
+      manifest.version !== undefined && snapshot.version !== undefined &&
+      manifest.version !== snapshot.version
+    )) {
+      throw new Error("Offline snapshot does not match the pack manifest");
     }
-  }
+    const sharded = manifest.snapshot_format === "sharded_v2" || isShardedSnapshot(snapshot);
+    const shardCount = sharded ? manifest.shard_count ?? snapshot.shard_count ?? 0 : 0;
+    if (sharded) {
+      if (!Number.isSafeInteger(shardCount) || shardCount < 1 || shardCount > MAX_PACK_SHARDS ||
+        (snapshot.shard_count !== undefined && snapshot.shard_count !== shardCount)) {
+        throw new Error("Offline snapshot shard count does not match the pack manifest");
+      }
+      storage.shard_count = shardCount;
+      snapshot.shard_count = shardCount;
+      const shardsBaseUrl = resolvePackAssetUrl(
+        region.shards_base_url ?? manifest.shards_base_url,
+        `/api/packs/${rid}/shards`
+      ).replace(/\/+$/, "");
+      const controller = new AbortController();
+      let nextIdx = 0;
+      let completed = 0;
+      const downloadWorker = async (): Promise<void> => {
+        try {
+          while (!controller.signal.aborted && nextIdx < shardCount) {
+            const idx = nextIdx++;
+            const fname = packShardFilename(idx);
+            const res = await fetch(`${shardsBaseUrl}/${fname}`, { cache: "no-store", signal: controller.signal });
+            if (!res.ok) throw new Error(`Shard ${fname} fetch failed (HTTP ${res.status})`);
+            const buf = await res.arrayBuffer();
+            await verifyFile(`shards/${fname}`, buf);
+            controller.signal.throwIfAborted();
+            await backend.put("pack_shards", packShardStorageKey(regionId, idx, generation), new Uint8Array(buf));
+            completed += 1;
+            onProgress?.({
+              stage: `Downloading track shards (${completed}/${shardCount})…`,
+              pct: Math.round(32 + (completed / shardCount) * 26),
+            });
+          }
+        } catch (err) {
+          controller.abort(err);
+        }
+      };
 
-  const vectorCachePath = buildOfflinePackTileCachePath(
-    region.region_id,
-    "vector"
-  );
-  const terrainCachePath = buildOfflinePackTileCachePath(
-    region.region_id,
-    "terrain"
-  );
-  const vectorUrl = resolvePackAssetUrl(
-    region.vector_pmtiles_url ?? manifest.vector_pmtiles_url,
-    vectorCachePath
-  );
-  const terrainUrl = resolvePackAssetUrl(
-    region.terrain_pmtiles_url ?? manifest.terrain_pmtiles_url,
-    terrainCachePath
-  );
-
-  let hasVector = false;
-  let hasTerrain = false;
-
-  const cacheTile = async (
-    tileUrl: string,
-    cacheKeyPath: string,
-    manifestFileName: string,
-    stageLabel: string,
-    pct: number
-  ): Promise<boolean> => {
-    onProgress?.({ stage: stageLabel, pct });
-    const res = await fetch(tileUrl, { cache: "no-store" });
-    if (!res.ok) return false;
-    const buf = await res.arrayBuffer();
-    if (buf.byteLength === 0) return false;
-    const entry = findManifestFileEntry(manifest, manifestFileName);
-    const check = await verifySha256Hex(buf, entry?.sha256);
-    if (check === "mismatch") {
-      allVerified = false;
-      throw new Error(`${manifestFileName} SHA-256 verification failed`);
+      await Promise.all(Array.from(
+        { length: Math.min(SHARD_DOWNLOAD_CONCURRENCY, shardCount) },
+        () => downloadWorker()
+      ));
+      controller.signal.throwIfAborted();
     }
-    cachedBytes += buf.byteLength;
 
-    if (typeof caches !== "undefined") {
+    const cacheTile = async (
+      kind: "vector" | "terrain",
+      declaredAvailable: boolean | undefined,
+      offeredUrl: string | null | undefined,
+      stage: string,
+      pct: number
+    ): Promise<string | null> => {
+      const filename = `${kind}.pmtiles`;
+      const declared = declaredAvailable === true || Boolean(findManifestFileEntry(manifest, filename));
+      if (declaredAvailable === false && !declared) return null;
+      const livePath = buildOfflinePackTileCachePath(regionId, kind);
+      const tileUrl = resolvePackAssetUrl(offeredUrl, livePath);
+      onProgress?.({ stage, pct });
+      const res = await fetch(tileUrl, { cache: "no-store" });
+      if (res.headers.get("X-TrailForge-Offline-Cache") === "HIT") {
+        throw new Error("Reload TrailForge before updating this offline pack");
+      }
+      if (!declared && (res.status === 404 || res.status === 410)) return null;
+      if (res.status !== 200) throw new Error(`${filename} fetch failed (HTTP ${res.status})`);
+      const buf = await res.arrayBuffer();
+      if (buf.byteLength === 0) throw new Error(`${filename} is empty`);
+      await verifyFile(filename, buf);
+
+      if (typeof caches === "undefined") {
+        throw new Error("Offline tile storage is unavailable in this browser");
+      }
       const cache = await caches.open(PACKS_CACHE_NAME);
-      await cache.put(
-        cacheKeyPath,
-        new Response(buf, {
-          status: 200,
-          headers: {
-            "Content-Type": "application/vnd.pmtiles",
-            "Content-Length": String(buf.byteLength),
-          },
-        })
-      );
-    }
-    return true;
-  };
+      const cachePath = buildOfflinePackTileCachePath(regionId, kind, generation);
+      await cache.put(cachePath, new Response(buf, {
+        headers: {
+          "Content-Type": "application/vnd.pmtiles",
+          "Content-Length": String(buf.byteLength),
+        },
+      }));
+      return cachePath;
+    };
 
-  try {
-    hasVector = await cacheTile(
-      vectorUrl,
-      vectorCachePath,
-      "vector.pmtiles",
-      "Caching vector PMTiles for offline Range 206…",
-      62
+    const vectorPath = await cacheTile(
+      "vector", manifest.vector_available,
+      region.vector_pmtiles_url ?? manifest.vector_pmtiles_url,
+      "Caching vector PMTiles for offline Range 206…", 62
     );
+    const terrainPath = await cacheTile(
+      "terrain", manifest.terrain_available,
+      region.terrain_pmtiles_url ?? manifest.terrain_pmtiles_url,
+      "Caching terrain hillshade PMTiles…", 86
+    );
+
+    const counts = manifest.counts ?? {};
+    record = {
+      region_id: regionId,
+      storage_generation: generation,
+      name: manifest.name ?? region.name,
+      version: manifest.version ?? region.version ?? "1",
+      downloaded_at: new Date().toISOString(),
+      snapshot_format: sharded ? "sharded_v2" : "inline_v1",
+      shard_count: shardCount,
+      total_size_bytes: manifest.total_size_bytes ?? region.total_size_bytes ?? cachedBytes,
+      track_count: counts.tracks ?? region.track_count ?? snapshot.tracks?.length ?? 0,
+      segment_count: counts.segments ?? region.segment_count ?? 0,
+      poi_count: counts.pois ?? region.poi_count ?? snapshot.pois?.length ?? 0,
+      bbox: manifest.bounds ?? manifest.bbox ?? region.bbox,
+      vector_pmtiles_url: vectorPath,
+      terrain_pmtiles_url: terrainPath,
+      has_vector_pmtiles: vectorPath !== null,
+      has_terrain_pmtiles: terrainPath !== null,
+      snowline_bands_m: manifest.snowline_bands_m ?? [...DEFAULT_SNOWLINE_BANDS_M],
+      attributions: manifest.attributions ?? snapshot.attributions ?? region.attributions ?? [],
+      sha256_verified: allVerified,
+    };
+
+    onProgress?.({ stage: "Saving pack to IndexedDB…", pct: 96 });
+    await backend.put("snapshots", packSnapshotStorageKey(regionId, generation), snapshot);
+    const committed = await backend.completePackOperation(regionId, generation, record);
+    if (!committed) throw new Error("Another operation has taken over this offline pack");
+    previous = committed.previous;
   } catch (err) {
-    if (err instanceof Error && err.message.includes("SHA-256")) {
-      await Promise.all(
-        writtenShardKeys.map((k) => backend.delete("pack_shards", k))
-      );
-      throw err;
-    }
+    await discardPackStorage(backend, storage);
+    await backend.completePackOperation(regionId, generation).catch(() => undefined);
+    throw err;
   }
 
+  notifyPackChange(regionId, generation);
+  if (previous) await discardPackStorage(backend, previous);
+  notifySwInvalidatePackCache(regionId);
   try {
-    hasTerrain = await cacheTile(
-      terrainUrl,
-      terrainCachePath,
-      "terrain.pmtiles",
-      "Caching terrain hillshade PMTiles…",
-      86
-    );
-  } catch (err) {
-    if (err instanceof Error && err.message.includes("SHA-256")) {
-      await Promise.all(
-        writtenShardKeys.map((k) => backend.delete("pack_shards", k))
-      );
-      throw err;
-    }
+    onProgress?.({ stage: "Offline pack ready", pct: 100 });
+  } catch {
+    // The installed pointer already committed successfully.
   }
-
-  // Clean up any stale surplus shards if the region sharded count shrank on update
-  const prevShardCount = existingPack?.shard_count ?? 0;
-  if (prevShardCount > shardCount) {
-    await Promise.all(
-      Array.from({ length: prevShardCount - shardCount }, (_, offset) =>
-        backend.delete(
-          "pack_shards",
-          packShardStorageKey(region.region_id, shardCount + offset)
-        )
-      )
-    );
-  }
-
-  const counts = manifest.counts ?? {};
-  const record: DownloadedPackRecord = {
-    region_id: region.region_id,
-    name: manifest.name ?? region.name,
-    version: manifest.version ?? region.version ?? "1",
-    downloaded_at: new Date().toISOString(),
-    snapshot_format: shardCount > 0 ? "sharded_v2" : "inline_v1",
-    shard_count: shardCount,
-    total_size_bytes: manifest.total_size_bytes ?? region.total_size_bytes ?? cachedBytes,
-    track_count:
-      counts.tracks ?? region.track_count ?? snapshot.tracks?.length ?? 0,
-    segment_count: counts.segments ?? region.segment_count ?? 0,
-    poi_count: counts.pois ?? region.poi_count ?? snapshot.pois?.length ?? 0,
-    bbox: (manifest.bounds ?? manifest.bbox ?? region.bbox) as BBoxTuple,
-    vector_pmtiles_url: hasVector ? vectorCachePath : null,
-    terrain_pmtiles_url: hasTerrain ? terrainCachePath : null,
-    has_vector_pmtiles: hasVector,
-    has_terrain_pmtiles: hasTerrain,
-    snowline_bands_m: manifest.snowline_bands_m ?? [...DEFAULT_SNOWLINE_BANDS_M],
-    attributions:
-      manifest.attributions ?? snapshot.attributions ?? region.attributions ?? [],
-    sha256_verified: allVerified,
-  };
-
-  onProgress?.({ stage: "Saving pack to IndexedDB…", pct: 96 });
-  clearSnapshotMemCache(region.region_id);
-  await saveOfflinePackData(record, snapshot);
-  onProgress?.({ stage: "Offline pack ready", pct: 100 });
   return record;
 }
 
 /* ---------- Offline Snapshot Query Helpers (used when offline or offline pack active) ---------- */
 
-async function resolvePreferredPackAndSnapshot(
-  regionId?: string | null
-): Promise<{
-  pack: DownloadedPackRecord;
-  snapshot: OfflinePackSnapshot | null;
-} | null> {
+async function resolvePreferredPack(regionId?: string | null): Promise<DownloadedPackRecord | null> {
   const targetId = regionId ?? getActiveOfflinePackId();
-  const backend = getOfflineBackend();
+  const preferred = targetId ? await getDownloadedPack(targetId) : null;
+  return preferred ?? (await listDownloadedPacks())[0] ?? null;
+}
 
-  if (targetId) {
-    const pack = await backend.get<DownloadedPackRecord>("packs", targetId);
-    if (pack) {
-      const snapshot = await loadSnapshotCached(targetId);
-      return { pack, snapshot };
-    }
+async function readPackSnapshot<T>(
+  pack: DownloadedPackRecord,
+  read: (pack: DownloadedPackRecord, snapshot: OfflinePackSnapshot) => Promise<T | null>
+): Promise<T | null> {
+  while (true) {
+    const snapshot = await loadSnapshotCached(pack);
+    const result = snapshot ? await read(pack, snapshot) : null;
+    if (result !== null) return result;
+
+    // The previously selected generation may have been removed while the
+    // snapshot or shard read was running. Retry using any newly installed one.
+    const latest = await getDownloadedPack(pack.region_id);
+    if (!latest || latest.storage_generation === pack.storage_generation) return null;
+    pack = latest;
   }
+}
 
-  const all = await listDownloadedPacks();
-  const first = all[0];
-  if (!first) return null;
-  const snapshot = await loadSnapshotCached(first.region_id);
-  return { pack: first, snapshot };
+async function resolvePreferredPackAndSnapshot(regionId?: string | null): Promise<{
+  pack: DownloadedPackRecord;
+  snapshot: OfflinePackSnapshot;
+} | null> {
+  const pack = await resolvePreferredPack(regionId);
+  return pack
+    ? readPackSnapshot(pack, async (pack, snapshot) => ({ pack, snapshot }))
+    : null;
 }
 
 export async function getOfflineTileManifest(
   regionId?: string | null
 ): Promise<TileManifestResponse | null> {
-  const resolved = await resolvePreferredPackAndSnapshot(regionId);
-  if (!resolved) return null;
-  const { pack } = resolved;
+  const pack = await resolvePreferredPack(regionId);
+  if (!pack) return null;
   return {
     generated_at: pack.downloaded_at,
     bounds: pack.bbox,
     minzoom: 6,
     maxzoom: 15,
-    vector_url:
-      pack.vector_pmtiles_url ??
-      `/api/packs/${encodeURIComponent(pack.region_id)}/tiles/vector.pmtiles`,
-    terrain_url:
-      pack.terrain_pmtiles_url ??
-      `/api/packs/${encodeURIComponent(pack.region_id)}/tiles/terrain.pmtiles`,
+    vector_url: pack.vector_pmtiles_url ?? buildOfflinePackTileCachePath(pack.region_id, "vector"),
+    terrain_url: pack.terrain_pmtiles_url ?? buildOfflinePackTileCachePath(pack.region_id, "terrain"),
     vector_available: pack.has_vector_pmtiles,
     terrain_available: pack.has_terrain_pmtiles,
     snowline_bands_m: pack.snowline_bands_m,
@@ -1011,20 +1104,20 @@ export async function getOfflineTileManifest(
 }
 
 async function resolveTrackFromPackSnapshot(
-  regionId: string,
+  pack: DownloadedPackRecord,
   snap: OfflinePackSnapshot,
   trackId: string
 ): Promise<TrackInspectorDetail | null> {
-  const indexHit = getTrackIndexForSnapshot(regionId, snap).get(trackId);
+  const indexHit = getTrackIndexForSnapshot(snap).get(trackId);
   if (!indexHit) return null;
 
   if (isShardedSnapshot(snap)) {
     const shardCount = Math.max(1, Number(snap.shard_count ?? 0));
     const shardIdx = shardIndexForTrack(trackId, shardCount);
-    const shard = await loadShardCached(regionId, shardIdx);
+    const shard = await loadShardCached(pack, shardIdx);
     const shardTrack = shard?.tracks?.[trackId];
     if (!shardTrack) return null;
-    return hydrateShardedTrack(regionId, snap, shardTrack);
+    return hydrateShardedTrack(snap, shardTrack);
   }
 
   return indexHit as TrackInspectorDetail;
@@ -1034,21 +1127,13 @@ export async function getOfflineTrackDetail(
   trackId: string
 ): Promise<TrackInspectorDetail | null> {
   const activeId = getActiveOfflinePackId();
-
-  if (activeId) {
-    const activeSnap = await loadSnapshotCached(activeId);
-    if (activeSnap) {
-      const hit = await resolveTrackFromPackSnapshot(activeId, activeSnap, trackId);
-      if (hit) return hit;
-    }
-  }
-
   const packs = await listDownloadedPacks();
+  const activeIndex = packs.findIndex((pack) => pack.region_id === activeId);
+  if (activeIndex > 0) packs.unshift(packs.splice(activeIndex, 1)[0]!);
   for (const pack of packs) {
-    if (pack.region_id === activeId) continue;
-    const snap = await loadSnapshotCached(pack.region_id);
-    if (!snap) continue;
-    const hit = await resolveTrackFromPackSnapshot(pack.region_id, snap, trackId);
+    const hit = await readPackSnapshot(pack, (pack, snapshot) =>
+      resolveTrackFromPackSnapshot(pack, snapshot, trackId)
+    );
     if (hit) return hit;
   }
   return null;

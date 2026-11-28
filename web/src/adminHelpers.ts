@@ -81,9 +81,11 @@ export function resolvePackBundleUrl(
  */
 export function buildOfflinePackTileCachePath(
   regionId: string,
-  kind: "vector" | "terrain"
+  kind: "vector" | "terrain",
+  generation?: string
 ): string {
-  return `/api/packs/${encodeURIComponent(regionId)}/tiles/${kind}.pmtiles`;
+  const suffix = generation ? `${encodeURIComponent(generation)}/${kind}` : kind;
+  return `/api/packs/${encodeURIComponent(regionId)}/tiles/${suffix}.pmtiles`;
 }
 
 export function normalizeRegistrationMode(
