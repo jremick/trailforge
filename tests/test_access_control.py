@@ -161,18 +161,18 @@ def test_packs_public_base_url_emits_r2_urls_and_default_relative_urls(
     get_settings.cache_clear()
     assert _build_region_summary(region, tmp_path, None)["status"] == "not_built"
     published = OfflinePack(
-        status="ready", version="test", community_telemetry_policy="static_v1",
+        status="ready", version="test", community_telemetry_policy="static_v2",
     )
     r2_summary = _build_region_summary(region, tmp_path, published)
     assert r2_summary["status"] == "ready"
-    prefix = "https://packs.example.com/australian-alps/static_v1"
+    prefix = "https://packs.example.com/australian-alps/static_v2"
     assert r2_summary["manifest_url"] == f"{prefix}/manifest.json"
     assert r2_summary["snapshot_url"] == f"{prefix}/snapshot.json"
     assert r2_summary["bundle_url"] == f"{prefix}/bundle.tar.gz"
     assert r2_summary["vector_pmtiles_url"] == f"{prefix}/vector.pmtiles"
     assert r2_summary["terrain_pmtiles_url"] == f"{prefix}/terrain.pmtiles"
 
-    # Even when a local static_v1 manifest exists on disk (e.g. Railway /data/packs), R2 URLs win
+    # Even when a local static_v2 manifest exists on disk (e.g. Railway /data/packs), R2 URLs win
     alps_dir = tmp_path / "australian-alps"
     alps_dir.mkdir(parents=True, exist_ok=True)
     (alps_dir / "manifest.json").write_text(
@@ -184,7 +184,7 @@ def test_packs_public_base_url_emits_r2_urls_and_default_relative_urls(
                 "region_type": region.region_type,
                 "version": "2026.11.27",
                 "generated_at": "2026-11-27T00:00:00Z",
-                "community_telemetry_policy": "static_v1",
+                "community_telemetry_policy": "static_v2",
                 "bbox": list(region.bbox),
                 "bounds": list(region.bbox),
             }
@@ -196,7 +196,7 @@ def test_packs_public_base_url_emits_r2_urls_and_default_relative_urls(
     assert hybrid_summary["manifest_url"] == f"{prefix}/manifest.json"
     assert hybrid_summary["vector_pmtiles_url"] == f"{prefix}/vector.pmtiles"
 
-    # Stale legacy local manifest falls back to the published static_v1 R2 record
+    # Stale legacy local manifest falls back to the published static_v2 R2 record
     (alps_dir / "manifest.json").write_text(
         json.dumps(
             {
@@ -206,6 +206,7 @@ def test_packs_public_base_url_emits_r2_urls_and_default_relative_urls(
                 "region_type": region.region_type,
                 "version": "2026.11.20",
                 "generated_at": "2026-11-20T00:00:00Z",
+                "community_telemetry_policy": "static_v1",
                 "vector_available": True,
                 "bbox": list(region.bbox),
                 "bounds": list(region.bbox),
@@ -216,6 +217,8 @@ def test_packs_public_base_url_emits_r2_urls_and_default_relative_urls(
     stale_local_summary = _build_region_summary(region, tmp_path, published)
     assert stale_local_summary["status"] == "ready"
     assert stale_local_summary["vector_pmtiles_url"] == f"{prefix}/vector.pmtiles"
+    published.community_telemetry_policy = "static_v1"
+    assert _build_region_summary(region, tmp_path, published)["status"] == "not_built"
     get_settings.cache_clear()
 
 

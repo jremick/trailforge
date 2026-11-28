@@ -212,7 +212,7 @@ curl -sSI \
 
 Confirm `HTTP/2 206`, `access-control-allow-origin: https://trails.example.com`, `content-range:`, `accept-ranges: bytes`, and `etag:` appear in the response.
 
-> **Upgrading from `v1.2.x`:** Re-run `python -m trailforge.tiles.cli` / `python -m trailforge.packs.cli --static-only` and `python -m trailforge.packs.r2_sync` immediately on rollout so the static baseline/weather archive (`trailforge_vector_baseline_weather_v1.pmtiles`) and `static_v1` regional packs are published to R2, then purge any retired legacy objects (`trailforge_vector.pmtiles`, `<region>/snapshot.json`). See [`docs/COMMUNITY_PRIVACY.md`](../../docs/COMMUNITY_PRIVACY.md).
+> **Upgrading TrailForge**. Follow the [community telemetry rollout order](../../docs/COMMUNITY_PRIVACY.md) to drain old writers, apply the migrations, publish current `static_v2` regional packs to R2, retire older URLs and refresh device packs.
 
 ### 4.3 Create Your First Admin Account & Friend Invite Codes
 

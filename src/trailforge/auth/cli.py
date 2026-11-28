@@ -14,6 +14,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from trailforge.auth.community_trust import revoke_community_trust
 from trailforge.auth.invites import classify_invite_status, create_invite_code
 from trailforge.auth.security import hash_password, normalize_email
 from trailforge.db.models import InviteCode, User
@@ -31,7 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser for ``python -m trailforge.auth.cli``."""
     parser = argparse.ArgumentParser(
         prog="python -m trailforge.auth.cli",
-        description="Manage TrailForge admin accounts and friend invite codes.",
+        description="Manage TrailForge admin accounts, friend invites and contributor trust.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -86,6 +87,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_list = sub.add_parser("list-invites", help="List all invite codes and their status.")
     p_list.add_argument("--json", action="store_true", help="Output JSON.")
+
+    p_trust = sub.add_parser(
+        "community-trust", help="Grant or revoke authority for a member's community evidence."
+    )
+    p_trust.add_argument("action", choices=("grant", "revoke"))
+    p_trust.add_argument("--email", required=True, help="Existing member's email address.")
+    p_trust.add_argument("--json", action="store_true", help="Output JSON.")
 
     return parser
 
@@ -225,6 +233,40 @@ def _cmd_create_invite(db: Session, args: argparse.Namespace) -> tuple[int, dict
     )
 
 
+def _cmd_community_trust(db: Session, args: argparse.Namespace) -> tuple[int, dict[str, Any] | str]:
+    try:
+        email = normalize_email(args.email)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2, ""
+
+    user = db.scalar(
+        select(User)
+        .where(func.lower(User.email) == email)
+        .with_for_update(key_share=True)
+        .execution_options(populate_existing=True)
+    )
+    if user is None:
+        print(f"Error: account {email!r} not found", file=sys.stderr)
+        return 1, ""
+
+    if args.action == "grant":
+        if not user.is_active:
+            db.rollback()
+            print("Error: activate this account before granting community trust", file=sys.stderr)
+            return 1, ""
+        if user.community_trusted_at is None:
+            user.community_trusted_at = db.scalar(select(func.clock_timestamp()))
+    else:
+        revoke_community_trust(db, user)
+    db.commit()
+
+    granted_at = _iso_or_none(user.community_trusted_at)
+    if args.json:
+        return 0, {"email": user.email, "role": user.role, "community_trusted_at": granted_at}
+    return 0, f"Community trust for {user.email}: {granted_at or 'not granted'}"
+
+
 def _cmd_list_invites(db: Session, args: argparse.Namespace) -> tuple[int, dict[str, Any] | str]:
     now = datetime.now(UTC)
     invites = (
@@ -268,6 +310,7 @@ def main(argv: Sequence[str] | None = None, *, session: Session | None = None) -
         "promote": _cmd_promote,
         "create-invite": _cmd_create_invite,
         "list-invites": _cmd_list_invites,
+        "community-trust": _cmd_community_trust,
     }
     handler = handlers[args.command]
 

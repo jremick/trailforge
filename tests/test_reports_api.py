@@ -14,12 +14,12 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
-from sqlalchemy import Engine, text
+from sqlalchemy import Engine, func, select, text
 from sqlalchemy.orm import Session
 
 from trailforge.api.main import create_app
 from trailforge.api.reports import router as reports_router
-from trailforge.db.models import ConditionReport
+from trailforge.db.models import ConditionReport, User
 from trailforge.db.session import get_db
 from trailforge.ingestion.connectors.fixtures import load_corridor_fixtures
 from trailforge.ingestion.pipeline import ingest_corridor_dataset
@@ -42,7 +42,11 @@ from trailforge.reports.photos import (
     resolve_photo_path,
     save_report_photo,
 )
-from trailforge.reports.queries import get_reports_for_track, snap_point_to_nearest_segment
+from trailforge.reports.queries import (
+    get_reports_for_track,
+    get_reports_for_tracks,
+    snap_point_to_nearest_segment,
+)
 
 
 def _make_valid_png_bytes() -> bytes:
@@ -691,7 +695,25 @@ def test_reports_api_end_to_end_photos_voting_decay_snapping_and_privacy(
                 )
                 assert anon_vote.status_code == 401
 
-                # Bob confirms -> refreshes staleness back to active!
+                # An unattested confirmation appears in the tally without refreshing the report.
+                unapproved_confirm = client.post(
+                    f"/api/reports/{snow_id}/vote",
+                    headers=bob_headers,
+                    json={"vote": "confirm"},
+                )
+                assert unapproved_confirm.status_code == 200
+                assert unapproved_confirm.json()["confirm_count"] == 1
+                assert unapproved_confirm.json()["user_vote"] == "confirm"
+                assert unapproved_confirm.json()["effective_status"] == "stale"
+                assert unapproved_confirm.json()["last_confirmed_at"] is None
+                assert unapproved_confirm.json()["expires_at"] == stale_data["expires_at"]
+
+                bob = session.scalars(select(User).where(User.email == emails[1])).one()
+                bob.community_trusted_at = session.scalar(select(func.clock_timestamp()))
+                session.commit()
+                assert client.get(f"/api/reports/{snow_id}").json()["effective_status"] == "stale"
+
+                # A new confirmation after attestation refreshes the report, even for a new account.
                 r_v1 = client.post(
                     f"/api/reports/{snow_id}/vote",
                     headers=bob_headers,
@@ -705,8 +727,17 @@ def test_reports_api_end_to_end_photos_voting_decay_snapping_and_privacy(
                 assert v1_data["freshness_score"] > 0.9
                 assert v1_data["effective_status"] == "active"
                 assert v1_data["last_confirmed_at"] is not None
+                assert v1_data["expires_at"] > stale_data["expires_at"]
                 assert v1_data["user_vote"] == "confirm"
                 _assert_no_email_leaked(v1_data, emails)
+
+                offline_reports = get_reports_for_track(
+                    session, davies_track_id, include_vote_assessment=False
+                )["condition_reports"]
+                offline_snow = next(report for report in offline_reports if report["id"] == snow_id)
+                assert offline_snow["effective_status"] == "stale"
+                assert offline_snow["last_confirmed_at"] is None
+                assert offline_snow["expires_at"] == stale_data["expires_at"]
 
                 # Idempotent duplicate confirm by Bob keeps count == 1
                 r_v1_dup = client.post(
@@ -728,7 +759,7 @@ def test_reports_api_end_to_end_photos_voting_decay_snapping_and_privacy(
                 assert r_v2.json()["resolved_count"] == 1
                 assert r_v2.json()["effective_status"] != "resolved"
 
-                # Two recent accounts can record observations without removing a warning.
+                # Another account can record a resolve vote without contributing to quorum.
                 r_v3 = client.post(
                     f"/api/reports/{snow_id}/vote",
                     headers=carol_headers,
@@ -739,16 +770,32 @@ def test_reports_api_end_to_end_photos_voting_decay_snapping_and_privacy(
                 assert r_v3.json()["effective_status"] == "stale"
                 assert snow_id in {item["id"] for item in client.get("/api/reports").json()}
 
-                session.execute(text("UPDATE users SET created_at = now() - interval '8 days'"))
+                remaining_users = session.scalars(
+                    select(User).where(User.email.in_([emails[0], emails[2]]))
+                ).all()
+                attested_at = session.scalar(select(func.clock_timestamp()))
+                for voter in remaining_users:
+                    voter.community_trusted_at = attested_at
                 session.commit()
-                for headers in (bob_headers, carol_headers, alice_headers):
-                    mature_vote = client.post(
-                        f"/api/reports/{snow_id}/vote",
-                        headers=headers,
-                        json={"vote": "resolved"},
-                    )
-                    assert mature_vote.status_code == 200
-                assert mature_vote.json()["effective_status"] == "resolved"
+
+                # A third raw vote still leaves only two eligible votes until Carol votes anew.
+                second_eligible = client.post(
+                    f"/api/reports/{snow_id}/vote",
+                    headers=alice_headers,
+                    json={"vote": "resolved"},
+                )
+                assert second_eligible.status_code == 200
+                assert second_eligible.json()["resolved_count"] == 3
+                assert second_eligible.json()["effective_status"] == "stale"
+
+                third_eligible = client.post(
+                    f"/api/reports/{snow_id}/vote",
+                    headers=carol_headers,
+                    json={"vote": "resolved"},
+                )
+                assert third_eligible.status_code == 200
+                assert third_eligible.json()["effective_status"] == "resolved"
+                assert third_eligible.json()["status"] == "active"
 
                 # Resolved report omitted by default, shown when include_resolved=true
                 active_ids = {item["id"] for item in client.get("/api/reports").json()}
@@ -827,6 +874,64 @@ def test_reports_api_end_to_end_photos_voting_decay_snapping_and_privacy(
                     client.get("/api/reports", params={"include_resolved": "true"}).json(),
                     emails,
                 )
+
+                gate_id = gate_body["id"]
+                assert gate_id in {
+                    report["id"]
+                    for report in get_reports_for_track(
+                        session, davies_track_id, include_vote_assessment=False
+                    )["community_gate_warnings"]
+                }
+                assert gate_id not in {
+                    report["id"]
+                    for report in get_reports_for_tracks(
+                        session, [davies_track_id]
+                    )[davies_track_id]["community_gate_warnings"]
+                }
+
+                # Revocation immediately restores an otherwise active warning on all read paths.
+                carol = session.scalars(select(User).where(User.email == emails[2])).one()
+                carol.community_trusted_at = None
+                session.commit()
+                gate_detail = client.get(f"/api/reports/{gate_id}").json()
+                assert gate_detail["effective_status"] == "active"
+                assert gate_detail["resolved_count"] == 3
+                assert gate_id in {r["id"] for r in client.get("/api/reports").json()}
+                assert gate_id in {
+                    f["id"] for f in client.get("/api/reports/geojson").json()["features"]
+                }
+                assert gate_id in {
+                    report["id"]
+                    for report in get_reports_for_tracks(
+                        session, [davies_track_id]
+                    )[davies_track_id]["community_gate_warnings"]
+                }
+
+                carol.community_trusted_at = session.scalar(select(func.clock_timestamp()))
+                session.commit()
+                assert client.get(f"/api/reports/{gate_id}").json()["effective_status"] == "active"
+                vote_after_reattestation = client.post(
+                    f"/api/reports/{gate_id}/vote", headers=carol_headers, json={"vote": "resolved"}
+                )
+                assert vote_after_reattestation.status_code == 200
+                assert vote_after_reattestation.json()["effective_status"] == "resolved"
+                carol.is_active = False
+                session.commit()
+                assert client.get(f"/api/reports/{gate_id}").json()["effective_status"] == "active"
+
+                # Explicit operator resolution survives vote changes and applies in offline reads.
+                gate_row = session.get(ConditionReport, uuid.UUID(gate_id))
+                assert gate_row is not None
+                gate_row.status = "resolved"
+                session.commit()
+                completed = client.get(f"/api/reports/{gate_id}").json()
+                assert completed["effective_status"] == "resolved"
+                assert gate_id not in {
+                    report["id"]
+                    for report in get_reports_for_track(
+                        session, davies_track_id, include_vote_assessment=False
+                    )["condition_reports"]
+                }
 
             app.dependency_overrides.clear()
     finally:

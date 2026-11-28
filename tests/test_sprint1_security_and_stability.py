@@ -319,6 +319,7 @@ def test_sec_h4_and_m3_no_scrypt_on_rejected_register_and_no_admin_bypass(
             text(
                 """
                 CREATE TABLE users (
+                    community_trusted_at DATETIME,
                     id CHAR(32) PRIMARY KEY,
                     email TEXT NOT NULL UNIQUE,
                     display_name TEXT NOT NULL,
@@ -405,6 +406,7 @@ def test_sec_h5_and_m2_oauth_login_nonce_cookie_and_strict_json_types() -> None:
         for ddl in (
             """
             CREATE TABLE users (
+                community_trusted_at DATETIME,
                 id CHAR(32) PRIMARY KEY,
                 email TEXT NOT NULL UNIQUE,
                 display_name TEXT NOT NULL,
@@ -712,6 +714,7 @@ def test_cli_create_admin_password_stdin(
             text(
                 """
                 CREATE TABLE users (
+                    community_trusted_at DATETIME,
                     id CHAR(32) PRIMARY KEY,
                     email TEXT NOT NULL UNIQUE,
                     display_name TEXT NOT NULL,

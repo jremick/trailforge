@@ -470,6 +470,7 @@ def test_postgis_live_grading_rainfall_hotspots_outage_and_api(
                 email=f"grading-fixture-{idx}@example.test",
                 password_hash="offline-fixture",
                 display_name=f"Synthetic Driver {idx}",
+                community_trusted_at=now - timedelta(days=1),
             )
             for idx in range(4)
         ]
@@ -717,7 +718,7 @@ def test_postgis_live_grading_rainfall_hotspots_outage_and_api(
                 static = build_regional_pack(
                     session, "australian-alps", tmp_path, skip_tiles=True, static_only=True
                 )
-                assert static.manifest.community_telemetry_policy == "static_v1"
+                assert static.manifest.community_telemetry_policy == "static_v2"
                 packed = client.get(snapshot_url).json()
                 assert packed["hotspots"]["features"] == []
                 assert all(track["sample_count"] == 0 for track in packed["tracks"])

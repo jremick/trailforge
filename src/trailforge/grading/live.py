@@ -28,12 +28,14 @@ from sqlalchemy import Text, bindparam, func, select, text, update
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Session
 
+from trailforge.auth.community_trust import has_active_telemetry_attestation
 from trailforge.db.models import (
     TelemetryObservation,
     Track,
     TrackSegment,
     TrackSegmentGrade,
     Trip,
+    User,
 )
 from trailforge.grading.baseline import GradeLiteral, score_to_grade
 from trailforge.grading.rainfall import (
@@ -50,7 +52,7 @@ from trailforge.matching.contribution_keys import (
     trip_contribution_hash_sql,
 )
 
-LIVE_FORMULA_VERSION: Final[str] = "live_v2"
+LIVE_FORMULA_VERSION: Final[str] = "live_v3"
 MIN_PUBLIC_CONTRIBUTORS: Final[int] = 3
 RECENCY_HALF_LIFE_DAYS: Final[float] = 90.0
 PRIOR_STRENGTH: Final[float] = 4.0
@@ -552,8 +554,46 @@ def sync_track_effective_grades(
 
 
 def lock_community_grading(session: Session) -> None:
-    """Serialize derivative calculations with withdrawals across API and worker processes."""
+    """Serialize grade calculation with withdrawals and operator trust revocations."""
     session.execute(text("SELECT pg_advisory_xact_lock(14812, 7)"))
+
+
+def clear_all_community_grades(session: Session) -> None:
+    """Fall back to terrain and weather if retained keys cannot identify affected grades."""
+    session.execute(text("""
+        WITH affected AS (
+            SELECT segment_id, baseline_grade, baseline_score,
+                   CASE WHEN jsonb_typeof(rainfall_context -> 'wet_score_adjustment') = 'number'
+                        THEN (rainfall_context ->> 'wet_score_adjustment')::double precision
+                        ELSE 0 END AS wet_adjustment
+            FROM track_segment_grades
+            WHERE sample_count > 0 OR live_grade IS NOT NULL OR live_breakdown IS NOT NULL
+               OR live_score IS NOT NULL OR is_obstacle_hotspot
+               OR last_driven_at IS NOT NULL OR avg_speed_kmh IS NOT NULL
+               OR avg_duration_s IS NOT NULL OR vehicle_class_split <> '{}'::jsonb
+               OR confidence_level <> 'baseline_only' OR confidence_score <> 0
+        )
+        UPDATE track_segment_grades AS grades
+        SET live_grade = NULL, live_score = NULL, live_breakdown = NULL,
+            effective_grade = CASE
+                WHEN affected.wet_adjustment <= 0 THEN affected.baseline_grade
+                WHEN affected.baseline_score + affected.wet_adjustment < 25 THEN 'Easy'
+                WHEN affected.baseline_score + affected.wet_adjustment < 50 THEN 'Medium'
+                WHEN affected.baseline_score + affected.wet_adjustment < 75 THEN 'Hard'
+                ELSE 'Extreme'
+            END,
+            confidence_level = 'baseline_only', confidence_score = 0, sample_count = 0,
+            last_driven_at = NULL, avg_speed_kmh = NULL, avg_duration_s = NULL,
+            vehicle_class_split = '{}'::jsonb, is_obstacle_hotspot = FALSE, live_computed_at = NULL
+        FROM affected
+        WHERE grades.segment_id = affected.segment_id
+    """))
+    sync_track_effective_grades(session)
+
+    from trailforge.packs.builder import invalidate_all_pack_telemetry
+
+    invalidate_all_pack_telemetry(session)
+    session.expire_all()
 
 
 def refresh_grades_after_withdrawal(session: Session, segment_ids: Sequence[str]) -> None:
@@ -655,10 +695,12 @@ def recompute_live_grades(
     obs_query = (
         select(*obs_cols)
         .join(Trip, trip_contribution_hash_sql() == TelemetryObservation.contribution_hash)
+        .join(User, User.id == Trip.user_id)
         .join(TrackSegment, TrackSegment.segment_id == TelemetryObservation.segment_id)
         .where(
             Trip.visibility == "community_anonymous",
             Trip.community_consent_confirmed.is_(True),
+            has_active_telemetry_attestation(),
             TrackSegment.is_active.is_(True),
             TrackSegment.is_vehicular.is_(True),
         )

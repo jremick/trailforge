@@ -21,7 +21,7 @@ from pydantic import (
     field_validator,
 )
 from shapely.geometry import Point
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from starlette.datastructures import UploadFile as StarletteUploadFile
@@ -44,12 +44,10 @@ from trailforge.db.models import (
 from trailforge.db.session import get_db
 from trailforge.reports.decay import (
     DEFAULT_SEVERITY_BY_TYPE,
-    MIN_RESOLVE_ACCOUNT_AGE,
     ReportSeverityLiteral,
     ReportTypeLiteral,
     build_osm_links,
     compute_expires_at,
-    evaluate_report_decay,
     extract_osm_way_id,
 )
 from trailforge.reports.photos import (
@@ -539,7 +537,7 @@ def vote_on_report(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Idempotently upsert a user's ``confirm`` or ``resolved`` vote and recalculate decay."""
+    """Idempotently record a vote and return the current report assessment."""
     try:
         rid = uuid.UUID(report_id)
     except ValueError as exc:
@@ -558,7 +556,7 @@ def vote_on_report(
             status_code=status.HTTP_404_NOT_FOUND, detail="Condition report not found"
         )
 
-    now = datetime.now(UTC)
+    now = db.scalar(select(func.clock_timestamp()))
     existing_vote = db.execute(
         select(ConditionReportVote)
         .where(
@@ -599,51 +597,15 @@ def vote_on_report(
             existing_vote.created_at = now
             db.flush()
 
-    votes = db.execute(
-        select(ConditionReportVote.vote_type, ConditionReportVote.created_at, User.created_at)
-        .join(User, User.id == ConditionReportVote.user_id)
+    confirm_count, resolved_count = db.execute(
+        select(
+            func.count().filter(ConditionReportVote.vote_type == "confirm"),
+            func.count().filter(ConditionReportVote.vote_type == "resolved"),
+        )
         .where(ConditionReportVote.report_id == rid)
-    ).all()
-
-    confirm_timestamps = [ts for vtype, ts, _ in votes if vtype == "confirm"]
-    confirm_count = len(confirm_timestamps)
-    resolved_count = sum(1 for vtype, _, _ in votes if vtype == "resolved")
-    eligible_resolve_count = sum(
-        1 for vtype, ts, joined_at in votes
-        if vtype == "resolved" and ts - joined_at >= MIN_RESOLVE_ACCOUNT_AGE
-    )
-    last_confirmed_at = max(confirm_timestamps) if confirm_timestamps else None
-
-    created_ref = report.created_at
-    if report.observed_at is not None and created_ref is not None:
-        c_utc = (
-            created_ref.astimezone(UTC) if created_ref.tzinfo else created_ref.replace(tzinfo=UTC)
-        )
-        o_utc = (
-            report.observed_at.astimezone(UTC)
-            if report.observed_at.tzinfo
-            else report.observed_at.replace(tzinfo=UTC)
-        )
-        base_ts = min(c_utc, o_utc)
-    else:
-        base_ts = report.observed_at or report.created_at
-
-    decay = evaluate_report_decay(
-        report.report_type,
-        created_at=base_ts,
-        last_confirmed_at=last_confirmed_at,
-        confirm_count=confirm_count,
-        resolved_count=eligible_resolve_count,
-        status="active",
-        now=now,
-    )
-
+    ).one()
     report.confirm_count = confirm_count
     report.resolve_count = resolved_count
-    report.eligible_resolve_count = eligible_resolve_count
-    report.decay_score = decay.freshness_score
-    report.status = decay.effective_status
-    report.expires_at = compute_expires_at(report.report_type, last_confirmed_at or base_ts)
     report.updated_at = now
 
     db.commit()

@@ -19,8 +19,9 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from trailforge import __version__
+from trailforge.auth.community_trust import has_active_telemetry_attestation
 from trailforge.config import Settings, get_settings
-from trailforge.db.models import FeedSyncStatus, TelemetryObservation, TrackSegmentGrade, Trip
+from trailforge.db.models import FeedSyncStatus, TelemetryObservation, TrackSegmentGrade, Trip, User
 from trailforge.db.session import DbHealthStatus, check_db_health, get_engine, reset_engine
 from trailforge.feeds.adapters import build_default_adapters
 from trailforge.feeds.base import adapter_dataset_key, live_feed_polling_enabled
@@ -177,9 +178,11 @@ def run_due_live_grading(
         latest_obs = session.scalar(
             select(func.max(TelemetryObservation.created_at))
             .join(Trip, trip_contribution_hash_sql() == TelemetryObservation.contribution_hash)
+            .join(User, User.id == Trip.user_id)
             .where(
                 Trip.visibility == "community_anonymous",
                 Trip.community_consent_confirmed.is_(True),
+                has_active_telemetry_attestation(),
             )
         )
         clear_last_observation = False

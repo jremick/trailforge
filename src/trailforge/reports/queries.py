@@ -8,9 +8,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Final
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import Select, func, literal, null, or_, select, true
 from sqlalchemy.orm import Session
 
+from trailforge.auth.community_trust import has_active_attestation
 from trailforge.db.models import (
     ConditionReport,
     ConditionReportVote,
@@ -19,9 +20,11 @@ from trailforge.db.models import (
     User,
 )
 from trailforge.reports.decay import (
+    MIN_RESOLVE_VOTES,
     REPORT_TYPE_LABELS,
     VALID_REPORT_TYPES,
     build_osm_links,
+    compute_expires_at,
     evaluate_report_decay,
     extract_osm_way_id,
     is_gate_warning_type,
@@ -149,42 +152,70 @@ def resolve_osm_way_id_for_track(
     return None
 
 
-def _load_vote_metadata(
+def _with_vote_assessment(
+    stmt: Select[Any],
+    *,
+    include_resolved: bool,
+    include_vote_assessment: bool,
+) -> Select[Any]:
+    """Evaluate current vote authority before applying any result limit."""
+    if not include_resolved:
+        stmt = stmt.where(ConditionReport.status != "resolved")
+    if not include_vote_assessment:
+        return stmt.add_columns(
+            literal(0).label("eligible_confirm_count"),
+            literal(0).label("eligible_resolve_count"),
+            null().label("last_confirmed_at"),
+        )
+
+    vote = ConditionReportVote
+    eligible = (
+        select(
+            func.count().filter(vote.vote_type == "confirm").label("eligible_confirm_count"),
+            func.count().filter(vote.vote_type == "resolved").label("eligible_resolve_count"),
+            func.max(vote.created_at)
+            .filter(vote.vote_type == "confirm")
+            .label("last_confirmed_at"),
+        )
+        .select_from(vote)
+        .join(User, User.id == vote.user_id)
+        .where(
+            vote.report_id == ConditionReport.id,
+            has_active_attestation(vote.created_at),
+        )
+        .correlate(ConditionReport)
+        .lateral("eligible_report_votes")
+    )
+    stmt = stmt.join(eligible, true()).add_columns(
+        eligible.c.eligible_confirm_count,
+        eligible.c.eligible_resolve_count,
+        eligible.c.last_confirmed_at,
+    )
+    if not include_resolved:
+        stmt = stmt.where(
+            or_(
+                eligible.c.eligible_resolve_count < MIN_RESOLVE_VOTES,
+                eligible.c.eligible_resolve_count <= eligible.c.eligible_confirm_count,
+            )
+        )
+    return stmt
+
+
+def _load_current_user_votes(
     session: Session,
     report_ids: Sequence[uuid.UUID],
     *,
-    current_user_id: uuid.UUID | None = None,
-) -> tuple[dict[uuid.UUID, datetime | None], dict[uuid.UUID, str]]:
-    """Return ``(last_confirmed_at_by_report, current_user_vote_by_report)`` in bulk."""
-    if not report_ids:
-        return {}, {}
-
-    confirm_rows = session.execute(
-        select(
-            ConditionReportVote.report_id,
-            func.max(ConditionReportVote.created_at).label("last_confirmed_at"),
-        )
-        .where(
+    current_user_id: uuid.UUID | None,
+) -> dict[uuid.UUID, str]:
+    if not report_ids or current_user_id is None:
+        return {}
+    rows = session.execute(
+        select(ConditionReportVote.report_id, ConditionReportVote.vote_type).where(
             ConditionReportVote.report_id.in_(report_ids),
-            ConditionReportVote.vote_type == "confirm",
+            ConditionReportVote.user_id == current_user_id,
         )
-        .group_by(ConditionReportVote.report_id)
     ).all()
-    last_confirmed_map: dict[uuid.UUID, datetime | None] = {
-        rid: ts for rid, ts in confirm_rows
-    }
-
-    user_vote_map: dict[uuid.UUID, str] = {}
-    if current_user_id is not None:
-        user_rows = session.execute(
-            select(ConditionReportVote.report_id, ConditionReportVote.vote_type).where(
-                ConditionReportVote.report_id.in_(report_ids),
-                ConditionReportVote.user_id == current_user_id,
-            )
-        ).all()
-        user_vote_map = {rid: vtype for rid, vtype in user_rows}
-
-    return last_confirmed_map, user_vote_map
+    return {rid: vote_type for rid, vote_type in rows}
 
 
 def _effective_reference_created_at(report: ConditionReport) -> datetime:
@@ -207,6 +238,8 @@ def serialize_condition_report(
     lat: float,
     author_display_name: str,
     track_name: str | None = None,
+    eligible_confirm_count: int = 0,
+    eligible_resolve_count: int = 0,
     last_confirmed_at: datetime | None = None,
     user_vote: str | None = None,
     osm_way_id: int | None = None,
@@ -218,8 +251,8 @@ def serialize_condition_report(
         report.report_type,
         created_at=base_ts,
         last_confirmed_at=last_confirmed_at,
-        confirm_count=int(report.confirm_count or 0),
-        resolved_count=int(report.eligible_resolve_count or 0),
+        confirm_count=eligible_confirm_count,
+        resolved_count=eligible_resolve_count,
         status=report.status,
         now=now,
     )
@@ -230,6 +263,7 @@ def serialize_condition_report(
     osm_edit_url = report.osm_edit_url or links["osm_edit_url"]
     title, notes = unpack_report_description(report.description, report.report_type)
     label = REPORT_TYPE_LABELS.get(report.report_type, report.report_type)  # type: ignore[arg-type]
+    freshness_reference = max(base_ts, last_confirmed_at) if last_confirmed_at else base_ts
 
     return {
         "id": str(report.id),
@@ -261,7 +295,7 @@ def serialize_condition_report(
         "created_at": _iso_or_none(report.created_at),
         "updated_at": _iso_or_none(report.updated_at),
         "last_confirmed_at": _iso_or_none(last_confirmed_at),
-        "expires_at": _iso_or_none(report.expires_at),
+        "expires_at": _iso_or_none(compute_expires_at(report.report_type, freshness_reference)),
         "user_vote": user_vote,
     }
 
@@ -273,6 +307,7 @@ def list_reports(
     report_type: str | None = None,
     bbox: tuple[float, float, float, float] | None = None,
     include_resolved: bool = False,
+    include_vote_assessment: bool = True,
     limit: int = 100,
     current_user_id: uuid.UUID | None = None,
     now: datetime | None = None,
@@ -314,50 +349,50 @@ def list_reports(
     if report_type is not None:
         stmt = stmt.where(ConditionReport.report_type == report_type)
 
-    if not include_resolved:
-        stmt = stmt.where(ConditionReport.status != "resolved")
-
-    # Fetch extra headroom when filtering dynamically resolved rows in Python
-    fetch_limit = min(max(limit * 2, limit), 1000)
-    rows = session.execute(stmt.limit(fetch_limit)).all()
-    if not rows:
-        return []
-
-    report_ids = [r[0].id for r in rows]
-    last_confirmed_map, user_vote_map = _load_vote_metadata(
-        session, report_ids, current_user_id=current_user_id
+    stmt = _with_vote_assessment(
+        stmt, include_resolved=include_resolved, include_vote_assessment=include_vote_assessment
+    )
+    rows = session.execute(stmt.limit(limit)).all()
+    user_votes = _load_current_user_votes(
+        session, [row[0].id for row in rows], current_user_id=current_user_id
     )
 
-    results: list[dict[str, Any]] = []
-    for report, lon, lat, author_name, track_name in rows:
-        payload = serialize_condition_report(
+    return [
+        serialize_condition_report(
             report,
             lon=float(lon),
             lat=float(lat),
             author_display_name=author_name,
             track_name=track_name,
-            last_confirmed_at=last_confirmed_map.get(report.id),
-            user_vote=user_vote_map.get(report.id),
+            eligible_confirm_count=eligible_confirms,
+            eligible_resolve_count=eligible_resolves,
+            last_confirmed_at=last_confirmed_at,
+            user_vote=user_votes.get(report.id),
             now=now,
         )
-        if not include_resolved and payload["effective_status"] == "resolved":
-            continue
-        results.append(payload)
-        if len(results) >= limit:
-            break
-
-    return results
+        for (
+            report,
+            lon,
+            lat,
+            author_name,
+            track_name,
+            eligible_confirms,
+            eligible_resolves,
+            last_confirmed_at,
+        ) in rows
+    ]
 
 
 def get_report_by_id(
     session: Session,
     report_id: uuid.UUID,
     *,
+    include_vote_assessment: bool = True,
     current_user_id: uuid.UUID | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any] | None:
     """Fetch and serialize a single non-hidden condition report by UUID."""
-    row = session.execute(
+    stmt = (
         select(
             ConditionReport,
             func.ST_X(ConditionReport.geom).label("lon"),
@@ -369,12 +404,26 @@ def get_report_by_id(
         .outerjoin(Track, ConditionReport.track_id == Track.track_id)
         .where(ConditionReport.id == report_id, ConditionReport.status != "hidden")
         .limit(1)
+    )
+    row = session.execute(
+        _with_vote_assessment(
+            stmt, include_resolved=True, include_vote_assessment=include_vote_assessment
+        )
     ).first()
     if row is None:
         return None
 
-    report, lon, lat, author_name, track_name = row
-    last_confirmed_map, user_vote_map = _load_vote_metadata(
+    (
+        report,
+        lon,
+        lat,
+        author_name,
+        track_name,
+        eligible_confirms,
+        eligible_resolves,
+        last_confirmed_at,
+    ) = row
+    user_votes = _load_current_user_votes(
         session, [report.id], current_user_id=current_user_id
     )
     return serialize_condition_report(
@@ -383,8 +432,10 @@ def get_report_by_id(
         lat=float(lat),
         author_display_name=author_name,
         track_name=track_name,
-        last_confirmed_at=last_confirmed_map.get(report.id),
-        user_vote=user_vote_map.get(report.id),
+        eligible_confirm_count=eligible_confirms,
+        eligible_resolve_count=eligible_resolves,
+        last_confirmed_at=last_confirmed_at,
+        user_vote=user_votes.get(report.id),
         now=now,
     )
 
@@ -394,6 +445,7 @@ def get_reports_for_track(
     track_id: str,
     *,
     include_resolved: bool = False,
+    include_vote_assessment: bool = True,
     current_user_id: uuid.UUID | None = None,
     now: datetime | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
@@ -406,6 +458,7 @@ def get_reports_for_track(
         session,
         track_id=track_id,
         include_resolved=include_resolved,
+        include_vote_assessment=include_vote_assessment,
         limit=200,
         current_user_id=current_user_id,
         now=now,
@@ -426,6 +479,7 @@ def get_reports_for_tracks(
     track_ids: list[str] | tuple[str, ...],
     *,
     include_resolved: bool = False,
+    include_vote_assessment: bool = True,
     current_user_id: uuid.UUID | None = None,
     now: datetime | None = None,
     max_results: int | None = None,
@@ -462,8 +516,9 @@ def get_reports_for_tracks(
         )
         .order_by(ConditionReport.observed_at.desc(), ConditionReport.created_at.desc())
     )
-    if not include_resolved:
-        stmt = stmt.where(ConditionReport.status != "resolved")
+    stmt = _with_vote_assessment(
+        stmt, include_resolved=include_resolved, include_vote_assessment=include_vote_assessment
+    )
     if max_results is not None:
         stmt = stmt.limit(max_results + 1)
 
@@ -475,26 +530,34 @@ def get_reports_for_tracks(
     if not rows:
         return result
 
-    report_ids = [r[0].id for r in rows]
-    last_confirmed_map, user_vote_map = _load_vote_metadata(
-        session, report_ids, current_user_id=current_user_id
+    user_votes = _load_current_user_votes(
+        session, [row[0].id for row in rows], current_user_id=current_user_id
     )
 
     seen_per_track: dict[str, set[uuid.UUID]] = {tid: set() for tid in unique_ids}
-    for report, lon, lat, author_name, track_name, segment_track_id in rows:
+    for (
+        report,
+        lon,
+        lat,
+        author_name,
+        track_name,
+        segment_track_id,
+        eligible_confirms,
+        eligible_resolves,
+        last_confirmed_at,
+    ) in rows:
         payload = serialize_condition_report(
             report,
             lon=float(lon),
             lat=float(lat),
             author_display_name=author_name,
             track_name=track_name,
-            last_confirmed_at=last_confirmed_map.get(report.id),
-            user_vote=user_vote_map.get(report.id),
+            eligible_confirm_count=eligible_confirms,
+            eligible_resolve_count=eligible_resolves,
+            last_confirmed_at=last_confirmed_at,
+            user_vote=user_votes.get(report.id),
             now=now,
         )
-        if not include_resolved and payload["effective_status"] == "resolved":
-            continue
-
         target_tids: set[str] = set()
         if report.track_id in result:
             target_tids.add(report.track_id)
@@ -523,6 +586,7 @@ def get_reports_geojson(
     track_id: str | None = None,
     report_type: str | None = None,
     include_resolved: bool = False,
+    include_vote_assessment: bool = True,
     limit: int = 500,
     current_user_id: uuid.UUID | None = None,
     now: datetime | None = None,
@@ -533,6 +597,7 @@ def get_reports_geojson(
         track_id=track_id,
         report_type=report_type,
         include_resolved=include_resolved,
+        include_vote_assessment=include_vote_assessment,
         limit=limit,
         current_user_id=current_user_id,
         now=now,

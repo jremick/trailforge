@@ -220,6 +220,7 @@ def test_ui_config_admin_settings_and_user_preferences_api_offline_sqlite(
             text(
                 """
                 CREATE TABLE users (
+                    community_trusted_at DATETIME,
                     id CHAR(32) PRIMARY KEY,
                     email TEXT NOT NULL UNIQUE,
                     display_name TEXT NOT NULL,

@@ -36,6 +36,7 @@ from trailforge.db.models import (
     POI,
     CAPADPark,
     OfflinePack,
+    OfflinePackTelemetryRevision,
     PlannedRoute,
     RainfallSnapshot,
     Track,
@@ -48,7 +49,7 @@ from trailforge.db.models import (
     VehicleProfile,
 )
 from trailforge.feeds.queries import list_closures
-from trailforge.grading.live import get_live_summaries_for_tracks
+from trailforge.grading.live import LIVE_FORMULA_VERSION, get_live_summaries_for_tracks
 from trailforge.mcp.context import (
     SCOPE_READ,
     SCOPE_WRITE,
@@ -103,6 +104,7 @@ from trailforge.mcp.schemas import (
     format_attribution_markdown,
     simplify_linestring_coords,
 )
+from trailforge.packs.builder import STATIC_PACK_TELEMETRY_POLICY
 from trailforge.packs.catalog import PACK_REGIONS, PackRegionSpec, list_pack_regions
 from trailforge.reports.queries import list_reports
 from trailforge.routes.export import build_route_geojson, build_route_gpx
@@ -2583,6 +2585,9 @@ def _tool_list_regions_and_packs(db: Session, args: dict[str, Any]) -> types.Cal
         regions = [r for r in regions if state_filter in r.states]
 
     built_packs = {row.pack_id: row for row in db.execute(select(OfflinePack)).scalars().all()}
+    revisions = dict(db.execute(select(
+        OfflinePackTelemetryRevision.region_id, OfflinePackTelemetryRevision.revision
+    )).all())
     items: list[dict[str, Any]] = []
     states_seen: list[str] = []
     for spec in regions:
@@ -2590,6 +2595,14 @@ def _tool_list_regions_and_packs(db: Session, args: dict[str, Any]) -> types.Cal
             if st not in states_seen:
                 states_seen.append(st)
         pack_row = built_packs.get(spec.region_id)
+        if pack_row and pack_row.status == "ready" and not (
+            pack_row.community_telemetry_policy == STATIC_PACK_TELEMETRY_POLICY
+            or (
+                pack_row.community_telemetry_policy == LIVE_FORMULA_VERSION
+                and pack_row.community_telemetry_revision == revisions.get(spec.region_id)
+            )
+        ):
+            pack_row = None
         items.append(
             {
                 "region_id": spec.region_id,

@@ -1002,7 +1002,7 @@ class TrackMatcher(Protocol):
      1. Delete all `telemetry_observations` and `unmapped_track_candidates` matching `contribution_hash`.
      2. Rotate `trip.contribution_nonce = gen_random_uuid()`.
      3. Refresh affected grades, hotspots and track grades in the same transaction, and invalidate affected local packs.
-   - Public telemetry requires three distinct consenting contributors. Off-network geometry is generalized to grid cells, and public archives for CDNs exclude trip telemetry. See [Community telemetry privacy](COMMUNITY_PRIVACY.md).
+   - Public live grades require three distinct consenting contributors whose trip and traversal were recorded after their current operator attestation. Off-network geometry is generalized to grid cells, and public archives for CDNs exclude trip telemetry. See [Community telemetry privacy](COMMUNITY_PRIVACY.md).
 
 ---
 

@@ -366,7 +366,7 @@ def test_all_four_regional_packs_build_checksums_tarball_snapshot_range_and_memo
             grd.vehicle_class_split = {"Touring 4WD": 3, "Modified 4WD": 1}
             grd.wet_risk_level = "wet"
             grd.live_breakdown = {
-                "version": "live_v2",
+                "version": "live_v3",
                 "sample_count": 4,
                 "confidence_level": "medium",
                 "avg_speed_kmh": 5.4,
@@ -713,7 +713,7 @@ def test_sharded_v2_hash_vectors_shard_endpoint_security_and_r2_manifest_flags(
             assert alps["shard_hash"] == "fnv1a32"
             assert (
                 alps["shards_base_url"]
-                == "https://tiles.example.test/packs/australian-alps/static_v1/shards"
+                == "https://tiles.example.test/packs/australian-alps/static_v2/shards"
             )
             assert alps["bundle_url"] is None
             assert alps["bundle_size_bytes"] == 0
@@ -788,7 +788,7 @@ def test_sharded_v2_pack_build_static_only_no_bundle_and_shard_api(
             grd.confidence_level = "high"
             grd.sample_count = 6
             grd.live_breakdown = {
-                "version": "live_v2",
+                "version": "live_v3",
                 "sample_count": 6,
                 "is_obstacle_hotspot": True,
                 "obstacle_reasons": ["Crawl"],

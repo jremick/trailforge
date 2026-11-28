@@ -1256,7 +1256,7 @@ def test_r2_sync_mock_http_streaming_etag_skip_and_cli_dry_run(tmp_path: Path) -
         "manifest.json": json.dumps({
             "region_id": "australian-alps",
             "version": "2026.11.26",
-            "community_telemetry_policy": "static_v1",
+            "community_telemetry_policy": "static_v2",
         }).encode(),
         "snapshot.json": b'{"tracks":[]}\n',
         "vector.pmtiles": b"PMTilesPACKV" + b"\x03" * 256,
@@ -1336,13 +1336,13 @@ def test_r2_sync_mock_http_streaming_etag_skip_and_cli_dry_run(tmp_path: Path) -
         )
         assert stored_objects["manifest.json"]["content_type"] == "application/json"
         assert stored_objects["manifest.json"]["cache_control"] == "public, max-age=300"
-        assert stored_objects["australian-alps/static_v1/bundle.tar.gz"]["content_type"] == (
+        assert stored_objects["australian-alps/static_v2/bundle.tar.gz"]["content_type"] == (
             "application/gzip"
         )
-        assert stored_objects["australian-alps/static_v1/bundle.tar.gz"]["cache_control"] == (
+        assert stored_objects["australian-alps/static_v2/bundle.tar.gz"]["cache_control"] == (
             "no-store"
         )
-        assert stored_objects["australian-alps/static_v1/vector.pmtiles"]["content_type"] == (
+        assert stored_objects["australian-alps/static_v2/vector.pmtiles"]["content_type"] == (
             "application/vnd.pmtiles"
         )
 
@@ -1421,7 +1421,7 @@ def test_r2_sync_mock_http_streaming_etag_skip_and_cli_dry_run(tmp_path: Path) -
     assert cli_summary["planned"] == 8
     keys = {item["object_key"] for item in cli_summary["items"]}
     assert "trailforge_vector_baseline_weather_v1.pmtiles" in keys
-    assert "australian-alps/static_v1/bundle.tar.gz" in keys
+    assert "australian-alps/static_v2/bundle.tar.gz" in keys
 
 
 def test_r2_sync_discovers_and_uploads_sharded_v2_pack_shards(tmp_path: Path) -> None:
@@ -1433,7 +1433,7 @@ def test_r2_sync_discovers_and_uploads_sharded_v2_pack_shards(tmp_path: Path) ->
         json.dumps(
             {
                 "region_id": "australian-alps",
-                "community_telemetry_policy": "static_v1",
+                "community_telemetry_policy": "static_v2",
                 "snapshot_format": "sharded_v2",
                 "shard_count": 2,
             }
@@ -1452,7 +1452,7 @@ def test_r2_sync_discovers_and_uploads_sharded_v2_pack_shards(tmp_path: Path) ->
         json.dumps(
             {
                 "region_id": "blue-mountains",
-                "community_telemetry_policy": "live_v2",
+                "community_telemetry_policy": "live_v3",
                 "snapshot_format": "sharded_v2",
                 "shard_count": 1,
             }
@@ -1463,14 +1463,14 @@ def test_r2_sync_discovers_and_uploads_sharded_v2_pack_shards(tmp_path: Path) ->
 
     discovered = r2_sync.discover_sync_artifacts(packs_dir=packs_dir, packs_prefix="packs")
     by_key = {art.object_key: art for art in discovered}
-    assert "packs/australian-alps/static_v1/shards/tracks_00.json.gz" in by_key
-    assert "packs/australian-alps/static_v1/shards/tracks_01.json.gz" in by_key
+    assert "packs/australian-alps/static_v2/shards/tracks_00.json.gz" in by_key
+    assert "packs/australian-alps/static_v2/shards/tracks_01.json.gz" in by_key
     assert (
-        by_key["packs/australian-alps/static_v1/shards/tracks_00.json.gz"].content_type
+        by_key["packs/australian-alps/static_v2/shards/tracks_00.json.gz"].content_type
         == "application/gzip"
     )
     assert (
-        by_key["packs/australian-alps/static_v1/shards/tracks_00.json.gz"].cache_control
+        by_key["packs/australian-alps/static_v2/shards/tracks_00.json.gz"].cache_control
         == "no-store"
     )
     assert not any("blue-mountains" in k for k in by_key)
