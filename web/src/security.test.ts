@@ -364,7 +364,7 @@ describe("M-3: Security headers & CSP in Cloudflare Pages _headers and Nginx", (
       );
     expect(cspLine).toBeDefined();
     expect(cspLine).toContain("default-src 'self'");
-    expect(cspLine).toContain("script-src 'self'");
+    expect(cspLine).toContain("script-src 'self' https://static.cloudflareinsights.com");
     expect(cspLine).toContain("style-src 'self' 'unsafe-inline'");
     expect(cspLine).toContain("worker-src 'self' blob:");
     expect(cspLine).toContain("img-src 'self' data: blob: https:");

@@ -4,9 +4,11 @@ import {
   CANONICAL_LAYER_ORDER,
   DEFAULT_LAYER_VISIBILITY,
   DEFAULT_PUBLIC_UI_CONFIG,
+  LAYER_GROUPS,
   USER_LAYER_PREFS_STORAGE_KEY,
   clearStoredUserLayerPrefs,
   extractLayerVisibilityMap,
+  groupOrderedLayerKeys,
   loadStoredUserLayerPrefs,
   moveLayerInOrder,
   normalizeLayerOrder,
@@ -116,6 +118,14 @@ describe("layerPrefsHelpers — default ordering & reordering", () => {
       "snowLine",
       "pois",
     ]);
+  });
+
+  it("partitions all 12 canonical layers cleanly into 3 semantic sidebar groups", () => {
+    expect(LAYER_GROUPS).toHaveLength(3);
+    const grouped = groupOrderedLayerKeys(CANONICAL_LAYER_ORDER);
+    const flat = grouped.flatMap((g) => g.keys);
+    expect(flat).toHaveLength(CANONICAL_LAYER_ORDER.length);
+    expect(new Set(flat)).toEqual(new Set(CANONICAL_LAYER_ORDER));
   });
 });
 

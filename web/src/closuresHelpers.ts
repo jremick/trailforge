@@ -195,6 +195,33 @@ export function summarizeFeedStatus(
 }
 
 /**
+ * Safely convert agency feed descriptions that may contain raw HTML fragments
+ * (such as cached VicEmergency `<div>` / `&nbsp;` strings) into clean plain text
+ * suitable for safe escaped rendering.
+ */
+export function formatClosurePlainText(raw: string | null | undefined): string {
+  if (!raw) return "";
+  let text = String(raw);
+  // Decode double-encoded entities once before tag stripping when needed
+  text = text
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/<\s*br\s*\/?>/gi, "\n")
+    .replace(/<\/\s*(p|div|li|tr|h[1-6])\s*>/gi, "\n")
+    .replace(/<\s*li\b[^>]*>/gi, "• ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/[ \t\r\f\v]+/g, " ")
+    .replace(/ *\n */g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return text;
+}
+
+/**
  * Only permit safe external `http://` or `https://` agency links without control chars.
  */
 export function sanitizeExternalHttpUrl(
@@ -310,7 +337,7 @@ export function extractClosureSummaryFromProps(
     agency: asNonEmptyString(props.agency),
     title: title ?? "Closure / Emergency Alert",
     subtitle: asNonEmptyString(props.subtitle),
-    description: asNonEmptyString(props.description),
+    description: asNonEmptyString(formatClosurePlainText(asNonEmptyString(props.description))),
     closure_type: asNonEmptyString(props.closure_type) ?? "incident",
     severity: asNonEmptyString(props.severity) ?? "warning",
     status: asNonEmptyString(props.status) ?? "active",

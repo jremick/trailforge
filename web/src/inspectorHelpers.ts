@@ -732,13 +732,13 @@ export function buildElevationProfileSvg(
   for (let i = 0; i < yTickCount; i += 1) {
     yTicks.push(Math.round(yMin + ((yMax - yMin) * i) / (yTickCount - 1)));
   }
-  const axisFontSize = detailed ? "11" : "9.5";
+  const axisFontSize = detailed ? "11.5" : "10";
   const gridHtml = yTicks
     .map((e) => {
       const y = toY(e).toFixed(1);
       return `
-        <line x1="${padL}" y1="${y}" x2="${width - padR}" y2="${y}" stroke="#233240" stroke-width="1" stroke-dasharray="2 2"/>
-        <text x="${padL - 6}" y="${Number(y) + 3.5}" text-anchor="end" fill="#7F95AA" font-size="${axisFontSize}" font-family="ui-monospace, monospace">${Math.round(e)}m</text>
+        <line x1="${padL}" y1="${y}" x2="${width - padR}" y2="${y}" stroke="var(--chart-grid, #283938)" stroke-width="1" stroke-dasharray="2 2"/>
+        <text x="${padL - 6}" y="${Number(y) + 3.5}" text-anchor="end" fill="var(--chart-axis, #869e9c)" font-size="${axisFontSize}" font-family="var(--font-sans, sans-serif)" font-variant-numeric="tabular-nums">${Math.round(e)}m</text>
       `;
     })
     .join("");
@@ -754,11 +754,11 @@ export function buildElevationProfileSvg(
     const label = i === 0 ? "0 km" : `${(distM / 1000).toFixed(1)} km`;
     if (detailed && i > 0 && i < xTickCount - 1) {
       xTicksHtml.push(
-        `<line x1="${x.toFixed(1)}" y1="${padT}" x2="${x.toFixed(1)}" y2="${baseY}" stroke="#1C2A36" stroke-width="1" stroke-dasharray="2 3"/>`
+        `<line x1="${x.toFixed(1)}" y1="${padT}" x2="${x.toFixed(1)}" y2="${baseY}" stroke="var(--chart-grid-minor, #1f2e2d)" stroke-width="1" stroke-dasharray="2 3"/>`
       );
     }
     xTicksHtml.push(
-      `<text x="${x.toFixed(1)}" y="${height - (detailed ? 8 : 5)}" text-anchor="${anchor}" fill="#7F95AA" font-size="${axisFontSize}" font-family="ui-monospace, monospace">${label}</text>`
+      `<text x="${x.toFixed(1)}" y="${height - (detailed ? 8 : 5)}" text-anchor="${anchor}" fill="var(--chart-axis, #869e9c)" font-size="${axisFontSize}" font-family="var(--font-sans, sans-serif)" font-variant-numeric="tabular-nums">${label}</text>`
     );
   }
 
@@ -767,11 +767,21 @@ export function buildElevationProfileSvg(
   let snowLineHtml = "";
   if (hasSnowLineIntersection) {
     const sy = toY(snowLineM);
-    const labelY = Math.max(padT + (detailed ? 12 : 9), sy - 4);
+    const snowFontSize = detailed ? 11 : 9.5;
+    const labelText = `Snow-line ${snowLineM}m`;
+    const pillW = Math.round(labelText.length * (detailed ? 6.6 : 5.8) + 12);
+    const pillH = detailed ? 17 : 14;
+    const pillX = Math.max(padL + 10, width - padR - pillW - 4);
+    const pillY = Math.max(
+      padT + 3,
+      Math.min(padT + plotH - pillH - 3, sy - pillH - 3)
+    );
+    const labelY = pillY + pillH - (detailed ? 4 : 3.5);
     snowLineHtml = `
-      <rect x="${padL}" y="${padT}" width="${plotW}" height="${Math.max(0, sy - padT).toFixed(1)}" fill="rgba(186, 230, 253, 0.09)"/>
-      <line x1="${padL}" y1="${sy.toFixed(1)}" x2="${width - padR}" y2="${sy.toFixed(1)}" stroke="#7DD3FC" stroke-width="${detailed ? "1.5" : "1.3"}" stroke-dasharray="5 3"/>
-      <text x="${width - padR - 4}" y="${labelY.toFixed(1)}" text-anchor="end" fill="#7DD3FC" font-size="${detailed ? "10.5" : "9"}" font-family="ui-monospace, monospace">Snow-line ${snowLineM}m</text>
+      <rect x="${padL}" y="${padT}" width="${plotW}" height="${Math.max(0, sy - padT).toFixed(1)}" fill="var(--chart-snow-fill, rgba(186, 230, 253, 0.1))"/>
+      <line x1="${padL}" y1="${sy.toFixed(1)}" x2="${width - padR}" y2="${sy.toFixed(1)}" stroke="var(--chart-snow, #7DD3FC)" stroke-width="${detailed ? "1.5" : "1.3"}" stroke-dasharray="5 3"/>
+      <rect x="${pillX}" y="${pillY.toFixed(1)}" width="${pillW}" height="${pillH}" rx="4" fill="var(--chart-pill-bg, rgba(11, 17, 17, 0.84))" stroke="var(--chart-snow, #7DD3FC)" stroke-opacity="0.45" stroke-width="0.9"/>
+      <text x="${pillX + 6}" y="${labelY.toFixed(1)}" text-anchor="start" fill="var(--chart-snow, #7DD3FC)" font-size="${snowFontSize}" font-family="var(--font-sans, sans-serif)" font-weight="600" font-variant-numeric="tabular-nums">${labelText}</text>
     `;
   }
 
@@ -783,7 +793,7 @@ export function buildElevationProfileSvg(
       const label = escapeHtml(c.name ?? "Water crossing");
       return `
         <line x1="${cx}" y1="${padT}" x2="${cx}" y2="${baseY}" stroke="rgba(56, 189, 248, ${detailed ? "0.42" : "0.35"})" stroke-width="1" stroke-dasharray="2 2"/>
-        <circle cx="${cx}" cy="${baseY}" r="${detailed ? "4.4" : "3.2"}" fill="#38BDF8" stroke="#0B1117" stroke-width="1.2"><title>${label} (${(c.dist_m! / 1000).toFixed(2)} km)</title></circle>
+        <circle cx="${cx}" cy="${baseY}" r="${detailed ? "4.4" : "3.2"}" fill="#38BDF8" stroke="var(--bg-topbar, #0B1111)" stroke-width="1.2"><title>${label} (${(c.dist_m! / 1000).toFixed(2)} km)</title></circle>
       `;
     })
     .join("");
@@ -792,9 +802,9 @@ export function buildElevationProfileSvg(
   const scrubOverlayHtml = detailed
     ? `
       <g class="tf-elev-crosshair hidden" data-role="elev-crosshair" pointer-events="none">
-        <line data-role="crosshair-line" x1="${padL}" y1="${padT}" x2="${padL}" y2="${baseY}" stroke="#FDE047" stroke-width="1.5" stroke-dasharray="3 2"/>
-        <circle data-role="crosshair-halo" cx="${padL}" cy="${baseY}" r="9" fill="rgba(253, 224, 71, 0.28)"/>
-        <circle data-role="crosshair-dot" cx="${padL}" cy="${baseY}" r="4.8" fill="#FDE047" stroke="#070B10" stroke-width="2"/>
+        <line data-role="crosshair-line" x1="${padL}" y1="${padT}" x2="${padL}" y2="${baseY}" stroke="var(--chart-crosshair, #F59E0B)" stroke-width="1.5" stroke-dasharray="3 2"/>
+        <circle data-role="crosshair-halo" cx="${padL}" cy="${baseY}" r="9" fill="rgba(245, 158, 11, 0.25)"/>
+        <circle data-role="crosshair-dot" cx="${padL}" cy="${baseY}" r="4.8" fill="var(--chart-crosshair, #F59E0B)" stroke="var(--bg-topbar, #0B1111)" stroke-width="2"/>
       </g>
       <rect class="tf-elev-scrub-hit" data-role="elev-scrub-hit" x="${padL}" y="${padT}" width="${plotW}" height="${plotH}" fill="transparent"/>
     `
@@ -806,8 +816,8 @@ export function buildElevationProfileSvg(
     <svg class="tf-elev-svg ${detailed ? "tf-elev-svg-lg" : ""}" viewBox="0 0 ${width} ${height}" width="100%" height="${height}" role="img" aria-label="Track elevation profile from ${Math.round(rawMinE)} m to ${Math.round(rawMaxE)} m over ${totalDistKm} km">
       <defs>
         <linearGradient id="${gradId}" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.28"/>
-          <stop offset="100%" stop-color="#0E151B" stop-opacity="0.02"/>
+          <stop offset="0%" stop-color="var(--chart-fill-top, #38BDF8)" stop-opacity="0.24"/>
+          <stop offset="100%" stop-color="var(--chart-fill-bottom, #0F1616)" stop-opacity="0.02"/>
         </linearGradient>
       </defs>
       ${gridHtml}
@@ -817,7 +827,7 @@ export function buildElevationProfileSvg(
       ${segLinesHtml}
       ${crossingMarkersHtml}
       ${steepMarkersHtml}
-      <line x1="${padL}" y1="${baseY}" x2="${width - padR}" y2="${baseY}" stroke="#324659" stroke-width="1"/>
+      <line x1="${padL}" y1="${baseY}" x2="${width - padR}" y2="${baseY}" stroke="var(--border-strong, #394f4e)" stroke-width="1"/>
       ${xTicksHtml.join("")}
       ${scrubOverlayHtml}
     </svg>

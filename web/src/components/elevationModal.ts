@@ -1,3 +1,4 @@
+import { uiIcon } from "../icons";
 import { CourseMiniMap } from "./courseMiniMap";
 import {
   buildElevationProfileSvg,
@@ -300,27 +301,29 @@ export class ElevationProfileModal {
       <div class="tf-elev-modal">
         <div class="tf-elev-modal-head">
           <div class="tf-elev-modal-title-group">
-            <div class="tf-inspector-kicker">Terrain Elevation &amp; Synchronized Track Map</div>
             <div class="tf-elev-modal-title-row">
               <h2 class="tf-elev-modal-title">${escapeHtml(norm.name)}</h2>
               <span class="tf-elev-grade-chip" style="border-color:${gradeColor};color:${gradeColor}">
                 <span class="tf-elev-grade-dot" style="background:${gradeColor}"></span>
                 ${escapeHtml(norm.grade)}${norm.score !== null ? ` · ${Math.round(norm.score)}/100` : ""}
               </span>
-              <span class="tf-pill mono">${escapeHtml(norm.state)}</span>
-              ${norm.is4wdOnly ? `<span class="tf-pill tf-pill-amber">4WD Only</span>` : ""}
+              <span class="tf-inspector-subline">${escapeHtml(
+                [norm.state, norm.is4wdOnly ? "4WD only" : null]
+                  .filter(Boolean)
+                  .join(" · ")
+              )}</span>
             </div>
           </div>
 
           <div class="tf-elev-modal-actions">
-            <button type="button" class="tf-action-btn" data-modal-action="share" title="Copy shareable link to this track and profile view">🔗 Share</button>
+            <button type="button" class="tf-action-btn" data-modal-action="share" title="Copy shareable link to this track and profile view">${uiIcon("share", 13)}<span>Share</span></button>
             ${
               detail.bbox
-                ? `<button type="button" class="tf-action-btn" data-modal-action="zoom">⌖ Zoom Map</button>`
+                ? `<button type="button" class="tf-action-btn" data-modal-action="zoom">${uiIcon("target", 13)}<span>Zoom map</span></button>`
                 : ""
             }
-            <button type="button" class="tf-action-btn" data-modal-action="gpx">⬇ GPX</button>
-            <button type="button" class="tf-inspector-close" data-modal-action="close" aria-label="Close elevation profile window">×</button>
+            <button type="button" class="tf-action-btn" data-modal-action="gpx">${uiIcon("download", 13)}<span>GPX</span></button>
+            <button type="button" class="tf-inspector-close" data-modal-action="close" aria-label="Close elevation profile window">${uiIcon("close", 15)}</button>
           </div>
         </div>
 
@@ -357,12 +360,12 @@ export class ElevationProfileModal {
           </div>
 
           <div class="tf-elev-stage">
-            ${norm.hasMultipleCourseSections ? `<p class="tf-inspector-muted">Distance combines the mapped track sections. Check the map for junctions and gaps.</p>` : ""}
+            ${norm.hasMultipleCourseSections ? `<p class="tf-elev-stage-note">Distance combines the mapped track sections. Check the map for junctions and gaps.</p>` : ""}
             <div class="tf-elev-scrub-hud" data-role="scrub-hud">
               <span class="tf-elev-scrub-hint">${
                 hasCourse
-                  ? "Move cursor across the Elevation Profile or Track Map — both markers stay synced in real time."
-                  : "Move cursor or drag across the profile to inspect exact elevation, slope, grade, and surface."
+                  ? "Move cursor across the elevation profile or track map to sync both markers."
+                  : "Move cursor or drag across the profile to inspect elevation, slope, grade, and surface."
               }</span>
             </div>
             ${visualStageHtml}

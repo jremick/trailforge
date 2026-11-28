@@ -1,4 +1,14 @@
 import "./styles.css";
+import { MobileBottomSheetController } from "./bottomSheet";
+import { uiIcon } from "./icons";
+import {
+  applyUiThemeToDocument,
+  getNextUiTheme,
+  getThemeLabel,
+  resolveInitialUiTheme,
+  saveStoredUiTheme,
+  type UiTheme,
+} from "./themeHelpers";
 import {
   DEFAULT_AUTH_CONFIG,
   canManageAdminCompute,
@@ -328,7 +338,10 @@ class TrailForgeApp {
   private readonly map: TrailForgeMap;
   private readonly demoBannerEl: HTMLElement;
   private readonly demoBannerTextEl: HTMLElement;
-  private readonly collapseBtnEl: HTMLButtonElement;
+  private readonly mobileScrimEl: HTMLElement;
+  private readonly basemapWrapEl: HTMLElement;
+  private readonly basemapMobileBtnEl: HTMLButtonElement;
+  private readonly basemapMobileLabelEl: HTMLElement;
   private readonly cursorCoordsEl: HTMLElement;
   private readonly cursorMgrsEl: HTMLElement;
   private readonly offlineBannerEl: HTMLElement;
@@ -336,7 +349,16 @@ class TrailForgeApp {
   private readonly routePickBannerEl: HTMLElement;
   private readonly toastContainerEl: HTMLElement;
   private readonly basemapButtons: NodeListOf<HTMLButtonElement>;
+  private readonly sheetControllers: {
+    inspector: MobileBottomSheetController;
+    closure: MobileBottomSheetController;
+    account: MobileBottomSheetController;
+    admin: MobileBottomSheetController;
+    packs: MobileBottomSheetController;
+    route: MobileBottomSheetController;
+  };
 
+  private activeTheme: UiTheme = resolveInitialUiTheme();
   private sidebarCollapsed = false;
   private preferredSidebarWidthPx: number = SIDEBAR_DEFAULT_WIDTH_PX;
   private activeSidebarWidthPx: number = SIDEBAR_DEFAULT_WIDTH_PX;
@@ -426,6 +448,7 @@ class TrailForgeApp {
   private routePlanAbort: AbortController | null = null;
 
   constructor(root: HTMLElement) {
+    applyUiThemeToDocument(this.activeTheme);
     const initiallyOnline =
       typeof navigator === "undefined" ? true : navigator.onLine;
     this.isOnline = initiallyOnline;
@@ -505,6 +528,9 @@ class TrailForgeApp {
     this.layerState = initialResolvedPrefs.layerState;
     this.hasCustomLayerPrefs = initialResolvedPrefs.hasCustomPreferences;
 
+    const activeBasemapMeta =
+      BASEMAP_OPTIONS.find((b) => b.id === this.activeBasemap) ?? BASEMAP_OPTIONS[0]!;
+
     root.innerHTML = `
       <div class="tf-shell ${this.sidebarCollapsed ? "sidebar-collapsed" : ""}" data-role="shell">
         <header data-role="topbar"></header>
@@ -512,7 +538,7 @@ class TrailForgeApp {
         <div class="tf-demo-banner hidden" data-role="demo-banner" role="status">
           <span class="tf-demo-banner-copy">
             <span class="tf-demo-banner-dot" aria-hidden="true"></span>
-            <span data-role="demo-banner-text"></span>
+            <span class="tf-demo-banner-text" data-role="demo-banner-text"></span>
           </span>
           <button
             type="button"
@@ -520,22 +546,12 @@ class TrailForgeApp {
             data-role="demo-banner-dismiss"
             title="Dismiss notice"
             aria-label="Dismiss notice"
-          >×</button>
+          >${uiIcon("close", 13)}</button>
         </div>
 
         <main class="tf-workspace">
           <div class="tf-map-container" data-role="map"></div>
-
-          <button
-            type="button"
-            class="tf-sidebar-toggle"
-            data-role="sidebar-toggle"
-            title="Show layers sidebar (shortcut: [)"
-            aria-label="Show layers sidebar"
-            aria-expanded="${!this.sidebarCollapsed}"
-            aria-hidden="${!this.sidebarCollapsed}"
-            tabindex="${this.sidebarCollapsed ? "0" : "-1"}"
-          >${this.renderSidebarToggleMarkup(true)}</button>
+          <div class="tf-mobile-scrim hidden" data-role="mobile-scrim" aria-hidden="true"></div>
 
           <aside data-role="sidebar"></aside>
           <aside data-role="inspector"></aside>
@@ -548,35 +564,46 @@ class TrailForgeApp {
           <div data-role="recorder-hud"></div>
 
           <div class="tf-map-toolbar">
-            <div class="tf-basemap-switcher" role="group" aria-label="Basemap switcher">
-              ${BASEMAP_OPTIONS.map(
-                (b) =>
-                  `<button type="button" class="tf-basemap-btn ${b.id === this.activeBasemap ? "active" : ""}" data-basemap="${escapeHtml(b.id)}" title="${escapeHtml(b.hint)}">${escapeHtml(b.label)}</button>`
-              ).join("")}
+            <div class="tf-basemap-wrap" data-role="basemap-wrap">
+              <button
+                type="button"
+                class="tf-basemap-mobile-btn"
+                data-role="basemap-mobile-btn"
+                aria-haspopup="true"
+                aria-expanded="false"
+                title="Switch map basemap style"
+              >
+                ${uiIcon("map", 14)}
+                <span data-role="basemap-mobile-label">${escapeHtml(activeBasemapMeta.label)}</span>
+                ${uiIcon("chevronDown", 13)}
+              </button>
+              <div class="tf-basemap-switcher" role="group" aria-label="Basemap switcher">
+                ${BASEMAP_OPTIONS.map(
+                  (b) =>
+                    `<button type="button" class="tf-basemap-btn ${b.id === this.activeBasemap ? "active" : ""}" data-basemap="${escapeHtml(b.id)}" title="${escapeHtml(b.hint)}">${escapeHtml(b.label)}</button>`
+                ).join("")}
+              </div>
             </div>
             <div class="tf-map-actions" role="group" aria-label="Map navigation controls">
               <button type="button" class="tf-map-icon-btn" data-map-action="zoom-in" title="Zoom in" aria-label="Zoom in">+</button>
               <button type="button" class="tf-map-icon-btn" data-map-action="zoom-out" title="Zoom out" aria-label="Zoom out">−</button>
               <button type="button" class="tf-map-icon-btn" data-map-action="north" title="Reset north" aria-label="Reset north">N</button>
               <button type="button" class="tf-map-icon-btn" data-map-action="share" title="Copy shareable link to current map view" aria-label="Copy shareable link">
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
-                  <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
-                </svg>
+                ${uiIcon("share", 13)}
               </button>
             </div>
           </div>
 
           <div class="tf-offline-banner ${initiallyOnline ? "hidden" : ""}" data-role="offline-banner" role="status">
-            Offline mode — displaying built-in dark topo graticule &amp; corridor bounds
+            Offline mode: displaying built-in topo graticule &amp; corridor bounds
           </div>
 
           <div class="tf-pin-drop-banner hidden" data-role="pin-drop-banner" role="status">
-            ⌖ Click anywhere on the map to select coordinates · Esc to cancel
+            Click anywhere on the map to pick coordinates · Esc to cancel
           </div>
 
           <div class="tf-pin-drop-banner tf-route-pick-banner hidden" data-role="route-pick-banner" role="status">
-            ⇢ Click tracks on map to append to route · Esc to stop
+            Click tracks on map to append to route · Esc to stop
           </div>
 
           <div class="tf-coord-hud" data-role="coord-hud">
@@ -594,10 +621,13 @@ class TrailForgeApp {
     this.shellEl = this.q(root, "[data-role='shell']");
     this.demoBannerEl = this.q(root, "[data-role='demo-banner']");
     this.demoBannerTextEl = this.q(root, "[data-role='demo-banner-text']");
-    this.collapseBtnEl = this.q<HTMLButtonElement>(
+    this.mobileScrimEl = this.q(root, "[data-role='mobile-scrim']");
+    this.basemapWrapEl = this.q(root, "[data-role='basemap-wrap']");
+    this.basemapMobileBtnEl = this.q<HTMLButtonElement>(
       root,
-      "[data-role='sidebar-toggle']"
+      "[data-role='basemap-mobile-btn']"
     );
+    this.basemapMobileLabelEl = this.q(root, "[data-role='basemap-mobile-label']");
     this.cursorCoordsEl = this.q(root, "[data-role='cursor-coords']");
     this.cursorMgrsEl = this.q(root, "[data-role='cursor-mgrs']");
     this.offlineBannerEl = this.q(root, "[data-role='offline-banner']");
@@ -612,6 +642,9 @@ class TrailForgeApp {
       {
         onToggleSidebar: () => {
           this.setSidebarCollapsed(!this.sidebarCollapsed, { persist: true });
+        },
+        onToggleTheme: () => {
+          this.toggleUiTheme();
         },
         onSearchSelect: (item) => this.handleSearchSelect(item),
         onSearchNoMatch: (query, remoteError) => {
@@ -660,7 +693,8 @@ class TrailForgeApp {
             void this.openAdminPanel("overview");
           }
         },
-      }
+      },
+      { initialTheme: this.activeTheme }
     );
 
     this.sidebar = new Sidebar(
@@ -698,6 +732,9 @@ class TrailForgeApp {
           this.map.setLayerVisibility(this.layerState);
           this.inspector.setSnowLineElevation(elevationM);
           this.syncRoutePlannerUiState();
+        },
+        onPresetChange: (presetId) => {
+          this.selectPreset(presetId);
         },
         onResetRegion: () => {
           this.map.flyToPreset(
@@ -892,6 +929,37 @@ class TrailForgeApp {
     this.adminPanelEl = this.q(root, "[data-role='admin-panel']");
     this.packsPanelEl = this.q(root, "[data-role='packs-panel']");
     this.routePanelEl = this.q(root, "[data-role='route-panel']");
+
+    this.sheetControllers = {
+      inspector: new MobileBottomSheetController(
+        this.q(root, "[data-role='inspector']"),
+        {
+          onDismiss: () => {
+            this.inspector.close();
+            this.shellEl.classList.remove("inspector-open");
+            this.map.setSelectedTrackId(null);
+            this.pickedReportCoords = null;
+            this.syncUrlState({ trackId: null, profileOpen: false }, "push");
+          },
+        }
+      ),
+      closure: new MobileBottomSheetController(
+        this.q(root, "[data-role='closure-inspector']"),
+        { onDismiss: () => this.closeClosureInspector() }
+      ),
+      account: new MobileBottomSheetController(this.accountPanelEl, {
+        onDismiss: () => this.closeAccountPanel(),
+      }),
+      admin: new MobileBottomSheetController(this.adminPanelEl, {
+        onDismiss: () => this.closeAdminPanel(),
+      }),
+      packs: new MobileBottomSheetController(this.packsPanelEl, {
+        onDismiss: () => this.closePacksPanel(),
+      }),
+      route: new MobileBottomSheetController(this.routePanelEl, {
+        onDismiss: () => this.closeRoutePlanner(),
+      }),
+    };
 
     this.recorderHud = new InCabRecorderHud(
       this.q(root, "[data-role='recorder-hud']"),
@@ -1961,6 +2029,7 @@ class TrailForgeApp {
       syncing: this.isSyncingQueue,
     });
     panel.open();
+    this.sheetControllers.packs.reset("half");
     this.shellEl.classList.add("packs-open");
     void this.refreshPacksCatalog();
   }
@@ -2021,6 +2090,7 @@ class TrailForgeApp {
     const panel = await this.ensureRoutePlanner();
     panel.updateState(this.buildRoutePlannerState());
     panel.open();
+    this.sheetControllers.route.reset("half");
     this.shellEl.classList.add("route-open");
     this.syncRoutePlannerUiState();
     if (this.user && this.isOnline) {
@@ -2581,6 +2651,7 @@ class TrailForgeApp {
     const panel = await this.ensureAccountPanel();
     panel.updateState(this.buildAccountPanelState());
     panel.open(tab);
+    this.sheetControllers.account.reset("half");
     this.shellEl.classList.add("account-open");
   }
 
@@ -2607,6 +2678,7 @@ class TrailForgeApp {
     if (request.signal.aborted) return;
     panel.updateState({ currentUserId: request.ownerId });
     panel.open(tab);
+    this.sheetControllers.admin.reset("half");
     this.shellEl.classList.add("admin-open");
     this.topbar.updateAdminAccess(true, true);
     void this.refreshAdminConsoleData();
@@ -2683,8 +2755,25 @@ class TrailForgeApp {
         this.syncDemoBanner();
       });
 
-    this.collapseBtnEl.addEventListener("click", () => {
-      this.setSidebarCollapsed(!this.sidebarCollapsed, { persist: true });
+    this.mobileScrimEl.addEventListener("click", () => {
+      if (!this.sidebarCollapsed) {
+        this.setSidebarCollapsed(true, { persist: false });
+      }
+    });
+
+    this.basemapMobileBtnEl.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const willOpen = !this.basemapWrapEl.classList.contains("menu-open");
+      this.basemapWrapEl.classList.toggle("menu-open", willOpen);
+      this.basemapMobileBtnEl.setAttribute("aria-expanded", String(willOpen));
+    });
+
+    document.addEventListener("click", (e) => {
+      if (!this.basemapWrapEl.classList.contains("menu-open")) return;
+      if (!this.basemapWrapEl.contains(e.target as Node)) {
+        this.basemapWrapEl.classList.remove("menu-open");
+        this.basemapMobileBtnEl.setAttribute("aria-expanded", "false");
+      }
     });
 
     window.addEventListener("resize", () => {
@@ -3262,6 +3351,7 @@ class TrailForgeApp {
 
     this.activeOverlappingClosures =
       overlapping.length > 0 ? overlapping : [primary];
+    this.sheetControllers.closure.reset("half");
     this.shellEl.classList.add("closure-open");
     this.map.setSelectedClosureId(primary.closure_id);
 
@@ -3315,6 +3405,7 @@ class TrailForgeApp {
     this.closeAdminPanel();
     this.closePacksPanel();
     this.closeRoutePlanner();
+    this.sheetControllers.inspector.reset("half");
     this.shellEl.classList.add("inspector-open");
     this.map.setSelectedTrackId(trackId);
     this.inspector.showLoading(trackLabel);
@@ -3544,9 +3635,15 @@ class TrailForgeApp {
     this.basemapButtons.forEach((b) =>
       b.classList.toggle("active", b.dataset.basemap === basemap)
     );
+    const meta = BASEMAP_OPTIONS.find((b) => b.id === basemap);
+    if (meta) {
+      this.basemapMobileLabelEl.textContent = meta.label;
+    }
+    this.basemapWrapEl.classList.remove("menu-open");
+    this.basemapMobileBtnEl.setAttribute("aria-expanded", "false");
     if (basemap === "offline-topo") {
       this.offlineBannerEl.textContent =
-        "Offline Topo active — zero external raster tile requests";
+        "Offline Topo active: zero external raster tile requests";
       this.offlineBannerEl.classList.remove("hidden");
     } else if (typeof navigator === "undefined" || navigator.onLine) {
       this.offlineBannerEl.classList.add("hidden");
@@ -3787,25 +3884,12 @@ class TrailForgeApp {
     );
   }
 
-  private renderSidebarToggleMarkup(collapsed: boolean): string {
-    if (collapsed) {
-      return `
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
-          <polyline points="2 12 12 17 22 12"></polyline>
-          <polyline points="2 17 12 22 22 17"></polyline>
-        </svg>
-        <span class="tf-sidebar-toggle-label">Layers</span>
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <polyline points="9 18 15 12 9 6"></polyline>
-        </svg>
-      `;
-    }
-    return `
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <polyline points="15 18 9 12 15 6"></polyline>
-      </svg>
-    `;
+  private toggleUiTheme(): void {
+    const next = getNextUiTheme(this.activeTheme);
+    this.activeTheme = saveStoredUiTheme(next);
+    applyUiThemeToDocument(this.activeTheme);
+    this.topbar.updateTheme(this.activeTheme);
+    this.showToast(`Switched to ${getThemeLabel(this.activeTheme)} theme`, "info");
   }
 
   private setSidebarCollapsed(
@@ -3814,9 +3898,7 @@ class TrailForgeApp {
   ): void {
     this.sidebarCollapsed = collapsed;
     this.shellEl.classList.toggle("sidebar-collapsed", collapsed);
-    this.collapseBtnEl.setAttribute("aria-expanded", String(!collapsed));
-    this.collapseBtnEl.setAttribute("aria-hidden", String(!collapsed));
-    this.collapseBtnEl.tabIndex = collapsed ? 0 : -1;
+    this.mobileScrimEl.classList.toggle("hidden", collapsed);
     this.sidebar.updateCollapsedState(collapsed);
     this.topbar.updateSidebarState(collapsed);
     if (options?.persist) {

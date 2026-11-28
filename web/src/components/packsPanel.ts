@@ -1,4 +1,6 @@
 import { resolvePackBundleUrl } from "../adminHelpers";
+import { renderSheetHandleMarkup } from "../bottomSheet";
+import { uiIcon } from "../icons";
 import {
   formatByteSize,
   type PackDownloadProgress,
@@ -69,7 +71,7 @@ export class OfflinePacksPanel {
     this.root = container;
     this.state = initialState;
     this.callbacks = callbacks;
-    this.root.className = "tf-account-panel tf-packs-panel";
+    this.root.className = "tf-drawer tf-account-panel tf-packs-panel";
     this.root.setAttribute("aria-label", "Offline Regional Packs & Sync Queue");
     this.root.setAttribute("aria-hidden", "true");
   }
@@ -234,25 +236,21 @@ export class OfflinePacksPanel {
         return `
           <div class="tf-pack-card ${isActive ? "active" : ""}">
             <div class="tf-pack-head">
-              <div>
+              <div class="tf-pack-head-copy">
                 <div class="tf-pack-title">${escapeHtml(region.name)}</div>
-                <div class="tf-pack-id mono">${escapeHtml(region.region_id)} · ${escapeHtml(region.bbox.map((n) => n.toFixed(2)).join(", "))}</div>
+                <div class="tf-pack-id">
+                  <span>${category === "state" ? "Statewide" : "4WD region"}</span>
+                  ${stateLabel ? `<span>· ${escapeHtml(stateLabel)}</span>` : ""}
+                  <span>· ${escapeHtml(sizeText)}</span>
+                </div>
               </div>
               <div class="tf-pack-badges">
-                ${
-                  stateLabel
-                    ? `<span class="tf-mini-tag">${escapeHtml(stateLabel)}</span>`
-                    : ""
-                }
-                <span class="tf-mini-tag ${category === "state" ? "cyan" : ""}">
-                  ${category === "state" ? "STATE" : "4WD REGION"}
-                </span>
-                <span class="tf-mini-tag ${isReady ? "emerald" : "amber"}">
-                  ${isBuilding ? "BUILDING…" : escapeHtml(region.status.replace(/_/g, " ").toUpperCase())}
+                <span class="tf-status-tag ${isReady ? "tone-ok" : "tone-warn"}">
+                  ${isBuilding ? "Building…" : isReady ? "Ready" : "Not built"}
                 </span>
                 ${
                   cached
-                    ? `<span class="tf-mini-tag cyan">${cached.sha256_verified ? "✓ CACHED" : "CACHED"}</span>`
+                    ? `<span class="tf-status-tag tone-info">${cached.sha256_verified ? "Verified offline" : "Cached"}</span>`
                     : ""
                 }
               </div>
@@ -260,10 +258,10 @@ export class OfflinePacksPanel {
 
             <p class="tf-pack-desc">${escapeHtml(region.description)}</p>
 
-            <div class="tf-pack-metrics mono">
-              <span>Size: ${escapeHtml(sizeText)}</span>
-              <span>· Tracks: ${cached?.track_count ?? region.track_count ?? 0}</span>
-              <span>· POIs: ${cached?.poi_count ?? region.poi_count ?? 0}</span>
+            <div class="tf-pack-metrics">
+              <span>${cached?.track_count ?? region.track_count ?? 0} tracks</span>
+              <span>· ${cached?.poi_count ?? region.poi_count ?? 0} POIs</span>
+              <span class="mono tf-pack-id-code">· ${escapeHtml(region.region_id)}</span>
             </div>
 
             ${progressHtml}
@@ -272,18 +270,18 @@ export class OfflinePacksPanel {
               ${
                 !isReady
                   ? canBuild
-                    ? `<button type="button" class="tf-btn-primary" data-build-pack="${escapeHtml(region.region_id)}" ${isBuilding || !this.state.online ? "disabled" : ""}>${isBuilding ? "Building…" : "⚙ Build Pack"}</button>`
+                    ? `<button type="button" class="tf-btn-primary" data-build-pack="${escapeHtml(region.region_id)}" ${isBuilding || !this.state.online ? "disabled" : ""}>${uiIcon("sliders", 13)}<span>${isBuilding ? "Building…" : "Build pack"}</span></button>`
                     : `<span class="tf-pack-admin-note">Not yet built by instance admin</span>`
-                  : `<button type="button" class="tf-btn-primary" data-download-pack="${escapeHtml(region.region_id)}" ${isDownloading || !this.state.online ? "disabled" : ""}>${cached ? "↻ Update Offline Copy" : "⬇ Download for Offline"}</button>`
+                  : `<button type="button" class="tf-btn-primary" data-download-pack="${escapeHtml(region.region_id)}" ${isDownloading || !this.state.online ? "disabled" : ""}>${uiIcon(cached ? "refresh" : "download", 13)}<span>${cached ? "Update offline copy" : "Download offline"}</span></button>`
               }
               ${
                 cached
-                  ? `<button type="button" class="tf-mini-btn ${isActive ? "active" : ""}" data-use-pack="${escapeHtml(region.region_id)}">${isActive ? "✓ Active Offline" : "Use Offline Pack"}</button>`
+                  ? `<button type="button" class="tf-mini-btn ${isActive ? "active" : ""}" data-use-pack="${escapeHtml(region.region_id)}">${isActive ? `${uiIcon("check", 12)}<span>Active offline</span>` : "Use offline"}</button>`
                   : ""
               }
               ${
                 isReady && this.state.online && bundleUrl
-                  ? `<a class="tf-mini-btn" href="${escapeHtml(bundleUrl)}" download="${escapeHtml(region.region_id)}.tar.gz" title="Download full offline tar.gz archive">⬇ .tar.gz</a>`
+                  ? `<a class="tf-mini-btn" href="${escapeHtml(bundleUrl)}" download="${escapeHtml(region.region_id)}.tar.gz" title="Download full offline tar.gz archive">${uiIcon("download", 12)}<span>.tar.gz</span></a>`
                   : ""
               }
               ${
@@ -300,7 +298,12 @@ export class OfflinePacksPanel {
 
             ${
               attributions.length > 0
-                ? `<div class="tf-pack-attribs">${escapeHtml(attributions.join(" · "))}</div>`
+                ? `
+                  <details class="tf-pack-attribs-details">
+                    <summary class="tf-pack-attribs-summary">Data credits (${attributions.length})</summary>
+                    <div class="tf-pack-attribs">${escapeHtml(attributions.join(" · "))}</div>
+                  </details>
+                `
                 : ""
             }
           </div>
@@ -309,14 +312,15 @@ export class OfflinePacksPanel {
       .join("");
 
     this.root.innerHTML = `
+      ${renderSheetHandleMarkup("Resize offline packs panel")}
       <div class="tf-inspector-head">
-        <div>
-          <div class="tf-inspector-kicker">Offline Packs &amp; Sync · ${allRegions.length} AU Packs · ${this.state.online ? "Online" : "Offline Mode"}</div>
-          <h2 class="tf-inspector-title">Pan-Australia Offline Packs</h2>
+        <div class="tf-inspector-head-copy">
+          <h2 class="tf-inspector-title">Offline regional packs</h2>
+          <div class="tf-inspector-subline">${allRegions.length} Australian packs · ${this.state.online ? "Online" : "Offline mode"}</div>
         </div>
         <div class="tf-head-actions">
-          <button type="button" class="tf-mini-btn" data-role="refresh-packs" ${!this.state.online || this.state.loading ? "disabled" : ""}>↻</button>
-          <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Offline Packs panel">×</button>
+          <button type="button" class="tf-icon-action-btn" data-role="refresh-packs" title="Refresh pack catalog" aria-label="Refresh pack catalog" ${!this.state.online || this.state.loading ? "disabled" : ""}>${uiIcon("refresh", 14)}</button>
+          <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Offline Packs panel">${uiIcon("close", 15)}</button>
         </div>
       </div>
 
@@ -331,34 +335,34 @@ export class OfflinePacksPanel {
 
         <section class="tf-insp-section">
           <div class="tf-insp-sec-head">
-            <h3>Downloadable AU Bundles</h3>
-            <span class="mono tf-insp-meta">${this.state.downloaded.length} cached · ${regions.length} shown</span>
+            <h3>Downloadable bundles</h3>
+            <span class="tf-insp-meta">${this.state.downloaded.length} cached · ${regions.length} shown</span>
           </div>
           <p class="tf-panel-hint">
-            Packs bundle vector PMTiles, Terrain-RGB hillshade PMTiles (served offline via HTTP 206 Range slicing), graded tracks, live evidence, POIs, CAPAD parks, and state agency closures.
+            Download maps, elevation contours, graded tracks, POIs, parks, and closures for full offline navigation with no signal.
           </p>
-          <div class="tf-pack-filter-bar" role="tablist" aria-label="Filter offline packs by category">
+          <div class="tf-segmented-control" role="tablist" aria-label="Filter offline packs by category">
             <button
               type="button"
               role="tab"
               aria-selected="${this.activeFilter === "all"}"
-              class="tf-pack-filter-pill ${this.activeFilter === "all" ? "active" : ""}"
+              class="tf-seg-btn ${this.activeFilter === "all" ? "active" : ""}"
               data-pack-filter="all"
-            >All <span class="mono">(${allRegions.length})</span></button>
+            >All (${allRegions.length})</button>
             <button
               type="button"
               role="tab"
               aria-selected="${this.activeFilter === "region"}"
-              class="tf-pack-filter-pill ${this.activeFilter === "region" ? "active" : ""}"
+              class="tf-seg-btn ${this.activeFilter === "region" ? "active" : ""}"
               data-pack-filter="region"
-            >Iconic 4WD Regions <span class="mono">(${regionCount})</span></button>
+            >Regions (${regionCount})</button>
             <button
               type="button"
               role="tab"
               aria-selected="${this.activeFilter === "state"}"
-              class="tf-pack-filter-pill ${this.activeFilter === "state" ? "active" : ""}"
+              class="tf-seg-btn ${this.activeFilter === "state" ? "active" : ""}"
               data-pack-filter="state"
-            >Statewide <span class="mono">(${stateCount})</span></button>
+            >States (${stateCount})</button>
           </div>
           <div class="tf-card-stack">${cardsHtml}</div>
         </section>

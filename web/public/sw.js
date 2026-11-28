@@ -2,7 +2,7 @@
 // Supports offline SPA shell caching + HTTP 206 Partial Content Range slicing
 // for downloaded regional PMTiles packs so MapLibre GL JS renders 100% offline.
 
-const SHELL_CACHE = "trailforge-shell-v3";
+const SHELL_CACHE = "trailforge-shell-v4";
 const PACKS_CACHE = "trailforge-packs-v1";
 const ALLOWED_CACHES = new Set([SHELL_CACHE, PACKS_CACHE]);
 const MAX_MEM_PACK_BLOBS = 2;

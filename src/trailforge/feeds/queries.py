@@ -404,7 +404,7 @@ def list_closures(
                 "agency": meta.agency if meta else alert.source_feed,
                 "external_id": alert.external_id,
                 "title": alert.title,
-                "description": alert.description,
+                "description": clean_closure_text(alert.description),
                 "closure_type": closure_type,
                 "severity": api_sev,
                 "status": alert.status,
@@ -530,7 +530,7 @@ def get_closures_geojson(
                         "status": row.status,
                         "state": row.state,
                         "title": row.title,
-                        "description": row.description,
+                        "description": clean_closure_text(row.description),
                         "agency": meta.agency if meta else row.source_feed,
                         "source_url": row.source_url,
                         "effective_from": _iso_or_none(row.effective_from),
@@ -838,7 +838,7 @@ def get_closures_for_track_ids(
                 "is_stale": stale_by_dataset.get((alert.source_feed, alert.dataset_key), True)
                 or alert.status == "stale",
                 "capad_park_name": park_name,
-                "description": alert.description,
+                "description": clean_closure_text(alert.description),
             }
         )
 

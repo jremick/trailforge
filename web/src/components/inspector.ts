@@ -1,6 +1,7 @@
-import { ElevationProfileModal } from "./elevationModal";
+import { renderSheetHandleMarkup } from "../bottomSheet";
 import {
   formatClosureDateRange,
+  formatClosurePlainText,
   formatClosureTypeLabel,
   formatRelativeTimestamp,
   getClosureStatusBadge,
@@ -14,6 +15,7 @@ import {
   formatWetRiskBanner,
   normalizeVehicleClassSplit,
 } from "../gradingHelpers";
+import { uiIcon } from "../icons";
 import {
   buildElevationProfileSvg,
   formatBreakdownFactors,
@@ -35,8 +37,6 @@ import {
   resolveReportOsmLinks,
   sanitizeReportPhotoUrl,
 } from "../reportsHelpers";
-
-export { sanitizeReportPhotoUrl };
 import type {
   BasemapId,
   BBoxTuple,
@@ -48,11 +48,17 @@ import type {
   TileManifestResponse,
   TrackInspectorDetail,
   VehicleCapabilityClass,
+  WaterwayCrossingItem,
 } from "../types";
 import {
   computeClientSuitability,
   getSuitabilityTone,
 } from "../vehicleHelpers";
+import { ElevationProfileModal } from "./elevationModal";
+
+export { sanitizeReportPhotoUrl };
+
+export type TrackInspectorTab = "overview" | "conditions" | "along";
 
 export interface TrackInspectorContext {
   snowLineElevationM: number;
@@ -92,11 +98,52 @@ export interface TrackInspectorCallbacks {
   ) => Promise<void>;
 }
 
+function deduplicateCrossings(
+  crossings: readonly WaterwayCrossingItem[]
+): WaterwayCrossingItem[] {
+  const seen = new Set<string>();
+  const out: WaterwayCrossingItem[] = [];
+  for (const c of crossings) {
+    const nameKey = (c.name ?? "unnamed").trim().toLowerCase();
+    const distBucket =
+      typeof c.dist_m === "number" ? Math.round(c.dist_m / 40) : -1;
+    const key = `${nameKey}:${distBucket}`;
+    if (nameKey !== "unnamed" && seen.has(key)) continue;
+    seen.add(key);
+    out.push(c);
+  }
+  return out;
+}
+
+function deduplicatePois(pois: readonly PoiItem[]): PoiItem[] {
+  const seen = new Set<string>();
+  const out: PoiItem[] = [];
+  for (const poi of pois) {
+    const normName = poi.name
+      .trim()
+      .toLowerCase()
+      .replace(/\bcampsite\b/g, "campground")
+      .replace(/\s+/g, " ");
+    const coordBucket = `${Math.round(poi.lat * 200)}:${Math.round(poi.lon * 200)}`;
+    const key = `${normName}:${coordBucket}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(poi);
+  }
+  return out;
+}
+
+function stripLeadingWarningGlyph(text: string): string {
+  return text.replace(/^[⚠⛔🚧!\s]+/u, "").trim();
+}
+
 export class TrackInspectorDrawer {
   private readonly root: HTMLElement;
   private readonly callbacks: TrackInspectorCallbacks;
   private readonly elevationModal: ElevationProfileModal;
   private currentDetail: TrackInspectorDetail | null = null;
+  private activeTab: TrackInspectorTab = "overview";
+  private exportMenuOpen = false;
   private showReportForm = false;
   private reportSubmitting = false;
   private reportError: string | null = null;
@@ -121,7 +168,7 @@ export class TrackInspectorDrawer {
       onShareTrack: (trackId) => this.callbacks.onShareTrack?.(trackId),
       onOpenStateChange: (open) => this.callbacks.onElevationModalChange?.(open),
     });
-    this.root.className = "tf-inspector";
+    this.root.className = "tf-drawer tf-inspector";
     this.root.setAttribute("aria-label", "Track Inspector");
     this.root.setAttribute("aria-hidden", "true");
     this.renderEmpty();
@@ -160,6 +207,7 @@ export class TrackInspectorDrawer {
     this.context = { ...this.context, ...patch };
     if (patch.pickedReportCoords) {
       this.showReportForm = true;
+      this.activeTab = "conditions";
     }
     if (this.isOpen && this.currentDetail) {
       this.renderDetail(this.currentDetail);
@@ -173,19 +221,22 @@ export class TrackInspectorDrawer {
   showLoading(trackLabel?: string): void {
     this.isOpen = true;
     this.currentDetail = null;
+    this.activeTab = "overview";
+    this.exportMenuOpen = false;
     this.showReportForm = false;
     this.reportError = null;
     this.root.setAttribute("aria-hidden", "false");
     this.root.innerHTML = `
+      ${renderSheetHandleMarkup("Resize track inspector")}
       <div class="tf-inspector-head">
-        <div>
-          <div class="tf-inspector-kicker">Track Inspector</div>
+        <div class="tf-inspector-head-copy">
           <h2 class="tf-inspector-title">${escapeHtml(trackLabel ?? "Loading track…")}</h2>
+          <div class="tf-inspector-subline">Fetching track geometry &amp; conditions</div>
         </div>
-        <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Track Inspector">×</button>
+        <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Track Inspector">${uiIcon("close", 15)}</button>
       </div>
       <div class="tf-inspector-body">
-        <div class="tf-inspector-loading">Fetching canonical segments, closures, condition reports, rig suitability &amp; elevation profile…</div>
+        <div class="tf-inspector-loading">Loading segments, elevation profile, agency closures, condition reports, and rig suitability…</div>
       </div>
     `;
     this.bindClose();
@@ -196,12 +247,12 @@ export class TrackInspectorDrawer {
     this.currentDetail = null;
     this.root.setAttribute("aria-hidden", "false");
     this.root.innerHTML = `
+      ${renderSheetHandleMarkup("Resize track inspector")}
       <div class="tf-inspector-head">
-        <div>
-          <div class="tf-inspector-kicker">Track Inspector</div>
+        <div class="tf-inspector-head-copy">
           <h2 class="tf-inspector-title">Unable to load track</h2>
         </div>
-        <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Track Inspector">×</button>
+        <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Track Inspector">${uiIcon("close", 15)}</button>
       </div>
       <div class="tf-inspector-body">
         <div class="tf-inspector-error">${escapeHtml(message)}</div>
@@ -214,8 +265,13 @@ export class TrackInspectorDrawer {
     detail: TrackInspectorDetail,
     contextPatch?: Partial<TrackInspectorContext>
   ): void {
+    const isNewTrack = this.currentDetail?.track_id !== detail.track_id;
     this.isOpen = true;
     this.currentDetail = detail;
+    if (isNewTrack) {
+      this.activeTab = "overview";
+      this.exportMenuOpen = false;
+    }
     if (contextPatch) {
       this.context = { ...this.context, ...contextPatch };
     }
@@ -226,6 +282,7 @@ export class TrackInspectorDrawer {
   close(): void {
     this.isOpen = false;
     this.currentDetail = null;
+    this.exportMenuOpen = false;
     this.resetReportForm();
     this.elevationModal.close();
     this.root.setAttribute("aria-hidden", "true");
@@ -243,15 +300,15 @@ export class TrackInspectorDrawer {
 
   private renderEmpty(): void {
     this.root.innerHTML = `
+      ${renderSheetHandleMarkup("Resize track inspector")}
       <div class="tf-inspector-head">
-        <div>
-          <div class="tf-inspector-kicker">Track Inspector</div>
-          <h2 class="tf-inspector-title">Select a 4WD Track</h2>
+        <div class="tf-inspector-head-copy">
+          <h2 class="tf-inspector-title">Select a 4WD track</h2>
         </div>
-        <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Track Inspector">×</button>
+        <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Track Inspector">${uiIcon("close", 15)}</button>
       </div>
       <div class="tf-inspector-body">
-        <p class="tf-inspector-muted">Click any graded track on the map or search by track name to inspect elevation profile, official closures, community condition reports &amp; gate warnings, rig suitability, explainable difficulty breakdown, creek crossings, nearby POIs, and CAPAD park tenure.</p>
+        <p class="tf-inspector-muted">Click any graded track on the map or search by name to inspect elevation, official closures, rig suitability, difficulty factors, creek crossings, and nearby camps.</p>
       </div>
     `;
     this.bindClose();
@@ -278,7 +335,6 @@ export class TrackInspectorDrawer {
     const gradeColor = getGradeColor(norm.grade);
     const factors = formatBreakdownFactors(norm.breakdown);
     const overrides = norm.breakdown?.overrides ?? [];
-    const reasons = norm.breakdown?.reasons ?? [];
     const chart = buildElevationProfileSvg(norm.profile, {
       snowLineElevationM: this.context.snowLineElevationM,
       crossings: norm.crossings,
@@ -297,34 +353,28 @@ export class TrackInspectorDrawer {
     const closureBadge = getClosureStatusBadge(closureStatus);
     const activeClosures = detail.active_closures ?? [];
 
-    // Slice 08 Community Condition Reports & Distinct Gate Warnings
     const { gateWarnings, timelineReports } = partitionTrackReports(
       detail.condition_reports ?? [],
       detail.community_gate_warnings ?? null
     );
 
-    const badgesHtml = [
+    const statusTagHtml =
       closureBadge.tone !== "open"
-        ? `<span class="tf-pill tf-pill-${closureBadge.tone === "critical" ? "red" : closureBadge.tone === "warning" ? "amber" : "ice"}">⚠ ${escapeHtml(closureBadge.label)}</span>`
-        : "",
-      gateWarnings.length > 0
-        ? `<span class="tf-pill tf-pill-red">⛔ ${gateWarnings.length} Gate / Access Report${gateWarnings.length === 1 ? "" : "s"}</span>`
-        : "",
-      `<span class="tf-pill mono">${escapeHtml(norm.state)}</span>`,
-      norm.is4wdOnly
-        ? `<span class="tf-pill tf-pill-amber">4WD Only</span>`
-        : "",
-      accessWarning && closureBadge.tone === "open"
-        ? `<span class="tf-pill tf-pill-red">${norm.hasGateBarrier ? "Gate / " : ""}${escapeHtml(norm.accessStatus)}</span>`
-        : "",
-      aboveSnowline
-        ? `<span class="tf-pill tf-pill-ice">Alpine &gt; ${this.context.snowLineElevationM} m</span>`
-        : "",
-    ]
-      .filter(Boolean)
-      .join("");
+        ? `<span class="tf-status-tag tone-${closureBadge.tone === "critical" ? "danger" : closureBadge.tone === "warning" ? "warn" : "info"}">${uiIcon("alert", 12)}<span>${escapeHtml(closureBadge.label)}</span></span>`
+        : gateWarnings.length > 0
+          ? `<span class="tf-status-tag tone-danger">${uiIcon("gate", 12)}<span>${gateWarnings.length} Gate alert${gateWarnings.length === 1 ? "" : "s"}</span></span>`
+          : accessWarning
+            ? `<span class="tf-status-tag tone-warn">${uiIcon("gate", 12)}<span>${norm.hasGateBarrier ? "Gated" : escapeHtml(norm.accessStatus)}</span></span>`
+            : "";
 
-    // Slice 05 Personalized Rig Suitability Card
+    const metaParts = [
+      norm.state,
+      norm.is4wdOnly ? "4WD only" : null,
+      aboveSnowline
+        ? `Alpine > ${this.context.snowLineElevationM.toLocaleString()} m`
+        : null,
+    ].filter(Boolean);
+
     const suitability =
       detail.suitability ??
       computeClientSuitability(norm.grade, this.context.activeVehicleClass, {
@@ -334,40 +384,461 @@ export class TrackInspectorDrawer {
     const suitTone = getSuitabilityTone(suitability.rating);
     const rigSubtitle = suitability.vehicle_name
       ? `${suitability.vehicle_name} (${suitability.vehicle_class})`
-      : `${suitability.vehicle_class} profile`;
+      : suitability.vehicle_class;
 
-    const suitabilityHtml = `
-      <section class="tf-suitability-card tone-${suitTone}">
-        <div class="tf-suit-head">
-          <div>
-            <div class="tf-suit-kicker">Rig Suitability · ${escapeHtml(rigSubtitle)}</div>
-            <div class="tf-suit-rating">${escapeHtml(suitability.rating)}</div>
+    const liveBreakdown = detail.live_breakdown ?? null;
+    const liveGrade = detail.live_grade ?? liveBreakdown?.live_grade ?? null;
+    const liveScore = detail.live_score ?? liveBreakdown?.live_score ?? null;
+    const sampleCount =
+      detail.sample_count ?? liveBreakdown?.sample_count ?? 0;
+    const confidence = formatConfidenceBadge(
+      detail.confidence_level ?? liveBreakdown?.confidence_level,
+      sampleCount
+    );
+    const lastDriven = formatLastDriven(
+      detail.last_driven_at ?? liveBreakdown?.last_driven_at
+    );
+    const avgSpeedKmh =
+      detail.avg_speed_kmh ?? liveBreakdown?.avg_speed_kmh ?? null;
+    const estDurationText = formatDurationMinutes(
+      detail.est_duration_min,
+      liveBreakdown?.avg_duration_s
+    );
+    const vehicleSplit = normalizeVehicleClassSplit(
+      detail.vehicle_class_split ?? liveBreakdown?.vehicle_class_split
+    );
+    const wetRisk = formatWetRiskBanner(detail.rainfall_context);
+    const hotspots = detail.obstacle_hotspots ?? [];
+    const liveReasons = liveBreakdown?.reasons ?? [];
+    const outlierClamped = liveBreakdown?.outlier_clamped_count ?? 0;
+
+    const displayCrossings = deduplicateCrossings(norm.crossings);
+    const displayPois = deduplicatePois(detail.nearby_pois ?? []);
+
+    const alertTotal = activeClosures.length + gateWarnings.length;
+    const conditionCount = alertTotal + timelineReports.length;
+    const alongCount = displayCrossings.length + displayPois.length;
+
+    // Compact Alert Summary Strip above fold so closures are unmissable without burying track stats
+    const alertStripHtml =
+      alertTotal > 0
+        ? `
+          <button
+            type="button"
+            class="tf-alert-strip tone-${closureBadge.tone === "critical" || gateWarnings.length > 0 ? "danger" : "warn"}"
+            data-jump-tab="conditions"
+          >
+            ${uiIcon("alert", 15)}
+            <span class="tf-alert-strip-copy">
+              <strong>${alertTotal} active ${alertTotal === 1 ? "alert" : "alerts"}</strong>
+              <span>${escapeHtml(
+                activeClosures[0]?.title ??
+                  gateWarnings[0]?.title ??
+                  "Check official closures and gate warnings"
+              )}</span>
+            </span>
+            <span class="tf-alert-strip-cta">View</span>
+          </button>
+        `
+        : "";
+
+    const elevRangeText =
+      norm.minElevM !== null && norm.maxElevM !== null
+        ? `${Math.round(norm.minElevM)}–${Math.round(norm.maxElevM)} m`
+        : "-";
+    const gainLossText =
+      norm.elevLossM !== null
+        ? `+${Math.round(norm.elevGainM)} / −${Math.round(norm.elevLossM)} m`
+        : `+${Math.round(norm.elevGainM)} m`;
+    const slopeText =
+      norm.maxSlopeDeg !== null
+        ? `${norm.maxSlopeDeg.toFixed(1)}° peak${
+            norm.sustainedSlopeDeg !== null
+              ? ` · ${norm.sustainedSlopeDeg.toFixed(1)}° sust`
+              : ""
+          }`
+        : "-";
+
+    const overviewTabHtml = this.renderOverviewTab({
+      norm,
+      detail,
+      gradeColor,
+      factors,
+      overrides,
+      chart,
+    });
+
+    const conditionsTabHtml = this.renderConditionsTab({
+      detail,
+      activeClosures,
+      gateWarnings,
+      timelineReports,
+      wetRisk,
+      liveBreakdown,
+      liveGrade,
+      liveScore,
+      sampleCount,
+      confidence,
+      lastDriven,
+      avgSpeedKmh,
+      estDurationText,
+      vehicleSplit,
+      hotspots,
+      liveReasons,
+      outlierClamped,
+    });
+
+    const alongTabHtml = this.renderAlongTab(displayCrossings, displayPois);
+
+    this.root.innerHTML = `
+      ${renderSheetHandleMarkup("Resize track inspector")}
+      <div class="tf-inspector-head">
+        <div class="tf-inspector-head-copy">
+          <h2 class="tf-inspector-title">${escapeHtml(norm.name)}</h2>
+          ${
+            norm.altNames.length > 0
+              ? `<div class="tf-inspector-alt">Also: ${escapeHtml(norm.altNames.join(", "))}</div>`
+              : ""
+          }
+          <div class="tf-inspector-subline">
+            ${statusTagHtml}
+            <span>${escapeHtml(metaParts.join(" · "))}</span>
           </div>
-          <button type="button" class="tf-mini-btn" data-role="change-rig">Change Rig</button>
         </div>
+        <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Track Inspector">${uiIcon("close", 15)}</button>
+      </div>
+
+      <div class="tf-inspector-body">
+        <div class="tf-inspector-actionbar">
+          <button
+            type="button"
+            class="tf-btn-primary tf-inspector-primary-cta ${this.context.isInRoute ? "in-route" : ""}"
+            data-role="toggle-route"
+            title="${this.context.isInRoute ? "Open active multi-track route" : "Add this track to the active route"}"
+          >
+            ${uiIcon(this.context.isInRoute ? "check" : "route", 14)}
+            <span>${this.context.isInRoute ? "In route" : "Add to route"}</span>
+          </button>
+
+          <div class="tf-inspector-util-btns">
+            <button
+              type="button"
+              class="tf-icon-action-btn ${this.context.isFavorite ? "starred" : ""}"
+              data-role="toggle-fav"
+              title="${this.context.isAuthenticated ? (this.context.isFavorite ? "Remove from saved" : "Save favorite") : "Sign in to save favorite"}"
+              aria-label="${this.context.isFavorite ? "Remove favorite" : "Save favorite"}"
+            >${uiIcon(this.context.isFavorite ? "starFilled" : "star", 15)}</button>
+
+            <div class="tf-export-wrap" data-role="export-wrap">
+              <button
+                type="button"
+                class="tf-icon-action-btn ${this.exportMenuOpen ? "active" : ""}"
+                data-role="toggle-export-menu"
+                aria-haspopup="menu"
+                aria-expanded="${this.exportMenuOpen}"
+                title="Export track GPX or GeoJSON"
+                aria-label="Export track"
+              >${uiIcon("download", 15)}</button>
+              <div class="tf-export-menu ${this.exportMenuOpen ? "" : "hidden"}" data-role="export-menu" role="menu">
+                <button type="button" class="tf-export-menu-item" role="menuitem" data-export-track="gpx">
+                  ${uiIcon("download", 13)}
+                  <span>Export GPX 1.1</span>
+                </button>
+                <button type="button" class="tf-export-menu-item" role="menuitem" data-export-track="geojson">
+                  ${uiIcon("download", 13)}
+                  <span>Export GeoJSON</span>
+                </button>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              class="tf-icon-action-btn"
+              data-role="share-track"
+              title="Copy shareable link to this track"
+              aria-label="Share track link"
+            >${uiIcon("share", 15)}</button>
+
+            ${
+              detail.bbox
+                ? `<button type="button" class="tf-icon-action-btn" data-role="zoom-track" title="Zoom map to full track" aria-label="Zoom to track">${uiIcon("target", 15)}</button>`
+                : ""
+            }
+          </div>
+        </div>
+
+        ${alertStripHtml}
+
+        <div class="tf-decision-card tone-${suitTone}" style="--grade-accent:${gradeColor}">
+          <div class="tf-decision-top">
+            <div class="tf-grade-hero-left">
+              <span class="tf-grade-swatch" style="background:${gradeColor}"></span>
+              <div>
+                <div class="tf-grade-name" style="color:${gradeColor}">${escapeHtml(norm.grade)}</div>
+                <div class="tf-grade-sub">${
+                  liveGrade && sampleCount > 0
+                    ? `Baseline + ${sampleCount} live traversal${sampleCount === 1 ? "" : "s"}`
+                    : "Deterministic terrain baseline"
+                }</div>
+              </div>
+            </div>
+            ${
+              norm.score !== null
+                ? `<div class="tf-grade-score">${Math.round(norm.score)}<span>/100</span></div>`
+                : ""
+            }
+          </div>
+
+          <div class="tf-decision-suit">
+            <div class="tf-suit-head">
+              <div>
+                <div class="tf-suit-kicker">${escapeHtml(rigSubtitle)}</div>
+                <div class="tf-suit-rating">${escapeHtml(suitability.rating)}</div>
+              </div>
+              <button type="button" class="tf-text-action-btn" data-role="change-rig">Change rig</button>
+            </div>
+            ${
+              suitability.reason
+                ? `<div class="tf-suit-reason">${escapeHtml(suitability.reason)}</div>`
+                : ""
+            }
+            ${
+              suitability.warnings && suitability.warnings.length > 0
+                ? `<ul class="tf-suit-warnings">
+                    ${suitability.warnings
+                      .map(
+                        (w) =>
+                          `<li>${uiIcon("alert", 12)}<span>${escapeHtml(stripLeadingWarningGlyph(w))}</span></li>`
+                      )
+                      .join("")}
+                  </ul>`
+                : ""
+            }
+          </div>
+        </div>
+
+        <div class="tf-metric-grid">
+          <div class="tf-metric-cell">
+            <span class="tf-metric-label">Distance</span>
+            <span class="tf-metric-val">${norm.totalLengthKm.toFixed(2)} km</span>
+          </div>
+          <div class="tf-metric-cell">
+            <span class="tf-metric-label">Elevation</span>
+            <span class="tf-metric-val">${escapeHtml(elevRangeText)}</span>
+          </div>
+          <div class="tf-metric-cell">
+            <span class="tf-metric-label">Climb / drop</span>
+            <span class="tf-metric-val">${escapeHtml(gainLossText)}</span>
+          </div>
+          <div class="tf-metric-cell">
+            <span class="tf-metric-label">Slope</span>
+            <span class="tf-metric-val">${escapeHtml(slopeText)}</span>
+          </div>
+          <div class="tf-metric-cell">
+            <span class="tf-metric-label">Crossings</span>
+            <span class="tf-metric-val">${displayCrossings.length}</span>
+          </div>
+          <div class="tf-metric-cell">
+            <span class="tf-metric-label">Est. drive time</span>
+            <span class="tf-metric-val">${escapeHtml(estDurationText)}</span>
+          </div>
+        </div>
+
+        <div class="tf-segmented-control tf-inspector-tabs" role="tablist" aria-label="Track detail sections">
+          <button
+            type="button"
+            role="tab"
+            class="tf-seg-btn ${this.activeTab === "overview" ? "active" : ""}"
+            aria-selected="${this.activeTab === "overview"}"
+            data-insp-tab="overview"
+          >Overview</button>
+          <button
+            type="button"
+            role="tab"
+            class="tf-seg-btn ${this.activeTab === "conditions" ? "active" : ""}"
+            aria-selected="${this.activeTab === "conditions"}"
+            data-insp-tab="conditions"
+          >Conditions${conditionCount > 0 ? ` (${conditionCount})` : ""}</button>
+          <button
+            type="button"
+            role="tab"
+            class="tf-seg-btn ${this.activeTab === "along" ? "active" : ""}"
+            aria-selected="${this.activeTab === "along"}"
+            data-insp-tab="along"
+          >Along track${alongCount > 0 ? ` (${alongCount})` : ""}</button>
+        </div>
+
         ${
-          suitability.reason
-            ? `<div class="tf-suit-reason">${escapeHtml(suitability.reason)}</div>`
-            : ""
+          this.activeTab === "overview"
+            ? overviewTabHtml
+            : this.activeTab === "conditions"
+              ? conditionsTabHtml
+              : alongTabHtml
         }
-        ${
-          suitability.warnings && suitability.warnings.length > 0
-            ? `<ul class="tf-suit-warnings">
-                ${suitability.warnings.map((w) => `<li>⚠ ${escapeHtml(w)}</li>`).join("")}
-              </ul>`
-            : ""
-        }
-      </section>
+      </div>
     `;
 
-    // Slice 04 Official Closures & Access Alerts Panel
+    this.bindDetailHandlers(detail, norm, activeClosures, hotspots, displayPois);
+  }
+
+  private renderOverviewTab(params: {
+    norm: ReturnType<typeof normalizeTrackInspector>;
+    detail: TrackInspectorDetail;
+    gradeColor: string;
+    factors: ReturnType<typeof formatBreakdownFactors>;
+    overrides: string[];
+    chart: ReturnType<typeof buildElevationProfileSvg>;
+  }): string {
+    const { norm, detail, gradeColor, factors, overrides, chart } = params;
+
+    const factorsHtml =
+      factors.length > 0
+        ? factors
+            .map(
+              (f) => `
+                <div class="tf-factor-row">
+                  <div class="tf-factor-head">
+                    <span class="tf-factor-label">${escapeHtml(f.label)}</span>
+                    <span class="tf-factor-pts">${f.points} / ${f.maxPoints}</span>
+                  </div>
+                  <div class="tf-factor-track">
+                    <div class="tf-factor-fill" style="width:${f.pct}%;background:${gradeColor}"></div>
+                  </div>
+                  <div class="tf-factor-detail">${escapeHtml(f.detail)}</div>
+                </div>
+              `
+            )
+            .join("")
+        : `<p class="tf-inspector-muted">No structured baseline breakdown returned for this track.</p>`;
+
+    const overridesHtml =
+      overrides.length > 0
+        ? `<div class="tf-override-list">
+            ${overrides
+              .map(
+                (ov) =>
+                  `<div class="tf-override-badge">${uiIcon("alert", 13)}<span>${escapeHtml(formatOverrideLabel(ov))}</span></div>`
+              )
+              .join("")}
+          </div>`
+        : "";
+
+    const parksHtml =
+      norm.parks.length > 0
+        ? norm.parks
+            .map((pk) => {
+              const meta = [
+                pk.park_type,
+                pk.type_abbr,
+                pk.iucn ? `IUCN ${pk.iucn}` : null,
+                pk.state,
+              ]
+                .filter(Boolean)
+                .join(" · ");
+              return `
+                <div class="tf-clean-row">
+                  <div class="tf-list-card-title">${escapeHtml(pk.name)}</div>
+                  <div class="tf-list-card-sub">${escapeHtml(meta)}</div>
+                </div>
+              `;
+            })
+            .join("")
+        : `<p class="tf-inspector-muted">Outside mapped CAPAD 2025 reserve boundaries.</p>`;
+
+    return `
+      <section class="tf-insp-block">
+        <div class="tf-insp-sec-head">
+          <h3>Elevation profile</h3>
+          <div class="tf-elev-head-right">
+            <span class="tf-insp-meta">${
+              chart.steepZoneCount > 0
+                ? `${chart.steepZoneCount} steep ≥14°`
+                : "DEM AHD"
+            }</span>
+            ${
+              norm.profile.length >= 2
+                ? `<button type="button" class="tf-text-action-btn" data-role="expand-elevation" title="Open large interactive elevation & track profile window">${uiIcon("expand", 13)}<span>Expand</span></button>`
+                : ""
+            }
+          </div>
+        </div>
+        <div class="tf-elev-chart-wrap ${norm.profile.length >= 2 ? "expandable" : ""}" ${norm.profile.length >= 2 ? 'data-role="expand-elevation-chart" title="Click to open large interactive elevation profile"' : ""}>
+          ${chart.svgHtml}
+        </div>
+        ${norm.hasMultipleCourseSections ? `<p class="tf-inspector-muted">Distance combines mapped track sections. Check the map for junctions and gaps.</p>` : ""}
+      </section>
+
+      <section class="tf-insp-block">
+        <div class="tf-insp-sec-head">
+          <h3>Terrain difficulty breakdown</h3>
+          <span class="tf-insp-meta">${escapeHtml(norm.breakdown?.dem_tier ?? "DEM baseline")}</span>
+        </div>
+        <div class="tf-factor-list">${factorsHtml}</div>
+        ${overridesHtml}
+      </section>
+
+      <section class="tf-insp-block">
+        <div class="tf-insp-sec-head">
+          <h3>Park &amp; forest tenure</h3>
+          <span class="tf-insp-meta">${norm.parks.length}</span>
+        </div>
+        <div class="tf-clean-list">${parksHtml}</div>
+      </section>
+
+      <div class="tf-insp-lineage">
+        Source: ${escapeHtml(detail.primary_source ?? "canonical")}
+        ${norm.breakdown?.dem_tier ? ` · DEM: ${escapeHtml(norm.breakdown.dem_tier)}` : ""}
+        ${detail.segment_count ? ` · ${detail.segment_count} segments` : ""}
+      </div>
+    `;
+  }
+
+  private renderConditionsTab(params: {
+    detail: TrackInspectorDetail;
+    activeClosures: ClosureItem[];
+    gateWarnings: ReturnType<typeof partitionTrackReports>["gateWarnings"];
+    timelineReports: ReturnType<typeof partitionTrackReports>["timelineReports"];
+    wetRisk: ReturnType<typeof formatWetRiskBanner>;
+    liveBreakdown: TrackInspectorDetail["live_breakdown"];
+    liveGrade: string | null;
+    liveScore: number | null;
+    sampleCount: number;
+    confidence: ReturnType<typeof formatConfidenceBadge>;
+    lastDriven: string;
+    avgSpeedKmh: number | null;
+    estDurationText: string;
+    vehicleSplit: ReturnType<typeof normalizeVehicleClassSplit>;
+    hotspots: NonNullable<TrackInspectorDetail["obstacle_hotspots"]>;
+    liveReasons: string[];
+    outlierClamped: number;
+  }): string {
+    const {
+      detail,
+      activeClosures,
+      gateWarnings,
+      timelineReports,
+      wetRisk,
+      liveBreakdown,
+      liveGrade,
+      liveScore,
+      sampleCount,
+      confidence,
+      lastDriven,
+      avgSpeedKmh,
+      estDurationText,
+      vehicleSplit,
+      hotspots,
+      liveReasons,
+      outlierClamped,
+    } = params;
+
     const closuresPanelHtml =
       activeClosures.length > 0
         ? `
-          <section class="tf-insp-section tf-closures-panel">
+          <section class="tf-insp-block">
             <div class="tf-insp-sec-head">
-              <h3>⚠ Official Closures &amp; Alerts</h3>
-              <span class="mono tf-insp-meta">${activeClosures.length}</span>
+              <h3>Official closures &amp; alerts</h3>
+              <span class="tf-insp-meta">${activeClosures.length}</span>
             </div>
             <div class="tf-card-stack">
               ${activeClosures
@@ -386,20 +857,21 @@ export class TrackInspectorDrawer {
                   const hasClosureId =
                     (c.closure_id !== undefined && c.closure_id !== null) ||
                     (c.id !== undefined && c.id !== null);
+                  const cleanDesc = formatClosurePlainText(c.description);
                   return `
                     <div class="tf-closure-card tone-${tone}">
                       <div class="tf-closure-top">
                         <span class="tf-closure-type">${escapeHtml(typeLabel)}</span>
                         ${
                           c.is_stale
-                            ? `<span class="tf-stale-badge" title="Upstream agency feed had errors; displaying last-known cached closure">STALE CACHE</span>`
+                            ? `<span class="tf-status-tag tone-warn">Stale cache</span>`
                             : ""
                         }
                       </div>
                       <div class="tf-closure-title">${escapeHtml(c.title)}</div>
                       ${
-                        c.description
-                          ? `<p class="tf-closure-desc">${escapeHtml(c.description)}</p>`
+                        cleanDesc
+                          ? `<p class="tf-closure-desc tf-clamp-3">${escapeHtml(cleanDesc)}</p>`
                           : ""
                       }
                       <div class="tf-closure-meta">
@@ -410,12 +882,12 @@ export class TrackInspectorDrawer {
                       <div class="tf-closure-card-actions">
                         ${
                           hasClosureId
-                            ? `<button type="button" class="tf-mini-btn" data-open-closure-idx="${closureIdx}">Full Incident Details →</button>`
+                            ? `<button type="button" class="tf-mini-btn" data-open-closure-idx="${closureIdx}">Full details</button>`
                             : ""
                         }
                         ${
                           safeUrl
-                            ? `<a class="tf-closure-link" href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">Official Agency Source ↗</a>`
+                            ? `<a class="tf-closure-link" href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer"><span>Agency source</span>${uiIcon("externalLink", 12)}</a>`
                             : ""
                         }
                       </div>
@@ -428,14 +900,13 @@ export class TrackInspectorDrawer {
         `
         : "";
 
-    // Slice 08 Distinct Community Gate / Private Property Warnings Callout
     const gateWarningsHtml =
       gateWarnings.length > 0
         ? `
-          <section class="tf-insp-section tf-gate-warnings-panel">
+          <section class="tf-insp-block">
             <div class="tf-insp-sec-head">
-              <h3>⛔ Community Gate &amp; Private Access Warnings</h3>
-              <span class="mono tf-insp-meta">${gateWarnings.length}</span>
+              <h3>Gate &amp; private access warnings</h3>
+              <span class="tf-insp-meta">${gateWarnings.length}</span>
             </div>
             <div class="tf-card-stack">
               ${gateWarnings
@@ -461,12 +932,12 @@ export class TrackInspectorDrawer {
                       <div class="tf-closure-meta">
                         ${r.author_display_name ? `<span>By ${escapeHtml(r.author_display_name)}</span>` : ""}
                         ${r.vehicle_class ? `<span>· ${escapeHtml(r.vehicle_class)}</span>` : ""}
-                        <span>· ✓${r.confirm_count} / ✔${r.resolved_count}</span>
+                        <span>· ${r.confirm_count} confirmed / ${r.resolved_count} resolved</span>
                         <span>· ${escapeHtml(when)}</span>
                       </div>
                       <div class="tf-osm-links">
-                        <a class="tf-closure-link" href="${escapeHtml(links.osmEditUrl)}" target="_blank" rel="noopener noreferrer">Suggest OSM Access Fix ↗</a>
-                        <a class="tf-closure-link" href="${escapeHtml(links.osmNoteUrl)}" target="_blank" rel="noopener noreferrer">Add OSM Note ↗</a>
+                        <a class="tf-closure-link" href="${escapeHtml(links.osmEditUrl)}" target="_blank" rel="noopener noreferrer"><span>Suggest OSM access fix</span>${uiIcon("externalLink", 12)}</a>
+                        <a class="tf-closure-link" href="${escapeHtml(links.osmNoteUrl)}" target="_blank" rel="noopener noreferrer"><span>Add OSM note</span>${uiIcon("externalLink", 12)}</a>
                       </div>
                     </div>
                   `;
@@ -477,7 +948,6 @@ export class TrackInspectorDrawer {
         `
         : "";
 
-    // Slice 08 Trail Condition Timeline & Report Submission Form
     const defaultCoords = this.resolveDefaultReportCoords(detail);
     const reportFormHtml = this.showReportForm
       ? `
@@ -488,31 +958,31 @@ export class TrackInspectorDrawer {
               : ""
           }
           <div class="tf-insp-sec-head">
-            <h3>Report Trail Condition</h3>
-            <button type="button" class="tf-mini-btn" data-role="pick-report-loc">⌖ Pick on Map</button>
+            <h3>Report trail condition</h3>
+            <button type="button" class="tf-text-action-btn" data-role="pick-report-loc">${uiIcon("target", 13)}<span>Pick on map</span></button>
           </div>
           <div class="tf-pin-coords mono">
-            Location: ${defaultCoords.lat.toFixed(5)}, ${defaultCoords.lon.toFixed(5)}
+            ${defaultCoords.lat.toFixed(5)}, ${defaultCoords.lon.toFixed(5)}
           </div>
           <label class="tf-field">
-            <span class="tf-label">Condition / Hazard Type</span>
+            <span class="tf-label">Condition or hazard type</span>
             <select class="tf-select" name="report_type">
               ${CONDITION_REPORT_TYPES.map(
                 (t) =>
-                  `<option value="${escapeHtml(t.value)}">${escapeHtml(t.label)}${t.isGateWarning ? " (Gate/Access Warning)" : ""}</option>`
+                  `<option value="${escapeHtml(t.value)}">${escapeHtml(t.label)}${t.isGateWarning ? " (Gate/Access)" : ""}</option>`
               ).join("")}
             </select>
           </label>
           <label class="tf-field">
-            <span class="tf-label">Details &amp; Advice</span>
-            <textarea class="tf-textarea" name="notes" rows="3" required maxlength="500" placeholder="Describe obstacle depth, detour, locked padlock, or clear conditions…"></textarea>
+            <span class="tf-label">Details &amp; advice</span>
+            <textarea class="tf-textarea" name="notes" rows="3" required maxlength="500" placeholder="Describe obstacle depth, detour, locked gate, or clear conditions…"></textarea>
           </label>
           <label class="tf-field">
-            <span class="tf-label">Photo Attachment (optional, JPEG/PNG/WebP ≤ 5 MB)</span>
+            <span class="tf-label">Photo attachment (optional, ≤ 5 MB)</span>
             <input type="file" class="tf-file-input" name="photo" accept="image/jpeg,image/png,image/webp" />
           </label>
           <div class="tf-btn-row">
-            <button type="submit" class="tf-btn-primary" ${this.reportSubmitting ? "disabled" : ""}>Submit Report</button>
+            <button type="submit" class="tf-btn-primary" ${this.reportSubmitting ? "disabled" : ""}>Submit report</button>
             <button type="button" class="tf-btn-secondary" data-role="cancel-report">Cancel</button>
           </div>
         </form>
@@ -554,49 +1024,22 @@ export class TrackInspectorDrawer {
                     <span>· ${escapeHtml(when)}</span>
                   </div>
                   <div class="tf-report-actions">
-                    <button type="button" class="tf-mini-btn" data-vote-report="${escapeHtml(rid)}" data-vote-kind="confirm">✓ Confirm (${r.confirm_count})</button>
-                    <button type="button" class="tf-mini-btn" data-vote-report="${escapeHtml(rid)}" data-vote-kind="resolved">✔ Resolved (${r.resolved_count})</button>
-                    <a class="tf-osm-inline" href="${escapeHtml(links.osmNoteUrl)}" target="_blank" rel="noopener noreferrer" title="Report map/access fix to OpenStreetMap">OSM Fix ↗</a>
+                    <button type="button" class="tf-mini-btn" data-vote-report="${escapeHtml(rid)}" data-vote-kind="confirm">${uiIcon("check", 12)}<span>Confirm (${r.confirm_count})</span></button>
+                    <button type="button" class="tf-mini-btn" data-vote-report="${escapeHtml(rid)}" data-vote-kind="resolved">Resolved (${r.resolved_count})</button>
+                    <a class="tf-osm-inline" href="${escapeHtml(links.osmNoteUrl)}" target="_blank" rel="noopener noreferrer" title="Report map/access fix to OpenStreetMap">OSM fix</a>
                   </div>
                 </div>
               `;
             })
             .join("")
-        : `<p class="tf-inspector-muted">No recent trail condition reports yet. Been through recently? Share an update above.</p>`;
-
-    // Slice 07 Live Crowdsourced Evidence & 72h Rainfall Context
-    const liveBreakdown = detail.live_breakdown ?? null;
-    const liveGrade = detail.live_grade ?? liveBreakdown?.live_grade ?? null;
-    const liveScore = detail.live_score ?? liveBreakdown?.live_score ?? null;
-    const sampleCount =
-      detail.sample_count ?? liveBreakdown?.sample_count ?? 0;
-    const confidence = formatConfidenceBadge(
-      detail.confidence_level ?? liveBreakdown?.confidence_level,
-      sampleCount
-    );
-    const lastDriven = formatLastDriven(
-      detail.last_driven_at ?? liveBreakdown?.last_driven_at
-    );
-    const avgSpeedKmh =
-      detail.avg_speed_kmh ?? liveBreakdown?.avg_speed_kmh ?? null;
-    const estDurationText = formatDurationMinutes(
-      detail.est_duration_min,
-      liveBreakdown?.avg_duration_s
-    );
-    const vehicleSplit = normalizeVehicleClassSplit(
-      detail.vehicle_class_split ?? liveBreakdown?.vehicle_class_split
-    );
-    const wetRisk = formatWetRiskBanner(detail.rainfall_context);
-    const hotspots = detail.obstacle_hotspots ?? [];
-    const liveReasons = liveBreakdown?.reasons ?? [];
-    const outlierClamped = liveBreakdown?.outlier_clamped_count ?? 0;
+        : `<p class="tf-inspector-muted">No recent trail condition reports yet. Been through recently? Share an update.</p>`;
 
     const wetBannerHtml = wetRisk
       ? `
         <div class="tf-wet-banner tone-${wetRisk.tone}">
           <div class="tf-wet-head">
-            <span class="tf-wet-title">🌧 72h Rainfall · ${escapeHtml(wetRisk.label)}</span>
-            <span class="mono tf-wet-totals">${escapeHtml(wetRisk.rain72hText)} (72h) · ${escapeHtml(wetRisk.rain24hText)} (24h)</span>
+            <span class="tf-wet-title">${uiIcon("rain", 14)}<span>72h rainfall · ${escapeHtml(wetRisk.label)}</span></span>
+            <span class="tf-wet-totals">${escapeHtml(wetRisk.rain72hText)} (72h) · ${escapeHtml(wetRisk.rain24hText)} (24h)</span>
           </div>
           ${
             wetRisk.warning
@@ -604,16 +1047,8 @@ export class TrackInspectorDrawer {
               : ""
           }
           <div class="tf-wet-meta">
-            ${
-              wetRisk.adjustmentText
-                ? `<span class="tf-mini-tag amber">${escapeHtml(wetRisk.adjustmentText)}</span>`
-                : `<span class="tf-mini-tag">No wet penalty</span>`
-            }
-            ${
-              wetRisk.isStale
-                ? `<span class="tf-stale-badge">CACHED WEATHER</span>`
-                : ""
-            }
+            <span>${escapeHtml(wetRisk.adjustmentText ?? "No wet penalty")}</span>
+            ${wetRisk.isStale ? `<span>· Cached weather</span>` : ""}
             <span class="tf-wet-attrib">${escapeHtml(wetRisk.attribution)}</span>
           </div>
         </div>
@@ -624,7 +1059,7 @@ export class TrackInspectorDrawer {
       vehicleSplit.length > 0
         ? `
           <div class="tf-split-block">
-            <div class="tf-subhead">Vehicle Capability Traffic Split</div>
+            <div class="tf-subhead">Traffic by vehicle class</div>
             <div class="tf-split-bar" role="img" aria-label="Traffic split by vehicle capability class">
               ${vehicleSplit
                 .filter((s) => s.pct > 0)
@@ -641,7 +1076,7 @@ export class TrackInspectorDrawer {
                     <span class="tf-split-chip ${s.count === 0 ? "dimmed" : ""}">
                       <span class="tf-diff-swatch" style="background:${s.color}"></span>
                       <span>${escapeHtml(s.shortLabel)}</span>
-                      <span class="mono">${s.pct}% (${s.count})</span>
+                      <span>${s.pct}% (${s.count})</span>
                     </span>
                   `
                 )
@@ -655,7 +1090,7 @@ export class TrackInspectorDrawer {
       hotspots.length > 0
         ? `
           <div class="tf-hotspots-block">
-            <div class="tf-subhead">Rough / Slow Obstacle Hotspots (${hotspots.length})</div>
+            <div class="tf-subhead">Obstacle hotspots (${hotspots.length})</div>
             <div class="tf-card-stack">
               ${hotspots
                 .map((h, idx) => {
@@ -684,8 +1119,8 @@ export class TrackInspectorDrawer {
                       ${clickable ? `data-hotspot-idx="${idx}"` : "disabled"}
                     >
                       <div class="tf-list-card-head">
-                        <span class="tf-list-card-title">⚡ ${escapeHtml(kmText)}</span>
-                        <span class="mono tf-list-card-sub">${escapeHtml([speedText, roughText].filter(Boolean).join(" · ") || "Hotspot")}</span>
+                        <span class="tf-list-card-title">${uiIcon("zap", 13)}<span>${escapeHtml(kmText)}</span></span>
+                        <span class="tf-list-card-sub">${escapeHtml([speedText, roughText].filter(Boolean).join(" · ") || "Hotspot")}</span>
                       </div>
                       ${
                         reasonsList
@@ -701,24 +1136,37 @@ export class TrackInspectorDrawer {
         `
         : "";
 
-    const liveGradeColor = liveGrade ? getGradeColor(liveGrade) : "#94A3B8";
-    const liveSectionHtml = `
-      <section class="tf-insp-section tf-live-section">
+    const liveGradeColor = liveGrade ? getGradeColor(liveGrade) : "var(--text-muted)";
+
+    return `
+      ${closuresPanelHtml}
+      ${gateWarningsHtml}
+
+      <section class="tf-insp-block">
         <div class="tf-insp-sec-head">
-          <h3>Live Crowdsourced Evidence</h3>
-          <span class="mono tf-insp-meta">${escapeHtml(liveBreakdown?.version ?? "live_v1")}</span>
+          <h3>Trail condition reports</h3>
+          <button type="button" class="tf-text-action-btn" data-role="open-report-form">${uiIcon("plus", 13)}<span>Add report</span></button>
+        </div>
+        ${reportFormHtml}
+        <div class="tf-card-stack">${timelineHtml}</div>
+      </section>
+
+      <section class="tf-insp-block">
+        <div class="tf-insp-sec-head">
+          <h3>Live telemetry &amp; rainfall</h3>
+          <span class="tf-insp-meta">${escapeHtml(confidence.label)}</span>
         </div>
 
         ${wetBannerHtml}
 
         <div class="tf-live-hero">
           <div class="tf-live-grade-box">
-            <span class="tf-live-kicker">Live Grade</span>
+            <span class="tf-metric-label">Live grade</span>
             <div class="tf-live-grade-val" style="color:${liveGradeColor}">
-              ${escapeHtml(liveGrade ?? "Baseline Only")}
+              ${escapeHtml(liveGrade ?? "Baseline only")}
               ${
                 liveScore !== null
-                  ? `<span class="mono tf-live-score">(${Math.round(liveScore)}/100)</span>`
+                  ? `<span class="tf-live-score">(${Math.round(liveScore)}/100)</span>`
                   : ""
               }
             </div>
@@ -728,28 +1176,28 @@ export class TrackInspectorDrawer {
           </span>
         </div>
 
-        <div class="tf-live-stats-grid">
-          <div class="tf-stat-card">
-            <span class="tf-stat-label">Traversals</span>
-            <span class="mono tf-stat-val">${sampleCount}</span>
+        <div class="tf-metric-grid tf-metric-grid-2">
+          <div class="tf-metric-cell">
+            <span class="tf-metric-label">Traversals</span>
+            <span class="tf-metric-val">${sampleCount}</span>
           </div>
-          <div class="tf-stat-card">
-            <span class="tf-stat-label">Last Driven</span>
-            <span class="mono tf-stat-val tf-stat-sm">${escapeHtml(lastDriven)}</span>
+          <div class="tf-metric-cell">
+            <span class="tf-metric-label">Last driven</span>
+            <span class="tf-metric-val">${escapeHtml(lastDriven)}</span>
           </div>
-          <div class="tf-stat-card">
-            <span class="tf-stat-label">Avg Speed</span>
-            <span class="mono tf-stat-val">${avgSpeedKmh !== null ? `${avgSpeedKmh.toFixed(1)} km/h` : "—"}</span>
+          <div class="tf-metric-cell">
+            <span class="tf-metric-label">Avg speed</span>
+            <span class="tf-metric-val">${avgSpeedKmh !== null ? `${avgSpeedKmh.toFixed(1)} km/h` : "-"}</span>
           </div>
-          <div class="tf-stat-card">
-            <span class="tf-stat-label">Est. Duration</span>
-            <span class="mono tf-stat-val">${escapeHtml(estDurationText)}</span>
+          <div class="tf-metric-cell">
+            <span class="tf-metric-label">Est. duration</span>
+            <span class="tf-metric-val">${escapeHtml(estDurationText)}</span>
           </div>
         </div>
 
         ${
           outlierClamped > 0
-            ? `<div class="tf-telemetry-note">🛡 Outlier guard: ${outlierClamped} extreme traversal sample${outlierClamped === 1 ? "" : "s"} clamped &amp; blended with baseline terrain prior.</div>`
+            ? `<div class="tf-telemetry-note">${uiIcon("shield", 13)}<span>Outlier guard: ${outlierClamped} extreme traversal${outlierClamped === 1 ? "" : "s"} clamped and blended with terrain baseline.</span></div>`
             : confidence.level === "low" || confidence.level === "none"
               ? `<div class="tf-telemetry-note">${escapeHtml(confidence.detail)}.</div>`
               : ""
@@ -765,80 +1213,37 @@ export class TrackInspectorDrawer {
               </ul>`
             : ""
         }
+        ${liveBreakdown?.version ? "" : ""}
       </section>
     `;
+  }
 
-    const elevRangeText =
-      norm.minElevM !== null && norm.maxElevM !== null
-        ? `${Math.round(norm.minElevM)}–${Math.round(norm.maxElevM)} m`
-        : "—";
-
-    const gainLossText =
-      norm.elevLossM !== null
-        ? `+${Math.round(norm.elevGainM)} / −${Math.round(norm.elevLossM)} m`
-        : `+${Math.round(norm.elevGainM)} m`;
-
-    const factorsHtml =
-      factors.length > 0
-        ? factors
-            .map(
-              (f) => `
-                <div class="tf-factor-row">
-                  <div class="tf-factor-head">
-                    <span class="tf-factor-label">${escapeHtml(f.label)}</span>
-                    <span class="mono tf-factor-pts">${f.points} / ${f.maxPoints}</span>
-                  </div>
-                  <div class="tf-factor-track">
-                    <div class="tf-factor-fill" style="width:${f.pct}%;background:${gradeColor}"></div>
-                  </div>
-                  <div class="tf-factor-detail">${escapeHtml(f.detail)}</div>
-                </div>
-              `
-            )
-            .join("")
-        : `<p class="tf-inspector-muted">No structured baseline breakdown returned for this track.</p>`;
-
-    const overridesHtml =
-      overrides.length > 0
-        ? `<div class="tf-override-list">
-            ${overrides
-              .map(
-                (ov) =>
-                  `<div class="tf-override-badge">▲ ${escapeHtml(formatOverrideLabel(ov))}</div>`
-              )
-              .join("")}
-          </div>`
-        : "";
-
-    const reasonsHtml =
-      reasons.length > 0
-        ? `<ul class="tf-reason-list">
-            ${reasons.map((r) => `<li>${escapeHtml(r)}</li>`).join("")}
-          </ul>`
-        : "";
-
+  private renderAlongTab(
+    crossings: readonly WaterwayCrossingItem[],
+    nearbyPois: readonly PoiItem[]
+  ): string {
     const crossingsHtml =
-      norm.crossings.length > 0
-        ? norm.crossings
+      crossings.length > 0
+        ? crossings
             .map((c) => {
               const name = c.name || "Unnamed watercourse";
               const type = (c.waterway_type ?? "stream").replace(/_/g, " ");
               const flowTag = c.perennial ? "Perennial" : "Intermittent";
-              const bridgeTag = c.bridged ? "Bridged" : "Unbridged Ford";
+              const bridgeTag = c.bridged ? "Bridged" : "Unbridged ford";
               const distText =
                 typeof c.dist_m === "number"
                   ? `${(c.dist_m / 1000).toFixed(2)} km`
                   : "";
               return `
-                <div class="tf-list-card">
+                <div class="tf-clean-row">
                   <div class="tf-list-card-head">
                     <span class="tf-list-card-title">${escapeHtml(name)}</span>
-                    <span class="mono tf-list-card-sub">${escapeHtml(distText)}</span>
+                    <span class="tf-list-card-sub">${escapeHtml(distText)}</span>
                   </div>
-                  <div class="tf-list-card-tags">
-                    <span class="tf-mini-tag">${escapeHtml(type)}</span>
-                    <span class="tf-mini-tag ${c.perennial ? "cyan" : ""}">${escapeHtml(flowTag)}</span>
-                    <span class="tf-mini-tag ${c.bridged ? "emerald" : "amber"}">${escapeHtml(bridgeTag)}</span>
+                  <div class="tf-list-card-sub">
+                    <span>${escapeHtml(type)}</span>
+                    <span>· ${escapeHtml(flowTag)}</span>
+                    <span class="${c.bridged ? "tf-accent-emerald" : "tf-accent-amber"}">· ${escapeHtml(bridgeTag)}</span>
                   </div>
                 </div>
               `;
@@ -846,7 +1251,6 @@ export class TrackInspectorDrawer {
             .join("")
         : `<p class="tf-inspector-muted">No recorded waterway crossings along this track.</p>`;
 
-    const nearbyPois = detail.nearby_pois ?? [];
     const poisHtml =
       nearbyPois.length > 0
         ? nearbyPois
@@ -876,210 +1280,77 @@ export class TrackInspectorDrawer {
               `;
             })
             .join("")
-        : `<p class="tf-inspector-muted">No POIs recorded within 1,500 m.</p>`;
+        : `<p class="tf-inspector-muted">No camps, huts, or POIs recorded within 1,500 m.</p>`;
 
-    const parksHtml =
-      norm.parks.length > 0
-        ? norm.parks
-            .map((pk) => {
-              const meta = [
-                pk.park_type,
-                pk.type_abbr,
-                pk.iucn ? `IUCN ${pk.iucn}` : null,
-                pk.state,
-              ]
-                .filter(Boolean)
-                .join(" · ");
-              return `
-                <div class="tf-list-card">
-                  <div class="tf-list-card-title">${escapeHtml(pk.name)}</div>
-                  <div class="tf-list-card-sub">${escapeHtml(meta)}</div>
-                </div>
-              `;
-            })
-            .join("")
-        : `<p class="tf-inspector-muted">Outside mapped CAPAD 2025 reserve boundaries.</p>`;
-
-    this.root.innerHTML = `
-      <div class="tf-inspector-head">
-        <div class="tf-inspector-head-copy">
-          <div class="tf-inspector-kicker">Track Inspector</div>
-          <h2 class="tf-inspector-title">${escapeHtml(norm.name)}</h2>
-          ${
-            norm.altNames.length > 0
-              ? `<div class="tf-inspector-alt">Also: ${escapeHtml(norm.altNames.join(", "))}</div>`
-              : ""
-          }
-          <div class="tf-inspector-badges">${badgesHtml}</div>
+    return `
+      <section class="tf-insp-block">
+        <div class="tf-insp-sec-head">
+          <h3>Waterway crossings</h3>
+          <span class="tf-insp-meta">${crossings.length}</span>
         </div>
-        <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Track Inspector">×</button>
-      </div>
+        <div class="tf-clean-list">${crossingsHtml}</div>
+      </section>
 
-      <div class="tf-inspector-body">
-        <div class="tf-inspector-actions">
-          <button
-            type="button"
-            class="tf-action-btn ${this.context.isInRoute ? "in-route" : ""}"
-            data-role="toggle-route"
-            title="${this.context.isInRoute ? "Track is in active route — click to open Route Planner" : "Add this track to the active multi-track route"}"
-          >${this.context.isInRoute ? "✓ In Route" : "+ Route"}</button>
-          <button
-            type="button"
-            class="tf-action-btn ${this.context.isFavorite ? "starred" : ""}"
-            data-role="toggle-fav"
-            title="${this.context.isAuthenticated ? "Toggle saved favorite" : "Sign in to save favorite"}"
-          >${this.context.isFavorite ? "★ Saved" : "☆ Save"}</button>
-          <button type="button" class="tf-action-btn" data-export-track="gpx" title="Download GridForge-compatible GPX 1.1">⬇ GPX</button>
-          <button type="button" class="tf-action-btn" data-export-track="geojson" title="Download GeoJSON FeatureCollection">⬇ GeoJSON</button>
-          <button type="button" class="tf-action-btn" data-role="share-track" title="Copy shareable link to this track and map view">🔗 Share</button>
-          ${
-            detail.bbox
-              ? `<button type="button" class="tf-action-btn" data-role="zoom-track">⌖ Zoom</button>`
-              : ""
-          }
+      <section class="tf-insp-block">
+        <div class="tf-insp-sec-head">
+          <h3>Nearby camps, huts &amp; POIs</h3>
+          <span class="tf-insp-meta">${nearbyPois.length}</span>
         </div>
-
-        ${closuresPanelHtml}
-        ${gateWarningsHtml}
-
-        <div class="tf-grade-hero" style="border-color:${gradeColor}">
-          <div class="tf-grade-hero-left">
-            <span class="tf-grade-swatch" style="background:${gradeColor}"></span>
-            <div>
-              <div class="tf-grade-name" style="color:${gradeColor}">${escapeHtml(norm.grade)}</div>
-              <div class="tf-grade-sub">${
-                liveGrade && sampleCount > 0
-                  ? `Effective Grade · Baseline + ${sampleCount} Live Traversals`
-                  : "Day-1 Deterministic Terrain Baseline"
-              }</div>
-            </div>
-          </div>
-          <div class="tf-grade-hero-right">
-            ${
-              norm.score !== null
-                ? `<div class="tf-grade-score mono">${Math.round(norm.score)}<span>/100</span></div>`
-                : ""
-            }
-          </div>
-        </div>
-
-        ${suitabilityHtml}
-
-        <div class="tf-stat-grid">
-          <div class="tf-stat-card">
-            <span class="tf-stat-label">Distance</span>
-            <span class="tf-stat-val mono">${norm.totalLengthKm.toFixed(2)} km</span>
-          </div>
-          <div class="tf-stat-card">
-            <span class="tf-stat-label">Elevation</span>
-            <span class="tf-stat-val mono">${escapeHtml(elevRangeText)}</span>
-          </div>
-          <div class="tf-stat-card">
-            <span class="tf-stat-label">Climb / Drop</span>
-            <span class="tf-stat-val mono">${escapeHtml(gainLossText)}</span>
-          </div>
-          <div class="tf-stat-card">
-            <span class="tf-stat-label">Max Slope</span>
-            <span class="tf-stat-val mono">${norm.maxSlopeDeg !== null ? `${norm.maxSlopeDeg.toFixed(1)}°` : "—"}</span>
-          </div>
-          <div class="tf-stat-card">
-            <span class="tf-stat-label">Sustained</span>
-            <span class="tf-stat-val mono">${norm.sustainedSlopeDeg !== null ? `${norm.sustainedSlopeDeg.toFixed(1)}°` : "—"}</span>
-          </div>
-          <div class="tf-stat-card">
-            <span class="tf-stat-label">Crossings</span>
-            <span class="tf-stat-val mono">${norm.waterwayCrossingCount}</span>
-          </div>
-        </div>
-
-        <section class="tf-insp-section">
-          <div class="tf-insp-sec-head">
-            <h3>Elevation Profile</h3>
-            <div class="tf-elev-head-right">
-              <span class="mono tf-insp-meta">${
-                chart.steepZoneCount > 0
-                  ? `${chart.steepZoneCount} steep ≥14° ${chart.steepZoneCount === 1 ? "zone" : "zones"}`
-                  : "DEM AHD"
-              }</span>
-              ${
-                norm.profile.length >= 2
-                  ? `<button type="button" class="tf-mini-btn tf-elev-expand-btn" data-role="expand-elevation" title="Open large interactive elevation & track profile window">⤢ Expand</button>`
-                  : ""
-              }
-            </div>
-          </div>
-          <div class="tf-elev-chart-wrap ${norm.profile.length >= 2 ? "expandable" : ""}" ${norm.profile.length >= 2 ? 'data-role="expand-elevation-chart" title="Click to open large interactive elevation profile"' : ""}>
-            ${chart.svgHtml}
-          </div>
-          ${norm.hasMultipleCourseSections ? `<p class="tf-inspector-muted">Distance combines the mapped track sections. Check the map for junctions and gaps.</p>` : ""}
-        </section>
-
-        <section class="tf-insp-section">
-          <div class="tf-insp-sec-head">
-            <h3>Trail Condition Timeline</h3>
-            <button type="button" class="tf-mini-btn" data-role="open-report-form">+ Report</button>
-          </div>
-          ${reportFormHtml}
-          <div class="tf-card-stack">${timelineHtml}</div>
-        </section>
-
-        <section class="tf-insp-section">
-          <div class="tf-insp-sec-head">
-            <h3>Static Terrain Baseline</h3>
-            <span class="mono tf-insp-meta">${escapeHtml(norm.breakdown?.formula_version ?? "baseline_v1")}</span>
-          </div>
-          <div class="tf-factor-list">${factorsHtml}</div>
-          ${overridesHtml}
-          ${reasonsHtml}
-        </section>
-
-        ${liveSectionHtml}
-
-        <section class="tf-insp-section">
-          <div class="tf-insp-sec-head">
-            <h3>Waterway Crossings</h3>
-            <span class="mono tf-insp-meta">${norm.crossings.length}</span>
-          </div>
-          <div class="tf-card-stack">${crossingsHtml}</div>
-        </section>
-
-        <section class="tf-insp-section">
-          <div class="tf-insp-sec-head">
-            <h3>Nearby POIs</h3>
-            <span class="mono tf-insp-meta">${nearbyPois.length}</span>
-          </div>
-          <div class="tf-poi-list">${poisHtml}</div>
-        </section>
-
-        <section class="tf-insp-section">
-          <div class="tf-insp-sec-head">
-            <h3>CAPAD Park / Forest Tenure</h3>
-            <span class="mono tf-insp-meta">${norm.parks.length}</span>
-          </div>
-          <div class="tf-card-stack">${parksHtml}</div>
-        </section>
-
-        <div class="tf-insp-lineage mono">
-          Source: ${escapeHtml(detail.primary_source ?? "canonical")}
-          ${norm.breakdown?.dem_tier ? ` · DEM: ${escapeHtml(norm.breakdown.dem_tier)}` : ""}
-          ${detail.segment_count ? ` · ${detail.segment_count} segments` : ""}
-        </div>
-      </div>
+        <div class="tf-poi-list">${poisHtml}</div>
+      </section>
     `;
+  }
 
+  private bindDetailHandlers(
+    detail: TrackInspectorDetail,
+    norm: ReturnType<typeof normalizeTrackInspector>,
+    activeClosures: ClosureItem[],
+    hotspots: NonNullable<TrackInspectorDetail["obstacle_hotspots"]>,
+    nearbyPois: readonly PoiItem[]
+  ): void {
     this.bindClose();
 
     this.root
-      .querySelector<HTMLButtonElement>("[data-role='expand-elevation']")
-      ?.addEventListener("click", () => {
-        this.openElevationModal();
+      .querySelectorAll<HTMLButtonElement>("[data-insp-tab]")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const next = btn.dataset.inspTab as TrackInspectorTab | undefined;
+          if (next === "overview" || next === "conditions" || next === "along") {
+            this.activeTab = next;
+            this.exportMenuOpen = false;
+            this.renderDetail(detail);
+          }
+        });
       });
 
     this.root
-      .querySelector<HTMLElement>("[data-role='expand-elevation-chart']")
+      .querySelector<HTMLButtonElement>("[data-jump-tab='conditions']")
       ?.addEventListener("click", () => {
-        this.openElevationModal();
+        this.activeTab = "conditions";
+        this.renderDetail(detail);
       });
+
+    const exportToggle = this.root.querySelector<HTMLButtonElement>(
+      "[data-role='toggle-export-menu']"
+    );
+    const exportMenu = this.root.querySelector<HTMLElement>(
+      "[data-role='export-menu']"
+    );
+    exportToggle?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.exportMenuOpen = !this.exportMenuOpen;
+      exportMenu?.classList.toggle("hidden", !this.exportMenuOpen);
+      exportToggle.classList.toggle("active", this.exportMenuOpen);
+      exportToggle.setAttribute("aria-expanded", String(this.exportMenuOpen));
+    });
+
+    this.root
+      .querySelector<HTMLButtonElement>("[data-role='expand-elevation']")
+      ?.addEventListener("click", () => this.openElevationModal());
+
+    this.root
+      .querySelector<HTMLElement>("[data-role='expand-elevation-chart']")
+      ?.addEventListener("click", () => this.openElevationModal());
 
     this.root
       .querySelector<HTMLButtonElement>("[data-role='change-rig']")
@@ -1109,6 +1380,8 @@ export class TrackInspectorDrawer {
       .forEach((btn) => {
         btn.addEventListener("click", () => {
           const fmt = btn.dataset.exportTrack as "gpx" | "geojson";
+          this.exportMenuOpen = false;
+          exportMenu?.classList.add("hidden");
           this.callbacks.onExportTrack(detail.track_id, fmt);
         });
       });
@@ -1119,7 +1392,6 @@ export class TrackInspectorDrawer {
         this.callbacks.onShareTrack?.(detail.track_id);
       });
 
-    // Slice 08 Report form & voting handlers
     this.root
       .querySelector<HTMLButtonElement>("[data-role='open-report-form']")
       ?.addEventListener("click", () => {

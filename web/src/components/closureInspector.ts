@@ -1,10 +1,13 @@
+import { renderSheetHandleMarkup } from "../bottomSheet";
 import {
   buildClosureMetadataRows,
+  formatClosurePlainText,
   formatClosureSeverityLabel,
   formatClosureTypeLabel,
   getClosureTone,
   sanitizeExternalHttpUrl,
 } from "../closuresHelpers";
+import { uiIcon } from "../icons";
 import { escapeHtml, getGradeColor } from "../presets";
 import type { BBoxTuple, ClosureDetailResponse } from "../types";
 
@@ -27,7 +30,7 @@ export class ClosureInspectorDrawer {
   constructor(container: HTMLElement, callbacks: ClosureInspectorCallbacks) {
     this.root = container;
     this.callbacks = callbacks;
-    this.root.className = "tf-inspector tf-closure-inspector";
+    this.root.className = "tf-drawer tf-inspector tf-closure-inspector";
     this.root.setAttribute("aria-label", "Incident & Closure Details");
     this.root.setAttribute("aria-hidden", "true");
     this.renderEmpty();
@@ -119,28 +122,6 @@ export class ClosureInspectorDrawer {
     const safeUrl = sanitizeExternalHttpUrl(detail.source_url);
     const metaRows = buildClosureMetadataRows(detail);
 
-    const tonePillClass =
-      tone === "critical"
-        ? "tf-pill-red"
-        : tone === "warning"
-          ? "tf-pill-amber"
-          : "tf-pill-ice";
-
-    const badgesHtml = [
-      `<span class="tf-pill ${tonePillClass}">⚠ ${escapeHtml(sevLabel)}</span>`,
-      detail.state
-        ? `<span class="tf-pill mono">${escapeHtml(detail.state)}</span>`
-        : "",
-      detail.status
-        ? `<span class="tf-pill">${escapeHtml(detail.status.replace(/_/g, " ").toUpperCase())}</span>`
-        : "",
-      detail.is_stale
-        ? `<span class="tf-stale-badge" title="Upstream agency feed had errors; displaying last-known cached alert">STALE CACHE</span>`
-        : "",
-    ]
-      .filter(Boolean)
-      .join("");
-
     const overlappingHtml =
       this.overlapping.length > 1
         ? `
@@ -184,19 +165,19 @@ export class ClosureInspectorDrawer {
           <div class="tf-btn-row">
             ${
               detail.bbox
-                ? `<button type="button" class="tf-btn-secondary" data-role="zoom-closure">⌖ Zoom to Area</button>`
+                ? `<button type="button" class="tf-btn-secondary" data-role="zoom-closure">${uiIcon("target", 13)}<span>Zoom to area</span></button>`
                 : ""
             }
             ${
               safeUrl
-                ? `<a class="tf-btn-secondary tf-btn-link" href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">Official Agency Source ↗</a>`
+                ? `<a class="tf-btn-secondary tf-btn-link" href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer"><span>Agency source</span>${uiIcon("externalLink", 13)}</a>`
                 : ""
             }
           </div>
         `
         : "";
 
-    const descriptionParagraphs = (detail.description ?? "")
+    const descriptionParagraphs = formatClosurePlainText(detail.description)
       .split(/\n+/)
       .map((line) => line.trim())
       .filter(Boolean);
@@ -328,15 +309,27 @@ export class ClosureInspectorDrawer {
       ? `<div class="tf-feed-warn-banner">Showing cached map alert data (${escapeHtml(this.error)})</div>`
       : "";
 
+    const metaLine = [
+      typeLabel,
+      detail.state ?? null,
+      detail.status ? detail.status.replace(/_/g, " ") : null,
+      detail.is_stale ? "Stale cache" : null,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+
     this.root.innerHTML = `
+      ${renderSheetHandleMarkup("Resize incident details panel")}
       <div class="tf-inspector-head">
         <div class="tf-inspector-head-copy">
-          <div class="tf-inspector-kicker tf-closure-kicker-${tone}">⚠ ${escapeHtml(typeLabel)}</div>
           <h2 class="tf-inspector-title">${escapeHtml(detail.title)}</h2>
           ${subtitleHtml}
-          <div class="tf-inspector-badges">${badgesHtml}</div>
+          <div class="tf-inspector-subline">
+            <span class="tf-status-tag tone-${tone === "critical" ? "danger" : tone === "warning" ? "warn" : "info"}">${uiIcon("alert", 12)}<span>${escapeHtml(sevLabel)}</span></span>
+            <span>${escapeHtml(metaLine)}</span>
+          </div>
         </div>
-        <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Incident Details">×</button>
+        <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Incident Details">${uiIcon("close", 15)}</button>
       </div>
       <div class="tf-inspector-body">
         ${errorBannerHtml}

@@ -108,6 +108,64 @@ export const CANONICAL_LAYER_DEFINITIONS: readonly LayerDefinition[] = [
   },
 ] as const;
 
+export type LayerGroupId = "trails" | "terrain" | "reference";
+
+export interface LayerGroupDefinition {
+  id: LayerGroupId;
+  label: string;
+  keys: readonly LayerKey[];
+}
+
+/**
+ * Semantic display groups used in the default Map Layers sidebar view.
+ * Drag-and-drop / arrow list reordering remains available behind the "Reorder" toggle
+ * and preserves the canonical 12-key preference format 1:1 with the backend.
+ */
+export const LAYER_GROUPS: readonly LayerGroupDefinition[] = [
+  {
+    id: "trails",
+    label: "Trails & hazards",
+    keys: [
+      "tracks",
+      "steepHighlights",
+      "hotspots",
+      "closures",
+      "reports",
+      "unmapped",
+    ],
+  },
+  {
+    id: "terrain",
+    label: "Terrain & environment",
+    keys: ["contoursHillshade", "snowLine", "parksWaterways"],
+  },
+  {
+    id: "reference",
+    label: "Reference & POIs",
+    keys: ["pois", "placesRegions", "highways"],
+  },
+] as const;
+
+/**
+ * Partition an ordered list of LayerKeys into the 3 semantic sidebar groups,
+ * preserving relative order within each group.
+ */
+export function groupOrderedLayerKeys(
+  order: readonly LayerKey[]
+): Array<{ id: LayerGroupId; label: string; keys: LayerKey[] }> {
+  const normalized = normalizeLayerOrder(order);
+  const rank = new Map<LayerKey, number>(
+    normalized.map((k, idx) => [k, idx])
+  );
+  return LAYER_GROUPS.map((group) => ({
+    id: group.id,
+    label: group.label,
+    keys: [...group.keys].sort(
+      (a, b) => (rank.get(a) ?? 99) - (rank.get(b) ?? 99)
+    ),
+  }));
+}
+
 export const LAYER_DEFINITION_MAP: Readonly<Record<LayerKey, LayerDefinition>> =
   Object.fromEntries(
     CANONICAL_LAYER_DEFINITIONS.map((def) => [def.key, def])

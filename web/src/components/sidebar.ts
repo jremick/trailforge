@@ -2,9 +2,11 @@ import {
   formatRelativeTimestamp,
   summarizeFeedStatus,
 } from "../closuresHelpers";
+import { uiIcon } from "../icons";
 import {
   CANONICAL_LAYER_ORDER,
   LAYER_DEFINITION_MAP,
+  groupOrderedLayerKeys,
   moveLayerInOrder,
   normalizeLayerOrder,
   reorderLayerKeys,
@@ -13,6 +15,7 @@ import {
   DEFAULT_SNOWLINE_BANDS_M,
   DIFFICULTY_META,
   OUTDOOR_POI_ICONS,
+  REGION_PRESETS,
   escapeHtml,
   snapSnowlineBand,
 } from "../presets";
@@ -37,6 +40,7 @@ export interface SidebarCallbacks {
   onLayerOrderChange: (order: LayerKey[]) => void;
   onResetLayerPreferences?: () => void;
   onSnowLineElevationChange: (elevationM: number) => void;
+  onPresetChange?: (presetId: string) => void;
   onResetRegion: () => void;
   onOpenOfflinePacks?: () => void;
   onCollapse?: () => void;
@@ -56,16 +60,13 @@ export class Sidebar {
   private readonly root: HTMLElement;
   private readonly callbacks: SidebarCallbacks;
   private readonly layerListEl: HTMLElement;
+  private readonly reorderToggleBtn: HTMLButtonElement;
   private readonly layerPrefsBarEl: HTMLElement;
-  private readonly snowSliderRowEl: HTMLElement;
-  private readonly snowSliderEl: HTMLInputElement;
-  private readonly snowValEl: HTMLElement;
-  private readonly snowTicksEl: HTMLElement;
-  private readonly difficultyLegendEl: HTMLElement;
   private readonly tileModePillEl: HTMLElement;
   private readonly feedsSectionEl: HTMLDetailsElement;
   private readonly feedsPillEl: HTMLElement;
   private readonly feedsListEl: HTMLElement;
+  private readonly presetSelectEl: HTMLSelectElement;
   private readonly regionNameEl: HTMLElement;
   private readonly regionTagEl: HTMLElement;
   private readonly regionDescEl: HTMLElement;
@@ -84,6 +85,8 @@ export class Sidebar {
   private layerOrder: LayerKey[];
   private layerState: LayerVisibilityState;
   private hasCustomLayerPrefs: boolean;
+  private reorderMode = false;
+  private showAllPoiLegend = false;
   private draggingKey: LayerKey | null = null;
   private snowBands: number[] = [...DEFAULT_SNOWLINE_BANDS_M];
   private currentWidthPx: number = SIDEBAR_DEFAULT_WIDTH_PX;
@@ -108,22 +111,27 @@ export class Sidebar {
     this.root.className = "tf-sidebar";
     this.root.setAttribute("aria-label", "Map layers and trail controls");
 
-    const previewIcons = OUTDOOR_POI_ICONS.slice(0, 7);
-    const snappedInit = snapSnowlineBand(
-      initialLayers.snowLineElevationM,
-      this.snowBands
+    const iconicRegions = REGION_PRESETS.filter(
+      (p) => p.group === "region" && p.packCategory !== "state"
     );
-    const initIdx = Math.max(0, this.snowBands.indexOf(snappedInit));
+    const stateRegions = REGION_PRESETS.filter(
+      (p) => p.group === "region" && p.packCategory === "state"
+    );
+    const landmarks = REGION_PRESETS.filter((p) => p.group === "landmark");
+
+    const renderPresetOptions = (items: RegionPreset[]): string =>
+      items
+        .map(
+          (p) =>
+            `<option value="${escapeHtml(p.id)}" ${p.id === initialPreset.id ? "selected" : ""}>${escapeHtml(p.label)}</option>`
+        )
+        .join("");
 
     this.root.innerHTML = `
       <div class="tf-sidebar-head">
         <div class="tf-sidebar-head-title">
-          <svg class="tf-sidebar-head-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
-            <polyline points="2 12 12 17 22 12"></polyline>
-            <polyline points="2 17 12 22 22 17"></polyline>
-          </svg>
-          <span>Layers &amp; Controls</span>
+          ${uiIcon("layers", 15, "tf-sidebar-head-icon")}
+          <span>Layers &amp; controls</span>
         </div>
         <button
           type="button"
@@ -133,80 +141,92 @@ export class Sidebar {
           aria-label="Hide layers sidebar"
           aria-expanded="true"
         >
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <polyline points="15 18 9 12 15 6"></polyline>
-          </svg>
+          ${uiIcon("chevronLeft", 14)}
           <span>Hide</span>
         </button>
       </div>
+
       <div class="tf-sidebar-scroll">
         <details class="tf-section" open>
           <summary class="tf-section-summary">
             <span class="tf-section-title-group">
-              <span class="tf-section-title">Map Layers</span>
+              <span class="tf-section-title">Map layers</span>
             </span>
-            <span class="tf-section-pill" data-role="tile-mode-pill">Loading…</span>
+            <span class="tf-section-meta" data-role="tile-mode-pill">Loading…</span>
           </summary>
 
           <div class="tf-section-body">
+            <div class="tf-layer-toolbar">
+              <span class="tf-layer-toolbar-caption">Grouped by category</span>
+              <button
+                type="button"
+                class="tf-text-action-btn"
+                data-role="toggle-layer-reorder"
+                aria-pressed="false"
+                title="Customize list order with drag-and-drop or arrows"
+              >
+                ${uiIcon("sliders", 13)}
+                <span>Reorder</span>
+              </button>
+            </div>
+
             <div class="tf-layer-list" data-role="layer-list"></div>
 
             <div class="tf-layer-prefs-bar ${this.hasCustomLayerPrefs ? "" : "hidden"}" data-role="layer-prefs-bar">
-              <span class="tf-layer-prefs-note">Preferences saved</span>
+              <span class="tf-layer-prefs-note">Custom layer preferences active</span>
               <button
                 type="button"
                 class="tf-mini-btn"
                 data-role="reset-layer-prefs"
-                title="Reset map layer order and on/off toggles to instance defaults"
+                title="Reset map layer order and on/off toggles to defaults"
               >Reset defaults</button>
             </div>
 
-            <div class="tf-snow-control ${initialLayers.snowLine ? "" : "hidden"}" data-role="snow-control">
-              <div class="tf-snow-head">
-                <span>Snow-Line Threshold</span>
-                <span class="mono tf-accent-cyan" data-role="snow-val">&ge; ${snappedInit.toLocaleString()} m</span>
-              </div>
-              <input
-                type="range"
-                class="tf-range"
-                data-role="snow-slider"
-                min="0"
-                max="${this.snowBands.length - 1}"
-                step="1"
-                value="${initIdx}"
-                aria-label="Snow-line elevation threshold in meters"
-              />
-              <div class="tf-snow-ticks mono" data-role="snow-ticks"></div>
-            </div>
+            <div class="tf-poi-legend-block" data-role="poi-legend-block"></div>
+          </div>
+        </details>
 
-            <div class="tf-legend-block ${initialLayers.tracks ? "" : "hidden"}" data-role="difficulty-legend">
-              <div class="tf-subhead">Track Difficulty Grade</div>
-              <div class="tf-difficulty-grid">
-                ${DIFFICULTY_META.map(
-                  (d) => `
-                    <div class="tf-diff-item" title="${escapeHtml(d.hint)}">
-                      <span class="tf-diff-swatch" style="background:${d.color}"></span>
-                      <span>${escapeHtml(d.label)}</span>
-                    </div>
-                  `
-                ).join("")}
-              </div>
-            </div>
+        <details class="tf-section" open>
+          <summary class="tf-section-summary">
+            <span class="tf-section-title-group">
+              <span class="tf-section-title">Active corridor</span>
+            </span>
+            <span class="tf-section-meta" data-role="region-tag">${escapeHtml(initialPreset.stateTag)}</span>
+          </summary>
 
-            <div class="tf-legend-block">
-              <div class="tf-subhead">Outdoor POI Symbols (${OUTDOOR_POI_ICONS.length} loaded)</div>
-              <div class="tf-icon-strip">
-                ${previewIcons
-                  .map(
-                    (icon) => `
-                      <span class="tf-icon-chip" title="${escapeHtml(icon.label)}">
-                        <img src="${escapeHtml(icon.iconPath)}" alt="${escapeHtml(icon.label)}" width="16" height="16" loading="lazy" />
-                        <span>${escapeHtml(icon.label.split(" ")[0] ?? icon.label)}</span>
-                      </span>
-                    `
-                  )
-                  .join("")}
-              </div>
+          <div class="tf-section-body">
+            <label class="tf-field">
+              <span class="tf-label">Jump to region or state</span>
+              <select class="tf-select" data-role="sidebar-preset-select" aria-label="Jump to Australian region or corridor">
+                <optgroup label="Iconic 4WD Regions (${iconicRegions.length})">
+                  ${renderPresetOptions(iconicRegions)}
+                </optgroup>
+                <optgroup label="Australian States &amp; Territories (${stateRegions.length})">
+                  ${renderPresetOptions(stateRegions)}
+                </optgroup>
+                <optgroup label="4WD Corridors &amp; Landmarks">
+                  ${renderPresetOptions(landmarks)}
+                </optgroup>
+              </select>
+            </label>
+
+            <div class="tf-region-title" data-role="region-name">${escapeHtml(initialPreset.label)}</div>
+            <p class="tf-region-desc" data-role="region-desc">${escapeHtml(initialPreset.description)}</p>
+            <div class="tf-kv-grid">
+              <span class="tf-kv-key">Bounds</span>
+              <span class="tf-kv-val mono" data-role="region-bbox"></span>
+              <span class="tf-kv-key">Offline pack</span>
+              <span class="tf-kv-val" data-role="region-pack"></span>
+            </div>
+            <div class="tf-btn-row">
+              <button type="button" class="tf-btn-secondary" data-role="reset-region">
+                ${uiIcon("target", 13)}
+                <span>Recenter</span>
+              </button>
+              <button type="button" class="tf-btn-secondary" data-role="open-packs">
+                ${uiIcon("download", 13)}
+                <span>Offline packs</span>
+              </button>
             </div>
           </div>
         </details>
@@ -214,9 +234,9 @@ export class Sidebar {
         <details class="tf-section" data-role="feeds-section">
           <summary class="tf-section-summary">
             <span class="tf-section-title-group">
-              <span class="tf-section-title">AU Agency Feeds</span>
+              <span class="tf-section-title">Agency closure feeds</span>
             </span>
-            <span class="tf-section-pill mono" data-role="feeds-pill">Checking…</span>
+            <span class="tf-section-meta" data-role="feeds-pill">Checking…</span>
           </summary>
 
           <div class="tf-section-body" data-role="feeds-list">
@@ -224,60 +244,33 @@ export class Sidebar {
           </div>
         </details>
 
-        <details class="tf-section" open>
-          <summary class="tf-section-summary">
-            <span class="tf-section-title-group">
-              <span class="tf-section-title">Active Corridor</span>
-            </span>
-            <span class="tf-section-pill mono" data-role="region-tag">${escapeHtml(initialPreset.stateTag)}</span>
-          </summary>
-
-          <div class="tf-section-body">
-            <div class="tf-region-title" data-role="region-name">${escapeHtml(initialPreset.label)}</div>
-            <p class="tf-region-desc" data-role="region-desc">${escapeHtml(initialPreset.description)}</p>
-            <div class="tf-kv-grid">
-              <span class="tf-kv-key">Bounds</span>
-              <span class="tf-kv-val mono" data-role="region-bbox"></span>
-              <span class="tf-kv-key">Offline Pack</span>
-              <span class="tf-kv-val mono" data-role="region-pack"></span>
-            </div>
-            <div class="tf-btn-row">
-              <button type="button" class="tf-btn-secondary" data-role="reset-region">
-                ⌖ Recenter
-              </button>
-              <button type="button" class="tf-btn-secondary" data-role="open-packs">
-                ⬇ Offline Packs
-              </button>
-            </div>
-          </div>
-        </details>
-
         <details class="tf-section ${showTelemetry ? "" : "hidden"}" data-role="telemetry-section">
           <summary class="tf-section-summary">
             <span class="tf-section-title-group">
-              <span class="tf-section-title">Stack &amp; Offline Telemetry</span>
+              <span class="tf-section-title">Stack &amp; offline status</span>
             </span>
-            <span class="tf-section-pill">v0.1</span>
+            <span class="tf-section-meta">Diagnostics</span>
           </summary>
 
           <div class="tf-section-body">
             <div class="tf-kv-grid">
               <span class="tf-kv-key">Vector/DEM</span>
               <span class="tf-kv-val mono" data-role="sys-tiles">Checking…</span>
-              <span class="tf-kv-key">API Health</span>
+              <span class="tf-kv-key">API health</span>
               <span class="tf-kv-val mono" data-role="sys-api">Connecting…</span>
               <span class="tf-kv-key">PostGIS</span>
-              <span class="tf-kv-val mono" data-role="sys-postgis">—</span>
-              <span class="tf-kv-key">Schema Rev</span>
-              <span class="tf-kv-val mono" data-role="sys-schema">—</span>
+              <span class="tf-kv-val mono" data-role="sys-postgis">-</span>
+              <span class="tf-kv-key">Schema rev</span>
+              <span class="tf-kv-val mono" data-role="sys-schema">-</span>
               <span class="tf-kv-key">Network</span>
-              <span class="tf-kv-val mono" data-role="sys-network">Online</span>
-              <span class="tf-kv-key">PWA Cache</span>
-              <span class="tf-kv-val mono" data-role="sys-sw">Registering…</span>
+              <span class="tf-kv-val" data-role="sys-network">Online</span>
+              <span class="tf-kv-key">PWA cache</span>
+              <span class="tf-kv-val" data-role="sys-sw">Registering…</span>
             </div>
           </div>
         </details>
       </div>
+
       <div
         class="tf-sidebar-resizer"
         data-role="sidebar-resizer"
@@ -295,16 +288,17 @@ export class Sidebar {
     `;
 
     this.layerListEl = this.q("[data-role='layer-list']");
+    this.reorderToggleBtn = this.q<HTMLButtonElement>(
+      "[data-role='toggle-layer-reorder']"
+    );
     this.layerPrefsBarEl = this.q("[data-role='layer-prefs-bar']");
-    this.snowSliderRowEl = this.q("[data-role='snow-control']");
-    this.snowSliderEl = this.q<HTMLInputElement>("[data-role='snow-slider']");
-    this.snowValEl = this.q("[data-role='snow-val']");
-    this.snowTicksEl = this.q("[data-role='snow-ticks']");
-    this.difficultyLegendEl = this.q("[data-role='difficulty-legend']");
     this.tileModePillEl = this.q("[data-role='tile-mode-pill']");
     this.feedsSectionEl = this.q<HTMLDetailsElement>("[data-role='feeds-section']");
     this.feedsPillEl = this.q("[data-role='feeds-pill']");
     this.feedsListEl = this.q("[data-role='feeds-list']");
+    this.presetSelectEl = this.q<HTMLSelectElement>(
+      "[data-role='sidebar-preset-select']"
+    );
     this.regionNameEl = this.q("[data-role='region-name']");
     this.regionTagEl = this.q("[data-role='region-tag']");
     this.regionDescEl = this.q("[data-role='region-desc']");
@@ -323,11 +317,17 @@ export class Sidebar {
     this.resizerEl = this.q("[data-role='sidebar-resizer']");
 
     this.renderLayerList();
-    this.renderSnowTicks();
+    this.renderPoiLegend();
     this.updatePreset(initialPreset);
 
     this.collapseBtnEl.addEventListener("click", () => {
       callbacks.onCollapse?.();
+    });
+
+    this.reorderToggleBtn.addEventListener("click", () => {
+      this.reorderMode = !this.reorderMode;
+      this.syncReorderToggleUi();
+      this.renderLayerList();
     });
 
     this.bindResizerEvents();
@@ -338,12 +338,8 @@ export class Sidebar {
         callbacks.onResetLayerPreferences?.();
       });
 
-    this.snowSliderEl.addEventListener("input", () => {
-      const idx = Number(this.snowSliderEl.value);
-      const elev = this.snowBands[idx] ?? 1000;
-      this.snowValEl.textContent = `≥ ${elev.toLocaleString()} m`;
-      this.layerState = { ...this.layerState, snowLineElevationM: elev };
-      this.callbacks.onSnowLineElevationChange(elev);
+    this.presetSelectEl.addEventListener("change", () => {
+      callbacks.onPresetChange?.(this.presetSelectEl.value);
     });
 
     this.q("[data-role='reset-region']").addEventListener("click", () => {
@@ -355,6 +351,22 @@ export class Sidebar {
       ?.addEventListener("click", () => {
         callbacks.onOpenOfflinePacks?.();
       });
+  }
+
+  private syncReorderToggleUi(): void {
+    const caption = this.root.querySelector<HTMLElement>(
+      ".tf-layer-toolbar-caption"
+    );
+    if (caption) {
+      caption.textContent = this.reorderMode
+        ? "Drag rows or use arrows to reorder"
+        : "Grouped by category";
+    }
+    this.reorderToggleBtn.setAttribute("aria-pressed", String(this.reorderMode));
+    this.reorderToggleBtn.classList.toggle("active", this.reorderMode);
+    this.reorderToggleBtn.innerHTML = this.reorderMode
+      ? `${uiIcon("check", 13)}<span>Done</span>`
+      : `${uiIcon("sliders", 13)}<span>Reorder</span>`;
   }
 
   /**
@@ -370,7 +382,6 @@ export class Sidebar {
     this.layerState = { ...layers };
     this.hasCustomLayerPrefs = hasCustomPrefs;
     this.renderLayerList();
-    this.syncConditionalLayerControls();
     this.layerPrefsBarEl.classList.toggle("hidden", !hasCustomPrefs);
   }
 
@@ -398,66 +409,186 @@ export class Sidebar {
     this.collapseBtnEl.setAttribute("aria-expanded", String(!collapsed));
   }
 
-  private syncConditionalLayerControls(): void {
-    this.snowSliderRowEl.classList.toggle("hidden", !this.layerState.snowLine);
-    this.difficultyLegendEl.classList.toggle("hidden", !this.layerState.tracks);
+  private renderInlineLayerAccessory(key: LayerKey): string {
+    if (key === "tracks" && this.layerState.tracks) {
+      return `
+        <div class="tf-inline-grade-legend" data-role="difficulty-legend">
+          ${DIFFICULTY_META.map(
+            (d) => `
+              <span class="tf-inline-grade-item" title="${escapeHtml(d.hint)}">
+                <span class="tf-diff-swatch" style="background:${d.color}"></span>
+                <span>${escapeHtml(d.label)}</span>
+              </span>
+            `
+          ).join("")}
+        </div>
+      `;
+    }
+
+    if (key === "snowLine" && this.layerState.snowLine) {
+      const snapped = snapSnowlineBand(
+        this.layerState.snowLineElevationM,
+        this.snowBands
+      );
+      const idx = Math.max(0, this.snowBands.indexOf(snapped));
+      const first = this.snowBands[0] ?? 800;
+      const mid = this.snowBands[Math.floor(this.snowBands.length / 2)] ?? 1100;
+      const last = this.snowBands[this.snowBands.length - 1] ?? 1600;
+      return `
+        <div class="tf-snow-control" data-role="snow-control">
+          <div class="tf-snow-head">
+            <span>Elevation threshold</span>
+            <span class="tf-snow-val" data-role="snow-val">&ge; ${snapped.toLocaleString()} m</span>
+          </div>
+          <input
+            type="range"
+            class="tf-range"
+            data-role="snow-slider"
+            min="0"
+            max="${this.snowBands.length - 1}"
+            step="1"
+            value="${idx}"
+            aria-label="Snow-line elevation threshold in meters"
+          />
+          <div class="tf-snow-ticks" data-role="snow-ticks">
+            <span>${first} m</span><span>${mid} m</span><span>${last} m</span>
+          </div>
+        </div>
+      `;
+    }
+
+    return "";
   }
 
   private renderLayerList(): void {
-    const total = this.layerOrder.length;
-    this.layerListEl.innerHTML = this.layerOrder
-      .map((key, idx) => {
-        const item = LAYER_DEFINITION_MAP[key];
-        const checked = Boolean(this.layerState[key]);
-        return `
-          <div
-            class="tf-toggle-row tf-layer-row"
-            data-layer-row="${escapeHtml(key)}"
-            draggable="true"
-          >
-            <span
-              class="tf-layer-drag-handle"
-              title="Drag to reorder layer"
-              aria-hidden="true"
-            >⋮⋮</span>
-            <label class="tf-layer-toggle-main">
-              <input
-                type="checkbox"
-                class="tf-checkbox"
-                data-layer-key="${escapeHtml(key)}"
-                ${checked ? "checked" : ""}
-              />
-              <span class="tf-toggle-copy">
-                <span class="tf-toggle-label">${escapeHtml(item.label)}</span>
-                <span class="tf-toggle-hint">${escapeHtml(item.hint)}</span>
-              </span>
-            </label>
-            <div class="tf-layer-move-controls">
-              <button
-                type="button"
-                class="tf-layer-move-btn"
-                data-move-layer="${escapeHtml(key)}"
-                data-move-dir="up"
-                title="Move ${escapeHtml(item.shortLabel)} up"
-                aria-label="Move ${escapeHtml(item.shortLabel)} up"
-                ${idx === 0 ? "disabled" : ""}
-              >↑</button>
-              <button
-                type="button"
-                class="tf-layer-move-btn"
-                data-move-layer="${escapeHtml(key)}"
-                data-move-dir="down"
-                title="Move ${escapeHtml(item.shortLabel)} down"
-                aria-label="Move ${escapeHtml(item.shortLabel)} down"
-                ${idx === total - 1 ? "disabled" : ""}
-              >↓</button>
+    if (this.reorderMode) {
+      const total = this.layerOrder.length;
+      this.layerListEl.innerHTML = this.layerOrder
+        .map((key, idx) => {
+          const item = LAYER_DEFINITION_MAP[key];
+          const checked = Boolean(this.layerState[key]);
+          return `
+            <div
+              class="tf-toggle-row tf-layer-row is-reordering"
+              data-layer-row="${escapeHtml(key)}"
+              draggable="true"
+            >
+              <span
+                class="tf-layer-drag-handle"
+                title="Drag to reorder layer"
+                aria-hidden="true"
+              >⋮⋮</span>
+              <label class="tf-layer-toggle-main">
+                <input
+                  type="checkbox"
+                  class="tf-checkbox"
+                  data-layer-key="${escapeHtml(key)}"
+                  ${checked ? "checked" : ""}
+                />
+                <span class="tf-toggle-copy">
+                  <span class="tf-toggle-label">${escapeHtml(item.label)}</span>
+                </span>
+              </label>
+              <div class="tf-layer-move-controls always-visible">
+                <button
+                  type="button"
+                  class="tf-layer-move-btn"
+                  data-move-layer="${escapeHtml(key)}"
+                  data-move-dir="up"
+                  title="Move ${escapeHtml(item.shortLabel)} up"
+                  aria-label="Move ${escapeHtml(item.shortLabel)} up"
+                  ${idx === 0 ? "disabled" : ""}
+                >↑</button>
+                <button
+                  type="button"
+                  class="tf-layer-move-btn"
+                  data-move-layer="${escapeHtml(key)}"
+                  data-move-dir="down"
+                  title="Move ${escapeHtml(item.shortLabel)} down"
+                  aria-label="Move ${escapeHtml(item.shortLabel)} down"
+                  ${idx === total - 1 ? "disabled" : ""}
+                >↓</button>
+              </div>
             </div>
-          </div>
-        `;
-      })
-      .join("");
+          `;
+        })
+        .join("");
+    } else {
+      const groups = groupOrderedLayerKeys(this.layerOrder);
+      this.layerListEl.innerHTML = groups
+        .map(
+          (group) => `
+            <div class="tf-layer-group" data-layer-group="${escapeHtml(group.id)}">
+              <div class="tf-layer-group-title">${escapeHtml(group.label)}</div>
+              <div class="tf-layer-group-rows">
+                ${group.keys
+                  .map((key) => {
+                    const item = LAYER_DEFINITION_MAP[key];
+                    const checked = Boolean(this.layerState[key]);
+                    const accessory = this.renderInlineLayerAccessory(key);
+                    return `
+                      <div class="tf-layer-item-wrap">
+                        <label class="tf-layer-clean-row" title="${escapeHtml(item.hint)}">
+                          <input
+                            type="checkbox"
+                            class="tf-checkbox"
+                            data-layer-key="${escapeHtml(key)}"
+                            ${checked ? "checked" : ""}
+                          />
+                          <span class="tf-toggle-copy">
+                            <span class="tf-toggle-label">${escapeHtml(item.label)}</span>
+                            <span class="tf-toggle-hint">${escapeHtml(item.hint)}</span>
+                          </span>
+                        </label>
+                        ${accessory}
+                      </div>
+                    `;
+                  })
+                  .join("")}
+              </div>
+            </div>
+          `
+        )
+        .join("");
+    }
 
     this.bindLayerListEvents();
+  }
+
+  private renderPoiLegend(): void {
+    const mount = this.root.querySelector<HTMLElement>("[data-role='poi-legend-block']");
+    if (!mount) return;
+    const shown = this.showAllPoiLegend
+      ? OUTDOOR_POI_ICONS
+      : OUTDOOR_POI_ICONS.slice(0, 6);
+
+    mount.innerHTML = `
+      <div class="tf-poi-legend-head">
+        <span class="tf-layer-group-title">Outdoor POI symbols (${OUTDOOR_POI_ICONS.length})</span>
+        <button type="button" class="tf-text-action-btn" data-role="toggle-poi-legend">
+          ${this.showAllPoiLegend ? "Show fewer" : "Show all"}
+        </button>
+      </div>
+      <div class="tf-icon-grid">
+        ${shown
+          .map(
+            (icon) => `
+              <span class="tf-icon-legend-item" title="${escapeHtml(icon.label)}">
+                <img src="${escapeHtml(icon.iconPath)}" alt="" width="16" height="16" loading="lazy" />
+                <span>${escapeHtml(icon.label)}</span>
+              </span>
+            `
+          )
+          .join("")}
+      </div>
+    `;
+
+    mount
+      .querySelector<HTMLButtonElement>("[data-role='toggle-poi-legend']")
+      ?.addEventListener("click", () => {
+        this.showAllPoiLegend = !this.showAllPoiLegend;
+        this.renderPoiLegend();
+      });
   }
 
   private bindLayerListEvents(): void {
@@ -467,10 +598,28 @@ export class Sidebar {
         input.addEventListener("change", () => {
           const key = input.dataset.layerKey as LayerKey;
           this.layerState = { ...this.layerState, [key]: input.checked };
-          this.syncConditionalLayerControls();
+          if (key === "tracks" || key === "snowLine") {
+            this.renderLayerList();
+          }
           this.callbacks.onLayerToggle(key, input.checked);
         });
       });
+
+    const snowSlider = this.layerListEl.querySelector<HTMLInputElement>(
+      "[data-role='snow-slider']"
+    );
+    const snowVal = this.layerListEl.querySelector<HTMLElement>(
+      "[data-role='snow-val']"
+    );
+    snowSlider?.addEventListener("input", () => {
+      const idx = Number(snowSlider.value);
+      const elev = this.snowBands[idx] ?? 1000;
+      if (snowVal) snowVal.textContent = `≥ ${elev.toLocaleString()} m`;
+      this.layerState = { ...this.layerState, snowLineElevationM: elev };
+      this.callbacks.onSnowLineElevationChange(elev);
+    });
+
+    if (!this.reorderMode) return;
 
     this.layerListEl
       .querySelectorAll<HTMLButtonElement>("[data-move-layer]")
@@ -636,7 +785,7 @@ export class Sidebar {
 
     const bannerHtml =
       summary.kind === "degraded" || summary.kind === "stale"
-        ? `<div class="tf-feed-warn-banner">⚠ ${escapeHtml(summary.tooltip)}</div>`
+        ? `<div class="tf-feed-warn-banner">${uiIcon("alert", 13)}<span>${escapeHtml(summary.tooltip)}</span></div>`
         : "";
 
     this.feedsListEl.innerHTML = `
@@ -658,11 +807,11 @@ export class Sidebar {
               <div class="tf-feed-row" title="${escapeHtml(feed.last_error ?? feed.source_url ?? name)}">
                 <div class="tf-feed-row-head">
                   <span class="tf-feed-name"><span class="tf-status-dot ${dotCls}"></span>${escapeHtml(name)}</span>
-                  <span class="mono tf-feed-count">${feed.record_count ?? 0}</span>
+                  <span class="tf-feed-count">${feed.record_count ?? 0}</span>
                 </div>
                 <div class="tf-feed-row-sub">
-                  <span>${escapeHtml(feed.state ?? "AU")} · ${escapeHtml(feed.status)}${feed.is_stale ? " (STALE)" : ""}</span>
-                  <span class="mono">${escapeHtml(updated)}</span>
+                  <span>${escapeHtml(feed.state ?? "AU")} · ${escapeHtml(feed.status)}${feed.is_stale ? " (stale)" : ""}</span>
+                  <span>${escapeHtml(updated)}</span>
                 </div>
               </div>
             `;
@@ -676,20 +825,18 @@ export class Sidebar {
     if (bands.length === 0) return;
     this.snowBands = [...bands].sort((a, b) => a - b);
     const snapped = snapSnowlineBand(currentElevationM, this.snowBands);
-    const idx = Math.max(0, this.snowBands.indexOf(snapped));
-    this.snowSliderEl.min = "0";
-    this.snowSliderEl.max = String(this.snowBands.length - 1);
-    this.snowSliderEl.value = String(idx);
-    this.snowValEl.textContent = `≥ ${snapped.toLocaleString()} m`;
-    this.renderSnowTicks();
+    this.layerState = { ...this.layerState, snowLineElevationM: snapped };
+    if (this.layerState.snowLine && !this.reorderMode) {
+      this.renderLayerList();
+    }
   }
 
   updateTileMode(mode: TileMode, detail?: string): void {
     const pillLabels: Record<TileMode, string> = {
       loading: "Loading…",
-      pmtiles: "PMTiles Live",
-      "geojson-fallback": "GeoJSON Mode",
-      offline: "Offline Shell",
+      pmtiles: "PMTiles live",
+      "geojson-fallback": "GeoJSON mode",
+      offline: "Offline shell",
     };
     this.tileModePillEl.textContent = pillLabels[mode];
     this.sysTilesEl.textContent = detail ?? pillLabels[mode];
@@ -697,12 +844,15 @@ export class Sidebar {
 
   updatePreset(preset: RegionPreset): void {
     const [w, s, e, n] = preset.bbox;
+    if (this.presetSelectEl.value !== preset.id) {
+      this.presetSelectEl.value = preset.id;
+    }
     this.regionNameEl.textContent = preset.label;
     this.regionTagEl.textContent = preset.stateTag;
     this.regionDescEl.textContent = preset.description;
     this.regionBboxEl.textContent = `${w.toFixed(2)}E..${e.toFixed(2)}E, ${s.toFixed(2)}..${n.toFixed(2)}`;
     this.regionPackEl.textContent = preset.estimatedPackHint
-      ? `${preset.estimatedPackHint} (Offline Pack)`
+      ? `${preset.estimatedPackHint} offline pack`
       : "Corridor view";
   }
 
@@ -716,13 +866,13 @@ export class Sidebar {
         state.kind === "online"
           ? `${state.data.status.toUpperCase()} (${state.data.service ?? "trailforge"})`
           : "DEGRADED (DB offline)";
-      this.sysPostgisEl.textContent = state.data.postgis_version ?? "—";
-      this.sysSchemaEl.textContent = state.data.schema_revision ?? "—";
+      this.sysPostgisEl.textContent = state.data.postgis_version ?? "-";
+      this.sysSchemaEl.textContent = state.data.schema_revision ?? "-";
       return;
     }
     this.sysApiEl.textContent = "Offline (standalone shell)";
-    this.sysPostgisEl.textContent = "—";
-    this.sysSchemaEl.textContent = "—";
+    this.sysPostgisEl.textContent = "-";
+    this.sysSchemaEl.textContent = "-";
   }
 
   updateNetworkStatus(online: boolean): void {
@@ -739,13 +889,6 @@ export class Sidebar {
       error: "Unavailable",
     };
     this.sysSwEl.textContent = labels[status];
-  }
-
-  private renderSnowTicks(): void {
-    const first = this.snowBands[0] ?? 800;
-    const mid = this.snowBands[Math.floor(this.snowBands.length / 2)] ?? 1100;
-    const last = this.snowBands[this.snowBands.length - 1] ?? 1600;
-    this.snowTicksEl.innerHTML = `<span>${first}m</span><span>${mid}m</span><span>${last}m</span>`;
   }
 
   private q<T extends HTMLElement = HTMLElement>(selector: string): T {

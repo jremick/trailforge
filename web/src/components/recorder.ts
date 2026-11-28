@@ -1,3 +1,4 @@
+import { uiIcon } from "../icons";
 import {
   type BackgroundLocationHandle,
   type ImuCaptureHandle,
@@ -516,16 +517,18 @@ export class InCabRecorderHud {
 
   private patchLiveMetricsInPlace(): void {
     const stats = this.getCurrentStats();
-    const pill = this.root.querySelector<HTMLElement>("[data-role='rec-toggle']");
-    if (pill) {
-      pill.textContent =
+    const pillLabelEl = this.root.querySelector<HTMLElement>(
+      "[data-role='rec-toggle-label']"
+    );
+    if (pillLabelEl) {
+      pillLabelEl.textContent =
         this.phase === "recording"
-          ? `● REC ${(stats.distanceM / 1000).toFixed(2)} km · ${formatClock(stats.durationS)}`
+          ? `REC ${(stats.distanceM / 1000).toFixed(2)} km · ${formatClock(stats.durationS)}`
           : this.phase === "paused"
-            ? `❚❚ PAUSED ${(stats.distanceM / 1000).toFixed(2)} km`
+            ? `Paused ${(stats.distanceM / 1000).toFixed(2)} km`
             : this.phase === "stopped"
-              ? `■ SAVING (${stats.pointCount} pts)`
-              : "● In-Cab Recorder";
+              ? `Saving (${stats.pointCount} pts)`
+              : "In-cab recorder";
     }
     if (!this.expanded) return;
 
@@ -844,63 +847,63 @@ export class InCabRecorderHud {
         <div class="tf-recorder-card">
           <div class="tf-recorder-card-head">
             <div class="tf-recorder-head-left">
-              <span class="tf-recorder-title">In-Cab Recorder</span>
-              <span class="tf-rec-runtime-pill mono ${this.runtimeMode !== "pwa_browser" ? "native" : ""}" data-role="runtime-mode-pill">${escapeHtml(runtimeLabel)}</span>
+              <span class="tf-recorder-title">In-cab recorder</span>
+              <span class="tf-rec-runtime-pill ${this.runtimeMode !== "pwa_browser" ? "native" : ""}" data-role="runtime-mode-pill">${escapeHtml(runtimeLabel)}</span>
             </div>
-            <button type="button" class="tf-mini-btn" data-role="rec-collapse" aria-label="Collapse recorder">▾</button>
+            <button type="button" class="tf-icon-action-btn" data-role="rec-collapse" aria-label="Collapse recorder" title="Minimize recorder">${uiIcon("chevronDown", 14)}</button>
           </div>
 
           ${this.errorMsg ? `<div class="tf-inspector-error">${escapeHtml(this.errorMsg)}</div>` : ""}
           ${backtrackHud}
           ${clinometerHtml}
 
-          <div class="tf-recorder-stats mono">
+          <div class="tf-recorder-stats">
             <div><span class="tf-stat-label">Dist</span><strong data-rec-stat="dist">${(stats.distanceM / 1000).toFixed(2)} km</strong></div>
             <div><span class="tf-stat-label">Time</span><strong data-rec-stat="time">${formatClock(stats.durationS)}</strong></div>
             <div><span class="tf-stat-label">Speed</span><strong data-rec-stat="speed">${stats.currentSpeedKmh.toFixed(1)} km/h</strong></div>
-            <div><span class="tf-stat-label">Elev</span><strong data-rec-stat="elev">${stats.currentElevM !== null ? `${Math.round(stats.currentElevM)} m` : "—"}</strong></div>
+            <div><span class="tf-stat-label">Elev</span><strong data-rec-stat="elev">${stats.currentElevM !== null ? `${Math.round(stats.currentElevM)} m` : "-"}</strong></div>
             <div><span class="tf-stat-label">Pts</span><strong data-rec-stat="pts">${stats.pointCount}</strong></div>
-            <div><span class="tf-stat-label">Rough</span><strong data-rec-stat="rough">${roughDisplay !== null ? `${roughDisplay.toFixed(2)}g` : "—"}</strong></div>
+            <div><span class="tf-stat-label">Rough</span><strong data-rec-stat="rough">${roughDisplay !== null ? `${roughDisplay.toFixed(2)}g` : "-"}</strong></div>
             <div><span class="tf-stat-label">Shocks</span><strong data-rec-stat="shocks" class="${this.imuMetrics.shock_event_count > 0 ? "tf-accent-amber" : ""}">${this.imuMetrics.shock_event_count}</strong></div>
-            <div><span class="tf-stat-label">P95</span><strong data-rec-stat="p95">${p95Display !== null ? `${p95Display.toFixed(2)}g` : "—"}</strong></div>
+            <div><span class="tf-stat-label">P95</span><strong data-rec-stat="p95">${p95Display !== null ? `${p95Display.toFixed(2)}g` : "-"}</strong></div>
           </div>
 
           <div class="tf-recorder-controls">
             ${
               this.phase === "idle" || this.phase === "stopped"
-                ? `<button type="button" class="tf-btn-primary" data-role="rec-start">● Start GPS</button>
-                   <button type="button" class="tf-btn-secondary" data-role="rec-sim" title="Step along Davies Plain corridor with live 4WD clinometer & IMU shocks">▶ Simulate Drive</button>`
+                ? `<button type="button" class="tf-btn-primary" data-role="rec-start">${uiIcon("record", 13)}<span>Start GPS</span></button>
+                   <button type="button" class="tf-btn-secondary" data-role="rec-sim" title="Step along Davies Plain corridor with live 4WD clinometer & IMU shocks">${uiIcon("play", 13)}<span>Simulate drive</span></button>`
                 : ""
             }
             ${
               this.phase === "recording"
-                ? `<button type="button" class="tf-btn-secondary" data-role="rec-pause">❚❚ Pause</button>
-                   <button type="button" class="tf-btn-primary" data-role="rec-stop">■ Stop</button>`
+                ? `<button type="button" class="tf-btn-secondary" data-role="rec-pause">${uiIcon("pause", 13)}<span>Pause</span></button>
+                   <button type="button" class="tf-btn-primary" data-role="rec-stop">${uiIcon("stop", 13)}<span>Stop</span></button>`
                 : ""
             }
             ${
               this.phase === "paused"
-                ? `<button type="button" class="tf-btn-primary" data-role="rec-resume">▶ Resume</button>
-                   <button type="button" class="tf-btn-secondary" data-role="rec-stop">■ Stop</button>`
+                ? `<button type="button" class="tf-btn-primary" data-role="rec-resume">${uiIcon("play", 13)}<span>Resume</span></button>
+                   <button type="button" class="tf-btn-secondary" data-role="rec-stop">${uiIcon("stop", 13)}<span>Stop</span></button>`
                 : ""
             }
             ${
               this.points.length >= 2
-                ? `<button type="button" class="tf-mini-btn ${this.backtrackActive ? "active" : ""}" data-role="rec-backtrack">↩ Backtrack</button>`
+                ? `<button type="button" class="tf-mini-btn ${this.backtrackActive ? "active" : ""}" data-role="rec-backtrack">${uiIcon("backtrack", 13)}<span>Backtrack</span></button>`
                 : ""
             }
           </div>
 
           <div class="tf-recorder-toggles">
             <button type="button" class="tf-mini-btn ${this.wakeLockStatus === "active" ? "active" : ""}" data-role="rec-wakelock">
-              ☀ Keep Awake: ${this.wakeLockStatus === "active" ? "ON" : this.wakeLockStatus === "unsupported" ? "N/A" : "OFF"}
+              ${uiIcon("sun", 12)}<span>Keep awake: ${this.wakeLockStatus === "active" ? "On" : this.wakeLockStatus === "unsupported" ? "N/A" : "Off"}</span>
             </button>
             <button type="button" class="tf-mini-btn ${this.motionEnabled ? "active" : ""}" data-role="rec-motion">
-              〰 50 Hz IMU: ${this.motionEnabled ? "ON" : "OFF"}
+              ${uiIcon("zap", 12)}<span>50 Hz IMU: ${this.motionEnabled ? "On" : "Off"}</span>
             </button>
             ${
               this.points.length >= 2 && this.phase !== "stopped"
-                ? `<button type="button" class="tf-mini-btn" data-rec-export="gpx">⬇ GPX</button>`
+                ? `<button type="button" class="tf-mini-btn" data-rec-export="gpx">${uiIcon("download", 12)}<span>GPX</span></button>`
                 : ""
             }
             ${
@@ -919,9 +922,9 @@ export class InCabRecorderHud {
       ${bodyHtml}
       <button
         type="button"
-        class="tf-recorder-pill ${this.phase === "recording" ? "recording" : ""} ${this.backtrackActive ? "backtrack" : ""}"
+        class="tf-recorder-pill ${this.expanded ? "hidden" : ""} ${this.phase === "recording" ? "recording" : ""} ${this.backtrackActive ? "backtrack" : ""}"
         data-role="rec-toggle"
-      >${escapeHtml(pillLabel)}</button>
+      >${uiIcon("record", 11, "tf-rec-dot-icon")}<span data-role="rec-toggle-label">${escapeHtml(pillLabel.replace(/^[●❚■\s]+/, ""))}</span></button>
     `;
 
     this.renderedStructKey = this.computeStructKey();

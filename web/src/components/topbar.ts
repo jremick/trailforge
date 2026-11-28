@@ -1,4 +1,5 @@
 import { summarizeFeedStatus } from "../closuresHelpers";
+import { uiIcon } from "../icons";
 import { REGION_PRESETS, escapeHtml, getGradeColor } from "../presets";
 import {
   MIN_REMOTE_SEARCH_LENGTH,
@@ -9,6 +10,7 @@ import {
   runUnifiedSearch,
   shouldRunRemoteSearch,
 } from "../search";
+import { getThemeLabel, type UiTheme } from "../themeHelpers";
 import type {
   ClosuresStatusResponse,
   HealthState,
@@ -19,6 +21,7 @@ import type {
 
 export interface TopBarCallbacks {
   onToggleSidebar?: () => void;
+  onToggleTheme?: () => void;
   onSearchSelect: (item: UnifiedSearchItem) => void;
   onSearchNoMatch: (query: string, remoteError: boolean) => void;
   onSearchClear: () => void;
@@ -250,6 +253,7 @@ export class TopBar {
   private readonly statusDotEl: HTMLElement;
   private readonly statusBadgeEl: HTMLElement;
   private readonly statusMenuEl: HTMLElement;
+  private readonly themeBtnEl: HTMLButtonElement;
   private readonly feedPillEl: HTMLButtonElement;
   private readonly feedDotEl: HTMLElement;
   private readonly feedTextEl: HTMLElement;
@@ -286,11 +290,13 @@ export class TopBar {
   constructor(
     container: HTMLElement,
     initialPresetId: string,
-    callbacks: TopBarCallbacks
+    callbacks: TopBarCallbacks,
+    options?: { initialTheme?: UiTheme }
   ) {
     this.root = container;
     this.callbacks = callbacks;
     this.root.className = "tf-topbar";
+    const initialTheme: UiTheme = options?.initialTheme ?? "dark";
 
     const iconicRegions = REGION_PRESETS.filter(
       (p) => p.group === "region" && p.packCategory !== "state"
@@ -421,6 +427,14 @@ export class TopBar {
 
         <span class="tf-topbar-divider" aria-hidden="true"></span>
 
+        <button
+          type="button"
+          class="tf-nav-icon-btn tf-theme-btn"
+          data-role="theme-btn"
+          aria-label="Switch color theme"
+          title="Switch theme"
+        ></button>
+
         <div class="tf-status-wrap" data-role="status-wrap">
           <button
             type="button"
@@ -490,7 +504,7 @@ export class TopBar {
           type="button"
           class="tf-nav-btn tf-admin-btn hidden"
           data-role="admin-btn"
-          title="Admin Console — Traffic, Storage, Friend Invites & Users"
+          title="Admin Console: traffic, storage, friend invites & users"
         >
           <svg class="tf-admin-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
@@ -519,6 +533,8 @@ export class TopBar {
     this.statusDotEl = this.q("[data-role='status-dot']");
     this.statusBadgeEl = this.q("[data-role='status-badge']");
     this.statusMenuEl = this.q("[data-role='status-menu']");
+    this.themeBtnEl = this.q<HTMLButtonElement>("[data-role='theme-btn']");
+    this.updateTheme(initialTheme);
     this.feedPillEl = this.q<HTMLButtonElement>("[data-role='feed-pill']");
     this.feedDotEl = this.q("[data-role='feed-dot']");
     this.feedTextEl = this.q("[data-role='feed-text']");
@@ -537,6 +553,10 @@ export class TopBar {
 
     this.sidebarBtnEl.addEventListener("click", () => {
       callbacks.onToggleSidebar?.();
+    });
+
+    this.themeBtnEl.addEventListener("click", () => {
+      callbacks.onToggleTheme?.();
     });
 
     this.searchFormEl.addEventListener("submit", (e) => {
@@ -663,6 +683,16 @@ export class TopBar {
     this.healthPillEl.addEventListener("click", () => {
       callbacks.onHealthClick();
     });
+  }
+
+  updateTheme(theme: UiTheme): void {
+    const isDaylight = theme === "daylight";
+    const nextLabel = isDaylight ? getThemeLabel("dark") : getThemeLabel("daylight");
+    this.themeBtnEl.innerHTML = uiIcon(isDaylight ? "moon" : "sun", 15);
+    this.themeBtnEl.classList.toggle("is-daylight", isDaylight);
+    this.themeBtnEl.title = `Switch to ${nextLabel} theme`;
+    this.themeBtnEl.setAttribute("aria-label", `Switch to ${nextLabel} theme`);
+    this.themeBtnEl.setAttribute("aria-pressed", String(isDaylight));
   }
 
   updateSidebarState(collapsed: boolean): void {
@@ -852,7 +882,7 @@ export class TopBar {
     this.healthDotEl.classList.add("offline");
     this.healthTextEl.textContent = "API Offline";
     this.healthDetailEl.textContent =
-      state.error ?? "Backend unreachable — operating in offline shell mode";
+      state.error ?? "Backend unreachable. Operating in offline shell mode.";
     this.healthSeverity = "offline";
     this.healthSummaryTitle = "API Offline";
     this.syncCombinedStatusIndicator();
@@ -1155,13 +1185,22 @@ export class TopBar {
     if (items.length === 0) {
       this.searchMenuEl.innerHTML = `<div class="tf-search-empty">${
         options.remoteError
-          ? "Offline — enter lat,lon, MGRS, or a town/region name."
+          ? "Offline: enter lat,lon, MGRS, or a town/region name."
           : "No matching tracks, POIs, parks, or places."
       }</div>`;
       this.searchMenuEl.classList.remove("hidden");
       this.searchInputEl.setAttribute("aria-expanded", "true");
       return;
     }
+
+    const kindLabels: Record<string, string> = {
+      track: "Track",
+      poi: "POI",
+      park: "Park",
+      place: "Place",
+      preset: "Region",
+      coord: "Coord",
+    };
 
     const rowsHtml = items
       .map((item, idx) => {
@@ -1177,7 +1216,7 @@ export class TopBar {
         const kindBadge =
           item.kind === "track" && item.grade
             ? `<span class="tf-search-badge" style="border-color:${getGradeColor(item.grade)};color:${getGradeColor(item.grade)}">${escapeHtml(item.grade)}</span>`
-            : `<span class="${badgeClass}">${escapeHtml(item.kind.toUpperCase())}</span>`;
+            : `<span class="${badgeClass}">${escapeHtml(kindLabels[item.kind] ?? item.kind)}</span>`;
 
         const iconImg = item.iconKey
           ? `<img class="tf-search-item-icon" src="/icons/${escapeHtml(item.iconKey)}.svg" alt="" width="16" height="16" />`

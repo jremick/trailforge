@@ -4,6 +4,7 @@ import {
   computeGeometryBBox,
   extractClosureSummaryFromProps,
   formatClosureDateRange,
+  formatClosurePlainText,
   formatClosureSeverityLabel,
   formatClosureTypeLabel,
   formatRelativeTimestamp,
@@ -233,5 +234,14 @@ describe("clickable incident & closure detail helpers", () => {
     expect(rows.map((r) => r.label)).toContain("Location");
     expect(rows.map((r) => r.label)).toContain("Size / Area");
     expect(rows.map((r) => r.label)).toContain("Last Updated");
+  });
+
+  it("strips raw HTML tags and entities from agency closure descriptions cleanly", () => {
+    const raw =
+      '<div style="margin-bottom:20px">This&nbsp;<b>Flood Watch</b> applies to Alpine catchments.</div><p>Check road conditions &amp; river levels.</p>';
+    expect(formatClosurePlainText(raw)).toBe(
+      "This Flood Watch applies to Alpine catchments.\nCheck road conditions & river levels."
+    );
+    expect(formatClosurePlainText(null)).toBe("");
   });
 });

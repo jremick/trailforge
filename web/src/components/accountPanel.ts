@@ -3,6 +3,8 @@ import {
   getRegistrationUiState,
   isAdminUser,
 } from "../adminHelpers";
+import { renderSheetHandleMarkup } from "../bottomSheet";
+import { uiIcon } from "../icons";
 import { AiTokensSection } from "./aiTokensSection";
 import { escapeHtml, getGradeColor } from "../presets";
 import {
@@ -140,7 +142,7 @@ export class RigAccountPanel {
     this.state = initialState;
     this.aiTokens = new AiTokensSection({ ownerId: initialState.user?.id });
     this.callbacks = callbacks;
-    this.root.className = "tf-account-panel";
+    this.root.className = "tf-drawer tf-account-panel";
     this.root.setAttribute(
       "aria-label",
       "Rig profiles, trip telemetry, saved tracks, pins, and account"
@@ -193,20 +195,23 @@ export class RigAccountPanel {
     const showAdminBtn = isAdminUser(user);
 
     this.root.innerHTML = `
+      ${renderSheetHandleMarkup("Resize rig and account panel")}
       <div class="tf-inspector-head">
-        <div>
-          <div class="tf-inspector-kicker">Rig, Telemetry &amp; Data</div>
+        <div class="tf-inspector-head-copy">
           <h2 class="tf-inspector-title">${
-            user ? escapeHtml(user.display_name) : "Anonymous Mode"
+            user ? escapeHtml(user.display_name) : "Rig & account"
           }</h2>
+          <div class="tf-inspector-subline">${
+            user ? escapeHtml(user.email) : "Anonymous browsing · Sign in optional"
+          }</div>
         </div>
         <div class="tf-head-actions">
           ${
             showAdminBtn
-              ? `<button type="button" class="tf-mini-btn tf-admin-hdr-btn" data-role="open-admin" title="Open Admin Console">🛡 Admin</button>`
+              ? `<button type="button" class="tf-mini-btn tf-admin-hdr-btn" data-role="open-admin" title="Open Admin Console">${uiIcon("shield", 13)}<span>Admin</span></button>`
               : ""
           }
-          <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Rig & Account panel">×</button>
+          <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Rig & Account panel">${uiIcon("close", 15)}</button>
         </div>
       </div>
 

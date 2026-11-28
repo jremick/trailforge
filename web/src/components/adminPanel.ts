@@ -8,6 +8,8 @@ import {
   normalizeRouteBreakdown,
   normalizeTrafficWindow,
 } from "../adminHelpers";
+import { renderSheetHandleMarkup } from "../bottomSheet";
+import { uiIcon } from "../icons";
 import {
   CANONICAL_LAYER_ORDER,
   DEFAULT_LAYER_VISIBILITY,
@@ -82,10 +84,10 @@ export class AdminConsolePanel {
     this.root = container;
     this.state = initialState;
     this.callbacks = callbacks;
-    this.root.className = "tf-account-panel tf-admin-panel";
+    this.root.className = "tf-drawer tf-account-panel tf-admin-panel";
     this.root.setAttribute(
       "aria-label",
-      "Admin Console — Traffic, Storage, Friend Invites and Users"
+      "Admin Console: traffic, storage, friend invites and users"
     );
     this.root.setAttribute("aria-hidden", "true");
   }
@@ -140,20 +142,22 @@ export class AdminConsolePanel {
       .toUpperCase();
 
     this.root.innerHTML = `
+      ${renderSheetHandleMarkup("Resize admin console")}
       <div class="tf-inspector-head">
-        <div>
-          <div class="tf-inspector-kicker">Instance Administration · ${escapeHtml(modeLabel)}</div>
-          <h2 class="tf-inspector-title">Admin Console</h2>
+        <div class="tf-inspector-head-copy">
+          <h2 class="tf-inspector-title">Admin console</h2>
+          <div class="tf-inspector-subline">Registration mode: ${escapeHtml(modeLabel.toLowerCase())}</div>
         </div>
         <div class="tf-head-actions">
           <button
             type="button"
-            class="tf-mini-btn"
+            class="tf-icon-action-btn"
             data-role="admin-refresh"
             title="Refresh traffic, invites & users"
+            aria-label="Refresh admin stats"
             ${this.state.loading ? "disabled" : ""}
-          >↻</button>
-          <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Admin Console">×</button>
+          >${uiIcon("refresh", 14)}</button>
+          <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Admin Console">${uiIcon("close", 15)}</button>
         </div>
       </div>
 

@@ -1,3 +1,4 @@
+import { renderSheetHandleMarkup } from "../bottomSheet";
 import {
   formatClosureDateRange,
   formatClosureTypeLabel,
@@ -5,6 +6,7 @@ import {
   getClosureTone,
 } from "../closuresHelpers";
 import { formatDurationMinutes } from "../gradingHelpers";
+import { uiIcon } from "../icons";
 import { escapeHtml, getGradeColor, resolvePoiIconName } from "../presets";
 import { formatReportFreshness, formatReportTypeLabel } from "../reportsHelpers";
 import {
@@ -96,7 +98,7 @@ export class RoutePlannerDrawer {
     this.root = container;
     this.state = initialState;
     this.callbacks = callbacks;
-    this.root.className = "tf-account-panel tf-route-panel";
+    this.root.className = "tf-drawer tf-account-panel tf-route-panel";
     this.root.setAttribute("aria-label", "Interactive Multi-Track Route Planner");
     this.root.setAttribute("aria-hidden", "true");
   }
@@ -703,14 +705,14 @@ export class RoutePlannerDrawer {
       `;
 
     this.root.innerHTML = `
+      ${renderSheetHandleMarkup("Resize route planner")}
       <div class="tf-inspector-head">
         <div class="tf-inspector-head-copy">
-          <div class="tf-inspector-kicker">Route Planner · GridForge Handoff</div>
-          <h2 class="tf-inspector-title">Multi-Track Route Builder</h2>
+          <h2 class="tf-inspector-title">Route planner</h2>
+          <div class="tf-inspector-subline">${legCount} leg${legCount === 1 ? "" : "s"} · GPX &amp; GridForge strip atlas</div>
         </div>
         <div class="tf-head-actions">
-          <span class="tf-route-count-pill mono">${legCount} leg${legCount === 1 ? "" : "s"}</span>
-          <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Route Planner">×</button>
+          <button type="button" class="tf-inspector-close" data-role="close" aria-label="Close Route Planner">${uiIcon("close", 15)}</button>
         </div>
       </div>
 

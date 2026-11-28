@@ -144,7 +144,11 @@ export function buildCourseMiniMapStyle(
   const showSat = basemap === "satellite";
   const showOffline = basemap === "offline-topo";
   const showVector = basemap === "vector";
-  const showTerrainContext = showOffline || showVector;
+  // Keep vector basemap visible beneath raster layers so if external raster tiles
+  // throttle or fail, the mini-map always shows crisp topographic terrain & roads
+  // instead of a blank void.
+  const showVectorUnderlay = showVector || showOpenTopo || showOsm;
+  const showTerrainContext = showOffline || showVector || showOpenTopo;
   const vis = (enabled: boolean): "visible" | "none" => (enabled ? "visible" : "none");
 
   const useVector = Boolean(tileManifest?.vector_available && tileManifest.vector_url);
@@ -213,60 +217,30 @@ export function buildCourseMiniMapStyle(
     {
       id: "mini-bg",
       type: "background",
-      paint: { "background-color": "#0E151B" },
+      paint: { "background-color": "#0F1616" },
     },
     {
       id: "mini-graticule-lines",
       type: "line",
       source: "mini-graticule",
       paint: {
-        "line-color": "#1E2E3C",
+        "line-color": "#223332",
         "line-width": 1,
         "line-opacity": 0.8,
       },
     },
     {
-      id: "mini-basemap-opentopo",
-      type: "raster",
-      source: "mini-opentopo",
-      layout: { visibility: vis(showOpenTopo) },
-      paint: {
-        "raster-opacity": 0.92,
-        "raster-brightness-max": 0.9,
-        "raster-contrast": 0.08,
-      },
-    },
-    {
-      id: "mini-basemap-osm",
-      type: "raster",
-      source: "mini-osm",
-      layout: { visibility: vis(showOsm) },
-      paint: {
-        "raster-opacity": 0.9,
-        "raster-brightness-max": 0.88,
-      },
-    },
-    {
-      id: "mini-basemap-satellite",
-      type: "raster",
-      source: "mini-satellite",
-      layout: { visibility: vis(showSat) },
-      paint: {
-        "raster-opacity": 0.95,
-      },
-    },
-    {
       id: "mini-vbase-land",
       type: "background",
-      layout: { visibility: vis(showVector) },
-      paint: { "background-color": "#111921" },
+      layout: { visibility: vis(showVectorUnderlay) },
+      paint: { "background-color": "#111919" },
     },
     {
       id: "mini-vbase-landcover",
       type: "fill",
       source: "mini-vector-basemap",
       "source-layer": "landcover",
-      layout: { visibility: vis(showVector) },
+      layout: { visibility: vis(showVectorUnderlay) },
       paint: {
         "fill-color": [
           "match",
@@ -285,7 +259,7 @@ export function buildCourseMiniMapStyle(
       type: "fill",
       source: "mini-vector-basemap",
       "source-layer": "park",
-      layout: { visibility: vis(showVector) },
+      layout: { visibility: vis(showVectorUnderlay) },
       paint: {
         "fill-color": "#132922",
         "fill-opacity": 0.52,
@@ -297,7 +271,7 @@ export function buildCourseMiniMapStyle(
       source: "mini-vector-basemap",
       "source-layer": "landuse",
       minzoom: 8,
-      layout: { visibility: vis(showVector) },
+      layout: { visibility: vis(showVectorUnderlay) },
       paint: {
         "fill-color": "#1B242E",
         "fill-opacity": 0.72,
@@ -308,7 +282,7 @@ export function buildCourseMiniMapStyle(
       type: "fill",
       source: "mini-vector-basemap",
       "source-layer": "water",
-      layout: { visibility: vis(showVector) },
+      layout: { visibility: vis(showVectorUnderlay) },
       paint: { "fill-color": "#0C2336" },
     },
     {
@@ -316,7 +290,7 @@ export function buildCourseMiniMapStyle(
       type: "line",
       source: "mini-vector-basemap",
       "source-layer": "waterway",
-      layout: { visibility: vis(showVector) },
+      layout: { visibility: vis(showVectorUnderlay) },
       paint: {
         "line-color": "#1D4E6E",
         "line-width": 1.2,
@@ -334,7 +308,7 @@ export function buildCourseMiniMapStyle(
         ["literal", ["motorway", "trunk", "primary", "secondary", "tertiary", "minor"]],
       ],
       layout: {
-        visibility: vis(showVector),
+        visibility: vis(showVectorUnderlay),
         "line-cap": "round",
         "line-join": "round",
       },
@@ -352,6 +326,36 @@ export function buildCourseMiniMapStyle(
         ],
         "line-width": ["interpolate", ["linear"], ["zoom"], 8, 1.0, 14, 3.0],
         "line-opacity": 0.88,
+      },
+    },
+    {
+      id: "mini-basemap-opentopo",
+      type: "raster",
+      source: "mini-opentopo",
+      layout: { visibility: vis(showOpenTopo) },
+      paint: {
+        "raster-opacity": 0.94,
+        "raster-brightness-max": 0.92,
+        "raster-contrast": 0.08,
+      },
+    },
+    {
+      id: "mini-basemap-osm",
+      type: "raster",
+      source: "mini-osm",
+      layout: { visibility: vis(showOsm) },
+      paint: {
+        "raster-opacity": 0.92,
+        "raster-brightness-max": 0.9,
+      },
+    },
+    {
+      id: "mini-basemap-satellite",
+      type: "raster",
+      source: "mini-satellite",
+      layout: { visibility: vis(showSat) },
+      paint: {
+        "raster-opacity": 0.95,
       },
     },
   ];
